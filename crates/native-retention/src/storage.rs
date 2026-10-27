@@ -297,10 +297,10 @@ impl Inner {
             manifest = Some(decode::<Manifest>(&value)?);
         }
         let manifest = manifest.ok_or(Error::Corrupt("missing manifest"))?;
-        if !matches!(manifest.version, 2 | 3)
+        if !matches!(manifest.version, 2 | 3 | 4 | 5)
             || (manifest.version == 2
                 && (manifest.cleanup.is_some() || manifest.cleanup_commitment.is_some()))
-            || (manifest.version == 3
+            || (manifest.version >= 3
                 && manifest.cleanup_commitment != Some(cleanup_inventory(&manifest.cleanup)))
         {
             return Err(Error::Corrupt("unsupported format"));
@@ -643,7 +643,8 @@ impl Inner {
         epoch: u64,
         checkpoint: RootCheckpoint,
         bundle: BundleDescriptor,
-    ) -> Result<PendingCapture> {
+        allow_reuse: bool,
+    ) -> Result<DirtyCaptureDisposition> {
         if bundle.size_bytes == 0 {
             return Err(Error::Invalid("capture bundle size"));
         }
@@ -671,8 +672,32 @@ impl Inner {
                 id: root.id.0,
             })
             .collect();
+        let reusable = if allow_reuse && data.manifest.cleanup.is_none() {
+            let mut selected = None;
+            for capture in data.captures.values() {
+                validate_capture(capture, self.id, data.manifest.epoch, &self.limits)?;
+                if capture.checkpoint.registration() == registration
+                    && capture.bundle == bundle
+                    && capture.checkpoint.checkpoint()? == checkpoint
+                    && selected.as_ref().is_none_or(|old: &PendingCapture| {
+                        capture.registry_epoch > old.registry_epoch
+                    })
+                {
+                    selected = Some(capture.pending()?);
+                }
+            }
+            selected
+        } else {
+            None
+        };
         entry.op_heads = checkpoint.op_heads;
         entry.working_copy_operation = checkpoint.working_copy_operation;
+        if let Some(pending) = reusable {
+            // Only the current Dirty workspace checkpoint changes. The old
+            // immutable pending row, inventory and capture epoch stay exact.
+            self.persist(&mut data, entry, None)?;
+            return Ok(DirtyCaptureDisposition::ReusedPending(pending));
+        }
         let id = capture_id(
             self.id,
             registration,
@@ -690,8 +715,9 @@ impl Inner {
         };
         let pending = capture.pending()?;
         self.persist_with_capture(&mut data, entry, None, Some(capture))?;
-        Ok(pending)
+        Ok(DirtyCaptureDisposition::Queued(pending))
     }
+
     pub fn read_capture(&self, id: CaptureId) -> Result<PendingCapture> {
         self.check()?;
         let data = self.data.lock().map_err(|_| Error::Poisoned)?;
@@ -703,6 +729,19 @@ impl Inner {
         }
         validate_capture(capture, self.id, data.manifest.epoch, &self.limits)?;
         capture.pending()
+    }
+    pub fn pending_capture_registrations(
+        &self, max_entries: usize, max_bytes: usize,
+    ) -> Result<CaptureRegistrations> {
+        self.check()?;
+        let data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        let count = data.captures.len();
+        if count > max_entries || count.checked_mul(CaptureRegistrations::BYTES_PER_ENTRY)
+            .is_none_or(|bytes| bytes > max_bytes) {
+            return Err(Error::Limit("capture registration census"));
+        }
+        Ok(CaptureRegistrations { registrations: data.captures.values()
+            .map(|capture| capture.checkpoint.registration()).collect() })
     }
     pub fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         self.check()?;
@@ -733,16 +772,32 @@ impl Inner {
         old: &PendingCapture,
         successor: &PendingCapture,
         upload: CaptureUploadCleanup,
+        basis: Option<CaptureCleanupBasis>,
         coverage: &[tinytree_model::EncodedObject],
     ) -> Result<CaptureCleanupObligation> {
         self.check()?;
-        validate_upload_cleanup(&upload)?;
+        validate_upload_cleanup(&upload, basis.as_ref())?;
+        match &basis {
+            Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(proof))
+                if proof.successor_binding != successor.binding() =>
+            {
+                return Err(Error::Invalid("retained successor binding"));
+            }
+            Some(CaptureCleanupBasis::RetainedOldCaptureV1(proof))
+                if proof.retired_binding != old.binding()
+                    || proof.source.roots != retained_root_set_digest(&old.checkpoint.roots) =>
+            {
+                return Err(Error::Invalid("retained old capture binding or roots"));
+            }
+            _ => {}
+        }
         coverage_limits(coverage)?;
         let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
         if let Some(cleanup) = &data.manifest.cleanup {
             if cleanup.retired_binding == old.binding()
                 && cleanup.successor_binding == successor.binding()
                 && cleanup.upload == upload
+                && cleanup.basis == basis
             {
                 return Ok(cleanup.clone());
             }
@@ -765,7 +820,16 @@ impl Inner {
         {
             return Err(Error::Invalid("capture retirement order or registration"));
         }
-        verify_capture_coverage(old, successor, coverage)?;
+        match &basis {
+            Some(CaptureCleanupBasis::RetainedOldCaptureV1(_)) => {
+                if !coverage.is_empty() {
+                    return Err(Error::Invalid(
+                        "retained-only mode is not successor coverage",
+                    ));
+                }
+            }
+            _ => verify_capture_coverage(old, successor, coverage)?,
+        }
         let mut cleanup = CaptureCleanupObligation {
             id: [0; 32],
             registry: self.id,
@@ -782,6 +846,7 @@ impl Inner {
             retired_binding: old.binding(),
             successor_binding: successor.binding(),
             upload,
+            basis,
             remove_bundle: !data
                 .captures
                 .values()
@@ -789,7 +854,12 @@ impl Inner {
         };
         cleanup.id = cleanup_binding(&cleanup)?;
         let mut manifest = data.manifest.clone();
-        manifest.version = 3; // Permanent fail-closed boundary for pre-retirement readers.
+        // Never downgrade after a covered retirement, including after ACK.
+        manifest.version = manifest.version.max(match &cleanup.basis {
+            Some(CaptureCleanupBasis::RetainedOldCaptureV1(_)) => 5,
+            Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(_)) => 4,
+            None => 3,
+        });
         manifest.epoch = cleanup.registry_epoch;
         manifest.cleanup = Some(cleanup.clone());
         let mut capture_digests = data.capture_digests.clone();
@@ -807,7 +877,34 @@ impl Inner {
         data.captures.remove(&old.id);
         Ok(cleanup)
     }
-    pub fn acknowledge_capture_cleanup(&self, expected: &CaptureCleanupObligation) -> Result<()> {
+    pub fn acknowledge_capture_cleanup(
+        &self,
+        expected: &CaptureCleanupObligation,
+        witness: Option<&RetainedSuccessorWitness>,
+    ) -> Result<()> {
+        match (&expected.basis, witness) {
+            (None, None) => {}
+            (Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(proof)), Some(actual))
+                if &proof.witness == actual => {}
+            _ => return Err(Error::Invalid("capture cleanup protected witness")),
+        }
+        self.acknowledge_validated_capture_cleanup(expected)
+    }
+    pub fn acknowledge_retained_capture_cleanup(
+        &self,
+        expected: &CaptureCleanupObligation,
+        witness: &RetainedSourceWitness,
+    ) -> Result<()> {
+        match &expected.basis {
+            Some(CaptureCleanupBasis::RetainedOldCaptureV1(proof)) if &proof.source == witness => {}
+            _ => return Err(Error::Invalid("capture cleanup retained-source witness")),
+        }
+        self.acknowledge_validated_capture_cleanup(expected)
+    }
+    fn acknowledge_validated_capture_cleanup(
+        &self,
+        expected: &CaptureCleanupObligation,
+    ) -> Result<()> {
         self.check()?;
         let mut data = self.data.lock().map_err(|_| Error::Poisoned)?;
         if data.manifest.cleanup.as_ref() != Some(expected) {
@@ -958,16 +1055,62 @@ impl Inner {
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| Error::Corrupt("record encoding"))
 }
-fn validate_upload_cleanup(upload: &CaptureUploadCleanup) -> Result<()> {
-    if upload.published.size_bytes == 0
-        || upload.published.size_bytes > 4096
-        || upload
-            .job
-            .is_some_and(|job| job.size_bytes == 0 || job.size_bytes > 32 * 1024 * 1024)
-    {
+fn validate_upload_cleanup(
+    upload: &CaptureUploadCleanup,
+    basis: Option<&CaptureCleanupBasis>,
+) -> Result<()> {
+    let valid = |descriptor: BundleDescriptor, max| {
+        descriptor.size_bytes > 0 && descriptor.size_bytes <= max
+    };
+    if upload.job.is_some_and(|job| !valid(job, 32 * 1024 * 1024)) {
         return Err(Error::Invalid("capture cleanup upload bytes"));
     }
-    Ok(())
+    match basis {
+        None if upload
+            .published
+            .is_some_and(|published| valid(published, 4096)) =>
+        {
+            Ok(())
+        }
+        Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(proof))
+            if upload.published.is_none()
+                && upload.job.is_some()
+                && proof.provider != [0; 32]
+                && proof.cloud_workspace != [0; 32]
+                && proof.generation > 0
+                && proof.manifest_id != [0; 32]
+                && proof.manifest.blake3 != [0; 32]
+                && proof.capture.blake3 != [0; 32]
+                && proof.witness.job.blake3 != [0; 32]
+                && proof.witness.published.blake3 != [0; 32]
+                && valid(proof.manifest, MAX_RETAINED_SUCCESSOR_MANIFEST_BYTES)
+                && valid(proof.capture, MAX_RETAINED_SUCCESSOR_CAPTURE_BYTES)
+                && valid(proof.witness.job, 32 * 1024 * 1024)
+                && valid(proof.witness.published, 4096) =>
+        {
+            Ok(())
+        }
+        Some(CaptureCleanupBasis::RetainedOldCaptureV1(proof))
+            if upload.job.is_some()
+                && upload.published.is_some_and(|p| valid(p, 4096))
+                && proof.retired_binding != [0; 32]
+                && proof.provider != [0; 32]
+                && proof.cloud_workspace != [0; 32]
+                && proof.generation > 0
+                && proof.manifest_id != [0; 32]
+                && proof.manifest.blake3 != [0; 32]
+                && proof.capture.blake3 != [0; 32]
+                && valid(proof.manifest, MAX_RETAINED_SUCCESSOR_MANIFEST_BYTES)
+                && valid(proof.capture, MAX_RETAINED_SUCCESSOR_CAPTURE_BYTES)
+                && proof.source.authority != [0; 32]
+                && proof.source.pin != [0; 32]
+                && proof.source.binding != [0; 32]
+                && proof.source.roots != [0; 32] =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Invalid("capture cleanup basis or provenance")),
+    }
 }
 fn coverage_limits(objects: &[tinytree_model::EncodedObject]) -> Result<()> {
     if objects.len() > MAX_CAPTURE_COVERAGE_OBJECTS {
@@ -1074,7 +1217,15 @@ fn cleanup_binding(cleanup: &CaptureCleanupObligation) -> Result<[u8; 32]> {
     let mut normalized = cleanup.clone();
     normalized.id = [0; 32];
     let mut hash = blake3::Hasher::new();
-    hash.update(b"native-retention-capture-cleanup-v1\0");
+    hash.update(match &cleanup.basis {
+        Some(CaptureCleanupBasis::RetainedOldCaptureV1(_)) => {
+            b"native-retention-capture-cleanup-v3\0"
+        }
+        Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(_)) => {
+            b"native-retention-capture-cleanup-v2\0"
+        }
+        None => b"native-retention-capture-cleanup-v1\0",
+    });
     hash.update(&encode(&normalized)?);
     Ok(*hash.finalize().as_bytes())
 }
@@ -1087,7 +1238,19 @@ fn validate_cleanup(
         .get(&cleanup.successor.id)
         .ok_or(Error::Corrupt("cleanup successor missing"))?
         .pending()?;
-    if manifest.version != 3
+    if !matches!(manifest.version, 3 | 4 | 5)
+        || cleanup.basis.as_ref().is_some_and(|basis| match basis {
+            CaptureCleanupBasis::CoveredByRetainedSuccessorV1(_) => manifest.version < 4,
+            CaptureCleanupBasis::RetainedOldCaptureV1(_) => manifest.version != 5,
+        })
+        || cleanup.basis.as_ref().is_some_and(|basis| match basis {
+            CaptureCleanupBasis::CoveredByRetainedSuccessorV1(proof) => {
+                proof.successor_binding != successor.binding()
+            }
+            CaptureCleanupBasis::RetainedOldCaptureV1(proof) => {
+                proof.retired_binding != cleanup.retired_binding
+            }
+        })
         || cleanup.registry != manifest.id
         || cleanup.registry_epoch == 0
         || cleanup.registry_epoch > manifest.epoch
@@ -1103,7 +1266,7 @@ fn validate_cleanup(
             && captures
                 .values()
                 .any(|capture| capture.bundle.blake3 == cleanup.retired.bundle.blake3))
-        || validate_upload_cleanup(&cleanup.upload).is_err()
+        || validate_upload_cleanup(&cleanup.upload, cleanup.basis.as_ref()).is_err()
     {
         return Err(Error::Corrupt("capture cleanup obligation"));
     }

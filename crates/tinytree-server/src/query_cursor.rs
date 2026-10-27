@@ -54,7 +54,7 @@ fn page_window(c: &QueryConfig) -> usize {
         )
         .saturating_add(4096)
 }
-fn active_memory(c: &QueryConfig, projection: i32) -> usize {
+fn active_memory(c: &QueryConfig, projection: i32, path: bool) -> usize {
     let graph = if projection == q::Projection::Ids as i32 {
         0
     } else {
@@ -64,6 +64,7 @@ fn active_memory(c: &QueryConfig, projection: i32) -> usize {
         .memory_bytes()
         .unwrap_or(usize::MAX)
         .saturating_add(graph)
+        .saturating_add(if path { c.path_memory() } else { 0 })
         .saturating_add(page_window(c).saturating_mul(3))
         .saturating_add(if projection == q::Projection::Canonical as i32 {
             c.max_commit_bytes.saturating_mul(8)
@@ -117,7 +118,8 @@ pub(crate) fn validate_config(c: &QueryConfig) -> Result<(), ConfigError> {
         || !(1..=100_000).contains(&c.max_graph_query_frames)
         || !(1..=4096).contains(&c.max_graph_query_step_work)
         || !(1..=100_000_000).contains(&c.max_graph_query_steps)
-        || active_memory(c, q::Projection::Canonical as i32).saturating_add(history_memory(c))
+        || active_memory(c, q::Projection::Canonical as i32, false)
+            .saturating_add(history_memory(c))
             > c.max_cursor_memory_bytes
     {
         return Err(ConfigError("invalid query cursor limits"));
@@ -141,6 +143,7 @@ fn eval_error(error: EvalError) -> Status {
         EvalError::Graph(error) => index_error(error),
         EvalError::Invalid(_) => Status::invalid_argument("invalid query expression"),
         EvalError::Unsupported(_) => Status::unimplemented("query operator is not implemented"),
+        EvalError::Read(status) => status,
     }
 }
 struct ActiveReservation {
@@ -222,6 +225,16 @@ pub(crate) struct CursorHost {
     cleanup: std::sync::mpsc::Sender<Garbage>,
 }
 impl CursorHost {
+    pub(crate) fn reserve_annotation(&self, bytes: usize) -> Result<OwnedSemaphorePermit, Status> {
+        let bytes = u32::try_from(bytes).map_err(|_| {
+            Status::resource_exhausted("annotation context memory exceeds permit range")
+        })?;
+        self.memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("annotation context memory is busy"))
+    }
+
     pub fn new(config: &QueryConfig) -> Result<Self, ConfigError> {
         let (cleanup, receiver) = std::sync::mpsc::channel::<Garbage>();
         std::thread::Builder::new()
@@ -506,6 +519,7 @@ impl CursorHost {
     /// from QueryFacts' accepted blocking job, including after cancellation.
     pub fn membership(
         &self,
+        host: &QueryHost,
         scope: &Scoped,
         expression: q::GraphExpr,
         candidate: m::CommitId,
@@ -524,6 +538,13 @@ impl CursorHost {
         policy.max_steps = *remaining_steps;
         let bytes = policy
             .memory_bytes()
+            .and_then(|n| {
+                n.checked_add(if crate::query_eval::has_path(&expression) {
+                    config.path_memory()
+                } else {
+                    0
+                })
+            })
             .and_then(|n| n.checked_add(4096))
             .and_then(|n| u32::try_from(n).ok())
             .ok_or_else(|| Status::resource_exhausted("query membership memory budget exceeded"))?;
@@ -559,7 +580,16 @@ impl CursorHost {
                     "query membership deadline exceeded",
                 ));
             }
-            match evaluator.step(budget).map_err(eval_error)? {
+            let mut path = crate::query_history::CanonicalPathPredicate {
+                host,
+                scope,
+                repository: &scope.wire.key.as_ref().unwrap().repository_id,
+                deadline,
+            };
+            match evaluator
+                .step_with_path(budget, &mut path)
+                .map_err(eval_error)?
+            {
                 EvalStep::Progress => {}
                 EvalStep::Done => break false,
                 EvalStep::Row(row) => {
@@ -582,6 +612,7 @@ impl CursorHost {
         host: &QueryHost,
         owner: &str,
         mut request: q::EvaluateRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<CursorPage, Status> {
         let key = request
             .scope
@@ -668,9 +699,14 @@ impl CursorHost {
                     .memory
                     .clone()
                     .try_acquire_many_owned(
-                        u32::try_from(active_memory(&host.config, request.projection)).map_err(
-                            |_| Status::resource_exhausted("query cursor memory exceeds budget"),
-                        )?,
+                        u32::try_from(active_memory(
+                            &host.config,
+                            request.projection,
+                            crate::query_eval::has_path(&expression),
+                        ))
+                        .map_err(|_| {
+                            Status::resource_exhausted("query cursor memory exceeds budget")
+                        })?,
                     )
                     .map_err(|_| Status::resource_exhausted("query cursor memory exhausted"))?;
                 let expires = (now + host.config.query_ttl_seconds as i64)
@@ -832,9 +868,18 @@ impl CursorHost {
                     let State {
                         evaluator, budget, ..
                     } = &mut *state;
+                    let mut path = crate::query_history::CanonicalPathPredicate {
+                        host,
+                        scope: scope.as_ref().unwrap(),
+                        repository: &record.repository,
+                        deadline,
+                    };
                     match evaluator.as_mut().unwrap() {
                         RunningEvaluator::Ids(evaluator) => {
-                            match evaluator.step(budget).map_err(eval_error)? {
+                            match evaluator
+                                .step_with_path(budget, &mut path)
+                                .map_err(eval_error)?
+                            {
                                 EvalStep::Row(node) => Some(ids_row(&node)),
                                 EvalStep::Progress => None,
                                 EvalStep::Done => {
@@ -845,7 +890,10 @@ impl CursorHost {
                             }
                         }
                         RunningEvaluator::Graph(evaluator) => {
-                            match evaluator.step(budget).map_err(eval_error)? {
+                            match evaluator
+                                .step_with_path(budget, &mut path)
+                                .map_err(eval_error)?
+                            {
                                 GraphStep::Row(row) => Some(graph_row(
                                     host,
                                     &record.repository,

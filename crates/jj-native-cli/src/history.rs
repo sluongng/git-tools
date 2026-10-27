@@ -30,6 +30,8 @@ use std::{
 };
 use tinytree_model::CommitId;
 
+mod mixed;
+
 const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_LINES: usize = 16_384;
 const MAX_LOCAL_BYTES: usize = 32 * 1024 * 1024;
@@ -227,6 +229,30 @@ async fn capture_path(
         state = parent_state;
     }
 }
+
+async fn annotation_policy(query: &BrokerQueryClient, store: &Store) -> Result<q::HistoryPolicy, CommandError> {
+    use native_broker::BlameCapabilities as C;
+    // Policy2 binds stock's default parent-merge settings. Other settings keep
+    // the existing linear policy and its explicit merge boundary, not guessed
+    // attribution under a different merge algorithm.
+    let options = store.merge_options();
+    if options.hunk_level != jj_lib::files::FileMergeHunkLevel::Line
+        || options.same_change != jj_lib::merge::SameChange::Accept {
+        return Ok(q::HistoryPolicy::LinearFixedPathV1);
+    }
+    match query.blame_capabilities(Arc::new(())).await {
+        Ok(reply) => match reply.value {
+            C::Explicit { authorized: false, .. } => Err(failure(tonic::Status::permission_denied("resolved blame is not authorized"))),
+            C::Explicit { supported: true, authorized: true } => Ok(q::HistoryPolicy::JjResolvedFixedPathV1),
+            C::Explicit { supported: false, authorized: true } | C::LegacyUnnegotiated => Ok(q::HistoryPolicy::LinearFixedPathV1),
+        },
+        // This is the dedicated negotiation RPC, never a failed Blame. An old
+        // broker has no such method. Other failures are not compatibility.
+        Err(error) if error.code() == tonic::Code::Unimplemented => Ok(q::HistoryPolicy::LinearFixedPathV1),
+        Err(error) => Err(failure(error)),
+    }
+}
+
 
 fn input(scope: &QueryScope, revision: CommitId, path: &str, max_commits: u32) -> ScopedPathQuery {
     ScopedPathQuery {
@@ -474,13 +500,24 @@ async fn attribution(
         ));
     }
     let path_text = path.as_internal_file_string();
+    let mut selected_policy = q::HistoryPolicy::LinearFixedPathV1;
     // Non-file ancestors terminate this fixed path's lifetime. Never mistake an
     // upstream NotFound (which may mean missing canonical data) for an empty file.
     let remote = if captured.baseline_state.kind == "file" {
+        // A locally edited path must participate in the same globally filtered
+        // annotation graph as canonical ancestry. Pair-diff composition through
+        // an omitted merge is not associative for repeated lines. Preserve the
+        // existing linear private policy and its honest merge boundary until a
+        // unified private frontier is available; never retry a failed Blame.
+        if captured.steps.is_empty() {
+            selected_policy = annotation_policy(query, store).await?;
+        }
+        let mut request = input(scope, captured.baseline, path_text, args.max_commits);
+        request.policy = selected_policy;
         Some(
             query
                 .blame(
-                    input(scope, captured.baseline, path_text, args.max_commits),
+                    request,
                     Arc::new(()),
                 )
                 .await
@@ -489,6 +526,9 @@ async fn attribution(
     } else {
         None
     };
+    if !captured.steps.is_empty() && remote.as_ref().is_some_and(|reply| reply.value.coverage != q::HistoryCoverage::HistoryComplete as i32) {
+        return Err(user_error("native annotation of a private path requires a complete canonical linear frontier; unified private merge ancestry is not supported"));
+    }
     if let Some(reply) = &remote {
         // An incomplete response may legitimately omit an over-budget target.
         // Empty bytes in that response are not an empty regular file. Require
@@ -569,7 +609,10 @@ async fn attribution(
         )?;
         current = parent;
     }
-    let mut result_coverage = "complete";
+    // A skipped canonical merge can retain a line absent from the forced
+    // baseline text. Even if every pair-diff line looked locally introduced,
+    // an incomplete canonical frontier must not become a complete annotation.
+    let mut result_coverage = remote.as_ref().map_or(Ok("complete"), |reply| coverage(reply.value.coverage))?;
     if !pending.is_empty() {
         let remote = remote.as_ref().ok_or_else(|| {
             user_error("native annotation reached a non-file boundary with unresolved lines")
@@ -605,7 +648,7 @@ async fn attribution(
         version: 1,
         revision: hex(&revision.0),
         path: path_text.to_owned(),
-        policy: "linear_fixed_path_v1",
+        policy: if selected_policy == q::HistoryPolicy::JjResolvedFixedPathV1 { "jj_resolved_fixed_path_v1" } else { "linear_fixed_path_v1" },
         coverage: result_coverage,
         local_commits: captured.steps.len(),
         remote_scanned_commits: remote
@@ -774,7 +817,7 @@ async fn render_annotation(
     helper: &jj_cli::cli_util::WorkspaceCommandHelper,
     query: &BrokerQueryClient,
     scope: &QueryScope,
-    captured: &CapturedPath,
+    private_ids: &std::collections::BTreeSet<CommitId>,
     output: &BlameOutput,
     template: Option<&str>,
     started: Instant,
@@ -790,7 +833,13 @@ async fn render_annotation(
         None => helper.settings().get_string("templates.file_annotate")?,
     };
     let language = helper.commit_template_language();
-    let template = helper.parse_template(ui, &language, &template_text)?;
+    // jj's synchronous template bridge can poll async prefix work internally.
+    // A cooperative yield there cannot reach this outer current-thread driver.
+    // Disable only the waiter's coop budget while actually parsing, not while
+    // attributing lines or fetching their owned, deadline-bound metadata.
+    let template =
+        tokio::task::unconstrained(async { helper.parse_template(ui, &language, &template_text) })
+            .await?;
     let mut commits = HashMap::new();
     // Keep canonical reply/proof owners alive until rendering has finished.
     let mut metadata = Vec::new();
@@ -815,7 +864,7 @@ async fn render_annotation(
             .map_err(failure)?;
         let id = jj_lib::backend::CommitId::from_bytes(&bytes);
         let native = CommitId::from_slice(id.as_bytes()).map_err(failure)?;
-        if !captured.steps.iter().any(|step| step.id == native) {
+        if !private_ids.contains(&native) {
             // A returned origin ID is not object-read authority. Fetch its
             // canonical COMMIT through the exact captured query scope first.
             let reply = query
@@ -871,25 +920,31 @@ async fn render_annotation(
         exhausted: false,
         started,
     };
-    let mut last_id = None;
-    for line in &output.lines {
-        check_time(started)?;
-        let origin = line.origin.as_ref().unwrap();
-        let annotation = AnnotationLine {
-            commit: commits[&origin.commit].clone(),
-            content: line.bytes.clone().into(),
-            line_number: line.line,
-            original_line_number: origin.original_line,
-            first_line_in_hunk: last_id != Some(&origin.commit),
-        };
-        template.format(&annotation, &mut rendered)?;
-        if rendered.exhausted {
-            return Err(user_error(
-                "native annotation rendered output limit reached",
-            ));
+    // Format inside the future's poll (not an eagerly evaluated ready()).
+    // Keep per-line time/output checks; arbitrary template CPU is not preempted.
+    tokio::task::unconstrained(async {
+        let mut last_id = None;
+        for line in &output.lines {
+            check_time(started)?;
+            let origin = line.origin.as_ref().unwrap();
+            let annotation = AnnotationLine {
+                commit: commits[&origin.commit].clone(),
+                content: line.bytes.clone().into(),
+                line_number: line.line,
+                original_line_number: origin.original_line,
+                first_line_in_hunk: last_id != Some(&origin.commit),
+            };
+            template.format(&annotation, &mut rendered)?;
+            if rendered.exhausted {
+                return Err(user_error(
+                    "native annotation rendered output limit reached",
+                ));
+            }
+            last_id = Some(&origin.commit);
         }
-        last_id = Some(&origin.commit);
-    }
+        Ok::<(), CommandError>(())
+    })
+    .await?;
     check_time(started)?;
     ui.request_pager();
     rendered.inner.replay(ui.stdout_formatter().as_mut())?;
@@ -971,6 +1026,20 @@ async fn run_query(
     let query = query.with_operation_deadline(deadline);
     let scope = query_source.open(&query, random()).await.map_err(failure)?;
     let result = tokio::time::timeout_at(deadline, async {
+        if annotate {
+            let index = helper.repo().readonly_index().downcast_ref::<jj_native_index::NativeReadonlyIndex>()
+                .ok_or_else(|| user_error("native annotation requires its operation index"))?;
+            if let Some(prepared) = mixed::prepare(index, query_source.anchors(), revision, started)?
+                && mixed::enabled(&query, helper.repo().store()).await? {
+                let attributed = mixed::annotate(&query, &scope, index, revision, &path,
+                    helper.repo().store(), &args, started, prepared).await?;
+                if let Some(template) = &ordinary_template {
+                    render_annotation(ui, &helper, &query, &scope.value, &attributed.private_ids,
+                        &attributed.output, template.as_deref(), started).await?;
+                } else { render_blame(ui, &attributed.output, args.json)?; }
+                return Ok(());
+            }
+        }
         let captured = capture_path(
             &query,
             &scope.value,
@@ -1006,7 +1075,7 @@ async fn run_query(
                     &helper,
                     &query,
                     &scope.value,
-                    &captured,
+                    &captured.steps.iter().map(|step| step.id).collect(),
                     &output,
                     template.as_deref(),
                     started,

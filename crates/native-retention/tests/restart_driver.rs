@@ -126,10 +126,10 @@ fn main() {
                     successor,
                     native_retention::CaptureUploadCleanup {
                         job: None,
-                        published: BundleDescriptor {
+                        published: Some(BundleDescriptor {
                             blake3: [9; 32],
                             size_bytes: 64,
-                        },
+                        }),
                     },
                 )
                 .await

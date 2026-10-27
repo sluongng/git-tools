@@ -4,6 +4,7 @@ mod cleanup;
 pub use cleanup::CleanupHandle;
 mod local_export;
 mod memo;
+mod path_filter;
 mod persistence;
 mod portable;
 pub use local_export::LocalIndexExportReader;
@@ -172,6 +173,18 @@ impl Limits {
         Ok(())
     }
 }
+/// Static location of a failed query; never includes user expressions or IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryStage {
+    Other,
+    ScopeOpen,
+    ScopeClassify,
+    ScopeFork,
+    Fact,
+    Prefix,
+    GraphBegin,
+    GraphPage,
+}
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid native index configuration or identity")]
@@ -192,8 +205,23 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("native query failed ({0:?})")]
     Query(tonic::Code),
+    #[error("native query failed ({code:?}; stage={stage:?}; reason={reason:?})")]
+    QueryFailure {
+        code: tonic::Code,
+        stage: QueryStage,
+        reason: Option<native_broker::QueryFailureReason>,
+    },
     #[error("native canonical commit verification failed")]
     Canonical,
+}
+impl Error {
+    pub fn query_code(&self) -> Option<tonic::Code> {
+        match self {
+            Self::Query(code) => Some(*code),
+            Self::QueryFailure { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
 }
 fn err(e: Error) -> IndexError {
     IndexError::Other(Box::new(e))
@@ -202,7 +230,20 @@ fn rev_err(e: Error) -> RevsetEvaluationError {
     RevsetEvaluationError::Other(Box::new(e))
 }
 fn status(e: tonic::Status) -> Error {
-    Error::Query(e.code())
+    status_at(QueryStage::Other)(e)
+}
+fn status_at(stage: QueryStage) -> impl FnOnce(tonic::Status) -> Error {
+    move |error| {
+        if matches!(error.code(), tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted) {
+            Error::QueryFailure {
+                code: error.code(),
+                stage,
+                reason: native_broker::QueryFailureReason::from_status(&error),
+            }
+        } else {
+            Error::Query(error.code())
+        }
+    }
 }
 fn model_id(id: &CommitId) -> Result<m::CommitId, Error> {
     Ok(m::CommitId(
@@ -327,6 +368,11 @@ impl Core {
     }
 }
 impl NativeIndexStore {
+    /// Inspect the checked, immutable provider binding without opening graph
+    /// storage, repairing state, or acquiring query/object authority.
+    pub fn inspect_config(path: &Path) -> Result<Config, Error> {
+        Storage::inspect_config(path)
+    }
     /// Initialize a new private index. Roots are an explicit immutable seed,
     /// never inferred from repository refs or a fetched object subset.
     ///

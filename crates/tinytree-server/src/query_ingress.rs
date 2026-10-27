@@ -99,7 +99,9 @@ where
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         let search = request.uri().path().ends_with("/Search");
         let history = request.uri().path().ends_with("/PathHistory")
-            || request.uri().path().ends_with("/Blame");
+            || request.uri().path().ends_with("/Blame")
+            || request.uri().path().ends_with("/OpenAnnotationFrontier")
+            || request.uri().path().ends_with("/ReadAnnotationInput");
         let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
         let streaming = cloud_open
             || request.uri().path().ends_with("/OpenScope")
@@ -384,6 +386,17 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(blocked.code(), tonic::Code::DeadlineExceeded);
+        let dag_cache = host.admit_dag_history().unwrap();
+        assert_eq!(
+            host.admit_dag_history().unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        // These extra buffers contend for bytes, independently of the two
+        // unchanged history inflight slots. Releasing only the extra owner
+        // makes the same nonwaiting upgrade possible again.
+        assert!(second.has_history_memory());
+        drop(dag_cache);
+        drop(host.admit_dag_history().unwrap());
         drop(first);
         assert!(
             host.admit_history(tokio::time::Instant::now() + Duration::from_secs(1),)

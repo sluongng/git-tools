@@ -89,6 +89,7 @@ impl Inner {
             "/ReadMetadata",
             "/CopyCatalog",
             "/ReadFile",
+            "/ReadLocalFile",
             "/WriteMetadata",
             "/WriteFile",
         ]
@@ -834,79 +835,21 @@ impl p::object_io_server::ObjectIo for BrokerService {
             .read_file_for_cache(tinytree_model::FileId(key.id.0), work.clone())
             .await
             .map_err(wire::backend)?;
-        let (descriptor, mut source) = source.into_parts();
-        if descriptor.key != key || descriptor.size_bytes > self.inner.config.max_file_bytes {
-            return Err(Status::resource_exhausted("broker file exceeds limit"));
+        self.file_response(source,work,key).await
+    }
+    type ReadLocalFileStream = Stream<p::ReadFrame>;
+    async fn read_local_file(&self,request:Request<p::LocalFileRequest>)->Result<Response<Self::ReadLocalFileStream>,Status>{
+        let work=request.extensions().get::<Arc<Work>>().cloned().ok_or_else(||Status::internal("broker request missing resource scope"))?;
+        let input=request.into_inner();
+        self.authorize_command(&input.store_id,&work)?;
+        let expected=wire::descriptor(input.expected.ok_or_else(||Status::invalid_argument("bounded local FILE descriptor required"))?)?;
+        if expected.key.kind!=tinytree_model::Kind::File || expected.size_bytes>input.max_bytes || input.max_bytes>self.inner.config.max_file_bytes {
+            return Err(Status::invalid_argument("bounded local FILE request limit invalid"));
         }
-        let frame = self.inner.config.max_frame_bytes;
-        let (sender, receiver) = mpsc::channel(2);
-        tokio::spawn(async move {
-            let deadline = work.deadline;
-            let _work = work;
-            let result = async {
-                send_read(
-                    &sender,
-                    Ok(p::ReadFrame {
-                        frame: Some(p::read_frame::Frame::Descriptor(wire::describe(descriptor))),
-                    }),
-                    deadline,
-                )
-                .await?;
-                let mut offset = 0u64;
-                let mut count = 0u64;
-                loop {
-                    if sender.is_closed() || Instant::now() >= deadline {
-                        return Err(Status::cancelled("broker file consumer stopped"));
-                    }
-                    let mut data = vec![0; frame];
-                    // The owned task retains its budget until this read really
-                    // finishes, even when the transport body has expired.
-                    let n = source
-                        .read(&mut data)
-                        .await
-                        .map_err(|_| Status::data_loss("broker source read failed"))?;
-                    if n == 0 {
-                        break;
-                    }
-                    data.truncate(n);
-                    if n as u64 > descriptor.size_bytes.saturating_sub(offset) {
-                        return Err(Status::data_loss("broker source size changed"));
-                    }
-                    send_read(
-                        &sender,
-                        Ok(p::ReadFrame {
-                            frame: Some(p::read_frame::Frame::Chunk(p::Chunk { offset, data })),
-                        }),
-                        deadline,
-                    )
-                    .await?;
-                    offset += n as u64;
-                    count += 1;
-                }
-                if offset != descriptor.size_bytes {
-                    return Err(Status::data_loss("broker source truncated"));
-                }
-                send_read(
-                    &sender,
-                    Ok(p::ReadFrame {
-                        frame: Some(p::read_frame::Frame::Complete(p::Complete {
-                            count,
-                            size_bytes: offset,
-                            digest: descriptor.key.id.0.to_vec(),
-                        })),
-                    }),
-                    deadline,
-                )
-                .await
-            }
-            .await;
-            if let Err(status) = result {
-                let _ = send_read(&sender, Err(status), deadline).await;
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
-        )))
+        let provider=self.store(&input.store_id)?;
+        let read=provider.read_local_file_bounded(expected,input.max_bytes,work.clone()).await.map_err(wire::backend)?;
+        if read.descriptor()!=expected {return Err(Status::data_loss("bounded local FILE provider descriptor changed"));}
+        self.file_response(read,work,expected.key).await
     }
     async fn write_file(
         &self,
@@ -1420,4 +1363,82 @@ fn control_publication(
         generation: value.generation,
         head: value.head.0.to_vec(),
     })
+}
+
+impl BrokerService {
+    async fn file_response(&self,source:jj_native_backend::FileRead,work:Arc<Work>,key:tinytree_model::ObjectKey)->Result<Response<Stream<p::ReadFrame>>,Status>{
+        let (descriptor, mut source) = source.into_parts();
+        if descriptor.key != key || descriptor.size_bytes > self.inner.config.max_file_bytes {
+            return Err(Status::resource_exhausted("broker file exceeds limit"));
+        }
+        let frame = self.inner.config.max_frame_bytes;
+        let (sender, receiver) = mpsc::channel(2);
+        tokio::spawn(async move {
+            let deadline = work.deadline;
+            let _work = work;
+            let result = async {
+                send_read(
+                    &sender,
+                    Ok(p::ReadFrame {
+                        frame: Some(p::read_frame::Frame::Descriptor(wire::describe(descriptor))),
+                    }),
+                    deadline,
+                )
+                .await?;
+                let mut offset = 0u64;
+                let mut count = 0u64;
+                loop {
+                    if sender.is_closed() || Instant::now() >= deadline {
+                        return Err(Status::cancelled("broker file consumer stopped"));
+                    }
+                    let mut data = vec![0; frame];
+                    // The owned task retains its budget until this read really
+                    // finishes, even when the transport body has expired.
+                    let n = source
+                        .read(&mut data)
+                        .await
+                        .map_err(|_| Status::data_loss("broker source read failed"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    data.truncate(n);
+                    if n as u64 > descriptor.size_bytes.saturating_sub(offset) {
+                        return Err(Status::data_loss("broker source size changed"));
+                    }
+                    send_read(
+                        &sender,
+                        Ok(p::ReadFrame {
+                            frame: Some(p::read_frame::Frame::Chunk(p::Chunk { offset, data })),
+                        }),
+                        deadline,
+                    )
+                    .await?;
+                    offset += n as u64;
+                    count += 1;
+                }
+                if offset != descriptor.size_bytes {
+                    return Err(Status::data_loss("broker source truncated"));
+                }
+                send_read(
+                    &sender,
+                    Ok(p::ReadFrame {
+                        frame: Some(p::read_frame::Frame::Complete(p::Complete {
+                            count,
+                            size_bytes: offset,
+                            digest: descriptor.key.id.0.to_vec(),
+                        })),
+                    }),
+                    deadline,
+                )
+                .await
+            }
+            .await;
+            if let Err(status) = result {
+                let _ = send_read(&sender, Err(status), deadline).await;
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
 }

@@ -51,6 +51,15 @@ impl VerifiedMetadata {
     pub fn into_object(self) -> m::Object {
         self.object
     }
+    /// Consume verified canonical COMMIT metadata using the backend's ordinary
+    /// conversion. This performs no I/O, cache insertion, or scope admission;
+    /// callers retain responsibility for object identity and resource ownership.
+    pub fn into_backend_commit(self) -> BackendResult<Commit> {
+        match self.object {
+            m::Object::Commit(value) => Ok(convert::commit(value)),
+            _ => Err(invalid("verified metadata is not a native commit")),
+        }
+    }
 }
 /// A provider-attested preverified, immutable, pinned byte source. Unlike a
 /// descriptor response this conveys an actual readable local source lifetime.
@@ -67,6 +76,7 @@ impl fmt::Debug for FileRead {
     }
 }
 impl FileRead {
+    pub fn descriptor(&self) -> m::Descriptor { self.descriptor }
     /// This is NOT a verification function. Implementors must first verify ALL
     /// bytes and retain immutable/pinned ownership through EOF/drop, including
     /// cancelled blocking jobs. Future broker hydration must finish first.
@@ -212,6 +222,17 @@ pub trait NativeObjectIo: Send + Sync + fmt::Debug {
             "native provider does not support owned metadata writes",
         )))
     }
+    /// Exact resident-only delivery for private annotation. Validate actual local
+    /// descriptor against expected and the caller cap BEFORE reading any body.
+    /// Never hydrate, resolve a remote promise or fall back after a miss. Retain
+    /// owner and physical source through delivery and cancellation teardown.
+    async fn read_local_file_bounded(
+        &self, _expected: m::Descriptor, _max_bytes: u64,
+        _owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        Err(other(std::io::Error::new(std::io::ErrorKind::Unsupported,
+            "bounded resident annotation delivery is unavailable")))
+    }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead>;
     /// Ordinary file delivery whose owner follows all physical hydration,
     /// verification, spool work and returned readers after waiter cancellation.
@@ -276,6 +297,8 @@ pub struct DirectObjectIo {
     #[cfg(test)]
     metadata_put_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
+    staging_slot_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
     client_gc_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     file_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -307,6 +330,19 @@ struct MetadataPutJob {
     hook: Option<Arc<dyn Fn() + Send + Sync>>,
     _owner: MetadataOwner,
 }
+// Payload/storage/permits are destroyed before the external physical owner.
+struct CommitBatchPutJob {
+    encoded: Vec<m::EncodedObject>,
+    store: Arc<Store>,
+    _reservation: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    #[cfg(test)]
+    hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    _owner: MetadataOwner,
+}
+
 struct OwnedFileStaging {
     file: tempfile::NamedTempFile,
     _reservation: (
@@ -372,6 +408,10 @@ impl DirectObjectIo {
     #[cfg(test)]
     pub(crate) fn set_metadata_put_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.metadata_put_hook = Some(hook);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_staging_slot_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.staging_slot_hook = Some(hook);
     }
     #[cfg(test)]
     pub(crate) fn set_file_read_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
@@ -457,6 +497,113 @@ impl DirectObjectIo {
         .await
     }
 
+    /// Bounds for one unique-key COMMIT installation chunk. Larger pages must
+    /// be validated and partitioned before calling this concrete local API.
+    /// An individually larger valid commit can use ordinary single-object I/O.
+    pub fn commit_batch_limits(&self) -> tinytree_store::CommitBatchLimits {
+        self.store.commit_batch_limits()
+    }
+
+    /// Install one bounded encoded COMMIT chunk without changing reference,
+    /// provenance or remote authority. Exact descriptors are returned in input
+    /// order only after the Store's atomic durable publication completes.
+    pub async fn write_commit_batch_with_owner(
+        &self,
+        encoded: Vec<m::EncodedObject>,
+        owner: MetadataOwner,
+    ) -> BackendResult<Vec<m::Descriptor>> {
+        let limits = self.commit_batch_limits();
+        if encoded.is_empty() || encoded.len() > limits.max_objects {
+            return Err(invalid("native commit batch object count exceeded"));
+        }
+        let mut keys = BTreeSet::new();
+        let mut bytes = 0u64;
+        for object in &encoded {
+            if object.descriptor.key.kind != m::Kind::Commit {
+                return Err(invalid("native commit batch requires COMMIT metadata"));
+            }
+            if !keys.insert(object.descriptor.key.id) {
+                return Err(invalid("duplicate native commit batch member"));
+            }
+            if object.bytes.len() as u64 != object.descriptor.size_bytes {
+                return Err(invalid("native commit batch member size mismatch"));
+            }
+            bytes = bytes
+                .checked_add(object.descriptor.size_bytes)
+                .ok_or_else(|| invalid("native commit batch byte count overflow"))?;
+            if bytes > limits.max_bytes {
+                return Err(invalid("native commit batch byte bound exceeded"));
+            }
+        }
+        let reservation = self.reserve_commit_staging(encoded.len(), bytes).await?;
+        let job = CommitBatchPutJob {
+            encoded,
+            store: self.store.clone(),
+            _reservation: reservation,
+            #[cfg(test)]
+            hook: self.metadata_put_hook.clone(),
+            _owner: owner,
+        };
+        io::blocking(move || {
+            let job = job; // Keep aggregate field destruction order on cancellation.
+            #[cfg(test)]
+            if let Some(hook) = &job.hook {
+                hook();
+            }
+            let receipts = job
+                .store
+                .put_commit_batch(REPOSITORY, &job.encoded, now()?)
+                .map_err(other)?;
+            Ok(receipts
+                .into_iter()
+                .map(|receipt| receipt.descriptor)
+                .collect())
+        })
+        .await
+    }
+
+    async fn reserve_commit_staging(
+        &self,
+        count: usize,
+        bytes: u64,
+    ) -> BackendResult<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )> {
+        let count = u32::try_from(count).map_err(other)?;
+        let bytes = u32::try_from(bytes).map_err(other)?;
+        // Never await one dimension while retaining the other. A single-object
+        // writer may already own a slot while waiting for byte capacity.
+        loop {
+            let byte_permit = self
+                .staging_bytes
+                .clone()
+                .acquire_many_owned(bytes)
+                .await
+                .map_err(other)?;
+            match self.staging_uploads.clone().try_acquire_many_owned(count) {
+                Ok(slot_permit) => return Ok((slot_permit, byte_permit)),
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(invalid("native staging is closed"));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => drop(byte_permit),
+            }
+            let slot_permit = self
+                .staging_uploads
+                .clone()
+                .acquire_many_owned(count)
+                .await
+                .map_err(other)?;
+            match self.staging_bytes.clone().try_acquire_many_owned(bytes) {
+                Ok(byte_permit) => return Ok((slot_permit, byte_permit)),
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(invalid("native staging is closed"));
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => drop(slot_permit),
+            }
+        }
+    }
+
     pub fn init(path: &Path, config: Config) -> BackendResult<Self> {
         Self::open(path, config, true)
     }
@@ -522,6 +669,8 @@ impl DirectObjectIo {
             #[cfg(test)]
             metadata_put_hook: None,
             #[cfg(test)]
+            staging_slot_hook: None,
+            #[cfg(test)]
             client_gc_hook: None,
             #[cfg(test)]
             file_read_hook: None,
@@ -543,6 +692,10 @@ impl DirectObjectIo {
             .acquire_owned()
             .await
             .map_err(other)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.staging_slot_hook {
+            hook();
+        }
         let bytes = self
             .staging_bytes
             .clone()
@@ -597,6 +750,30 @@ impl NativeObjectIo for DirectObjectIo {
         DirectObjectIo::write_metadata_with_owner(self, object, owner).await
     }
 
+    async fn read_local_file_bounded(
+        &self, expected: m::Descriptor, max_bytes: u64,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> BackendResult<FileRead> {
+        if expected.key.kind != m::Kind::File || expected.format_version != m::FORMAT_VERSION
+            || expected.size_bytes > max_bytes || max_bytes > self.config.store.max_file_bytes {
+            return Err(invalid("bounded resident FILE descriptor or limit invalid"));
+        }
+        let store=self.store.clone();
+        let (lease,owner)=io::blocking(move || {
+            // Descriptor lookup is local metadata only. A missing resident FILE
+            // is not permission to ask a remote provider or shared cache.
+            if store.descriptor(REPOSITORY,expected.key).map_err(other)? != Some(expected) {
+                return Err(invalid("bounded resident FILE descriptor mismatch or absent"));
+            }
+            let lease=store.read(REPOSITORY,expected.key).map_err(other)?;
+            if lease.descriptor()!=expected {return Err(invalid("bounded resident FILE changed"));}
+            Ok((lease,owner))
+        }).await?;
+        let reader=io::Reader::for_delivery(lease,owner);
+        #[cfg(test)]
+        let reader=reader.with_read_hook(self.file_read_hook.clone());
+        FileRead::from_preverified_pinned_source(expected,Box::pin(reader))
+    }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         let store = self.store.clone();
         let key = m::ObjectKey {

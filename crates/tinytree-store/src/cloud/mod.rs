@@ -6,6 +6,29 @@ use tinytree_cloud::{BlobDigest, Dependencies, ObjectId as CloudId, VerifiedObje
 pub struct CloudOwner {
     pub principal: [u8; 32],
 }
+/// Host-local accounting for the global retained-cloud validation budget.
+///
+/// Catalog rows are stored metadata; retained-version work also charges repeated
+/// reads needed by future validation. These totals are not resident memory or a
+/// source-availability check. No repository, principal or object identities are
+/// included, and this inspection does not grant remote access to global usage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloudCatalogBudgetSummary {
+    pub catalog_records: u64,
+    pub catalog_metadata_bytes: u64,
+    pub retained_version_record_work: u64,
+    pub retained_version_metadata_work: u64,
+    pub selected_payload_bytes: u64,
+    pub retained_version_payload_work: u64,
+    pub namespaces: u64,
+    pub staging_records: u64,
+    pub workspaces: u64,
+    pub versions: u64,
+    pub publication_receipts: u64,
+    pub required_total_records: u64,
+    pub required_total_metadata_bytes: u64,
+    pub required_total_payload_bytes: u64,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CloudObjectDescriptor {
     pub id: CloudId,
@@ -19,6 +42,8 @@ pub struct CloudWriteReceipt {
 }
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
+    /// Optional owned-memory bound, independent of cumulative validation work.
+    pub resident: Option<CloudResidentLimits>,
     pub max_object_bytes: usize,
     pub index_artifacts: tinytree_cloud::IndexArtifactLimits,
     pub manifest_limits: tinytree_cloud::ManifestLimits,
@@ -39,6 +64,7 @@ pub struct CloudConfig {
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
+            resident: None,
             max_object_bytes: 4 * 1024 * 1024,
             index_artifacts: Default::default(),
             manifest_limits: tinytree_cloud::ManifestLimits::default(),
@@ -60,6 +86,9 @@ impl Default for CloudConfig {
 }
 impl CloudConfig {
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(limits) = self.resident {
+            limits.validate()?;
+        }
         self.index_artifacts
             .validate()
             .map_err(|_| Error::Invalid("cloud index artifact limits"))?;
@@ -94,6 +123,8 @@ const CLOUD_JSON_ROW_BYTES: usize = 1024 * 1024;
 const CLOUD_BINARY_ROW_BYTES: usize = 64 * 1024 * 1024 + 4096;
 mod native_read;
 pub use native_read::{CloudNativeReadLease, CloudNativeReadLimits, CloudVersionSelector};
+pub(super) mod resident;
+pub use resident::CloudResidentLimits;
 mod resources;
 pub use resources::CloudResourceProfile;
 mod artifacts;
@@ -112,7 +143,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
     serde_json::from_slice(bytes).map_err(|_| Error::Corrupt("cloud metadata encoding"))
 }
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 13] = [
     "cloud-objects-v1",
     "cloud-blobs-v1",
     "cloud-staging-v1",
@@ -125,6 +156,7 @@ const TABLES: [&str; 12] = [
     "cloud-index-artifacts-v1",
     "cloud-index-staging-v1",
     "cloud-captures-v1",
+    "cloud-opview-variants-v1",
 ];
 pub(super) struct Spaces {
     objects: SingleWriterTxKeyspace,
@@ -139,6 +171,7 @@ pub(super) struct Spaces {
     index_artifacts: SingleWriterTxKeyspace,
     index_staging: SingleWriterTxKeyspace,
     captures: SingleWriterTxKeyspace,
+    variants: SingleWriterTxKeyspace,
 }
 impl Spaces {
     pub(super) fn open(db: &SingleWriterTxDatabase, feature: u8) -> Result<Self> {
@@ -150,6 +183,9 @@ impl Spaces {
         }
         if feature >= 5 && !db.keyspace_exists(TABLES[11]) {
             return Err(Error::Corrupt("cloud capture keyspace missing"));
+        }
+        if feature >= 11 && !db.keyspace_exists(TABLES[12]) {
+            return Err(Error::Corrupt("cloud variant keyspace missing"));
         }
         Ok(Self {
             objects: db.keyspace(TABLES[0], KeyspaceCreateOptions::default)?,
@@ -164,9 +200,10 @@ impl Spaces {
             index_artifacts: db.keyspace(TABLES[9], KeyspaceCreateOptions::default)?,
             index_staging: db.keyspace(TABLES[10], KeyspaceCreateOptions::default)?,
             captures: db.keyspace(TABLES[11], KeyspaceCreateOptions::default)?,
+            variants: db.keyspace(TABLES[12], KeyspaceCreateOptions::default)?,
         })
     }
-    fn all(&self) -> [&SingleWriterTxKeyspace; 12] {
+    fn all(&self) -> [&SingleWriterTxKeyspace; 13] {
         [
             &self.objects,
             &self.blobs,
@@ -180,6 +217,7 @@ impl Spaces {
             &self.index_artifacts,
             &self.index_staging,
             &self.captures,
+            &self.variants,
         ]
     }
 }
@@ -318,6 +356,13 @@ fn object_key(repo: &str, owner: CloudOwner, id: CloudId) -> Vec<u8> {
     key.extend_from_slice(id.bytes());
     key
 }
+// A primary semantic selection is immutable. Additional raw encodings are keyed
+// independently and may be selected only by an explicit complete descriptor.
+fn variant_key(repo: &str, owner: CloudOwner, d: CloudObjectDescriptor) -> Vec<u8> {
+    let mut key = object_key(repo, owner, d.id);
+    key.extend_from_slice(&d.selected.blake3);
+    key
+}
 fn blob_key(repo: &str, owner: CloudOwner, digest: [u8; 32]) -> Vec<u8> {
     let mut key = scope(repo, owner);
     key.extend_from_slice(&digest);
@@ -376,6 +421,58 @@ impl Inner {
             })
             .transpose()
     }
+    fn cloud_representation_row(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        d: CloudObjectDescriptor,
+    ) -> Result<Option<(Vec<u8>, fjall::Slice)>> {
+        // Select only the bounded raw row here. Indexed callers must debit
+        // decoded-row scratch before deserializing any dependency collections.
+        let view = self.db.read_tx();
+        let key = variant_key(repo, owner, d);
+        if let Some(bytes) = view.get(&self.spaces.cloud.variants, &key)? {
+            if bytes.len() > CLOUD_JSON_ROW_BYTES {
+                return Err(Error::Corrupt("cloud metadata row size"));
+            }
+            return Ok(Some((key, bytes)));
+        }
+        let key = object_key(repo, owner, d.id);
+        Ok(view
+            .get(&self.spaces.cloud.objects, &key)?
+            .map(|bytes| {
+                if bytes.len() > CLOUD_JSON_ROW_BYTES {
+                    return Err(Error::Corrupt("cloud metadata row size"));
+                }
+                Ok((key, bytes))
+            })
+            .transpose()?)
+    }
+    fn cloud_representation(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        d: CloudObjectDescriptor,
+    ) -> Result<Option<ObjectRecord>> {
+        self.cloud_representation_row(repo, owner, d)?
+            .map(|(key, bytes)| {
+                let record: ObjectRecord = decode(&bytes)?;
+                let actual = record.selected.descriptor()?;
+                if record.version != 1 || actual.id != d.id {
+                    return Err(Error::Corrupt("cloud representation identity"));
+                }
+                if actual != d {
+                    if key == object_key(repo, owner, d.id) {
+                        return Ok(None);
+                    }
+                    return Err(Error::Corrupt("cloud variant descriptor"));
+                }
+                Ok(Some(record))
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
     fn cloud_account(&self, key: &[u8]) -> Result<Accounting> {
         self.db
             .read_tx()
@@ -455,6 +552,7 @@ pub struct CloudReadLease {
     repo: String,
     owner: CloudOwner,
     inner: Arc<Inner>,
+    _resident: Option<Arc<resident::Reservation>>,
 }
 impl CloudReadLease {
     pub fn descriptor(&self) -> CloudObjectDescriptor {
@@ -493,6 +591,45 @@ fn verify_record(
     Ok(verified)
 }
 impl Store {
+    /// Read the already validated global accounting under the publication gate.
+    /// This performs no catalog scan, publication, recovery or budget adjustment.
+    pub fn cloud_catalog_budget_summary(&self) -> Result<CloudCatalogBudgetSummary> {
+        let _gate = self.inner.lock()?;
+        let global = self.inner.cloud_account(&[0, 0])?;
+        let required_total_records = global
+            .records
+            .checked_add(global.version_records)
+            .and_then(|n| n.checked_add(global.namespaces.saturating_mul(2)))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::Corrupt("cloud accounting overflow"))?;
+        let required_total_metadata_bytes = global
+            .metadata_bytes
+            .checked_add(global.version_metadata_bytes)
+            .and_then(|n| n.checked_add(global.namespaces.saturating_mul(4096)))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(Error::Corrupt("cloud accounting overflow"))?;
+        let required_total_payload_bytes = global
+            .selected_bytes
+            .checked_add(global.version_payload_bytes)
+            .ok_or(Error::Corrupt("cloud accounting overflow"))?;
+        Ok(CloudCatalogBudgetSummary {
+            catalog_records: global.records,
+            catalog_metadata_bytes: global.metadata_bytes,
+            retained_version_record_work: global.version_records,
+            retained_version_metadata_work: global.version_metadata_bytes,
+            selected_payload_bytes: global.selected_bytes,
+            retained_version_payload_work: global.version_payload_bytes,
+            namespaces: global.namespaces,
+            staging_records: global.stages,
+            workspaces: global.workspaces,
+            versions: global.versions,
+            publication_receipts: global.receipts,
+            required_total_records,
+            required_total_metadata_bytes,
+            required_total_payload_bytes,
+        })
+    }
+
     pub fn lookup_cloud_objects(
         &self,
         repo: &str,
@@ -520,13 +657,38 @@ impl Store {
         id: CloudId,
         limits: tinytree_cloud::Limits,
     ) -> Result<CloudReadLease> {
+        self.read_cloud_representation_inner(repo, owner, id, None, limits)
+    }
+    /// Read exactly the requested verified raw representation, never the primary
+    /// as a substitute for another descriptor.
+    pub fn read_cloud_object_representation(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        descriptor: CloudObjectDescriptor,
+        limits: tinytree_cloud::Limits,
+    ) -> Result<CloudReadLease> {
+        self.read_cloud_representation_inner(repo, owner, descriptor.id, Some(descriptor), limits)
+    }
+    fn read_cloud_representation_inner(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        id: CloudId,
+        exact: Option<CloudObjectDescriptor>,
+        limits: tinytree_cloud::Limits,
+    ) -> Result<CloudReadLease> {
         let limits = self.inner.cloud_codec_limits(limits)?;
         let mut gate = self.inner.lock()?;
+        // The decoded dependency row remains live during out-of-gate byte
+        // verification. Retain its arena until the row and scratch are dropped.
+        let _resident_verification = gate.resident_arena.upgrade();
         self.inner.repository(repo)?;
-        let record = self
-            .inner
-            .cloud_object(repo, owner, id)?
-            .ok_or(Error::Invalid("cloud object unavailable"))?;
+        let record = match exact {
+            Some(d) => self.inner.cloud_representation(repo, owner, d)?,
+            None => self.inner.cloud_object(repo, owner, id)?,
+        }
+        .ok_or(Error::Invalid("cloud object unavailable"))?;
         let descriptor = record.selected.descriptor()?;
         if descriptor.selected.size_bytes > limits.max_payload_bytes as u64 {
             return Err(Error::Limit("cloud payload bytes"));
@@ -540,6 +702,8 @@ impl Store {
             return Err(Error::Corrupt("cloud backing type or size"));
         }
         let file = File::open(path)?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 1, 1)?;
         *gate
             .cloud_readers
             .entry((repo.to_owned(), owner.principal, id))
@@ -551,6 +715,7 @@ impl Store {
             repo: repo.into(),
             owner,
             inner: self.inner.clone(),
+            _resident: resident_lease,
         };
         let mut bytes = Vec::with_capacity(descriptor.selected.size_bytes as usize);
         lease.read_to_end(&mut bytes)?;
@@ -584,21 +749,6 @@ impl Drop for CloudReservation {
     }
 }
 impl Inner {
-    fn reserve_cloud(
-        self: &Arc<Self>,
-        repo: &str,
-        owner: CloudOwner,
-        id: CloudId,
-        digest: BlobDigest,
-    ) -> Result<CloudReservation> {
-        self.reserve_cloud_catalog(
-            repo,
-            owner,
-            &self.spaces.cloud.objects,
-            object_key(repo, owner, id),
-            digest,
-        )
-    }
     fn reserve_cloud_catalog(
         self: &Arc<Self>,
         repo: &str,
@@ -740,15 +890,58 @@ impl Inner {
         let mut principal = read_account(&owner_key)?;
         let mut global = read_account(&[0, 0])?;
         let fresh_namespace = tx.get(&self.spaces.cloud.accounting, &owner_key)?.is_none();
+        if self.config.cloud.resident.is_some() {
+            let mut prospective = global.clone();
+            let mut typed = 0i128;
+            for (space, key, value) in &changes {
+                if let Some(old) = tx.get(*space, key)? {
+                    adjust(&mut prospective.records, -1)?;
+                    adjust(
+                        &mut prospective.metadata_bytes,
+                        -((key.len() + old.len()) as i128),
+                    )?;
+                    if std::ptr::eq(*space, &self.spaces.cloud.roots) {
+                        typed -= resident::root_count(&old)? as i128;
+                    }
+                }
+                if let Some(value) = value {
+                    adjust(&mut prospective.records, 1)?;
+                    adjust(
+                        &mut prospective.metadata_bytes,
+                        (key.len() + value.len()) as i128,
+                    )?;
+                    if std::ptr::eq(*space, &self.spaces.cloud.roots) {
+                        typed += resident::root_count(value)? as i128;
+                    }
+                }
+            }
+            if fresh_namespace {
+                adjust(&mut prospective.namespaces, 1)?;
+            }
+            // This precedes even transaction-buffer insertions. The ordinary
+            // work/quota checks below remain independent and unchanged.
+            self.resident.prepare(&prospective, typed)?;
+        }
         let mut metadata = 0i128;
         let mut records = 0i128;
+        let mut typed_delta = 0i128;
         for (space, key, value) in changes {
             if let Some(old) = tx.get(space, &key)? {
+                if self.config.cloud.resident.is_some()
+                    && std::ptr::eq(space, &self.spaces.cloud.roots)
+                {
+                    typed_delta -= resident::root_count(&old)? as i128;
+                }
                 metadata -= (key.len() + old.len()) as i128;
                 records -= 1;
             }
             match value {
                 Some(value) => {
+                    if self.config.cloud.resident.is_some()
+                        && std::ptr::eq(space, &self.spaces.cloud.roots)
+                    {
+                        typed_delta += resident::root_count(&value)? as i128;
+                    }
                     let binary = std::ptr::eq(space, &self.spaces.cloud.manifests)
                         || std::ptr::eq(space, &self.spaces.cloud.roots)
                         || std::ptr::eq(space, &self.spaces.cloud.captures);
@@ -808,25 +1001,40 @@ impl Inner {
         {
             return Err(Error::Limit("cloud owner quota"));
         }
-        if growth
-            && (global
+        if growth {
+            let payload_exceeded = global
                 .selected_bytes
                 .checked_add(global.version_payload_bytes)
-                .is_none_or(|bytes| bytes > self.config.cloud.max_validation_payload_bytes)
-                || global
-                    .records
-                    .checked_add(global.version_records)
-                    .and_then(|n| n.checked_add(global.namespaces.saturating_mul(2)))
-                    .and_then(|n| n.checked_add(1))
-                    .is_none_or(|n| n > self.config.max_retention_validation_records as u64)
-                || global
-                    .metadata_bytes
-                    .checked_add(global.version_metadata_bytes)
-                    .and_then(|n| n.checked_add(global.namespaces.saturating_mul(4096)))
-                    .and_then(|n| n.checked_add(4096))
-                    .is_none_or(|n| n > self.config.max_retention_validation_bytes))
-        {
-            return Err(Error::Limit("cloud validation catalog budget"));
+                .is_none_or(|bytes| bytes > self.config.cloud.max_validation_payload_bytes);
+            let records_exceeded = global
+                .records
+                .checked_add(global.version_records)
+                .and_then(|n| n.checked_add(global.namespaces.saturating_mul(2)))
+                .and_then(|n| n.checked_add(1))
+                .is_none_or(|n| n > self.config.max_retention_validation_records as u64);
+            let metadata_exceeded = global
+                .metadata_bytes
+                .checked_add(global.version_metadata_bytes)
+                .and_then(|n| n.checked_add(global.namespaces.saturating_mul(4096)))
+                .and_then(|n| n.checked_add(4096))
+                .is_none_or(|n| n > self.config.max_retention_validation_bytes);
+            let exceeded = u8::from(records_exceeded)
+                | (u8::from(metadata_exceeded) << 1)
+                | (u8::from(payload_exceeded) << 2);
+            let reason = match exceeded {
+                0 => None,
+                1 => Some("cloud validation catalog budget exceeded: records"),
+                2 => Some("cloud validation catalog budget exceeded: metadata"),
+                3 => Some("cloud validation catalog budget exceeded: records_metadata"),
+                4 => Some("cloud validation catalog budget exceeded: payload"),
+                5 => Some("cloud validation catalog budget exceeded: records_payload"),
+                6 => Some("cloud validation catalog budget exceeded: metadata_payload"),
+                7 => Some("cloud validation catalog budget exceeded: records_metadata_payload"),
+                _ => unreachable!(),
+            };
+            if let Some(reason) = reason {
+                return Err(Error::Limit(reason));
+            }
         }
         let native = self.repository(repo)?;
         if growth
@@ -841,6 +1049,7 @@ impl Inner {
         {
             return Err(Error::Limit("repository quota"));
         }
+        self.resident.prepare(&global, typed_delta)?;
         tx.insert(
             &self.spaces.cloud.accounting,
             repository_key,
@@ -868,6 +1077,50 @@ impl Store {
         now: i64,
         limits: tinytree_cloud::Limits,
     ) -> Result<CloudWriteReceipt> {
+        self.put_cloud_object_inner(repo, owner, id, digest, bytes, now, limits, false)
+    }
+    /// Preserve the primary selection while staging the exact caller encoding.
+    pub fn put_cloud_object_representation(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        id: CloudId,
+        digest: BlobDigest,
+        bytes: &[u8],
+        now: i64,
+        limits: tinytree_cloud::Limits,
+    ) -> Result<CloudWriteReceipt> {
+        let primary = self.put_cloud_object(repo, owner, id, digest, bytes, now, limits)?;
+        if primary.descriptor.selected == digest {
+            return Ok(primary);
+        }
+        // Quota reservations do not pin a catalog record. Protect the primary
+        // physically across setup, verification and publication of the variant.
+        let _primary =
+            self.read_cloud_object_representation(repo, owner, primary.descriptor, limits)?;
+        #[cfg(test)]
+        {
+            let pause = self.inner.variant_put_pause.lock().unwrap().clone();
+            if let Some((entered, release)) = pause {
+                entered.wait();
+                release.wait();
+            }
+        }
+        // The later format includes the earlier durable external-check layout.
+        self.enable_external_checks()?;
+        self.put_cloud_object_inner(repo, owner, id, digest, bytes, now, limits, true)
+    }
+    fn put_cloud_object_inner(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        id: CloudId,
+        digest: BlobDigest,
+        bytes: &[u8],
+        now: i64,
+        limits: tinytree_cloud::Limits,
+        variant: bool,
+    ) -> Result<CloudWriteReceipt> {
         let limits = self.inner.cloud_codec_limits(limits)?;
         if id.is_intrinsic() {
             return Err(Error::Invalid("intrinsic cloud object payload"));
@@ -878,7 +1131,24 @@ impl Store {
         let expires = now
             .checked_add(self.inner.config.staging_ttl_seconds)
             .ok_or(Error::Invalid("cloud staging expiry"))?;
-        let reservation = self.inner.reserve_cloud(repo, owner, id, digest)?;
+        let proposed = CloudObjectDescriptor {
+            id,
+            selected: digest,
+        };
+        let (space, catalog_key) = if variant {
+            (
+                &self.inner.spaces.cloud.variants,
+                variant_key(repo, owner, proposed),
+            )
+        } else {
+            (
+                &self.inner.spaces.cloud.objects,
+                object_key(repo, owner, id),
+            )
+        };
+        let reservation =
+            self.inner
+                .reserve_cloud_catalog(repo, owner, space, catalog_key.clone(), digest)?;
         let verified = VerifiedObject::verify(id, digest, bytes, limits)
             .map_err(|_| Error::Invalid("cloud object verification"))?;
         let proposed = CloudObjectDescriptor {
@@ -897,17 +1167,31 @@ impl Store {
         loop {
             let _gate = self.inner.lock()?;
             self.inner.repository(repo)?;
-            if let Some(record) = self.inner.cloud_object(repo, owner, id)? {
+            if variant
+                && self.inner.cloud_object(repo, owner, id)?.is_none_or(|r| {
+                    r.selected
+                        .descriptor()
+                        .ok()
+                        .is_none_or(|d| d.selected == digest)
+                })
+            {
+                return Err(Error::Corrupt("cloud variant primary anchor"));
+            }
+            if let Some(record) = if variant {
+                self.inner.cloud_representation(repo, owner, proposed)?
+            } else {
+                self.inner.cloud_object(repo, owner, id)?
+            } {
                 let selected = record.selected.descriptor()?;
                 if candidate
                     .as_ref()
                     .is_none_or(|candidate| candidate.descriptor != selected)
                 {
                     drop(_gate);
-                    candidate = Some(self.read_cloud_object(
+                    candidate = Some(self.read_cloud_object_representation(
                         repo,
                         owner,
-                        id,
+                        selected,
                         self.inner.cloud_verification_limits(),
                     )?);
                     continue;
@@ -994,17 +1278,17 @@ impl Store {
                 .db
                 .write_tx()
                 .durability(Some(PersistMode::SyncAll));
-            advance_feature(&mut tx, &self.inner.spaces.meta, 3)?;
+            advance_feature(
+                &mut tx,
+                &self.inner.spaces.meta,
+                if variant { 11 } else { 3 },
+            )?;
             self.inner.cloud_changes(
                 &mut tx,
                 repo,
                 owner,
                 vec![
-                    (
-                        &self.inner.spaces.cloud.objects,
-                        object_key(repo, owner, id),
-                        Some(encode(&record)?),
-                    ),
+                    (space, catalog_key.clone(), Some(encode(&record)?)),
                     (&self.inner.spaces.cloud.blobs, key, Some(encode(&blob)?)),
                     (
                         &self.inner.spaces.cloud.staging,
@@ -1183,36 +1467,63 @@ impl Inner {
         let mut expected = HashMap::<Vec<u8>, Accounting>::new();
         let mut blob_refs = HashMap::<Vec<u8>, (u64, u64)>::new();
         let view = self.db.read_tx();
-        for item in view.iter(&self.spaces.cloud.objects) {
-            let (key, value) = item.into_inner()?;
-            scan.visit(self, &key, &value)?;
-            let (repo, owner, _) = parse_scope(&key)?;
-            self.repository(repo)?;
-            let record: ObjectRecord = decode(&value)?;
-            let descriptor = record.selected.descriptor()?;
-            if record.version != 1
-                || key.as_ref() != object_key(repo, owner, descriptor.id).as_slice()
-            {
-                return Err(Error::Corrupt("cloud object key identity"));
+        if feature < 11 && view.iter(&self.spaces.cloud.variants).next().is_some() {
+            return Err(Error::Corrupt("cloud variants precede feature"));
+        }
+        for (space, variant) in [
+            (&self.spaces.cloud.objects, false),
+            (&self.spaces.cloud.variants, true),
+        ] {
+            for item in view.iter(space) {
+                let (key, value) = item.into_inner()?;
+                scan.visit(self, &key, &value)?;
+                let (repo, owner, _) = parse_scope(&key)?;
+                self.repository(repo)?;
+                let record: ObjectRecord = decode(&value)?;
+                let descriptor = record.selected.descriptor()?;
+                if record.version != 1
+                    || key.as_ref()
+                        != if variant {
+                            variant_key(repo, owner, descriptor)
+                        } else {
+                            object_key(repo, owner, descriptor.id)
+                        }
+                        .as_slice()
+                {
+                    return Err(Error::Corrupt("cloud object key identity"));
+                }
+                if variant
+                    && self
+                        .cloud_object(repo, owner, descriptor.id)?
+                        .is_none_or(|primary| {
+                            primary
+                                .selected
+                                .descriptor()
+                                .ok()
+                                .is_none_or(|d| d.selected == descriptor.selected)
+                        })
+                {
+                    return Err(Error::Corrupt("cloud variant primary anchor"));
+                }
+                self.verify_cloud_backing(repo, owner, &record, &mut scan)?;
+                let a = expected.entry(scope(repo, owner)).or_default();
+                metadata_account(a, &key, &value)?;
+                adjust(&mut a.objects, 1)?;
+                adjust(
+                    &mut a.selected_bytes,
+                    descriptor.selected.size_bytes as i128,
+                )?;
+                let blob = blob_refs
+                    .entry(blob_key(repo, owner, descriptor.selected.blake3))
+                    .or_insert((descriptor.selected.size_bytes, 0));
+                if blob.0 != descriptor.selected.size_bytes {
+                    return Err(Error::Corrupt("cloud raw blob descriptor collision"));
+                }
+                blob.1 = blob
+                    .1
+                    .checked_add(1)
+                    .ok_or(Error::Corrupt("cloud blob references overflow"))?;
             }
-            self.verify_cloud_backing(repo, owner, &record, &mut scan)?;
-            let a = expected.entry(scope(repo, owner)).or_default();
-            metadata_account(a, &key, &value)?;
-            adjust(&mut a.objects, 1)?;
-            adjust(
-                &mut a.selected_bytes,
-                descriptor.selected.size_bytes as i128,
-            )?;
-            let blob = blob_refs
-                .entry(blob_key(repo, owner, descriptor.selected.blake3))
-                .or_insert((descriptor.selected.size_bytes, 0));
-            if blob.0 != descriptor.selected.size_bytes {
-                return Err(Error::Corrupt("cloud raw blob descriptor collision"));
-            }
-            blob.1 = blob
-                .1
-                .checked_add(1)
-                .ok_or(Error::Corrupt("cloud blob references overflow"))?;
         }
         self.validate_index_catalog(feature, &mut expected, &mut blob_refs, &mut scan)?;
         for item in view.iter(&self.spaces.cloud.blobs) {
@@ -1245,7 +1556,7 @@ impl Inner {
             let selected = stage.selected.descriptor()?;
             if suffix != stage_id(selected).as_bytes()
                 || self
-                    .cloud_object(repo, owner, selected.id)?
+                    .cloud_representation(repo, owner, selected)?
                     .is_none_or(|record| record.selected.descriptor().ok() != Some(selected))
             {
                 return Err(Error::Corrupt("cloud staging identity"));
@@ -1339,6 +1650,7 @@ pub(super) struct CloudGcPlan {
     pub objects: u64,
     pub bytes: u64,
     pub expired: u64,
+    _resident: Option<Arc<resident::Reservation>>,
 }
 impl CloudGcPlan {
     pub(super) fn apply(
@@ -1403,22 +1715,38 @@ impl Inner {
             payload: 0,
         };
         let published = self.retained_cloud_plan(Some(repo), None, true, &mut scan)?;
-        let mut objects = HashMap::<(CloudOwner, CloudId), (Vec<u8>, ObjectRecord)>::new();
-        for item in view.prefix(&self.spaces.cloud.objects, &prefix) {
-            let (key, value) = item.into_inner()?;
-            scan.visit(self, &key, &value)?;
-            let (actual, owner, _) = parse_scope(&key)?;
-            let record: ObjectRecord = decode(&value)?;
-            let selected = record.selected.descriptor()?;
-            if actual != repo
-                || record.version != 1
-                || key.as_ref() != object_key(repo, owner, selected.id).as_slice()
-            {
-                return Err(Error::Corrupt("cloud object key identity"));
+        // Each raw representation is a separately charged/collectable catalog
+        // record. Primary semantic selections remain anchors for retained variants.
+        let mut objects =
+            HashMap::<(CloudOwner, CloudId, [u8; 32]), (usize, Vec<u8>, ObjectRecord)>::new();
+        let mut primary = HashMap::new();
+        for (space, slot) in [
+            (&self.spaces.cloud.objects, 0),
+            (&self.spaces.cloud.variants, 12),
+        ] {
+            for item in view.prefix(space, &prefix) {
+                let (key, value) = item.into_inner()?;
+                scan.visit(self, &key, &value)?;
+                let (actual, owner, _) = parse_scope(&key)?;
+                let record: ObjectRecord = decode(&value)?;
+                let d = record.selected.descriptor()?;
+                let expected = if slot == 0 {
+                    object_key(repo, owner, d.id)
+                } else {
+                    variant_key(repo, owner, d)
+                };
+                if actual != repo || record.version != 1 || key.as_ref() != expected.as_slice() {
+                    return Err(Error::Corrupt("cloud object key identity"));
+                }
+                let root = (owner, d.id, d.selected.blake3);
+                if slot == 0 {
+                    primary.insert((owner, d.id), root);
+                }
+                objects.insert(root, (slot, key.to_vec(), record));
             }
-            objects.insert((owner, selected.id), (key.to_vec(), record));
         }
         let mut plan = CloudGcPlan {
+            _resident: gate.resident_arena.upgrade(),
             strict: published.native,
             transient: HashSet::new(),
             groups: HashMap::new(),
@@ -1427,26 +1755,34 @@ impl Inner {
             bytes: 0,
             expired: 0,
         };
-        let mut pending = Vec::new();
         let published_index = published.index;
-        let mut marked = published.cloud;
+        let mut marked = published.variants;
+        for semantic in published.cloud {
+            marked.insert(
+                *primary
+                    .get(&semantic)
+                    .ok_or(Error::Corrupt("cloud primary anchor missing"))?,
+            );
+        }
+        let mut pending = Vec::new();
         for item in view.prefix(&self.spaces.cloud.staging, &prefix) {
             let (key, value) = item.into_inner()?;
             scan.visit(self, &key, &value)?;
             let (actual, owner, suffix) = parse_scope(&key)?;
             let stage: StageRecord = decode(&value)?;
-            let selected = stage.selected.descriptor()?;
+            let d = stage.selected.descriptor()?;
+            let root = (owner, d.id, d.selected.blake3);
             if actual != repo
-                || suffix != stage_id(selected).as_bytes()
+                || suffix != stage_id(d).as_bytes()
                 || objects
-                    .get(&(owner, selected.id))
-                    .is_none_or(|(_, r)| r.selected.descriptor().ok() != Some(selected))
+                    .get(&root)
+                    .is_none_or(|(_, _, r)| r.selected.descriptor().ok() != Some(d))
             {
                 return Err(Error::Corrupt("cloud staging identity"));
             }
             if stage.expires > now {
-                if marked.insert((owner, selected.id)) {
-                    pending.push((owner, selected.id));
+                if marked.insert(root) {
+                    pending.push(root);
                 }
             } else {
                 let group = plan.groups.entry(owner).or_default();
@@ -1459,21 +1795,37 @@ impl Inner {
                 plan.expired += 1;
             }
         }
+        // Semantic read/validation leases conservatively protect every raw
+        // encoding while any lease for that identity is physically alive.
         for ((actual, owner, id), _) in &gate.cloud_readers {
             if actual == repo {
-                let root = (CloudOwner { principal: *owner }, *id);
-                if !objects.contains_key(&root) {
-                    return Err(Error::Corrupt("cloud active reader catalog missing"));
+                let owner = CloudOwner { principal: *owner };
+                let mut found = false;
+                for root in objects.keys().filter(|(o, i, _)| *o == owner && *i == *id) {
+                    found = true;
+                    if marked.insert(*root) {
+                        pending.push(*root);
+                    }
                 }
-                if marked.insert(root) {
-                    pending.push(root);
+                if !found {
+                    return Err(Error::Corrupt("cloud active reader catalog missing"));
                 }
             }
         }
-        while let Some((owner, id)) = pending.pop() {
-            let Some((_, record)) = objects.get(&(owner, id)) else {
-                continue;
-            };
+        // All variant roots retain the immutable primary, including roots named
+        // by a version rather than a live staging lease.
+        for &(owner, id, _) in &marked.clone() {
+            let anchor = *primary
+                .get(&(owner, id))
+                .ok_or(Error::Corrupt("cloud primary anchor missing"))?;
+            if marked.insert(anchor) {
+                pending.push(anchor);
+            }
+        }
+        while let Some(root @ (owner, id, _)) = pending.pop() {
+            let (_, _, record) = objects
+                .get(&root)
+                .ok_or(Error::Corrupt("cloud marked representation missing"))?;
             let verified = self.verify_cloud_backing(repo, owner, record, &mut scan)?;
             for commit in &verified.dependencies().native_commits {
                 if *commit != [0; 32] {
@@ -1482,6 +1834,12 @@ impl Inner {
                         id: ObjectId(*commit),
                     });
                 }
+            }
+            let anchor = *primary
+                .get(&(owner, id))
+                .ok_or(Error::Corrupt("cloud primary anchor missing"))?;
+            if marked.insert(anchor) {
+                pending.push(anchor);
             }
             for child in verified
                 .dependencies()
@@ -1498,11 +1856,12 @@ impl Inner {
                         .map(CloudId::View),
                 )
             {
-                if !child.is_intrinsic()
-                    && objects.contains_key(&(owner, child))
-                    && marked.insert((owner, child))
-                {
-                    pending.push((owner, child));
+                if !child.is_intrinsic() {
+                    if let Some(&child) = primary.get(&(owner, child)) {
+                        if marked.insert(child) {
+                            pending.push(child);
+                        }
+                    }
                 }
             }
             if marked.len() > self.config.max_retention_validation_records
@@ -1512,14 +1871,14 @@ impl Inner {
             }
         }
         let mut victim_refs = HashMap::<Vec<u8>, (CloudOwner, u64)>::new();
-        for ((owner, id), (key, record)) in objects {
-            if marked.contains(&(owner, id)) {
+        for (root @ (owner, _, _), (slot, key, record)) in objects {
+            if marked.contains(&root) {
                 continue;
             }
             let descriptor = record.selected.descriptor()?;
             let group = plan.groups.entry(owner).or_default();
             group.changes.push(GcChange {
-                space: 0,
+                space: slot,
                 key,
                 value: None,
             });
@@ -1572,5 +1931,22 @@ impl Inner {
                 });
         }
         Ok(plan)
+    }
+}
+
+impl Store {
+    /// This Store's only backing is its exclusively owned authoritative local
+    /// directory, never an evicting cache or externally retained blob service.
+    /// Publication validates and durably installs the full selected closure.
+    /// retained_cloud_plan roots ALL saved versions, exact raw variants, DATA
+    /// and index artifacts; gc extends strict native roots before closure mark.
+    /// Corruption/budget exhaustion abort collection rather than forgetting a
+    /// published dependency. Staging expiry and workspace advancement do not
+    /// expire versions. Quotas reject new admissions, not retained dependencies.
+    /// Any future backing/expiry mode must return false until it implements this
+    /// whole contract; a VersionRecord alone is insufficient. This is a storage
+    /// contract, not current source authorization, availability or infinite quota.
+    pub fn supports_durable_retained_offload(&self) -> bool {
+        true
     }
 }

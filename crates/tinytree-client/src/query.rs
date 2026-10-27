@@ -148,7 +148,74 @@ pub enum PrefixTarget {
     Change(ChangeId),
 }
 
+fn expression_has_path(expression: &q::GraphExpr) -> bool {
+    use q::graph_expr::Expression as E;
+    let mut todo = vec![expression];
+    let mut seen = 0;
+    while let Some(node) = todo.pop() {
+        seen += 1;
+        if seen > 1024 || todo.len() > 1024 {
+            return true;
+        }
+        match node.expression.as_ref() {
+            Some(E::ChangedPath(_)) => return true,
+            Some(E::Ancestors(v)) => todo.extend(v.heads.as_deref()),
+            Some(E::Range(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(E::DagRange(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(E::Heads(v) | E::Roots(v) | E::HasConflict(v)) => todo.extend(v.input.as_deref()),
+            Some(E::Union(v) | E::Intersection(v)) => {
+                if v.inputs.len() > 1024 {
+                    return true;
+                }
+                todo.extend(&v.inputs);
+            }
+            Some(E::Difference(v)) => {
+                todo.extend(v.left.as_deref());
+                todo.extend(v.right.as_deref());
+            }
+            Some(E::Latest(v)) => todo.extend(v.candidates.as_deref()),
+            _ => {}
+        }
+    }
+    false
+}
 impl NativeClient {
+    async fn require_path_capability(&self, expression: &q::GraphExpr) -> Result<(), Status> {
+        if !expression_has_path(expression) {
+            return Ok(());
+        }
+        let caps = self
+            .capabilities(&[crate::CapabilityFeature::ExactPathGraphV1])
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) {
+                    Status::unimplemented("server does not support exact-path graph filtering")
+                } else {
+                    e
+                }
+            })?;
+        let feature = &caps.features[0];
+        if !feature.authorized {
+            return Err(Status::permission_denied(
+                "exact-path graph filter is not authorized",
+            ));
+        }
+        if !feature.supported {
+            return Err(Status::unimplemented(
+                "server does not support exact-path graph filtering",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn checked_scope(
         &self,
         scope: &CheckedScopeHandle,
@@ -536,6 +603,7 @@ impl NativeClient {
                 QueryFact::Membership { expression, .. } => {
                     let (nodes, bytes, literals) =
                         validate_expression(expression, &self.inner.config.limits)?;
+                    self.require_path_capability(expression).await?;
                     expression_nodes = expression_nodes.checked_add(nodes).ok_or_else(|| {
                         Status::resource_exhausted("query expression nodes exceed budget")
                     })?;
@@ -746,6 +814,9 @@ impl NativeClient {
         selection: Option<&q::GraphExpr>,
     ) -> Result<CommitPrefix, Status> {
         self.checked_selection(selection, 256)?;
+        if let Some(expression) = selection {
+            self.require_path_capability(expression).await?;
+        }
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 64)?;
         let deadline = self.deadline();
@@ -824,6 +895,9 @@ impl NativeClient {
                     Status::resource_exhausted("selected prefix request exceeds budget")
                 })?,
         )?;
+        if let Some(expression) = selection {
+            self.require_path_capability(expression).await?;
+        }
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 32)?;
         self.batch(visible_heads.len())?;
@@ -947,6 +1021,9 @@ impl NativeClient {
                     Status::resource_exhausted("selected prefix request exceeds budget")
                 })?,
         )?;
+        if let Some(expression) = selection {
+            self.require_path_capability(expression).await?;
+        }
         self.checked_scope(scope, false)?;
         self.batch(visible_heads.len())?;
         visible_heads.sort_unstable();
@@ -1356,6 +1433,7 @@ impl NativeClient {
         }
         let limits = &self.inner.config.limits;
         let (nodes, encoded, _) = validate_expression(expression, limits)?;
+        self.require_path_capability(expression).await?;
         // Membership intersections inherit their literal bound. This lets a
         // selected canonical read or template membership check coexist with its
         // still-live outer query without changing graph traversal reservations.
@@ -2211,6 +2289,17 @@ fn validate_expression(
                 generation_range(value.generations_from_roots.as_ref())?;
                 children.push(value.roots.as_deref().ok_or_else(invalid)?);
                 children.push(value.heads.as_deref().ok_or_else(invalid)?);
+            }
+            E::ChangedPath(value) => {
+                if value.policy_version != 1
+                    || value.path.is_empty()
+                    || value.path.len() > 4096
+                    || value.path.contains(['\\', '\0'])
+                    || value.path.split('/').any(|c| matches!(c, "" | "." | ".."))
+                {
+                    return Err(invalid());
+                }
+                children.push(value.candidates.as_deref().ok_or_else(invalid)?);
             }
             E::Heads(value) | E::Roots(value) | E::HasConflict(value) => {
                 children.push(value.input.as_deref().ok_or_else(invalid)?)

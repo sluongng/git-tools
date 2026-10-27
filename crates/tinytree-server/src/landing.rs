@@ -153,6 +153,20 @@ impl LandingConfig {
                 p.name == name && p.version == version && p.repositories.iter().any(|r| r == repo)
             })
     }
+    pub(crate) fn validate_store_with_checker_history(
+        &self,
+        policy: &s::Config,
+    ) -> Result<(), ConfigError> {
+        let charges = self.validate_store(policy)?;
+        // Pure preflight cannot inspect historical checker state. Budget its
+        // catalogs even if execution is disabled; startup reserves them only
+        // when the checker is configured or durable obligations exist.
+        let minimum = charges.minimum(self, crate::landing_check::CheckerHost::catalog_work())?;
+        if minimum > self.max_buffered_bytes {
+            return Err(ConfigError("landing checker catalogs exceed memory pool"));
+        }
+        Ok(())
+    }
     pub(crate) fn validate_store(&self, policy: &s::Config) -> Result<Charges, ConfigError> {
         let sum = |values: &[u64]| {
             values.iter().try_fold(0u64, |a, b| {
@@ -253,6 +267,24 @@ pub(crate) struct Charges {
     status: u64,
     coordinator: u64,
 }
+impl Charges {
+    fn minimum(&self, config: &LandingConfig, checker_memory: u64) -> Result<u64, ConfigError> {
+        checker_memory
+            .checked_add(if config.enabled {
+                self.heavy
+                    .checked_mul(config.max_heavy_jobs as u64)
+                    .and_then(|n| n.checked_add(self.maintenance))
+                    .and_then(|n| {
+                        n.checked_add(self.status.checked_mul(config.max_inflight as u64)?)
+                    })
+                    .and_then(|n| n.checked_add(self.coordinator))
+                    .ok_or(ConfigError("landing checker resource overflow"))?
+            } else {
+                self.status
+            })
+            .ok_or(ConfigError("landing checker memory overflow"))
+    }
+}
 pub(crate) struct LandingHost {
     pub config: LandingConfig,
     store: s::Store,
@@ -315,21 +347,7 @@ impl LandingHost {
         } else {
             0
         };
-        let minimum = checker_memory
-            .checked_add(if config.enabled {
-                charges
-                    .heavy
-                    .checked_mul(config.max_heavy_jobs as u64)
-                    .and_then(|n| n.checked_add(charges.maintenance))
-                    .and_then(|n| {
-                        n.checked_add(charges.status.checked_mul(config.max_inflight as u64)?)
-                    })
-                    .and_then(|n| n.checked_add(charges.coordinator))
-                    .ok_or(ConfigError("landing checker resource overflow"))?
-            } else {
-                charges.status
-            })
-            .ok_or(ConfigError("landing checker memory overflow"))?;
+        let minimum = charges.minimum(&config, checker_memory)?;
         if minimum > config.max_buffered_bytes {
             return Err(ConfigError("landing checker catalogs exceed memory pool"));
         }

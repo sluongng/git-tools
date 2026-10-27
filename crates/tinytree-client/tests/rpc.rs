@@ -75,6 +75,7 @@ impl Running {
             first_scope: Arc::new(std::sync::Mutex::new(None)),
             first_page: Arc::new(std::sync::Mutex::new(None)),
             first_search: Arc::new(std::sync::Mutex::new(None)),
+            first_history_entry: Arc::new(std::sync::Mutex::new(None)),
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .send_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -170,6 +171,10 @@ enum Mode {
     CapabilitiesRepository,
     CapabilitiesReadiness,
     CapabilitiesAbsent,
+    CapabilitiesLegacyFeature,
+    CapabilitiesDenied,
+    CapabilitiesLimited,
+    CapabilitiesTransport,
     Normal,
     RetryFile,
     CorruptFile,
@@ -246,10 +251,18 @@ async fn capabilities_are_exact_checked_configuration_not_implicit_root_readines
             // ordinary creation must retain its original five-feature set.
             assert_eq!(F::ALL.len(), 5);
             let mut every_known_feature = F::ALL.to_vec();
-            every_known_feature.extend([F::LandingRecoveryCloudRead, F::LandingRecoveryCloudWrite]);
+            every_known_feature.extend([
+                F::LandingRecoveryCloudRead,
+                F::LandingRecoveryCloudWrite,
+                F::ExactPathGraphV1,
+                F::JjResolvedBlameV1,
+            ]);
             for requested in [
                 vec![F::LandingRecoveryCloudRead],
                 vec![F::LandingRecoveryCloudWrite],
+                vec![F::ExactPathGraphV1],
+                vec![F::JjResolvedBlameV1],
+                vec![F::DurableRetainedOffloadV1],
                 every_known_feature,
             ] {
                 let configured = client.capabilities(&requested).await.unwrap();
@@ -281,6 +294,63 @@ async fn capabilities_are_exact_checked_configuration_not_implicit_root_readines
         running.stop().await;
     }
 }
+#[tokio::test]
+async fn additive_singleton_negotiation_distinguishes_legacy_from_denial_limits_transport_and_corruption()
+ {
+    for (mode, legacy, error) in [
+        (Mode::Normal, false, None),
+        (Mode::CapabilitiesAbsent, true, None),
+        (Mode::CapabilitiesLegacyFeature, true, None),
+        (
+            Mode::CapabilitiesDenied,
+            false,
+            Some(Code::PermissionDenied),
+        ),
+        (
+            Mode::CapabilitiesLimited,
+            false,
+            Some(Code::ResourceExhausted),
+        ),
+        (Mode::CapabilitiesTransport, false, Some(Code::Unavailable)),
+        (Mode::CapabilitiesMissing, false, Some(Code::DataLoss)),
+        (Mode::CapabilitiesUnknown, false, Some(Code::DataLoss)),
+        (Mode::CapabilitiesSchema, false, Some(Code::DataLoss)),
+        (Mode::CapabilitiesReadiness, false, Some(Code::DataLoss)),
+    ] {
+        let (_directory, _store, service) = setup();
+        let running = Running::start(service, mode).await;
+        let client = running.client().await;
+        for (expected, result) in [
+            (
+                tinytree_client::CapabilityFeature::JjResolvedBlameV1,
+                client.resolved_blame_capability().await,
+            ),
+            (
+                tinytree_client::CapabilityFeature::DurableRetainedOffloadV1,
+                client.durable_retained_offload_capability().await,
+            ),
+        ] {
+            if let Some(error) = error {
+                assert_eq!(result.unwrap_err().code(), error);
+            } else if legacy {
+                assert!(result.unwrap().is_none());
+            } else {
+                let feature = result.unwrap().unwrap();
+                assert_eq!(feature.feature, expected);
+                assert!(!feature.supported);
+                assert_eq!(
+                    feature.authorized,
+                    expected == tinytree_client::CapabilityFeature::JjResolvedBlameV1
+                );
+            }
+        }
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(running.graph.load(Ordering::SeqCst), 0);
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        running.stop().await;
+    }
+}
+
 #[derive(Clone)]
 struct Faults {
     service: RepositoryService,
@@ -305,6 +375,12 @@ impl Repository for Faults {
                 "capability negotiation is not installed",
             ));
         }
+        if self.mode == Mode::CapabilitiesLegacyFeature && matches!(request.get_ref().features.as_slice(), [11] | [13]) {
+            return Err(Status::invalid_argument("legacy capability vocabulary ends at10"));
+        }
+        if self.mode == Mode::CapabilitiesDenied { return Err(Status::permission_denied("capability denied")); }
+        if self.mode == Mode::CapabilitiesLimited { return Err(Status::resource_exhausted("capability busy")); }
+        if self.mode == Mode::CapabilitiesTransport { return Err(Status::unavailable("capability transport unavailable")); }
         let mut response = self.service.get_capabilities(request).await?;
         let value = response.get_mut();
         match self.mode {
@@ -318,7 +394,7 @@ impl Repository for Faults {
                 value.features.swap(0, 1);
             }
             Mode::CapabilitiesUnknown => {
-                value.features[0].feature = 8;
+                value.features[0].feature = 99;
             }
             Mode::CapabilitiesSchema => {
                 value.schema_version = 2;
@@ -1603,6 +1679,10 @@ use tinytree_proto::query_v1 as q;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryMode {
     Normal,
+    AnnotationWrongDigest,
+    AnnotationMissingFlag,
+    AnnotationCyclicParent,
+    AnnotationInputHash,
     HistoryWrongDigest,
     HistoryWrongRevision,
     HistoryWrongPath,
@@ -1611,6 +1691,13 @@ enum QueryMode {
     HistoryFalseComplete,
     HistoryMalformedState,
     HistoryDuplicateEntry,
+    HistoryZeroProgress,
+    HistoryRepeatedFrontier,
+    HistoryPreviousEntry,
+    HistorySecondWrongRevision,
+    HistoryTerminalReadLimit,
+    HistoryCloseAfterPage,
+    HistorySlowPages,
     BlameWrongHash,
     BlameGap,
     BlameUnresolvedComplete,
@@ -1733,9 +1820,30 @@ struct QueryFaults {
     first_scope: Arc<std::sync::Mutex<Option<q::QueryScope>>>,
     first_page: Arc<std::sync::Mutex<Option<q::EvaluatePage>>>,
     first_search: Arc<std::sync::Mutex<Option<q::SearchResult>>>,
+    first_history_entry: Arc<std::sync::Mutex<Option<q::PathHistoryEntry>>>,
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
+    async fn open_annotation_frontier(&self, request: Request<q::OpenAnnotationFrontierRequest>) -> Result<Response<q::AnnotationFrontier>, Status> {
+        let mut reply = self.service.open_annotation_frontier(request).await?;
+        let result = reply.get_mut();
+        match self.mode {
+            QueryMode::AnnotationWrongDigest => result.scope_digest[0] ^= 1,
+            QueryMode::AnnotationMissingFlag => result.nodes.last_mut().unwrap().affects_path = None,
+            QueryMode::AnnotationCyclicParent => { let node = result.nodes.last_mut().unwrap(); node.parents = vec![node.revision.clone().unwrap()]; },
+            _ => {},
+        }
+        Ok(reply)
+    }
+
+    async fn read_annotation_input(&self, request: Request<q::ReadAnnotationInputRequest>) -> Result<Response<q::AnnotationInput>, Status> {
+        let mut reply = self.service.read_annotation_input(request).await?;
+        if self.mode == QueryMode::AnnotationInputHash { reply.get_mut().data[0] ^= 1; }
+        Ok(reply)
+    }
+
+    async fn close_annotation_frontier(&self, request: Request<q::CloseAnnotationFrontierRequest>) -> Result<Response<q::CloseAnnotationFrontierResponse>, Status> { self.service.close_annotation_frontier(request).await }
+
     async fn search(
         &self,
         request: Request<q::SearchRequest>,
@@ -1813,10 +1921,41 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<q::PathHistoryRequest>,
     ) -> Result<Response<q::PathHistoryResult>, Status> {
-        self.counts.histories.fetch_add(1, Ordering::SeqCst);
+        let page = self.counts.histories.fetch_add(1, Ordering::SeqCst);
+        let close_key = request.get_ref().scope.clone();
+        let close_metadata = request.metadata().clone();
+        if self.mode == QueryMode::HistorySlowPages {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
         let mut reply = self.service.path_history(request).await?;
+        if self.mode == QueryMode::HistoryCloseAfterPage && page == 0 {
+            let mut close = Request::new(q::CloseScopeRequest { scope: close_key });
+            *close.metadata_mut() = close_metadata;
+            self.service.close_scope(close).await?;
+        }
         let result = reply.get_mut();
         match self.mode {
+            QueryMode::HistoryZeroProgress => {
+                result.entries.clear();
+                result.scanned_commits = 0;
+            }
+            QueryMode::HistoryRepeatedFrontier => result.boundary = result.revision.clone(),
+            QueryMode::HistoryPreviousEntry => {
+                if let Some(entry) = result.entries.first_mut() {
+                    let mut first = self.first_history_entry.lock().unwrap();
+                    if let Some(previous) = first.as_ref() {
+                        *entry = previous.clone();
+                    } else {
+                        *first = Some(entry.clone());
+                    }
+                }
+            }
+            QueryMode::HistorySecondWrongRevision if page > 0 => {
+                result.revision.as_mut().unwrap().value[0] ^= 1;
+            }
+            QueryMode::HistoryTerminalReadLimit => {
+                result.coverage = q::HistoryCoverage::HistoryReadLimit as i32;
+            }
             QueryMode::HistoryWrongDigest => result.scope_digest[0] ^= 1,
             QueryMode::HistoryWrongRevision => result.revision.as_mut().unwrap().value[0] ^= 1,
             QueryMode::HistoryWrongPath => result.path.push_str(".different"),
@@ -2368,12 +2507,16 @@ impl QueryRunning {
             first_scope: Arc::new(std::sync::Mutex::new(None)),
             first_page: Arc::new(std::sync::Mutex::new(None)),
             first_search: Arc::new(std::sync::Mutex::new(None)),
+            first_history_entry: Arc::new(std::sync::Mutex::new(None)),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let cloud = CloudFaults::default();
         cloud.mode.store(30, Ordering::SeqCst);
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .add_service(RepositoryServer::new(service)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                    .send_compressed(tonic::codec::CompressionEncoding::Zstd))
                 .add_service(
                     RepositoryQueryServer::new(faults)
                         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
@@ -2464,6 +2607,61 @@ fn setup_query_configured(config: ServiceConfig) -> QueryFixture {
         change,
     }
 }
+// Alternating file presence gives real changed entries; the newest unchanged
+// commit deliberately contributes an empty page with positive scan progress.
+fn setup_history_chain() -> QueryFixture {
+    use tinytree_model as m;
+    let mut config = ServiceConfig::default();
+    config.query.max_history_commits = 1;
+    let mut fixture = setup_query_configured(config);
+    let (_, bytes) = fixture
+        .store
+        .read_metadata(
+            "example",
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(fixture.root.0),
+            },
+        )
+        .unwrap();
+    let m::Object::Commit(mut model) = m::decode(&bytes, Default::default()).unwrap() else {
+        unreachable!()
+    };
+    let original_tree = model.root_tree.clone();
+    let empty = m::encode(
+        &m::Object::Tree(m::Tree { entries: vec![] }),
+        Default::default(),
+    )
+    .unwrap();
+    fixture
+        .store
+        .put("example", empty.descriptor, &empty.bytes, 0)
+        .unwrap();
+    for number in 0..3 {
+        model.parents = vec![fixture.root];
+        model.predecessors.clear();
+        model.description = format!("bounded history step {number}");
+        model.root_tree = if number == 0 {
+            m::TreeMerge {
+                terms: vec![m::TreeId(empty.descriptor.key.id.0)],
+                labels: vec![String::new()],
+            }
+        } else {
+            original_tree.clone()
+        };
+        let object = m::encode(&m::Object::Commit(model.clone()), Default::default()).unwrap();
+        fixture
+            .store
+            .put("example", object.descriptor, &object.bytes, 0)
+            .unwrap();
+        fixture
+            .index
+            .ingest("example", object.descriptor, &object.bytes)
+            .unwrap();
+        fixture.root = m::CommitId(object.descriptor.key.id.0);
+    }
+    fixture
+}
 fn setup_query() -> (
     tempfile::TempDir,
     tempfile::TempDir,
@@ -2484,6 +2682,41 @@ fn setup_query() -> (
 
 fn change_hex(id: tinytree_model::ChangeId) -> String {
     id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[tokio::test]
+async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
+    for mode in [Mode::Normal, Mode::CapabilitiesAbsent] {
+        let (_store, _index, service, root, _) = setup_query();
+        let running = Running::start(service, mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                q::ChangedPathExpr {
+                    policy_version: 1,
+                    candidates: Some(Box::new(ids_commits(&[root]))),
+                    path: "file".into(),
+                    exact_file: true,
+                },
+            ))),
+        };
+        let result = client
+            .begin_graph_query(&scope, &expression, 1, false)
+            .await;
+        if mode == Mode::CapabilitiesAbsent {
+            assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+        } else {
+            let mut query = result.unwrap();
+            client.close_graph_query(&mut query).await.unwrap();
+        }
+        assert_eq!(running.queries.evaluations.load(Ordering::SeqCst), 0);
+        assert_eq!(running.metadata.load(Ordering::SeqCst), 0);
+        assert_eq!(running.files.load(Ordering::SeqCst), 0);
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -5406,6 +5639,235 @@ async fn rpc_only_guards_do_not_enter_query_state_pages_or_uncertain_drop_cleanu
     running.stop().await;
 }
 
+#[tokio::test]
+async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_private_grants() {
+    use tinytree_client::{
+        CapabilityFeature as F, CloudObjectId, CloudRawDigest, Config, NativeClient,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile: tinytree_server::Config =
+        toml::from_str(include_str!("../../tinytree-server/examples/cloud.toml")).unwrap();
+    profile.service.cloud.max_object_bytes = 1024 * 1024;
+    let store = Store::open(
+        directory.path(),
+        profile
+            .store
+            .materialize(profile.service.max_metadata_bytes),
+    )
+    .unwrap();
+    store.create_repository("alpha").unwrap();
+    store.create_repository("beta").unwrap();
+    let source_directory = tempfile::tempdir().unwrap();
+    use jj_lib::{
+        backend::{MillisSinceEpoch, Timestamp},
+        object_id::ObjectId as _,
+        op_store::{
+            OpStore, Operation, OperationMetadata, RootOperationData, TimestampRange, View,
+        },
+        simple_op_store::SimpleOpStore,
+    };
+    let source = SimpleOpStore::init(
+        source_directory.path(),
+        RootOperationData {
+            root_commit_id: jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+        },
+    )
+    .unwrap();
+    let mut view = View::make_root(jj_lib::backend::CommitId::from_bytes(&[0; 32]));
+    view.wc_commit_ids.insert(
+        "task".into(),
+        jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+    );
+    let view_id = source.write_view(&view).await.unwrap();
+    let time = Timestamp {
+        timestamp: MillisSinceEpoch(0),
+        tz_offset: 0,
+    };
+    let op = Operation {
+        view_id: view_id.clone(),
+        parents: vec![jj_lib::op_store::OperationId::from_bytes(&[0; 64])],
+        metadata: OperationMetadata {
+            time: TimestampRange {
+                start: time.clone(),
+                end: time,
+            },
+            description: "large exact operation description\n".repeat(12_000),
+            hostname: "agent".into(),
+            username: "agent".into(),
+            is_snapshot: true,
+            workspace_name: Some("task".into()),
+            attributes: Default::default(),
+        },
+        commit_predecessors: None,
+    };
+    let op_id = source.write_operation(&op).await.unwrap();
+    let objects = vec![
+        tinytree_cloud::export_operation(&source, &op_id, Default::default())
+            .await
+            .unwrap(),
+        tinytree_cloud::export_view(&source, &view_id, Default::default())
+            .await
+            .unwrap(),
+    ];
+    let service = RepositoryService::new(
+        store.clone(),
+        profile.service.clone(),
+        vec!["alpha".into(), "beta".into()],
+        vec![
+            Principal::new(
+                "writer",
+                "alpha-test-token-not-a-secret",
+                vec!["alpha".into()],
+                true,
+            )
+            .unwrap()
+            .with_cloud(true),
+            Principal::new(
+                "reader",
+                "reader-test-token-not-a-secret",
+                vec!["alpha".into()],
+                false,
+            )
+            .unwrap()
+            .with_cloud(true),
+            Principal::new(
+                "peer",
+                "peer-test-token-not-a-secret",
+                vec!["alpha".into()],
+                true,
+            )
+            .unwrap()
+            .with_cloud(true),
+        ],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(tinytree_server::serve_tcp(listener, service, None, async {
+        let _ = stopped.await;
+    }));
+    // Declared fixture credentials only; no process environment mutation.
+    let base = Config {
+        endpoint: format!("http://{}", address),
+        repository_id: "alpha".into(),
+        ..Default::default()
+    };
+    let sdk = NativeClient::connect(Config {
+        token_env: Some("TINYTREE_EXACT_TEST_WRITER".into()),
+        ..base.clone()
+    })
+    .await
+    .unwrap();
+    let caps = sdk
+        .capabilities(&[
+            F::ExactCloudRepresentationRead,
+            F::ExactCloudRepresentationWrite,
+        ])
+        .await
+        .unwrap();
+    assert!(caps.features.iter().all(|f| f.supported && f.authorized));
+    assert_eq!(F::ALL.len(), 5);
+    let mut changed = [false; 2];
+    for object in objects {
+        let raw = object.payload().unwrap();
+        let id = match object.id() {
+            tinytree_cloud::ObjectId::Operation(id) => CloudObjectId::Operation(id),
+            tinytree_cloud::ObjectId::View(id) => CloudObjectId::View(id),
+        };
+        let primary = sdk.cloud_put_object(id, raw).await.unwrap();
+        // Unknown protobuf fields are preserved raw but ignored by semantic ID.
+        let mut alternate = raw.to_vec();
+        alternate.extend_from_slice(&[0xa0, 0x06, 0x01]);
+        tinytree_cloud::VerifiedObject::verify(
+            object.id(),
+            tinytree_cloud::BlobDigest::of(&alternate),
+            &alternate,
+            tinytree_cloud::Limits::default(),
+        )
+        .unwrap();
+        let exact = sdk
+            .cloud_put_object_representation(id, &alternate)
+            .await
+            .unwrap();
+        assert_eq!(exact.descriptor.selected, CloudRawDigest::of(&alternate));
+        assert_ne!(exact.descriptor, primary.descriptor);
+        assert_eq!(
+            sdk.cloud_lookup_objects(&[id]).await.unwrap(),
+            vec![Some(primary.descriptor)]
+        );
+        assert_eq!(
+            sdk.cloud_read_object_representation(exact.descriptor)
+                .await
+                .unwrap()
+                .payload(),
+            alternate
+        );
+        assert_eq!(
+            sdk.cloud_read_object(primary.descriptor)
+                .await
+                .unwrap()
+                .payload(),
+            raw
+        );
+        let reader = NativeClient::connect(Config {
+            token_env: Some("TINYTREE_EXACT_TEST_READER".into()),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reader
+                .cloud_put_object_representation(id, &alternate)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let grants = reader
+            .capabilities(&[
+                F::ExactCloudRepresentationRead,
+                F::ExactCloudRepresentationWrite,
+            ])
+            .await
+            .unwrap();
+        assert!(grants.features[0].authorized);
+        assert!(!grants.features[1].authorized);
+        // A read grant is scoped to the authenticated private owner, not to
+        // another owner's catalog even when both can access this repository.
+        assert!(
+            reader
+                .cloud_read_object_representation(exact.descriptor)
+                .await
+                .is_err()
+        );
+        let peer = NativeClient::connect(Config {
+            token_env: Some("TINYTREE_EXACT_TEST_PEER".into()),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+        assert!(
+            peer.cloud_read_object_representation(exact.descriptor)
+                .await
+                .is_err()
+        );
+        let mut wrong = exact.descriptor;
+        wrong.selected.size_bytes += 1;
+        assert!(sdk.cloud_read_object_representation(wrong).await.is_err());
+        changed[match id {
+            CloudObjectId::Operation(_) => 0,
+            _ => 1,
+        }] = true;
+        if matches!(id, CloudObjectId::Operation(_)) {
+            assert!(alternate.len() > profile.service.cloud.max_request_bytes);
+        }
+    }
+    assert_eq!(changed, [true, true]);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 // Opaque raw transport fixture, intentionally not a native manifest/body claim.
 fn capture_transport_fixture(mode: usize) -> (Vec<u8>, Vec<u8>) {
     let data = b"portable capture transport DATA".to_vec();
@@ -5442,6 +5904,28 @@ struct CloudFaults {
 }
 #[tonic::async_trait]
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
+    async fn put_object_representation(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::PutObjectRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::WriteReceipt>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "fixture has no exact representation writer",
+        ))
+    }
+    type ReadObjectRepresentationStream = Self::ReadObjectStream;
+    async fn read_object_representation(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::ReadObjectRepresentationRequest>,
+    ) -> std::result::Result<tonic::Response<Self::ReadObjectRepresentationStream>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "fixture has no exact representation reader",
+        ))
+    }
+
     async fn list_workspaces(
         &self,
         request: Request<tinytree_client::cloud_protocol::ListWorkspacesRequest>,
@@ -5820,6 +6304,24 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             generation: 0,
             manifest_id: None,
         }))
+    }
+    async fn get_latest_captured_version(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::GetLatestCapturedVersionRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::Version>, Status> {
+        if self.mode.load(Ordering::SeqCst) < 40 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            return Err(Status::unimplemented("latest capture unavailable"));
+        }
+        let input = request.into_inner();
+        self.get_version(Request::new(
+            tinytree_client::cloud_protocol::GetVersionRequest {
+                repository_id: input.repository_id,
+                workspace_id: input.workspace_id,
+                generation: 1,
+            },
+        ))
+        .await
     }
     async fn get_version(
         &self,
@@ -7950,6 +8452,26 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
         "adding the default capture bound does not rotate existing custom cloud configuration identity"
     );
     let client = NativeClient::connect(config.clone()).await.unwrap();
+    let latest = client.cloud_latest_captured_version([1; 32]).await.unwrap();
+    assert_eq!(latest.generation, 1);
+    assert_eq!(latest.manifest(), capture_transport_fixture(40).1);
+    drop(latest);
+    faults.mode.store(0, Ordering::SeqCst);
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_latest_captured_version([1; 32])
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unimplemented
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before + 1,
+        "unsupported latest selection must not query or fall back to the publication head"
+    );
+    faults.mode.store(40, Ordering::SeqCst);
     let (data, manifest) = capture_transport_fixture(40);
     let selector = RetainedVersionSelector {
         workspace_id: [1; 32],
@@ -8109,20 +8631,149 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
         Some(selector.manifest_id)
     );
     assert_eq!(intent.capture_data(), data);
-    config.cloud.max_capture_bytes = 1;
-    let small = NativeClient::connect(config).await.unwrap();
-    let before = faults.calls.load(Ordering::SeqCst);
+    use tinytree_client::PublicationFailureReason as Reason;
+    let mut manifest_config = config.clone();
+    manifest_config.cloud.max_manifest_bytes = 1;
+    let mut capture_config = config.clone();
+    capture_config.cloud.max_capture_bytes = 1;
+    for (name, config, expected) in [
+        ("manifest-bytes", manifest_config, Reason::ClientManifestBytes),
+        ("capture-bytes", capture_config, Reason::ClientCaptureBytes),
+    ] {
+        let small = NativeClient::connect(config).await.unwrap();
+        let before = faults.calls.load(Ordering::SeqCst);
+        let failure = small.cloud_publish_captured_version(&intent).await.unwrap_err();
+        assert_eq!(failure.code(), Code::ResourceExhausted, "{name}");
+        assert_eq!(Reason::from_message(failure.message()), Some(expected), "{name}");
+        assert_eq!(faults.calls.load(Ordering::SeqCst), before);
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn checked_annotation_frontier_and_inputs_keep_source_and_detach_rpc_owners() {
+    let fixture = setup_query_retained();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    config.limits.max_graph_objects = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let result_drops = Arc::new(AtomicUsize::new(0));
+    let rpc_drops = Arc::new(AtomicUsize::new(0));
+    let operation = client
+        .clone()
+        .with_lifetime_guard(Arc::new(LifetimeProbe(result_drops.clone())))
+        .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(rpc_drops.clone())));
+    let frontier = operation
+        .open_annotation_frontier(&scope, &[fixture.root], "BUILD.bazel", 0)
+        .await
+        .unwrap();
     assert_eq!(
-        small
-            .cloud_publish_captured_version(&intent)
+        frontier.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(frontier.result().nodes.len(), 2, "one bounded non-root commit PLUS intrinsic root");
+    let selected = frontier
+        .result()
+        .nodes
+        .iter()
+        .find(|n| n.revision.as_ref().unwrap().value == fixture.root.0)
+        .unwrap();
+    let expected = selected.value.as_ref().unwrap().clone();
+    let body = operation
+        .read_annotation_input(&frontier, fixture.root, &expected)
+        .await
+        .unwrap();
+    assert!(!body.result().data.is_empty());
+    assert_eq!(body.result().value.as_ref(), Some(&expected));
+    // Holding the frontier and input does not retain the sole inflight permit,
+    // and other metadata queries on the captured scope remain available.
+    operation
+        .path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            0,
+        )
+        .await
+        .unwrap();
+    let mut forged = expected.clone();
+    forged.copy_id = vec![9; 32];
+    assert_eq!(
+        operation
+            .read_annotation_input(&frontier, fixture.root, &forged)
             .await
             .unwrap_err()
             .code(),
-        Code::ResourceExhausted
+        Code::InvalidArgument
     );
-    assert_eq!(faults.calls.load(Ordering::SeqCst), before);
-    server.abort();
-    let _ = server.await;
+    drop(operation);
+    assert_eq!(rpc_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    client.close_annotation_frontier(&frontier).await.unwrap();
+    assert_eq!(
+        client
+            .read_annotation_input(&frontier, fixture.root, &expected)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        client
+            .open_annotation_frontier(&scope, &[fixture.root], "BUILD.bazel", 0)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(
+        !body.result().data.is_empty(),
+        "logical close does not invalidate independently owned verified bytes"
+    );
+    drop(frontier);
+    drop(body);
+    assert_eq!(result_drops.load(Ordering::SeqCst), 1);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+#[tokio::test]
+async fn checked_annotation_rejects_unbound_graphs_and_corrupt_demand_inputs() {
+    for mode in [
+        QueryMode::AnnotationWrongDigest,
+        QueryMode::AnnotationMissingFlag,
+        QueryMode::AnnotationCyclicParent,
+        QueryMode::AnnotationInputHash,
+    ] {
+        let fixture = setup_query_retained();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let result = client
+            .open_annotation_frontier(&scope, &[fixture.root], "BUILD.bazel", 0)
+            .await;
+        let error = if mode == QueryMode::AnnotationInputHash {
+            let frontier = result.unwrap();
+            let selected = frontier
+                .result()
+                .nodes
+                .iter()
+                .find(|n| n.revision.as_ref().unwrap().value == fixture.root.0)
+                .unwrap();
+            client
+                .read_annotation_input(&frontier, fixture.root, selected.value.as_ref().unwrap())
+                .await
+                .unwrap_err()
+        } else {
+            result.unwrap_err()
+        };
+        assert_eq!(error.code(), Code::DataLoss, "{mode:?}: {error}");
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -8181,14 +8832,37 @@ async fn checked_path_history_and_blame_bind_revision_and_retain_only_result_own
             .iter()
             .all(|range| range.origin.as_ref().unwrap().value == fixture.root.0)
     );
+    let dag_blame = operation
+        .blame(&scope, fixture.root, "BUILD.bazel", q::HistoryPolicy::JjResolvedFixedPathV1, 0)
+        .await.unwrap();
+    assert_eq!(dag_blame.result().policy, q::HistoryPolicy::JjResolvedFixedPathV1 as i32);
+    assert_eq!(dag_blame.result().target_bytes, blame.result().target_bytes);
+    assert_eq!(dag_blame.result().ranges, blame.result().ranges);
+    assert_eq!(dag_blame.result().coverage, q::HistoryCoverage::HistoryComplete as i32);
+    drop(dag_blame);
+    let collection = operation
+        .collect_path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collection.result(), history.result());
     drop(operation);
     assert_released(&rpc_drops).await;
     assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    let collection_clone = collection.clone();
+    drop(collection);
     let history_clone = history.clone();
     drop(history);
     drop(blame);
     assert_eq!(result_drops.load(Ordering::SeqCst), 0);
     drop(history_clone);
+    assert_eq!(result_drops.load(Ordering::SeqCst), 0);
+    drop(collection_clone);
     assert_released(&result_drops).await;
     client.close_query_scope(&scope).await.unwrap();
     assert_eq!(
@@ -9961,4 +10635,189 @@ async fn small_query_reply_caps_reject_oversize_and_predecode_collection_expansi
         client.close_query_scope(&scope).await.unwrap();
         running.stop().await;
     }
+}
+
+#[tokio::test]
+async fn checked_history_collection_uses_same_scope_and_bounded_positive_progress() {
+    let fixture = setup_history_chain();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+    let mut config = running.config.clone();
+    config.limits.max_inflight = 1;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let one = client
+        .path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(one.result().scanned_commits, 1);
+    assert!(one.result().entries.is_empty());
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), 1);
+    let limited = client
+        .collect_path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.result().revision, one.result().revision);
+    assert_eq!(limited.result().scanned_commits, 2);
+    assert_eq!(limited.result().entries.len(), 1);
+    assert_eq!(
+        limited.result().coverage,
+        q::HistoryCoverage::HistoryScanLimit as i32
+    );
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), 3);
+    let all = client
+        .collect_path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(all.result().revision, one.result().revision);
+    assert_eq!(all.result().scanned_commits, 4);
+    assert_eq!(all.result().entries.len(), 3);
+    assert_eq!(
+        all.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert!(all.result().boundary.is_none());
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), 7);
+    let before = running.counts.histories.load(Ordering::SeqCst);
+    for (total, code) in [
+        (0, Code::InvalidArgument),
+        (u32::MAX, Code::ResourceExhausted),
+        (65536, Code::ResourceExhausted),
+    ] {
+        assert_eq!(
+            client
+                .collect_path_history(
+                    &scope,
+                    fixture.root,
+                    "BUILD.bazel",
+                    q::HistoryPolicy::LinearFixedPathV1,
+                    total
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            code
+        );
+    }
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), before);
+    client.close_query_scope(&scope).await.unwrap();
+    assert_eq!(
+        client
+            .collect_path_history(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                8
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_history_collection_rejects_frontier_echo_overlap_and_expired_scope() {
+    for (mode, expected, requests) in [
+        (QueryMode::HistoryZeroProgress, Code::DataLoss, 1),
+        (QueryMode::HistoryRepeatedFrontier, Code::DataLoss, 1),
+        (QueryMode::HistoryPreviousEntry, Code::DataLoss, 3),
+        (QueryMode::HistorySecondWrongRevision, Code::DataLoss, 2),
+        (
+            QueryMode::HistoryCloseAfterPage,
+            Code::FailedPrecondition,
+            2,
+        ),
+    ] {
+        let fixture = setup_history_chain();
+        let running = QueryRunning::start(fixture.service.clone(), mode).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let error = client
+            .collect_path_history(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                8,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected, "{mode:?}: {error}");
+        assert_eq!(
+            running.counts.histories.load(Ordering::SeqCst),
+            requests,
+            "{mode:?}"
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+    let fixture = setup_history_chain();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::HistoryTerminalReadLimit).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let result = client
+        .collect_path_history(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::LinearFixedPathV1,
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.result().coverage,
+        q::HistoryCoverage::HistoryReadLimit as i32
+    );
+    assert_eq!(running.counts.histories.load(Ordering::SeqCst), 1);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn checked_history_collection_keeps_one_absolute_deadline() {
+    let fixture = setup_history_chain();
+    let running = QueryRunning::start(fixture.service.clone(), QueryMode::HistorySlowPages).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(130);
+    let bounded = client.clone().with_operation_deadline(deadline);
+    assert_eq!(
+        bounded
+            .collect_path_history(
+                &scope,
+                fixture.root,
+                "BUILD.bazel",
+                q::HistoryPolicy::LinearFixedPathV1,
+                8
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    assert!(running.counts.histories.load(Ordering::SeqCst) <= 2);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
 }

@@ -78,6 +78,28 @@ impl PrivateDir {
         }
         Self::open_existing(path)
     }
+    /// Create a missing private directory suffix and durably publish its links.
+    /// The nearest pre-existing trusted directory may be shared-readable; its
+    /// ancestry must already be durable, including any directories retained
+    /// from an earlier failed attempt. Errors can leave a private partial suffix;
+    /// callers must not treat a later leaf-only sync as repairing its ancestry.
+    /// Only newly created directories and that anchor are synced, deepest first.
+    /// Existing targets must be private
+    /// and are synced without repairing permissions. Available on Unix only.
+    #[cfg(unix)]
+    pub fn create_all_durable(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        normalized(path)?;
+        if path.components().collect::<PathBuf>().as_os_str() != path.as_os_str() {
+            return Err(invalid("private storage path contains a lexical alias"));
+        }
+        let chain = unix::create_all_durable(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            _chain: chain,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

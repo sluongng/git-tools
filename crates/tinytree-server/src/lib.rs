@@ -414,6 +414,15 @@ mod tests {
     fn config_rejects_unsafe_transport_and_unbounded_limits() {
         let mut config = Config::default();
         assert!(config.validate().is_ok());
+        config.store.cloud.resident = Some(tinytree_store::CloudResidentLimits {
+            max_bytes: 0,
+            max_entries: 65_536,
+        });
+        assert!(
+            config.validate().is_err(),
+            "resident limits are validated even when cloud service is disabled"
+        );
+        config.store.cloud.resident = None;
         config.listen = "0.0.0.0:8093".into();
         assert!(config.validate().is_err());
         config.principals.push(PrincipalConfig {

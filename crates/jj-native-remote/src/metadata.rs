@@ -393,6 +393,16 @@ impl RemoteObjectIo {
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<VerifiedMetadata> {
         check(deadline)?;
+        let owner = if let Authority::CloudVersion(version) = &root {
+            let ledger = self.inner.ledger.clone();
+            let selected = version.clone();
+            let read =
+                io::blocking_owned(owner.clone(), move || ledger.retain_cloud_read(&selected))
+                    .await?;
+            Arc::new((owner, read)) as Arc<dyn Any + Send + Sync>
+        } else {
+            owner
+        };
         self.prove_owned(&root, key, owner.clone(), deadline)
             .await?;
         // SDK decoded payloads/quotas must outlive every temporary Node copy;

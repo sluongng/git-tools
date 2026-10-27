@@ -283,6 +283,17 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
                 child!(v.roots.as_deref());
                 child!(v.heads.as_deref());
             }
+            E::ChangedPath(v) => {
+                if v.policy_version != 1
+                    || v.path.is_empty()
+                    || v.path.len() > 4096
+                    || v.path.contains(['\\', '\0'])
+                    || v.path.split('/').any(|c| matches!(c, "" | "." | ".."))
+                {
+                    return Err(Status::invalid_argument("invalid exact-path graph filter"));
+                }
+                child!(v.candidates.as_deref());
+            }
             E::Heads(v) | E::Roots(v) | E::HasConflict(v) => child!(v.input.as_deref()),
             E::Union(v) | E::Intersection(v) => {
                 if v.inputs
@@ -347,6 +358,14 @@ impl Service<HttpRequest<Body>> for QueryRpcService {
 }
 #[tonic::async_trait]
 impl p::query_io_server::QueryIo for BrokerService {
+    async fn blame_capabilities(&self, request: Request<p::DescribeProviderRequest>)
+        -> Result<Response<p::BlameCapabilitiesReply>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let result = self.query_provider(&input.store_id)?.blame_capabilities(work.clone()).await
+            .map_err(crate::query::status)?;
+        reply(QueryReply { value: result.value.wire(), owner: result.owner }, work, self.query_limit())
+    }
     async fn preflight_creation(
         &self,
         request: Request<p::CreationRequest>,
@@ -779,6 +798,115 @@ impl p::query_io_server::QueryIo for BrokerService {
             self.query_limit(),
         )
     }
+    async fn annotation_capabilities(
+        &self,
+        request: Request<p::DescribeProviderRequest>,
+    ) -> Result<Response<p::BlameCapabilitiesReply>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let result = self
+            .query_provider(&input.store_id)?
+            .annotation_capabilities(work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        reply(
+            QueryReply {
+                value: result.value.annotation_wire(),
+                owner: result.owner,
+            },
+            work,
+            self.query_limit(),
+        )
+    }
+    async fn open_annotation_frontier(
+        &self,
+        request: Request<p::QueryOpenAnnotationRequest>,
+    ) -> Result<Response<q::AnnotationFrontier>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = OpenAnnotationFrontier {
+            scope: handle(&input.scope)?,
+            anchors: commits(input.anchors)?,
+            path: input.path,
+            max_commits: input.max_commits,
+                        limits: input.limits,
+        };
+        if input.limits.is_some(){return Err(Status::invalid_argument("lowered caps require limited frontier RPC"));}
+        input.validate(self.query_limit())?;
+        let result = provider
+            .open_annotation_frontier(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check(&result.value, self.query_limit())?;
+        reply(result, work, self.query_limit())
+    }
+    async fn open_limited_annotation_frontier(
+        &self,
+        request: Request<p::QueryOpenAnnotationRequest>,
+    ) -> Result<Response<q::AnnotationFrontier>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = OpenAnnotationFrontier {
+            scope: handle(&input.scope)?,
+            anchors: commits(input.anchors)?,
+            path: input.path,
+            max_commits: input.max_commits,
+                        limits: input.limits,
+        };
+        if input.limits.is_none(){return Err(Status::invalid_argument("limited frontier requires caps"));}
+        input.validate(self.query_limit())?;
+        let result = provider
+            .open_limited_annotation_frontier(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check(&result.value, self.query_limit())?;
+        reply(result, work, self.query_limit())
+    }
+    async fn read_annotation_input(
+        &self,
+        request: Request<p::QueryReadAnnotationRequest>,
+    ) -> Result<Response<q::AnnotationInput>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let provider = self.query_provider(&input.store_id)?;
+        let input = ReadAnnotationInput {
+            scope: handle(&input.scope)?,
+            context: handle(&input.context)?,
+            revision: tinytree_model::CommitId(handle(&input.revision)?),
+            expected: input
+                .expected
+                .ok_or_else(|| Status::invalid_argument("annotation expected state missing"))?,
+        };
+        input.validate(self.query_limit())?;
+        let result = provider
+            .read_annotation_input(input.clone(), work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        input.check(&result.value, self.query_config().model_limits())?;
+        reply(result, work, self.query_limit())
+    }
+    async fn close_annotation_frontier(
+        &self,
+        request: Request<p::QueryCloseRequest>,
+    ) -> Result<Response<p::QueryCloseReply>, Status> {
+        let (input, work) = input(request, self.query_limit())?;
+        self.authorize_command(&input.store_id, &work)?;
+        let result = self
+            .query_provider(&input.store_id)?
+            .close_annotation_frontier(handle(&input.handle)?, work.clone())
+            .await
+            .map_err(crate::query::status)?;
+        reply(
+            QueryReply {
+                value: p::QueryCloseReply {},
+                owner: result.owner,
+            },
+            work,
+            self.query_limit(),
+        )
+    }
     async fn path_history(
         &self,
         request: Request<p::QueryPathRequest>,
@@ -955,8 +1083,13 @@ message_size!(
     q::ShortestPrefixResult,
     q::PathHistoryResult,
     q::BlameResult,
-    q::SearchResult
+    q::SearchResult,
+    q::AnnotationFrontier,
+    q::AnnotationInput
 );
+impl WireSize for BlameCapabilities {
+    fn wire_size(&self) -> usize { self.wire().encoded_len() }
+}
 impl WireSize for QueryScope {
     fn wire_size(&self) -> usize {
         128
@@ -986,6 +1119,9 @@ impl WireSize for () {
 }
 #[async_trait::async_trait]
 impl NativeQueryIo for GuardedQuery {
+    async fn blame_capabilities(&self, owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> {
+        self.run(owner, move |provider, owner| async move { provider.blame_capabilities(owner).await }).await
+    }
     fn resources(&self) -> QueryResources {
         self.provider.resources()
     }
@@ -1232,6 +1368,73 @@ impl NativeQueryIo for GuardedQuery {
                 return Err(Status::data_loss("native query commit mismatch"));
             }
             Ok(r)
+        })
+        .await
+    }
+    async fn annotation_capabilities(
+        &self,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<BlameCapabilities>, Status> {
+        self.run(owner, move |provider, owner| async move {
+            provider.annotation_capabilities(owner).await
+        })
+        .await
+    }
+    async fn open_annotation_frontier(
+        &self,
+        input: OpenAnnotationFrontier,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationFrontier>, Status> {
+        if input.limits.is_some(){return self.open_limited_annotation_frontier(input,owner).await;}
+        input.validate(self.service.query_limit())?;
+        let cap = self.service.query_limit();
+        self.run(owner, move |provider, owner| async move {
+            let result = provider
+                .open_annotation_frontier(input.clone(), owner)
+                .await?;
+            input.check(&result.value, cap)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn open_limited_annotation_frontier(
+        &self,
+        input: OpenAnnotationFrontier,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationFrontier>, Status> {
+        if input.limits.is_none(){return Err(Status::invalid_argument("limited frontier requires caps"));}
+        input.validate(self.service.query_limit())?;
+        let cap = self.service.query_limit();
+        self.run(owner, move |provider, owner| async move {
+            let result = provider
+                .open_limited_annotation_frontier(input.clone(), owner)
+                .await?;
+            input.check(&result.value, cap)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn read_annotation_input(
+        &self,
+        input: ReadAnnotationInput,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationInput>, Status> {
+        input.validate(self.service.query_limit())?;
+        let limits = self.service.query_config().model_limits();
+        self.run(owner, move |provider, owner| async move {
+            let result = provider.read_annotation_input(input.clone(), owner).await?;
+            input.check(&result.value, limits)?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn close_annotation_frontier(
+        &self,
+        scope: [u8; 32],
+        owner: QueryOwner,
+    ) -> Result<QueryReply<()>, Status> {
+        self.run(owner, move |provider, owner| async move {
+            provider.close_annotation_frontier(scope, owner).await
         })
         .await
     }

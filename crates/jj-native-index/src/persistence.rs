@@ -211,6 +211,22 @@ impl Storage {
         File::open(storage.root.path().parent().ok_or(Error::Invalid)?)?.sync_all()?;
         Ok(storage)
     }
+    pub(super) fn inspect_config(path: &Path) -> Result<Config, Error> {
+        let root = private_fs::PrivateDir::open_existing(path)?;
+        let bytes = root.read("manifest", 16384)?;
+        let bytes = payload(0, b"manifest", &bytes)?;
+        let manifest: Manifest =
+            toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Corrupt)?)
+                .map_err(|_| Error::Corrupt)?;
+        if !matches!(manifest.version, 1 | 2) {
+            return Err(Error::Unsupported);
+        }
+        manifest.config.validate()?;
+        if manifest.identity == [0; 32] {
+            return Err(Error::Corrupt);
+        }
+        Ok(manifest.config)
+    }
     pub(super) fn open(path: &Path, expected: &Config, limits: &Limits) -> Result<Self, Error> {
         let root = private_fs::PrivateDir::open_existing(path)?;
         let bytes = root.read("manifest", 16384)?;

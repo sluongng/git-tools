@@ -7,6 +7,9 @@ import "tinytree/v1/repository.proto";
 // OP/VIEW semantic IDs and selected raw encodings are separate hash domains.
 service WorkspaceCloud {
   rpc PutObject(PutObjectRequest) returns (WriteReceipt);
+  // Explicit raw representation, without replacing first-writer selection.
+  rpc PutObjectRepresentation(PutObjectRequest) returns (WriteReceipt);
+  rpc ReadObjectRepresentation(ReadObjectRepresentationRequest) returns (stream ObjectChunk);
   rpc PutIndexArtifact(PutIndexArtifactRequest) returns (IndexArtifactWriteReceipt);
   rpc LookupIndexArtifacts(LookupIndexArtifactsRequest) returns (LookupIndexArtifactsResponse);
   rpc ReadIndexArtifact(ReadIndexArtifactRequest) returns (stream IndexArtifactChunk);
@@ -17,6 +20,8 @@ service WorkspaceCloud {
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
   rpc GetVersion(GetVersionRequest) returns (Version);
+  // Greatest logical capture sequence, not the most recently published version.
+  rpc GetLatestCapturedVersion(GetLatestCapturedVersionRequest) returns (Version);
   rpc ReadCapture(ReadCaptureRequest) returns (stream CaptureChunk);
   rpc ReadNativeClosure(ReadNativeClosureRequest) returns (stream NativeClosureChunk);
   rpc GetPublication(GetPublicationRequest) returns (GetPublicationResponse);
@@ -58,6 +63,10 @@ message ReadObjectRequest {
   string repository_id = 1;
   ObjectId id = 2;
 }
+message ReadObjectRepresentationRequest {
+  string repository_id = 1;
+  ObjectDescriptor descriptor = 2;
+}
 message ObjectChunk {
   ObjectDescriptor descriptor = 1;
   uint64 offset = 2;
@@ -84,6 +93,10 @@ message PublishVersionRequest {
   bytes capture_data = 8; // Canonical capture DATA, required by manifest v3.
 }
 message GetWorkspaceRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+}
+message GetLatestCapturedVersionRequest {
   string repository_id = 1;
   bytes workspace_id = 2;
 }

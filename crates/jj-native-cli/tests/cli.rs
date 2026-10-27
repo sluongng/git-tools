@@ -145,6 +145,94 @@ impl Client {
 }
 
 #[test]
+fn stock_annotation_filters_unchanged_merge_parents_before_attribution() {
+    let client = Client::new();
+    client.success(&["tinytree", "init"]);
+    let path = client.root.join("story.txt");
+    fs::write(&path, "x\n").unwrap();
+    client.success(&["describe", "-m", "A"]);
+    client.success(&["bookmark", "set", "base", "-r", "@"]);
+
+    client.success(&["new", "-r", "base"]);
+    client.success(&["describe", "-m", "U"]);
+    client.success(&["bookmark", "set", "unchanged", "-r", "@"]);
+
+    client.success(&["new", "-r", "base"]);
+    fs::remove_file(&path).unwrap();
+    client.success(&["describe", "-m", "D"]);
+    client.success(&["new"]);
+    fs::write(&path, "x\n").unwrap();
+    client.success(&["describe", "-m", "B"]);
+    client.success(&["bookmark", "set", "readded", "-r", "@"]);
+
+    client.success(&["new", "-r", "unchanged", "-r", "readded"]);
+    client.success(&["describe", "-m", "M"]);
+    // This is stock jj's local annotation engine, not the remote policy. The
+    // unchanged U is filtered out, then the indirect M->A edge is removed as
+    // transitive through B. Raw first-parent propagation would wrongly pick A.
+    assert_eq!(
+        client.success(&[
+            "--ignore-working-copy", "file", "annotate", "story.txt", "-r", "@",
+            "-T", "commit.description().first_line() ++ \":\" ++ content",
+        ]),
+        "B:x\n",
+    );
+}
+
+#[test]
+fn stock_annotation_resolves_recursive_bases_and_ordered_octopus_parents() {
+    struct Case {
+        commits: Vec<(&'static str, Vec<usize>, &'static str)>,
+        annotation: &'static str,
+    }
+    let cases = [
+        Case {
+            commits: vec![
+                ("base", vec![], "a\nstable\nb\n"),
+                ("left", vec![0], "A\nstable\nb\n"),
+                ("right", vec![0], "a\nstable\nB\n"),
+                ("merge-left", vec![1, 2], "A\nstable\nB\n"),
+                ("merge-right", vec![2, 1], "A\nstable\nB\n"),
+                ("recursive", vec![3, 4], "A\nstable\nB\n"),
+                ("unchanged-head", vec![5], "A\nstable\nB\n"),
+            ],
+            annotation: "left:A\nbase:stable\nright:B\n",
+        },
+        Case {
+            commits: vec![
+                ("base", vec![], "a\nanchor-a\nb\nanchor-b\nc\n"),
+                ("first", vec![0], "A\nanchor-a\nb\nanchor-b\nc\n"),
+                ("second", vec![0], "a\nanchor-a\nB\nanchor-b\nc\n"),
+                ("third", vec![0], "a\nanchor-a\nb\nanchor-b\nC\n"),
+                ("octopus", vec![1, 2, 3], "A\nanchor-a\nB\nanchor-b\nC\n"),
+                ("unchanged-head", vec![4], "A\nanchor-a\nB\nanchor-b\nC\n"),
+            ],
+            annotation: "first:A\nbase:anchor-a\nsecond:B\nbase:anchor-b\nthird:C\n",
+        },
+    ];
+    for case in cases {
+        let client = Client::new();
+        client.success(&["tinytree", "init"]);
+        for (index, (description, parents, content)) in case.commits.iter().enumerate() {
+            if index != 0 {
+                let mut args = vec!["new".to_owned()];
+                for parent in parents {
+                    args.extend(["-r".to_owned(), format!("node{parent}")]);
+                }
+                client.success(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            }
+            fs::write(client.root.join("story.txt"), content).unwrap();
+            client.success(&["describe", "-m", description]);
+            client.success(&["bookmark", "set", &format!("node{index}"), "-r", "@"]);
+        }
+        assert_eq!(client.success(&[
+            "--ignore-working-copy", "file", "annotate", "story.txt", "-r", "@",
+            "-T", "commit.description().first_line() ++ \":\" ++ content",
+        ]), case.annotation);
+    }
+}
+
+#[test]
 fn search_validates_regex_before_repository_access_and_accepts_fixed_strings() {
     let client = Client::new(); // Deliberately not a repository.
     let malformed = client.run(&["tinytree", "search", "["]);

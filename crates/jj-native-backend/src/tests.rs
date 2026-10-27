@@ -93,6 +93,14 @@ fn actual_backend_files_trees_signatures_copy_and_restart_without_git() {
         let (id, signed) = backend.write_commit(value, Some(&mut sign)).await.unwrap();
         assert_eq!(backend.read_commit(&id).await.unwrap(), signed);
         assert!(signed.secure_sig.is_some());
+        let native=m::CommitId(model_id(id.as_bytes()).unwrap());
+        let metadata=backend.local_annotation_path(native,&["a"],1024*1024,8).await.unwrap();
+        assert_eq!(metadata.parents, vec![m::CommitId::ROOT]);
+        assert_eq!(metadata.value,Some(m::TreeValue::File {id:m::FileId(model_id(file.as_bytes()).unwrap()),executable:true,size_bytes:bytes.len() as u64,copy_id:Some(m::CopyId(model_id(copy.as_bytes()).unwrap()))}));
+        assert!(metadata.charged_bytes < bytes.len(), "metadata projection does not read the large FILE body");
+        assert!(backend.local_annotation_path(native,&["a"],1,8).await.is_err());
+        assert!(backend.local_annotation_path(native,&["a"],1024*1024,1).await.is_err());
+
         (file, tree, copy, id, bytes)
     });
     block_on(async {
@@ -130,7 +138,9 @@ fn actual_backend_files_trees_signatures_copy_and_restart_without_git() {
 fn full_negative_tree_terms_labels_and_legacy_edges_round_trip() {
     block_on(async {
         let directory = tempfile::tempdir().unwrap();
-        let backend = NativeBackend::init(directory.path(), Config::default()).unwrap();
+        let config = Config::default();
+        let io = Arc::new(DirectObjectIo::init(directory.path(), config.clone()).unwrap());
+        let backend = NativeBackend::from_io(io.clone(), config).await.unwrap();
         let empty = backend.empty_tree_id().clone();
         let mut value = commit(&backend, backend.root_commit_id().clone(), empty.clone());
         value.root_tree = Merge::from_vec(vec![empty.clone(), empty.clone(), empty]);
@@ -141,6 +151,19 @@ fn full_negative_tree_terms_labels_and_legacy_edges_round_trip() {
         let (id, stored) = backend.write_commit(value.clone(), None).await.unwrap();
         assert_eq!(stored, value);
         assert_eq!(backend.read_commit(&id).await.unwrap(), value);
+        let metadata = io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id.as_bytes().try_into().unwrap()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(metadata.descriptor().key.id.0.as_slice(), id.as_bytes());
+        assert_eq!(
+            metadata.into_backend_commit().unwrap(),
+            value,
+            "pure verified conversion preserves labelled terms, predecessors and metadata"
+        );
         value.conflict_labels = ConflictLabels::unlabeled().into_merge();
         let (id, _) = backend.write_commit(value.clone(), None).await.unwrap();
         assert_eq!(backend.read_commit(&id).await.unwrap(), value);
@@ -164,6 +187,29 @@ fn full_negative_tree_terms_labels_and_legacy_edges_round_trip() {
             backend.read_commit(&id).await.unwrap(),
             stored,
             "write must return the actually stored commit"
+        );
+        let metadata = io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(id.as_bytes().try_into().unwrap()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.into_backend_commit().unwrap(),
+            stored,
+            "pure verified conversion preserves normalized labels and secure signatures"
+        );
+        let tree_metadata = io
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(backend.empty_tree_id().as_bytes().try_into().unwrap()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tree_metadata.into_backend_commit().is_err(),
+            "verified non-COMMIT metadata cannot become a backend commit"
         );
     });
 }
@@ -1071,61 +1117,233 @@ fn provider_attachment_requires_verified_bytes_not_a_descriptor_promise() {
     assert!(VerifiedMetadata::verify(descriptor, trailing, m::Limits::default()).is_err());
 }
 
+fn batch_commit(description: &str) -> m::EncodedObject {
+    let mut commit = m::synthetic_root();
+    commit.parents = vec![m::CommitId::ROOT];
+    commit.description = description.to_owned();
+    m::encode(&m::Object::Commit(commit), m::Limits::default()).unwrap()
+}
+
+#[test]
+fn direct_commit_batch_checks_full_chunk_and_reopens_verified_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.store.max_file_bytes = 2048;
+    config.store.max_staging_bytes = 4096;
+    config.store.max_staging_uploads = 2;
+    let provider = DirectObjectIo::init(directory.path(), config.clone()).unwrap();
+    assert_eq!(
+        provider.commit_batch_limits(),
+        tinytree_store::CommitBatchLimits {
+            max_objects: 2,
+            max_bytes: 4096
+        }
+    );
+    let objects = vec![batch_commit("first"), batch_commit("second")];
+    let mut corrupt = objects.clone();
+    *corrupt[1].bytes.last_mut().unwrap() ^= 1;
+    assert!(block_on(provider.write_commit_batch_with_owner(corrupt, Arc::new(()))).is_err());
+    assert!(
+        block_on(provider.write_commit_batch_with_owner(
+            vec![objects[0].clone(), objects[0].clone()],
+            Arc::new(())
+        ))
+        .is_err()
+    );
+    assert!(
+        block_on(provider.write_commit_batch_with_owner(vec![m::empty_tree()], Arc::new(())))
+            .is_err()
+    );
+    for object in &objects {
+        assert_eq!(
+            block_on(provider.descriptor(object.descriptor.key)).unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        block_on(provider.write_commit_batch_with_owner(objects.clone(), Arc::new(()))).unwrap(),
+        objects.iter().map(|o| o.descriptor).collect::<Vec<_>>()
+    );
+    drop(provider);
+    let provider = DirectObjectIo::load(directory.path(), config).unwrap();
+    for object in &objects {
+        assert_eq!(
+            block_on(provider.read_metadata(object.descriptor.key))
+                .unwrap()
+                .bytes(),
+            object.bytes
+        );
+    }
+}
+
+#[test]
+fn commit_batch_does_not_hold_bytes_while_waiting_for_legacy_writer_slots() {
+    use futures::io::AsyncRead;
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+    struct Blocked {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+    impl AsyncRead for Blocked {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            match Pin::new(&mut self.release).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => Poll::Ready(Ok(0)),
+            }
+        }
+    }
+    let objects = vec![batch_commit("A"), batch_commit("B")];
+    assert_eq!(
+        objects[0].descriptor.size_bytes,
+        objects[1].descriptor.size_bytes
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.store.max_file_bytes = objects[0].descriptor.size_bytes;
+    config.store.max_staging_bytes = objects.iter().map(|o| o.descriptor.size_bytes).sum();
+    config.store.max_staging_uploads = 2;
+    let mut provider = DirectObjectIo::init(directory.path(), config).unwrap();
+    let (slots, mut slot_events) = tokio::sync::mpsc::unbounded_channel();
+    provider.set_staging_slot_hook(Arc::new(move || {
+        slots.send(()).unwrap();
+    }));
+    let provider = Arc::new(provider);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let file_provider = provider.clone();
+        let file = tokio::spawn(async move {
+            let mut input = Blocked {
+                entered: Some(entered),
+                release: released,
+            };
+            file_provider.write_file(&mut input, u64::MAX).await
+        });
+        ready.await.unwrap();
+        slot_events.recv().await.unwrap();
+        let mut batch =
+            Box::pin(provider.write_commit_batch_with_owner(objects.clone(), Arc::new(())));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(batch.as_mut().poll(cx).is_pending())).await);
+        let legacy_provider = provider.clone();
+        let legacy = tokio::spawn(async move {
+            legacy_provider
+                .write_metadata(m::decode(&batch_commit("C").bytes, m::Limits::default()).unwrap())
+                .await
+        });
+        // The ordinary writer owns the other slot but cannot get bytes. A
+        // batch that holds all bytes while awaiting two slots would deadlock.
+        slot_events.recv().await.unwrap();
+        release.send(()).unwrap();
+        let (file, legacy, batch) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(file, legacy, batch)
+        })
+        .await
+        .expect("batch and legacy writer must make progress without cross-resource deadlock");
+        file.unwrap().unwrap();
+        legacy.unwrap().unwrap();
+        assert_eq!(
+            batch.unwrap(),
+            objects.iter().map(|o| o.descriptor).collect::<Vec<_>>()
+        );
+        for object in &objects {
+            assert_eq!(
+                provider
+                    .read_metadata(object.descriptor.key)
+                    .await
+                    .unwrap()
+                    .bytes(),
+                object.bytes
+            );
+        }
+    });
+}
+
 #[test]
 fn cancelled_metadata_install_keeps_the_physical_put_owner_and_admission() {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
-    let directory = tempfile::tempdir().unwrap();
-    let mut provider = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let worker_gate = gate.clone();
-    let (entered, started) = std::sync::mpsc::channel();
-    provider.set_metadata_put_hook(Arc::new(move || {
-        entered.send(()).unwrap();
-        let (lock, changed) = &*worker_gate;
-        let mut released = lock.lock().unwrap();
-        while !*released {
-            released = changed.wait(released).unwrap();
-        }
-    }));
-    let provider = Arc::new(provider);
-    let pool = Arc::new(tokio::sync::Semaphore::new(1));
-    let owner = Arc::new(pool.clone().try_acquire_owned().unwrap());
-    let weak = Arc::downgrade(&owner);
-    let mut commit = m::synthetic_root();
-    commit.parents = vec![m::CommitId::ROOT];
-    let object = m::Object::Commit(commit);
-    let expected = m::encode(&object, m::Limits::default()).unwrap().descriptor;
-    let worker: Arc<dyn NativeObjectIo> = provider.clone();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let task = runtime.spawn(async move { worker.write_metadata_with_owner(object, owner).await });
-    started.recv_timeout(Duration::from_secs(5)).unwrap();
-    task.abort();
-    let _ = runtime.block_on(task);
-    assert!(
-        weak.upgrade().is_some(),
-        "accepted Store.put must retain its caller after cancellation"
-    );
-    assert!(
-        pool.clone().try_acquire_owned().is_err(),
-        "another alias must not acquire physical work admission early"
-    );
-    let (lock, changed) = &*gate;
-    *lock.lock().unwrap() = true;
-    changed.notify_all();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while weak.upgrade().is_some() {
+    for batch in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut provider = DirectObjectIo::init(directory.path(), Default::default()).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered, started) = std::sync::mpsc::channel();
+        provider.set_metadata_put_hook(Arc::new(move || {
+            entered.send(()).unwrap();
+            let (lock, changed) = &*worker_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+        }));
+        let provider = Arc::new(provider);
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let owner = Arc::new(pool.clone().try_acquire_owned().unwrap());
+        let weak = Arc::downgrade(&owner);
+        let mut commit = m::synthetic_root();
+        commit.parents = vec![m::CommitId::ROOT];
+        let object = m::Object::Commit(commit);
+        let expected = m::encode(&object, m::Limits::default()).unwrap().descriptor;
+        let worker = provider.clone();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let task = runtime.spawn(async move {
+            if batch {
+                worker
+                    .write_commit_batch_with_owner(
+                        vec![m::encode(&object, m::Limits::default()).unwrap()],
+                        owner,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                let worker: Arc<dyn NativeObjectIo> = worker;
+                worker
+                    .write_metadata_with_owner(object, owner)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        task.abort();
+        let _ = runtime.block_on(task);
         assert!(
-            Instant::now() < deadline,
-            "physical put owner did not release"
+            weak.upgrade().is_some(),
+            "accepted Store.put must retain its caller after cancellation"
         );
-        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            pool.clone().try_acquire_owned().is_err(),
+            "another alias must not acquire physical work admission early"
+        );
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while weak.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "physical put owner did not release"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pool.clone().try_acquire_owned().is_ok());
+        assert_eq!(
+            block_on(provider.descriptor(expected.key)).unwrap(),
+            Some(expected)
+        );
     }
-    assert!(pool.clone().try_acquire_owned().is_ok());
-    assert_eq!(
-        block_on(provider.descriptor(expected.key)).unwrap(),
-        Some(expected)
-    );
 }
 
 #[test]
@@ -1881,5 +2099,41 @@ fn external_stack_rewrite_keeps_server_ids_and_operation_evolution() {
                 .predecessors_for_commit(hidden_y.id())
                 .is_none()
         );
+    });
+}
+
+#[test]
+fn annotation_file_checks_actual_resident_size_and_never_uses_legacy_hydration() {
+    use std::sync::atomic::{AtomicUsize,Ordering};
+    #[derive(Debug)]
+    struct Legacy { inner:Arc<DirectObjectIo>, body_calls:Arc<AtomicUsize> }
+    #[async_trait]
+    impl NativeObjectIo for Legacy {
+        async fn descriptor(&self,key:m::ObjectKey)->BackendResult<Option<m::Descriptor>>{self.inner.descriptor(key).await}
+        async fn read_metadata(&self,key:m::ObjectKey)->BackendResult<VerifiedMetadata>{self.inner.read_metadata(key).await}
+        async fn write_metadata(&self,obj:m::Object)->BackendResult<m::Descriptor>{self.inner.write_metadata(obj).await}
+        async fn read_file(&self,id:m::FileId)->BackendResult<FileRead>{self.body_calls.fetch_add(1,Ordering::SeqCst);self.inner.read_file(id).await}
+        async fn write_file(&self,input:&mut(dyn AsyncRead+Send+Unpin),max:u64)->BackendResult<m::FileId>{self.inner.write_file(input,max).await}
+        async fn copy_catalog_snapshot(&self,limits:CopyCatalogLimits)->BackendResult<CopyCatalogSnapshot>{self.inner.copy_catalog_snapshot(limits).await}
+    }
+    block_on(async {
+        let directory=tempfile::tempdir().unwrap();
+        let mut config=Config::default();config.store.max_file_bytes=64*1024;
+        let mut direct=DirectObjectIo::init(directory.path(),config.clone()).unwrap();
+        let reads=Arc::new(AtomicUsize::new(0));let observed=reads.clone();
+        direct.set_file_read_hook(Arc::new(move||{observed.fetch_add(1,Ordering::SeqCst);}));
+        let direct=Arc::new(direct);
+        let bytes=b"resident private annotation\n";
+        let id=direct.write_file(&mut Cursor::new(bytes),bytes.len() as u64).await.unwrap();
+        let backend=NativeBackend::from_io(direct.clone(),config.clone()).await.unwrap();
+        let value=|size_bytes|m::TreeValue::File{id,executable:false,size_bytes,copy_id:None};
+        assert!(backend.local_annotation_file(&value(1),512*1024,Arc::new(())).await.is_err());
+        assert_eq!(reads.load(Ordering::SeqCst),0,"cross-object size mismatch must fail before a body read");
+        let mut reader=backend.local_annotation_file(&value(bytes.len() as u64),512*1024,Arc::new(())).await.unwrap();
+        let mut actual=Vec::new();reader.read_to_end(&mut actual).await.unwrap();assert_eq!(actual,bytes);
+        let calls=Arc::new(AtomicUsize::new(0));
+        let legacy=NativeBackend::from_io(Arc::new(Legacy{inner:direct,body_calls:calls.clone()}),config).await.unwrap();
+        assert!(legacy.local_annotation_file(&value(bytes.len() as u64),512*1024,Arc::new(())).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst),0,"unsupported bounded delivery must never invoke ordinary/hydrating FILE read");
     });
 }

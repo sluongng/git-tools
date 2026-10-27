@@ -22,12 +22,22 @@ impl Config {
                     .ok_or(Error::Limit("cloud resource profile"))
             })
         };
-        // Several simultaneous catalog maps, copies, JSON containers and hash
-        // slack coexist with one decoded version. Keep the existing schema1
-        // policy unchanged; callers must explicitly size their service pool.
+        // Unset retains the legacy cumulative-work admission exactly. The
+        // opt-in policy precharges owned catalog arenas and retained pin-table
+        // capacity independently; codec/closure/path/packed scratch is additive.
+        let (catalog_bytes, catalog_entries) = match self.cloud.resident {
+            Some(limits) => {
+                limits.validate()?;
+                (Some(limits.max_bytes), Some(0))
+            }
+            None => (
+                self.max_retention_validation_bytes.checked_mul(128),
+                (self.max_retention_validation_records as u64).checked_mul(4096),
+            ),
+        };
         let version_v1_bytes = add(&[
-            self.max_retention_validation_bytes.checked_mul(128),
-            (self.max_retention_validation_records as u64).checked_mul(4096),
+            catalog_bytes,
+            catalog_entries,
             Some(self.cloud.max_version_decode_bytes as u64),
             Some(self.cloud.max_decode_bytes as u64),
             (self.cloud.manifest_limits.max_decode_bytes as u64).checked_mul(2),
@@ -66,12 +76,15 @@ impl Config {
         let version_v3_bytes = add(&[Some(version_v2_bytes), capture.checked_mul(3), Some(4096)])?;
         let capture_read_bytes =
             add(&[Some(version_v3_bytes), capture.checked_mul(2), Some(4096)])?;
+        let resident_bytes = self.cloud.resident.map_or(0, |limits| limits.max_bytes);
         let object_bytes = add(&[
+            Some(resident_bytes),
             Some(self.cloud.max_decode_bytes as u64),
             (self.cloud.max_object_bytes as u64).checked_mul(4),
             Some(8 * 1024 * 1024),
         ])?;
         let index_artifact_bytes = add(&[
+            Some(resident_bytes),
             Some(self.cloud.index_artifacts.max_decode_bytes as u64),
             (self.cloud.index_artifacts.max_artifact_bytes as u64).checked_mul(4),
             Some(8 * 1024 * 1024),

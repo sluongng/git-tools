@@ -13,6 +13,82 @@ use tonic::Status;
 
 type Owner = Arc<dyn Any + Send + Sync>;
 
+/// Fixed, non-sensitive phase information for a failed native capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCaptureStage {
+    BoundarySelection,
+    FrontierCollect,
+    StagingUpload,
+}
+impl NativeCaptureStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BoundarySelection => "boundary_selection",
+            Self::FrontierCollect => "frontier_collect",
+            Self::StagingUpload => "staging_upload",
+        }
+    }
+}
+/// Reasons are assigned only at known local failure sites, never from RPC text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCaptureReason {
+    RetainedBoundaryUnavailable,
+    NonresidentHistoryUnavailable,
+    NonresidentFileRootUnavailable,
+    ScopeOpenUnconfirmed,
+    ScopeCloseUnconfirmed,
+    Unknown,
+}
+impl NativeCaptureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainedBoundaryUnavailable => "retained_boundary_unavailable",
+            Self::NonresidentHistoryUnavailable => "nonresident_history_unavailable",
+            Self::NonresidentFileRootUnavailable => "nonresident_file_root_unavailable",
+            Self::ScopeOpenUnconfirmed => "scope_open_unconfirmed",
+            Self::ScopeCloseUnconfirmed => "scope_close_unconfirmed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+/// An anyhow context preserves the original error's downcasts and source chain.
+/// This context's Display/Debug contain only fixed enum values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCaptureFailure {
+    stage: NativeCaptureStage,
+    reason: NativeCaptureReason,
+}
+impl NativeCaptureFailure {
+    pub fn new(stage: NativeCaptureStage, reason: NativeCaptureReason) -> Self {
+        Self { stage, reason }
+    }
+    pub fn stage(self) -> NativeCaptureStage {
+        self.stage
+    }
+    pub fn reason(self) -> NativeCaptureReason {
+        self.reason
+    }
+    pub fn attach(self, error: anyhow::Error) -> anyhow::Error {
+        error.context(self)
+    }
+    pub(crate) fn at(stage: NativeCaptureStage, error: anyhow::Error) -> anyhow::Error {
+        let reason = error
+            .downcast_ref::<Self>()
+            .map_or(NativeCaptureReason::Unknown, |e| e.reason);
+        Self::new(stage, reason).attach(error)
+    }
+}
+impl std::fmt::Display for NativeCaptureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native capture {} failed ({})",
+            self.stage.as_str(),
+            self.reason.as_str()
+        )
+    }
+}
+
 #[path = "capture_frontier.rs"]
 mod capture_frontier;
 
@@ -327,13 +403,22 @@ impl RemoteRepositoryControl {
                             &limits,
                             deadline,
                         )
-                        .await?;
+                        .await
+                        .map_err(|e| {
+                            NativeCaptureFailure::at(NativeCaptureStage::BoundarySelection, e)
+                        })?;
                     let closure =
                         capture_frontier::collect(&control, roots, &boundaries, &limits, physical)
-                            .await?;
+                            .await
+                            .map_err(|e| {
+                                NativeCaptureFailure::at(NativeCaptureStage::FrontierCollect, e)
+                            })?;
                     let result = control
                         .upload_collected(source, closure, owner, limits, deadline)
-                        .await;
+                        .await
+                        .map_err(|e| {
+                            NativeCaptureFailure::at(NativeCaptureStage::StagingUpload, e)
+                        });
                     drop(boundaries);
                     result
                 })

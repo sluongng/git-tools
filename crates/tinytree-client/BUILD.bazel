@@ -25,7 +25,7 @@ rust_test(
 
 rust_test(
     name = "rpc_tests",
-    compile_data = ["//crates/tinytree-server:examples/landing.toml"],
+    compile_data = ["//crates/tinytree-server:examples/landing.toml", "//crates/tinytree-server:examples/cloud.toml"],
     srcs = ["tests/rpc.rs"],
     aliases = aliases(),
     data = [
@@ -35,7 +35,12 @@ rust_test(
         "//crates/tinytree-server:tests/fixtures/wrong-ca.pem",
     ],
     edition = "2024",
-    env = {"TINYTREE_CLIENT_TEST_TOKEN": "client-loopback-test-token-not-a-secret"},
+    env = {
+        "TINYTREE_CLIENT_TEST_TOKEN": "client-loopback-test-token-not-a-secret",
+        "TINYTREE_EXACT_TEST_WRITER": "alpha-test-token-not-a-secret",
+        "TINYTREE_EXACT_TEST_READER": "reader-test-token-not-a-secret",
+        "TINYTREE_EXACT_TEST_PEER": "peer-test-token-not-a-secret",
+    },
     rustc_env = {
         "TLS_CA_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/ca.pem)",
         "TLS_SERVER_CERT": "$(rootpath //crates/tinytree-server:tests/fixtures/server.pem)",

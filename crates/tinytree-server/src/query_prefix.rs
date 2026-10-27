@@ -26,10 +26,12 @@ fn eval_error(error: EvalError) -> Status {
         EvalError::Graph(e) => index_error(e),
         EvalError::Invalid(m) => Status::invalid_argument(m),
         EvalError::Unsupported(m) => Status::unimplemented(m),
+        EvalError::Read(status) => status,
     }
 }
 
-pub(crate) struct PrefixSelection {
+pub(crate) struct PrefixSelection<'a> {
+    path: Option<crate::query_history::CanonicalPathPredicate<'a>>,
     graph: Arc<OverlayGraph>,
     expression: q::GraphExpr,
     policy: EvalLimits,
@@ -42,15 +44,24 @@ pub(crate) struct PrefixSelection {
     // Heavy AST/evaluator buffers are destroyed before releasing admission.
     _memory: OwnedSemaphorePermit,
 }
-impl PrefixSelection {
+impl<'a> PrefixSelection<'a> {
     pub fn new(
-        scope: &Scoped,
+        host: &'a crate::query_index::QueryHost,
+        scope: &'a Scoped,
         expression: &q::GraphExpr,
         config: &QueryConfig,
         cursors: &CursorHost,
         deadline: Instant,
     ) -> Result<Self> {
-        Self::from_graph(scope.graph().clone(), expression, config, cursors, deadline)
+        let mut selected =
+            Self::from_graph(scope.graph().clone(), expression, config, cursors, deadline)?;
+        selected.path = Some(crate::query_history::CanonicalPathPredicate {
+            host,
+            scope,
+            repository: &scope.wire.key.as_ref().unwrap().repository_id,
+            deadline,
+        });
+        Ok(selected)
     }
     fn from_graph(
         graph: Arc<OverlayGraph>,
@@ -64,6 +75,13 @@ impl PrefixSelection {
             .max_result_ids
             .checked_mul(128)
             .and_then(|n| n.checked_add(16 * 1024))
+            .and_then(|n| {
+                n.checked_add(if crate::query_eval::has_path(expression) {
+                    config.path_memory()
+                } else {
+                    0
+                })
+            })
             .ok_or_else(exhausted)?;
         let memory = cursors.reserve_ephemeral(config, extra)?;
         let policy = limits(config);
@@ -79,6 +97,7 @@ impl PrefixSelection {
             .and_then(|n| u64::try_from(n).ok())
             .ok_or_else(exhausted)?;
         let mut selection = Self {
+            path: None,
             graph,
             expression: expression.clone(),
             policy,
@@ -139,7 +158,10 @@ impl PrefixSelection {
         let mut previous = 0;
         let nonempty = loop {
             self.tick(0)?;
-            let result = evaluator.step(budget);
+            let result = match &mut self.path {
+                Some(path) => evaluator.step_with_path(budget, path),
+                None => evaluator.step(budget),
+            };
             let steps = evaluator.steps();
             self.tick(steps.saturating_sub(previous))?;
             previous = steps;
@@ -212,7 +234,10 @@ impl PrefixSelection {
         let mut previous = 0;
         loop {
             self.tick(0)?;
-            let result = evaluator.step(budget);
+            let result = match &mut self.path {
+                Some(path) => evaluator.step_with_path(budget, path),
+                None => evaluator.step(budget),
+            };
             let steps = evaluator.steps();
             self.tick(steps.saturating_sub(previous))?;
             previous = steps;
@@ -743,6 +768,11 @@ fn check_shape(
                 visit(c)?;
             }
         }
+        X::ChangedPath(v) => {
+            if let Some(c) = &v.candidates {
+                visit(c)?;
+            }
+        }
         X::Heads(v) | X::Roots(v) | X::HasConflict(v) => {
             if let Some(c) = &v.input {
                 visit(c)?;
@@ -831,7 +861,7 @@ mod tests {
         expr: &q::GraphExpr,
         config: &QueryConfig,
         host: &CursorHost,
-    ) -> PrefixSelection {
+    ) -> PrefixSelection<'static> {
         PrefixSelection::from_graph(
             graph,
             expr,

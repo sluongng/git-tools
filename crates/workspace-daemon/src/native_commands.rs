@@ -441,6 +441,7 @@ impl NativeCommandHost {
         identity: [u8; 32],
         access: Arc<native_retention::HostAccessGuard>,
     ) -> Result<()> {
+        let _availability = self.availability_change();
         let workspace = self
             .workspace(&binding.rpc_mount_id)
             .map_err(|_| anyhow::anyhow!("native workspace unavailable"))?;
@@ -465,6 +466,7 @@ impl NativeCommandHost {
         if let Some(access) = &access {
             self.inner.registry.validate_host_access(access)?;
         }
+        let _availability = self.availability_change();
         let _start = self.inner.starts.lock().await;
         let mount = binding.rpc_mount_id.clone();
         ensure!(
@@ -664,6 +666,7 @@ impl NativeCommandHost {
                 "native command replay key is empty",
             ));
         }
+        let _availability = self.availability_change();
         let _start = self.inner.starts.lock().await;
         let workspace = self.workspace(mount)?;
         if !workspace.admission.active.load(Ordering::Acquire) {
@@ -727,6 +730,7 @@ impl NativeCommandHost {
                 "native command replay key is empty",
             ));
         }
+        let _availability = self.availability_change();
         let _start = self.inner.starts.lock().await;
         let workspace = self.workspace(mount)?;
         if !workspace.admission.active.load(Ordering::Acquire) {
@@ -1127,17 +1131,19 @@ impl NativeCommandHost {
             .await
             .map_err(|_| native_retention::Error::Storage)
         };
+        let _availability = self.availability_change();
         let result = self
             .inner
             .registry
-            .capture_dirty_owned(CommandToken::from_bytes(session.token), callback)
+            .capture_dirty_or_reuse_pending_owned(CommandToken::from_bytes(session.token), callback)
             .await;
+        let _availability = self.availability_change();
         let phase = *attempt
             .lock()
             .map_err(|_| Status::internal("native capture status unavailable"))?;
         match result {
-            Ok(_) => {
-                self.inner.capture.queued();
+            Ok(disposition) => {
+                self.inner.capture.record_dirty_capture(&disposition);
                 self.inner.capture.refresh(&self.inner.registry).await;
                 if !completion.wait_until(deadline).await {
                     self.inner.capture.disposition("indeterminate", true);
@@ -1210,6 +1216,12 @@ impl NativeCommandHost {
         )
         .await
     }
+    fn availability_change(&self) -> Option<crate::native_capture_upload::AvailabilityChange> {
+        self.inner
+            .upload_status
+            .get()
+            .map(|stats| stats.availability_change())
+    }
     pub(crate) fn set_upload_status(
         &self,
         stats: Arc<crate::native_capture_upload::Stats>,
@@ -1219,6 +1231,54 @@ impl NativeCommandHost {
             .set(stats)
             .map_err(|_| anyhow::anyhow!("capture uploader already configured"))
     }
+    /// Startup-only metadata validation. No registration or capture payload is
+    /// opened, and pending roots are never altered by this census.
+    pub(crate) async fn pending_provider_registrations(
+        &self, max_entries: usize, max_bytes: usize,
+    ) -> Result<native_retention::CaptureRegistrations> {
+        self.inner.registry.pending_capture_registrations(max_entries,max_bytes).await
+            .map_err(|_|anyhow::anyhow!("invalid pending provider census metadata"))
+    }
+    pub(crate) fn inspect_provider_mappings(
+        &self,
+        census: &mut crate::provider_identity::Census,
+        pending: &[native_retention::Registration],
+    ) -> Result<std::collections::BTreeMap<String, (String, [u8; 32])>> {
+        let mut result = std::collections::BTreeMap::new();
+        let mut registrations = std::collections::BTreeMap::new();
+        for item in std::fs::read_dir(self.inner.records.path())? {
+            census.entry()?;
+            let name = item?.file_name();
+            let name = name.to_str().context("invalid provider command census name")?;
+            let bytes = census.read(&self.inner.records, name, MAX_RECORD)?;
+            if crate::provider_identity::is_atomic_temporary(name) { continue; }
+            let mapping: Mapping = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid provider command census record"))?;
+            ensure!(mapping.version == 1 && name == format!("{}.json", mapping.mount)
+                && mapping.workspace.0 != [0;16] && mapping.op_store.0 != [0;16]
+                && !mapping.mount.is_empty() && mapping.mount.len() <=128
+                && mapping.mount.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+                "invalid provider command census record");
+            census.charge(512)?;
+            ensure!(registrations.insert((mapping.workspace.0,mapping.op_store.0),mapping.mount.clone()).is_none(),
+                "ambiguous pending provider census mapping");
+            census.identity(&mapping.alias, mapping.identity)?;
+            ensure!(result.insert(mapping.mount, (mapping.alias, mapping.identity)).is_none(),
+                "duplicate provider command census record");
+        }
+        for registration in pending {
+            let mount = registrations.get(&(registration.workspace.0,registration.op_store.0))
+                .context("pending provider census mapping unavailable")?;
+            ensure!(result.contains_key(mount),"pending provider census route unavailable");
+        }
+        Ok(result)
+    }
+    pub(crate) fn inspect_writer_lease(binding: &Binding) -> Result<File> {
+        let path = native_vfs_rpc::command_lock_path(&binding.admin, &binding.rpc_mount_id)?;
+        let file = existing_lease(&path, None)?;
+        file.try_lock_exclusive().context("native command writer is active during provider census")?;
+        Ok(file)
+    }
     fn capture_mapping_record(&self, ticket: &native_retention::PendingCapture) -> Result<Mapping> {
         let mut found = None;
         let mut count = 0;
@@ -1227,8 +1287,9 @@ impl NativeCommandHost {
             ensure!(count <= 4096, "capture mapping scan limit exceeded");
             let item = item?;
             let name = item.file_name();
-            let mapping: Mapping =
-                serde_json::from_slice(&self.inner.records.read(&name, MAX_RECORD)?)?;
+            let bytes = self.inner.records.read(&name, MAX_RECORD)?;
+            if name.to_str().is_some_and(crate::provider_identity::is_atomic_temporary) { continue; }
+            let mapping: Mapping = serde_json::from_slice(&bytes)?;
             ensure!(
                 mapping.version == 1 && name.to_str() == Some(&format!("{}.json", mapping.mount)),
                 "invalid capture mapping record"
@@ -1562,9 +1623,285 @@ mod tests {
         )
         .await??;
         drop(cleanup);
-        assert_eq!(registry.pending_captures().await?.len(), 1);
+        let pending = registry.pending_captures().await?;
+        assert_eq!(pending.len(), 1);
+        host.inner.records.replace(".private-12-34.tmp",b"{interrupted")?;
+        let registrations = host.pending_provider_registrations(128,16384).await?;
+        assert_eq!(registrations.as_slice(),&[pending[0].registration]);
+        assert_eq!(host.capture_mapping(&pending[0])?,("queue".into(),"example".into(),[8;32]));
+        assert_eq!(host.inner.records.read(".private-12-34.tmp",MAX_RECORD)?,b"{interrupted");
         Ok(())
     }
+    #[tokio::test]
+    async fn exact_bundle_boundary_preserves_private_working_copy_remote_and_index_changes()
+    -> Result<()> {
+        use native_capture_pack::{Entry, VerifiedPack};
+        use native_retention::{
+            CaptureBundle, DirtyCaptureDisposition, OwnedCaptureBundle, RootCheckpoint,
+        };
+        struct Case {
+            name: &'static str,
+            wc: u8,
+            index: u8,
+            remote: u8,
+            checkpoint_changed: bool,
+            remove_original: bool,
+            corrupt_original: bool,
+            reused: bool,
+        }
+        fn pack(
+            directory: Arc<PrivateDir>,
+            wc: u8,
+            index: u8,
+            remote: u8,
+        ) -> Result<(native_retention::BundleDescriptor, Arc<VerifiedPack>, bool)> {
+            let mut bytes = native_capture_pack::MAGIC.to_vec();
+            let mut entries = Vec::new();
+            for (kind, body) in [
+                (3, vec![index; 4]),
+                (5, vec![4; 4]),
+                (128, vec![wc; 4]),
+                (129, vec![remote; 4]),
+            ] {
+                let hash = *blake3::hash(&body).as_bytes();
+                let id = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                bytes.extend(native_capture_pack::frame_header(
+                    kind,
+                    &id,
+                    body.len() as u64,
+                    hash,
+                )?);
+                entries.push(Entry {
+                    kind,
+                    id,
+                    blake3: hash,
+                    size: body.len() as u64,
+                    offset: bytes.len() as u64,
+                });
+                bytes.extend(body);
+            }
+            let table = native_capture_pack::encode_table(&entries)?;
+            bytes.extend(native_capture_pack::TABLE_MAGIC);
+            bytes.extend((table.len() as u64).to_le_bytes());
+            bytes.extend(table);
+            let descriptor = native_retention::BundleDescriptor {
+                blake3: *blake3::hash(&bytes).as_bytes(),
+                size_bytes: bytes.len() as u64,
+            };
+            let name = format!("{}.pack", blake3::Hash::from(descriptor.blake3).to_hex());
+            let existed = directory.path().join(&name).try_exists()?;
+            if !existed {
+                directory.replace(&name, &bytes)?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    directory.path().join(&name),
+                    std::fs::Permissions::from_mode(0o600),
+                )?;
+            }
+            let verified = VerifiedPack::open(
+                directory,
+                descriptor.blake3,
+                descriptor.size_bytes,
+                Default::default(),
+                Arc::new(()),
+            )?;
+            Ok((descriptor, Arc::new(verified), existed))
+        }
+        for case in [
+            Case {
+                name: "identical full pack",
+                wc: 1,
+                index: 2,
+                remote: 3,
+                checkpoint_changed: false,
+                remove_original: false,
+                corrupt_original: false,
+                reused: true,
+            },
+            Case {
+                name: "private working copy changed",
+                wc: 9,
+                index: 2,
+                remote: 3,
+                checkpoint_changed: false,
+                remove_original: false,
+                corrupt_original: false,
+                reused: false,
+            },
+            Case {
+                name: "index artifact changed",
+                wc: 1,
+                index: 9,
+                remote: 3,
+                checkpoint_changed: false,
+                remove_original: false,
+                corrupt_original: false,
+                reused: false,
+            },
+            Case {
+                name: "private remote ledger changed",
+                wc: 1,
+                index: 2,
+                remote: 9,
+                checkpoint_changed: false,
+                remove_original: false,
+                corrupt_original: false,
+                reused: false,
+            },
+            Case {
+                name: "checkpoint changes despite equal pack",
+                wc: 1,
+                index: 2,
+                remote: 3,
+                checkpoint_changed: true,
+                remove_original: false,
+                corrupt_original: false,
+                reused: false,
+            },
+            Case {
+                name: "missing old pack is freshly staged",
+                wc: 1,
+                index: 2,
+                remote: 3,
+                checkpoint_changed: false,
+                remove_original: true,
+                corrupt_original: false,
+                reused: false,
+            },
+            Case {
+                name: "corrupt existing pack refuses capture",
+                wc: 1,
+                index: 2,
+                remote: 3,
+                checkpoint_changed: false,
+                remove_original: false,
+                corrupt_original: true,
+                reused: false,
+            },
+        ] {
+            let temporary = tempfile::tempdir()?;
+            let private = PrivateDir::create(temporary.path().join("private"))?;
+            let host = NativeCommandHost::open_with_capture(
+                &private.path().join("commands"),
+                crate::config::NativeCapture {
+                    policy: crate::config::NativeCapturePolicy::AfterCommandBestEffort,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let binding = binding(private.path(), "exact", 1)?;
+            host.register(&binding, [8; 32]).await?;
+            let registration = host.workspace("exact")?.registration;
+            let registry = host.capture_registry();
+            let directory = Arc::new(PrivateDir::open_existing(
+                private.path().join("commands/captures"),
+            )?);
+            let (descriptor, verified, _) = pack(directory.clone(), 1, 2, 3)?;
+            let first = registry.begin_command(registration).await?;
+            // The pack exists and verifies, but no pending ticket names it yet.
+            let initial = registry
+                .capture_dirty_or_reuse_pending_owned(first.token(), move || async move {
+                    Ok(OwnedCaptureBundle::new(
+                        CaptureBundle {
+                            checkpoint: RootCheckpoint::default(),
+                            bundle: descriptor,
+                        },
+                        verified,
+                    )
+                    .with_verified_existing_bundle())
+                })
+                .await?;
+            assert!(
+                matches!(&initial, DirtyCaptureDisposition::Queued(_)),
+                "an existing pack without pending membership must queue"
+            );
+            let ticket = initial.into_pending();
+            drop(first);
+            host.inner.capture.queued();
+            let name = format!("{}.pack", blake3::Hash::from(descriptor.blake3).to_hex());
+            if case.remove_original {
+                std::fs::remove_file(directory.path().join(&name))?;
+            }
+            if case.corrupt_original {
+                directory.replace(&name, b"invalid")?;
+            }
+            let second = registry.begin_command(registration).await?;
+            let outcome = registry
+                .capture_dirty_or_reuse_pending_owned(second.token(), move || async move {
+                    let (descriptor, verified, existed) =
+                        pack(directory, case.wc, case.index, case.remote)
+                            .map_err(|_| native_retention::Error::Storage)?;
+                    let checkpoint = if case.checkpoint_changed {
+                        RootCheckpoint {
+                            op_heads: vec![vec![7; 64]],
+                            working_copy_operation: Some(vec![7; 64]),
+                            ..Default::default()
+                        }
+                    } else {
+                        RootCheckpoint::default()
+                    };
+                    let captured = OwnedCaptureBundle::new(
+                        CaptureBundle {
+                            checkpoint,
+                            bundle: descriptor,
+                        },
+                        verified,
+                    );
+                    Ok(if existed {
+                        captured.with_verified_existing_bundle()
+                    } else {
+                        captured
+                    })
+                })
+                .await;
+            drop(second);
+            if case.corrupt_original {
+                assert!(
+                    outcome.is_err(),
+                    "corrupt exact-pack attestation must fail closed"
+                );
+                assert_eq!(registry.pending_captures().await?, vec![ticket]);
+                assert_eq!(host.status()["local_capture"]["queued"], 1);
+                assert_eq!(host.status()["local_capture"]["reused_pending"], 0);
+            } else {
+                let outcome = outcome?;
+                assert_eq!(
+                    matches!(&outcome, DirtyCaptureDisposition::ReusedPending(_)),
+                    case.reused,
+                    "{}",
+                    case.name
+                );
+                host.inner.capture.record_dirty_capture(&outcome);
+                host.inner.capture.refresh(&registry).await;
+                assert_eq!(
+                    registry.pending_captures().await?.len(),
+                    if case.reused { 1 } else { 2 },
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    host.status()["local_capture"]["queued"],
+                    if case.reused { 1 } else { 2 },
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    host.status()["local_capture"]["reused_pending"],
+                    usize::from(case.reused),
+                    "{}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                registry.workspace(registration).await?.state,
+                native_retention::WorkspaceState::Dirty,
+                "{}",
+                case.name
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_registration_is_closed_until_exact_prevalidated_activation_and_drop_stays_closed()
     -> Result<()> {

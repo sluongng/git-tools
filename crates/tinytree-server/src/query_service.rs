@@ -621,6 +621,7 @@ impl RepositoryQuery for QueryService {
                             })?;
                             q::graph_fact_answer::Answer::Membership(
                                 facts_host.cursors.membership(
+                                    &facts_host,
                                     scope,
                                     expression,
                                     candidate,
@@ -729,6 +730,7 @@ impl RepositoryQuery for QueryService {
             move |scope, budget, config| {
                 let (resolved, selection_digest) = if let Some(expression) = &input.selection {
                     let mut selected = crate::query_prefix::PrefixSelection::new(
+                        &prefix_host,
                         scope,
                         expression,
                         config,
@@ -792,6 +794,7 @@ impl RepositoryQuery for QueryService {
                 visible(scope, &heads, budget)?;
                 let (resolved, selection_digest) = if let Some(expression) = &input.selection {
                     let mut selected = crate::query_prefix::PrefixSelection::new(
+                        &prefix_host,
                         scope,
                         expression,
                         config,
@@ -880,6 +883,7 @@ impl RepositoryQuery for QueryService {
                 visible(scope, &heads, budget)?;
                 if let Some(expression) = &input.selection {
                     let mut selected = crate::query_prefix::PrefixSelection::new(
+                        &prefix_host,
                         scope,
                         expression,
                         config,
@@ -1048,6 +1052,97 @@ impl RepositoryQuery for QueryService {
             self.repository.service_config().query.max_response_bytes,
         )
     }
+    async fn open_annotation_frontier(
+        &self,
+        request: Request<q::OpenAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontier>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            crate::query_history::annotation::open(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
+    async fn read_annotation_input(
+        &self,
+        request: Request<q::ReadAnnotationInputRequest>,
+    ) -> Result<Response<q::AnnotationInput>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted_history(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            crate::query_history::annotation::read(
+                host,
+                &scope,
+                &key.repository_id,
+                input,
+                deadline,
+            )
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
+    async fn close_annotation_frontier(
+        &self,
+        request: Request<q::CloseAnnotationFrontierRequest>,
+    ) -> Result<Response<q::CloseAnnotationFrontierResponse>, Status> {
+        let (identity, deadline, host) = self.context(&request, false)?;
+        let admission = request.extensions().get::<Arc<Work>>().cloned();
+        self.bounded(request.get_ref())?;
+        let input = request.into_inner();
+        let key = scope_key(input.scope.clone())?;
+        identity.authorize(&key.repository_id, false)?;
+        let work = admitted(&host, deadline, admission).await?;
+        let (value, work) = execute(host, work, deadline, move |host, work| {
+            let scope = host.lookup(&identity.id, &key.repository_id, &key.handle)?;
+            if scope.is_cloud() {
+                identity.cloud_capability()?;
+            }
+            work.scopes.lock().unwrap().push(scope.clone());
+            crate::query_history::annotation::close(&scope, input)
+                .map(|()| q::CloseAnnotationFrontierResponse {})
+        })
+        .await?;
+        response(
+            value,
+            work,
+            self.repository.service_config().query.max_response_bytes,
+        )
+    }
     async fn close_query(
         &self,
         request: Request<q::CloseQueryRequest>,
@@ -1086,7 +1181,7 @@ impl RepositoryQuery for QueryService {
             if host.requires_cloud(&identity.id, &key.repository_id, &key.handle)? {
                 identity.cloud_capability()?;
             }
-            let result = host.cursors.evaluate(host, &identity.id, input)?;
+            let result = host.cursors.evaluate(host, &identity.id, input, deadline)?;
             work.query_owners.lock().unwrap().push(result.owner);
             Ok(result.page)
         })

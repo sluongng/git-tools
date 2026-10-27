@@ -10,6 +10,9 @@ use std::{
 use tinytree_client::{NativeClient, VerifiedRetainedVersion};
 use tinytree_model as m;
 use tokio::time::Instant;
+#[path = "capture_ancestor.rs"]
+mod ancestor;
+use ancestor::AncestorWitness;
 
 type Owner = Arc<dyn Any + Send + Sync>;
 /// Construction is private to this provider. A caller cannot promote a root,
@@ -23,6 +26,13 @@ pub(crate) struct CaptureBoundaries {
     _cloud: Vec<Arc<VerifiedRetainedVersion>>,
     _client: NativeClient,
     _owner: Owner,
+}
+struct Selection {
+    holds: HashSet<usize>,
+    cloud: HashSet<usize>,
+    edges: usize,
+    objects: usize,
+    ancestors: HashMap<usize, Vec<AncestorWitness>>,
 }
 struct HoldProof {
     _name: String,
@@ -145,7 +155,18 @@ impl RemoteRepositoryControl {
         root: &Root,
         head: m::ObjectKey,
     ) -> Result<(u64, u64)> {
-        let view = io::network(client.open(vec![root.hold_name.clone()])).await?;
+        let generation = root.generation.context("capture hold generation missing")?;
+        self.fresh_capture_hold_named(client, &root.hold_name, generation, head)
+            .await
+    }
+    async fn fresh_capture_hold_named(
+        &self,
+        client: &NativeClient,
+        name: &str,
+        generation: u64,
+        head: m::ObjectKey,
+    ) -> Result<(u64, u64)> {
+        let view = io::network(client.open(vec![name.to_owned()])).await?;
         ensure!(
             view.repository_id == self.inner.config.remote.repository_id
                 && view.references.len() == 1,
@@ -161,9 +182,9 @@ impl RemoteRepositoryControl {
             .as_ref()
             .context("capture hold target absent")?;
         ensure!(
-            reference.name == root.hold_name
+            reference.name == name
                 && reference.generation > 0
-                && Some(reference.generation) == root.generation
+                && reference.generation == generation
                 && key.kind == m::Kind::Commit as i32
                 && key.native_id.as_slice() == head.id.0,
             "capture hold target or generation differs"
@@ -350,7 +371,13 @@ impl RemoteRepositoryControl {
         })
         .await?;
         budget.charge(charged)?;
-        let (selected_holds, selected_cloud, selection_edges, selection_objects) = select_relevant(
+        let Selection {
+            holds: selected_holds,
+            cloud: selected_cloud,
+            edges: selection_edges,
+            objects: selection_objects,
+            mut ancestors,
+        } = select_relevant(
             self,
             roots,
             &records,
@@ -450,12 +477,29 @@ impl RemoteRepositoryControl {
                     },
                 )?;
             }
+            if let Some(witnesses) = ancestors.remove(&index) {
+                for witness in witnesses {
+                    ensure!(
+                        witness.head == head
+                            && witness.name == root.hold_name
+                            && witness.generation == generation
+                            && witness.member
+                            && witness.scope.repository_id()
+                                == self.inner.config.remote.repository_id
+                            && witness.scope.remote_roots() == [m::CommitId(head.id.0)]
+                            && witness.scope.query_identity_version() == 2,
+                        "capture ancestor hold witness differs"
+                    );
+                    budget.key(&mut keys, witness.ancestor)?;
+                }
+            }
             holds.push(HoldProof {
                 _name: root.hold_name,
                 _generation: generation,
                 _commit: commit,
             });
         }
+        ensure!(ancestors.is_empty(), "capture ancestor hold proof missing");
         for (index, authority) in authorities.into_iter().enumerate() {
             if !selected_cloud.contains(&index) {
                 continue;
@@ -545,8 +589,17 @@ impl RemoteRepositoryControl {
     }
 }
 #[derive(Clone, Copy, Default)]
+enum HoldHint {
+    #[default]
+    None,
+    Exact(usize),
+    Derived(usize),
+}
+// Keep the existing per-hint allocation charge valid for both hint kinds.
+const _: () = assert!(std::mem::size_of::<HoldHint>() <= std::mem::size_of::<Option<usize>>());
+#[derive(Clone, Copy, Default)]
 struct Hint {
-    hold: Option<usize>,
+    hold: HoldHint,
     cloud: Option<usize>,
 }
 fn hint<'a>(
@@ -565,6 +618,95 @@ fn hint<'a>(
     }
     Ok(hints.get_mut(&key).unwrap())
 }
+async fn derive_hold_hints(
+    control: &RemoteRepositoryControl,
+    records: &[Root],
+    owner: Owner,
+    limits: &NativeTransferLimits,
+    budget: &mut Budget,
+    hints: &mut HashMap<m::ObjectKey, Hint>,
+    edges: &mut usize,
+) -> Result<()> {
+    for (index, root) in records.iter().enumerate() {
+        if !root.retained()
+            || !(root.ready || root.complete)
+            || root.binding != control.inner.ledger.binding.scope
+        {
+            continue;
+        }
+        io::check_deadline()?;
+        let head = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(crate::unhex(&root.head)?),
+        };
+        // Local canonical direct edges select a candidate hold only. They do
+        // not authorize cutoffs: the selected hold is freshly proved below.
+        // An unavailable unrelated head contributes no derived hints.
+        let Ok(Some(descriptor)) = control
+            .inner
+            .local
+            .descriptor_with_owner(head, owner.clone())
+            .await
+        else {
+            io::check_deadline()?;
+            continue;
+        };
+        let bytes = usize::try_from(descriptor.size_bytes)?;
+        if descriptor.key != head
+            || descriptor.format_version != m::FORMAT_VERSION
+            || bytes > control.inner.config.remote.limits.max_metadata_bytes
+        {
+            continue;
+        }
+        budget.charge(proof_cost(bytes)?)?;
+        let Ok(value) = control
+            .inner
+            .local
+            .read_metadata_with_owner(head, owner.clone())
+            .await
+        else {
+            io::check_deadline()?;
+            continue;
+        };
+        if value.descriptor() != descriptor {
+            continue;
+        }
+        let m::Object::Commit(commit) = value.into_object() else {
+            continue;
+        };
+        let count = commit
+            .parents
+            .len()
+            .checked_add(commit.predecessors.len())
+            .and_then(|n| n.checked_add(commit.root_tree.terms.len()))
+            .context("capture selection hint edge overflow")?;
+        *edges = edges
+            .checked_add(count)
+            .filter(|n| *n <= limits.closure.max_edges)
+            .context("capture selection hint edge budget exceeded")?;
+        for parent in commit.parents.iter().chain(&commit.predecessors) {
+            let key = m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(parent.0),
+            };
+            let candidate = hint(hints, key, budget, limits.closure.max_objects)?;
+            if matches!(candidate.hold, HoldHint::None) {
+                candidate.hold = HoldHint::Derived(index);
+            }
+        }
+        for tree in &commit.root_tree.terms {
+            let key = m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(tree.0),
+            };
+            let candidate = hint(hints, key, budget, limits.closure.max_objects)?;
+            if matches!(candidate.hold, HoldHint::None) {
+                candidate.hold = HoldHint::Derived(index);
+            }
+        }
+    }
+    Ok(())
+}
 async fn select_relevant(
     control: &RemoteRepositoryControl,
     roots: &[m::ObjectKey],
@@ -574,7 +716,7 @@ async fn select_relevant(
     owner: Owner,
     limits: &NativeTransferLimits,
     budget: &mut Budget,
-) -> Result<(HashSet<usize>, HashSet<usize>, usize, usize)> {
+) -> Result<Selection> {
     let mut hints = HashMap::<m::ObjectKey, Hint>::new();
     for (index, root) in records.iter().enumerate() {
         if root.retained() && (root.ready || root.complete) {
@@ -582,7 +724,8 @@ async fn select_relevant(
                 kind: m::Kind::Commit,
                 id: m::ObjectId(crate::unhex(&root.head)?),
             };
-            hint(&mut hints, key, budget, limits.closure.max_objects)?.hold = Some(index);
+            hint(&mut hints, key, budget, limits.closure.max_objects)?.hold =
+                HoldHint::Exact(index);
         }
     }
     for (index, authority) in authorities.iter().enumerate() {
@@ -615,6 +758,10 @@ async fn select_relevant(
     let mut active = HashSet::new();
     let mut done = HashSet::new();
     let mut edges = 0usize;
+    let mut derived_hints = false;
+    let mut proof_attempts = 0usize;
+    let mut ancestor_keys = HashSet::new();
+    let mut ancestors = HashMap::<usize, Vec<AncestorWitness>>::new();
     budget.charge(
         roots
             .len()
@@ -632,7 +779,7 @@ async fn select_relevant(
             done.insert(key);
             continue;
         }
-        if done.contains(&key) || landing_keys.contains(&key) {
+        if done.contains(&key) || landing_keys.contains(&key) || ancestor_keys.contains(&key) {
             continue;
         }
         let mut covered_cloud = false;
@@ -653,7 +800,7 @@ async fn select_relevant(
                 selected_cloud.insert(index);
                 continue;
             }
-            if let Some(index) = candidate.hold {
+            if let HoldHint::Exact(index) = candidate.hold {
                 if !selected_holds.contains(&index) {
                     budget.charge(128)?;
                     selected_holds.insert(index);
@@ -667,6 +814,15 @@ async fn select_relevant(
                 }
                 continue;
             }
+            // Exact hold/cloud hints retain priority over a direct-edge
+            // candidate. Shared derived edges use the first catalog record.
+            if let HoldHint::Derived(index) = candidate.hold {
+                if !selected_holds.contains(&index) {
+                    budget.charge(128)?;
+                    selected_holds.insert(index);
+                }
+                continue;
+            }
         }
         // TREE selection never walks checkout contents. Only locally resident
         // COMMITs may bridge authored history to a candidate retained anchor.
@@ -675,7 +831,11 @@ async fn select_relevant(
         }
         ensure!(
             !active.contains(&key)
-                && active.len().saturating_add(done.len()) < limits.closure.max_objects,
+                && active
+                    .len()
+                    .saturating_add(done.len())
+                    .saturating_add(proof_attempts)
+                    < limits.closure.max_objects,
             "capture selection commit cycle/count exceeds budget"
         );
         let descriptor = control
@@ -683,12 +843,109 @@ async fn select_relevant(
             .local
             .descriptor_with_owner(key, owner.clone())
             .await
-            .map_err(crate::backend)?
-            .ok_or_else(|| {
+            .map_err(crate::backend)?;
+        let Some(descriptor) = descriptor else {
+            if !derived_hints {
+                // Refine only the otherwise unsupported nonresident-COMMIT
+                // path. Exact/cloud-covered captures never inspect unrelated
+                // held heads or pay for their direct-edge candidate hints.
+                derived_hints = true;
+                derive_hold_hints(
+                    control,
+                    records,
+                    owner.clone(),
+                    limits,
+                    budget,
+                    &mut hints,
+                    &mut edges,
+                )
+                .await?;
+                pending.push((key, false));
+                continue;
+            }
+            let mut matched = None;
+            for (index, root) in records.iter().enumerate() {
+                if !root.retained()
+                    || !(root.ready || root.complete)
+                    || root.binding != control.inner.ledger.binding.scope
+                {
+                    continue;
+                }
+                io::check_deadline()?;
+                let head = control.existing_capture_root(root)?;
+                let generation = root.generation.context("capture hold generation missing")?;
+                ensure!(
+                    active
+                        .len()
+                        .saturating_add(done.len())
+                        .saturating_add(proof_attempts)
+                        < limits.closure.max_objects,
+                    "capture ancestor attempt count exceeds budget"
+                );
+                proof_attempts += 1;
+                edges = edges
+                    .checked_add(1)
+                    .filter(|n| *n <= limits.closure.max_edges)
+                    .context("capture ancestor fact edge budget exceeded")?;
+                // SDK buffers use the already-funded shared pool. Charge the
+                // caller-owned handle/roots/facts, identity copies, completion,
+                // guard storage and transient allocation overlap before use.
+                let strings = root
+                    .hold_name
+                    .len()
+                    .checked_add(control.inner.config.remote.repository_id.len())
+                    .and_then(|n| n.checked_mul(4))
+                    .context("capture ancestor identity budget overflow")?;
+                budget.charge(
+                    8192usize
+                        .checked_add(strings)
+                        .context("capture ancestor proof budget overflow")?,
+                )?;
+                let witness = control
+                    .capture_ancestor_proof(
+                        key,
+                        head,
+                        root.hold_name.clone(),
+                        generation,
+                        owner.clone(),
+                        io::scope()
+                            .context("capture ancestor scope absent")?
+                            .deadline,
+                    )
+                    .await?;
+                if witness.member {
+                    matched = Some((index, witness));
+                    break;
+                }
+            }
+            if let Some((index, witness)) = matched {
+                if !selected_holds.contains(&index) {
+                    budget.charge(128)?;
+                    selected_holds.insert(index);
+                }
+                if !ancestors.contains_key(&index) {
+                    budget.charge(256)?;
+                    ancestors.insert(index, Vec::new());
+                }
+                budget.charge(4 * std::mem::size_of::<AncestorWitness>() + 64)?;
+                budget.key(&mut ancestor_keys, key)?;
+                ancestors
+                    .get_mut(&index)
+                    .expect("capture ancestor group")
+                    .push(witness);
+                continue;
+            }
+            return Err(crate::NativeCaptureFailure::new(
+                crate::NativeCaptureStage::BoundarySelection,
+                crate::NativeCaptureReason::RetainedBoundaryUnavailable,
+            )
+            .attach(
                 tonic::Status::unimplemented(
                     "capture requires a retained boundary before remote commit ancestry",
                 )
-            })?;
+                .into(),
+            ));
+        };
         budget.charge(
             proof_cost(usize::try_from(descriptor.size_bytes)?)?
                 .checked_add(512)
@@ -744,7 +1001,16 @@ async fn select_relevant(
             ));
         }
     }
-    Ok((selected_holds, selected_cloud, edges, done.len()))
+    Ok(Selection {
+        holds: selected_holds,
+        cloud: selected_cloud,
+        edges,
+        objects: done
+            .len()
+            .checked_add(proof_attempts)
+            .context("capture selection object count overflow")?,
+        ancestors,
+    })
 }
 fn canonical_roots(
     proof: &VerifiedRetainedVersion,

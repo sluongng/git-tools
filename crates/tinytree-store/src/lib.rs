@@ -25,12 +25,12 @@ use tinytree_model::{CommitId, Descriptor, Kind, Limits, ObjectId, ObjectKey};
 
 mod cloud;
 pub use cloud::{
-    CloudCaptureReadLease, CloudConfig, CloudIndexReadLease, CloudIndexWriteReceipt,
-    CloudNativeReadLease, CloudNativeReadLimits, CloudObjectDescriptor, CloudOwner,
-    CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResourceProfile,
-    CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion, CloudVersionPage,
-    CloudVersionReadGuard, CloudVersionSelector, CloudWorkspace, CloudWorkspacePage,
-    CloudWriteReceipt, PublishCapturedCloudRequest, PublishCloudRequest,
+    CloudCaptureReadLease, CloudCatalogBudgetSummary, CloudConfig, CloudIndexReadLease,
+    CloudIndexWriteReceipt, CloudNativeReadLease, CloudNativeReadLimits, CloudObjectDescriptor,
+    CloudOwner, CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResidentLimits,
+    CloudResourceProfile, CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion,
+    CloudVersionPage, CloudVersionReadGuard, CloudVersionSelector, CloudWorkspace,
+    CloudWorkspacePage, CloudWriteReceipt, PublishCapturedCloudRequest, PublishCloudRequest,
 };
 mod external_checks;
 mod landing;
@@ -96,7 +96,10 @@ impl From<io::Error> for Error {
 }
 impl From<fjall::Error> for Error {
     fn from(e: fjall::Error) -> Self {
-        Self::Database(e)
+        match e {
+            fjall::Error::RecoveryAllocationLimit => Self::Limit("store recovery allocation"),
+            error => Self::Database(error),
+        }
     }
 }
 impl From<tinytree_model::Error> for Error {
@@ -148,6 +151,15 @@ impl Default for Config {
     }
 }
 
+/// Small physical publication chunks; operator staging limits can reduce both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitBatchLimits {
+    pub max_objects: usize,
+    pub max_bytes: u64,
+}
+const COMMIT_BATCH_OBJECTS: usize = 32;
+const COMMIT_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reference {
     pub name: String,
@@ -193,7 +205,15 @@ struct Inner {
     db: SingleWriterTxDatabase,
     spaces: Spaces,
     gate: Mutex<Runtime>,
+    resident: Arc<cloud::resident::Budget>,
     uncertain_commit: AtomicBool,
+    #[cfg(test)]
+    variant_put_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    commit_batch_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    cloud_version_read_pause:
+        Mutex<Option<(std::sync::mpsc::SyncSender<()>, Arc<std::sync::Barrier>)>>,
     packed_read_bytes: Arc<AtomicU64>,
     _owner: File,
 }
@@ -214,6 +234,8 @@ struct Spaces {
 }
 #[derive(Default)]
 struct Runtime {
+    resident_arena: Weak<cloud::resident::Reservation>,
+    pin_highwater: [usize; 4],
     readers: HashMap<(String, ObjectKey), usize>,
     cloud_readers: HashMap<(String, [u8; 32], tinytree_cloud::ObjectId), usize>,
     index_artifact_readers: HashMap<(String, [u8; 32], tinytree_cloud::IndexArtifactId), usize>,
@@ -223,6 +245,84 @@ struct Runtime {
     staging_bytes: u64,
     staging_uploads: usize,
     repository_reservations: HashMap<String, (u64, u64)>,
+    pin_reservations: Vec<cloud::resident::Reservation>,
+}
+
+impl Runtime {
+    // Hash buckets and owned repository keys survive reader removal. Reserve a
+    // conservative capacity high-water before insertion, never refund on remove.
+    fn reserve_pins(&mut self, inner: &Inner, slot: usize, additional: usize) -> Result<()> {
+        let mut additions = [0; 4];
+        *additions
+            .get_mut(slot)
+            .ok_or(Error::Invalid("cloud pin table"))? = additional;
+        self.reserve_pin_growth(inner, additions)
+    }
+    fn reserve_pin_growth(&mut self, inner: &Inner, additions: [usize; 4]) -> Result<()> {
+        if inner.config.cloud.resident.is_none() {
+            return Ok(());
+        }
+        let lengths = [
+            self.readers.len(),
+            self.cloud_readers.len(),
+            self.index_artifact_readers.len(),
+            self.cloud_version_readers.len(),
+        ];
+        let mut next = self.pin_highwater;
+        let mut growth = 0usize;
+        for slot in 0..4 {
+            let wanted = lengths[slot]
+                .checked_add(additions[slot])
+                .ok_or(Error::Limit("cloud resident memory"))?;
+            next[slot] = next[slot].max(wanted);
+            growth = growth
+                .checked_add(next[slot] - self.pin_highwater[slot])
+                .ok_or(Error::Limit("cloud resident memory"))?;
+        }
+        if growth == 0 {
+            return Ok(());
+        }
+        let charge = cloud::resident::Charge {
+            bytes: (growth as u64)
+                .checked_mul(4096)
+                .ok_or(Error::Limit("cloud resident memory"))?,
+            entries: (growth as u64)
+                .checked_mul(4)
+                .ok_or(Error::Limit("cloud resident memory"))?,
+        };
+        // All slots are admitted atomically. Callers perform semantic and
+        // overflow checks first, then immediately insert only missing keys.
+        let reservation = inner.resident.reserve(charge)?;
+        self.pin_reservations.push(reservation);
+        self.pin_highwater = next;
+        Ok(())
+    }
+}
+
+// The physical gate precedes the arena in drop order. Models created after
+// admission drop first; returned leases explicitly retain the shared arena.
+struct RuntimeGuard<'a> {
+    guard: MutexGuard<'a, Runtime>,
+    _arena: Option<Arc<cloud::resident::Reservation>>,
+}
+impl std::ops::Deref for RuntimeGuard<'_> {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        &self.guard
+    }
+}
+impl std::ops::DerefMut for RuntimeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Runtime {
+        &mut self.guard
+    }
+}
+impl Drop for RuntimeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(arena) = &self._arena {
+            arena.discard_pending();
+        }
+        self.guard.resident_arena = Weak::new();
+    }
 }
 
 // Metadata records deliberately use a separate representation from canonical
@@ -377,6 +477,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-8") => Ok(8),
         Some(b"tinytree-store-9") => Ok(9),
         Some(b"tinytree-store-10") => Ok(10),
+        Some(b"tinytree-store-11") => Ok(11),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -397,6 +498,7 @@ fn advance_feature(
             8 => b"tinytree-store-8".as_slice(),
             9 => b"tinytree-store-9".as_slice(),
             10 => b"tinytree-store-10".as_slice(),
+            11 => b"tinytree-store-11".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);
@@ -605,8 +707,15 @@ impl Store {
             }
             sync_dir(&root)?;
         }
+        let resident_catalog = if !planned.fresh && config.cloud.resident.is_some() {
+            cloud::resident::preflight(&root, &config)?
+        } else {
+            cloud::resident::Catalog::default()
+        };
+        let resident = cloud::resident::Budget::new(config.cloud.resident, resident_catalog);
         let db = SingleWriterTxDatabase::builder(root.join("metadata"))
             .manual_journal_persist(true)
+            .recovery_allocation_limits(cloud::resident::recovery_limits(&config))
             .open()?;
         if !planned.fresh {
             for space in ["meta", "repos", "objects", "refs", "receipts", "staging"] {
@@ -688,12 +797,20 @@ impl Store {
                 db,
                 spaces,
                 gate: Mutex::new(Runtime::default()),
+                resident,
                 uncertain_commit: AtomicBool::new(false),
+                #[cfg(test)]
+                variant_put_pause: Mutex::new(None),
+                #[cfg(test)]
+                commit_batch_pause: Mutex::new(None),
+                #[cfg(test)]
+                cloud_version_read_pause: Mutex::new(None),
                 packed_read_bytes: Arc::new(AtomicU64::new(0)),
                 _owner: owner,
             }),
         };
         if !planned.fresh {
+            let _arena = store.inner.resident.arena()?;
             store.inner.validate_retention_on_reopen()?;
             store.inner.validate_packs_on_reopen()?;
             store.inner.validate_cloud_on_reopen()?;
@@ -848,12 +965,15 @@ impl Store {
             .inner
             .descriptor(repo, object)?
             .ok_or(Error::MissingObject(object))?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
         let readers = gate.readers.entry((repo.to_owned(), object)).or_default();
         *readers = readers.checked_add(1).ok_or(Error::Limit("reader roots"))?;
         Ok(RootReadGuard {
             descriptor,
             repo: repo.to_owned(),
             inner: Arc::clone(&self.inner),
+            _resident: resident_lease,
         })
     }
 
@@ -866,6 +986,8 @@ impl Store {
             .descriptor(repo, object)?
             .ok_or(Error::MissingObject(object))?;
         let file = self.inner.open_backing(repo, descriptor)?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
         *gate.readers.entry((repo.to_owned(), object)).or_default() += 1;
         drop(gate);
         let mut lease = ReadLease {
@@ -873,6 +995,7 @@ impl Store {
             descriptor,
             repo: repo.to_owned(),
             inner: Arc::clone(&self.inner),
+            _resident: resident_lease,
         };
         // Verify outside the gate; the lease prevents deletion while hashing.
         verify_stream(&mut lease.file, descriptor, self.inner.config.model_limits)?;
@@ -897,7 +1020,257 @@ impl Store {
         bytes: &[u8],
         now: i64,
     ) -> Result<WriteReceipt> {
+        if descriptor.key.kind != Kind::File {
+            let requested_expiry = now
+                .checked_add(self.inner.config.staging_ttl_seconds)
+                .ok_or(Error::Invalid("lease expiry"))?;
+            let reservation = self.inner.reserve(repo, descriptor)?;
+            // This byte-slice API can verify the complete submitted metadata
+            // without a temporary payload. A descriptor row alone is not a hit:
+            // read() verifies the indexed backing and pins it against GC.
+            tinytree_model::verify(&descriptor, bytes, self.inner.config.model_limits)?;
+            match self.read(repo, descriptor.key) {
+                Ok(lease) => {
+                    if lease.descriptor() != descriptor {
+                        return Err(Error::Corrupt("descriptor collision"));
+                    }
+                    let guard = self.inner.lock()?;
+                    self.inner.repository(repo)?;
+                    let receipt = self.record_installed_write(
+                        repo,
+                        descriptor,
+                        requested_expiry,
+                        now,
+                        &guard,
+                    )?;
+                    // Persist the ordinary staging/age transaction before
+                    // releasing the physical reader. No payload or namespace
+                    // changed, so its original durable install needs no resync.
+                    drop(guard);
+                    drop(lease);
+                    drop(reservation);
+                    return Ok(receipt);
+                }
+                // Preserve the streaming install/repair path for an absent
+                // object, including an indexed loose payload lost on disk.
+                Err(Error::MissingObject(_) | Error::Corrupt("indexed payload missing")) => {}
+                Err(error) => return Err(error),
+            }
+            drop(reservation);
+        }
         self.put_stream(repo, descriptor, &mut io::Cursor::new(bytes), now)
+    }
+
+    pub fn commit_batch_limits(&self) -> CommitBatchLimits {
+        CommitBatchLimits {
+            max_objects: COMMIT_BATCH_OBJECTS.min(self.inner.config.max_staging_uploads),
+            max_bytes: COMMIT_BATCH_BYTES.min(self.inner.config.max_staging_bytes),
+        }
+    }
+
+    /// Install one bounded, unique-key COMMIT chunk. Every payload is verified
+    /// and durably installed before one atomic index/staging publication. This
+    /// does not publish a reference or create remote retention authority.
+    pub fn put_commit_batch(
+        &self,
+        repo: &str,
+        objects: &[tinytree_model::EncodedObject],
+        now: i64,
+    ) -> Result<Vec<WriteReceipt>> {
+        let limits = self.commit_batch_limits();
+        if objects.is_empty() || objects.len() > limits.max_objects {
+            return Err(Error::Limit("commit batch object count"));
+        }
+        let requested_expiry = now
+            .checked_add(self.inner.config.staging_ttl_seconds)
+            .ok_or(Error::Invalid("lease expiry"))?;
+        let mut keys = HashSet::with_capacity(objects.len());
+        let mut total = 0u64;
+        for object in objects {
+            if object.descriptor.key.kind != Kind::Commit {
+                return Err(Error::Invalid("commit batch kind"));
+            }
+            if !keys.insert(object.descriptor.key) {
+                return Err(Error::Invalid("duplicate commit batch member"));
+            }
+            total = total
+                .checked_add(object.descriptor.size_bytes)
+                .ok_or(Error::Limit("commit batch bytes"))?;
+            if total > limits.max_bytes {
+                return Err(Error::Limit("commit batch bytes"));
+            }
+            tinytree_model::verify(
+                &object.descriptor,
+                &object.bytes,
+                self.inner.config.model_limits,
+            )?;
+        }
+        // All reservations are synchronous/fail-closed. No async wait can hold
+        // one member's capacity while waiting for another member's capacity.
+        let mut reservations = Vec::with_capacity(objects.len());
+        for object in objects {
+            reservations.push(self.inner.reserve(repo, object.descriptor)?);
+        }
+        let mut prepared = Vec::with_capacity(objects.len());
+        for object in objects {
+            let descriptor = object.descriptor;
+            let pin = match self.read(repo, descriptor.key) {
+                Ok(lease) => {
+                    if lease.descriptor() != descriptor {
+                        return Err(Error::Corrupt("descriptor collision"));
+                    }
+                    Some(self.commit_pin(lease)?)
+                }
+                Err(Error::MissingObject(_) | Error::Corrupt("indexed payload missing")) => None,
+                Err(error) => return Err(error),
+            };
+            let needs_directory_sync = pin.is_none();
+            let (temporary, pin) = if pin.is_some() {
+                (None, pin)
+            } else {
+                let mut temporary = NamedTempFile::new_in(self.inner.root.join("staging"))?;
+                temporary.write_all(&object.bytes)?;
+                verify_stream(
+                    temporary.as_file_mut(),
+                    descriptor,
+                    self.inner.config.model_limits,
+                )?;
+                temporary.as_file().sync_all()?;
+                let candidate = self
+                    .existing_candidate(repo, descriptor)?
+                    .map(|lease| self.commit_pin(lease))
+                    .transpose()?;
+                (Some(temporary), candidate)
+            };
+            prepared.push(PreparedCommit {
+                descriptor,
+                temporary,
+                pin,
+                needs_directory_sync,
+            });
+        }
+        #[cfg(test)]
+        {
+            let pause = self
+                .inner
+                .commit_batch_pause
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .clone();
+            if let Some((entered, resume)) = pause {
+                entered.wait();
+                resume.wait();
+            }
+        }
+        let guard = loop {
+            let mut guard = self.inner.lock()?;
+            self.inner.check_commit_batch_quota(repo, objects)?;
+            let mut collision = None;
+            for (index, member) in prepared.iter_mut().enumerate() {
+                if member.pin.is_some() {
+                    continue;
+                }
+                let temporary = member
+                    .temporary
+                    .take()
+                    .ok_or(Error::Corrupt("commit batch staging"))?;
+                let resident_lease = self.inner.resident.lease()?;
+                guard.reserve_pins(&self.inner, 0, 1)?;
+                match temporary.persist_noclobber(self.inner.path(repo, member.descriptor.key)) {
+                    Ok(file) => {
+                        // A later concurrent-duplicate check may release the
+                        // gate. Pin this verified new, not-yet-indexed payload
+                        // before doing so, including against pending GC unlink.
+                        *guard
+                            .readers
+                            .entry((repo.to_owned(), member.descriptor.key))
+                            .or_default() += 1;
+                        member.pin = Some(RootReadGuard {
+                            descriptor: member.descriptor,
+                            repo: repo.to_owned(),
+                            inner: self.inner.clone(),
+                            _resident: resident_lease,
+                        });
+                        drop(file);
+                    }
+                    Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                        member.temporary = Some(error.file);
+                        collision = Some(index);
+                        break;
+                    }
+                    Err(error) => return Err(error.error.into()),
+                }
+            }
+            if let Some(index) = collision {
+                drop(guard);
+                prepared[index].pin = self
+                    .existing_candidate(repo, prepared[index].descriptor)?
+                    .map(|lease| self.commit_pin(lease))
+                    .transpose()?;
+                continue;
+            }
+            break guard;
+        };
+        if prepared.iter().any(|member| member.needs_directory_sync) {
+            sync_dir(
+                &self
+                    .inner
+                    .root
+                    .join("repos")
+                    .join(repo)
+                    .join((Kind::Commit as u8).to_string()),
+            )?;
+        }
+        // The final gate excludes pack/GC changes. Recheck the actual current
+        // loose/packed location for every verified immutable member before ACK.
+        for object in objects {
+            self.inner.check_backing(repo, object.descriptor)?;
+        }
+        let mut tx = self
+            .inner
+            .db
+            .write_tx()
+            .durability(Some(PersistMode::SyncAll));
+        let mut receipts = Vec::with_capacity(objects.len());
+        for object in objects {
+            receipts.push(self.record_write_in_tx(
+                repo,
+                object.descriptor,
+                requested_expiry,
+                now,
+                &mut tx,
+            )?);
+        }
+        self.inner.commit(tx)?;
+        drop(guard); // Never drop physical reader/reservation owners under gate.
+        drop(prepared);
+        drop(reservations);
+        Ok(receipts)
+    }
+
+    // Verification has finished. Transfer GC custody without a pin gap, then
+    // release any charged packed reconstruction before reading the next member.
+    // Indexed immutable bytes may move between loose/packed backing, but cannot
+    // be collected while this same reader-root map entry is retained.
+    fn commit_pin(&self, lease: ReadLease) -> Result<RootReadGuard> {
+        let descriptor = lease.descriptor;
+        let mut gate = self.inner.lock()?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
+        let readers = gate
+            .readers
+            .entry((lease.repo.clone(), descriptor.key))
+            .or_default();
+        *readers = readers.checked_add(1).ok_or(Error::Limit("reader roots"))?;
+        let pin = RootReadGuard {
+            descriptor,
+            repo: lease.repo.clone(),
+            inner: self.inner.clone(),
+            _resident: resident_lease,
+        };
+        drop(gate);
+        drop(lease);
+        Ok(pin)
     }
 
     pub fn put_stream(
@@ -975,11 +1348,43 @@ impl Store {
             }
         };
         sync_dir(target.parent().ok_or(Error::Corrupt("object path"))?)?;
+        let receipt =
+            self.record_installed_write(repo, descriptor, requested_expiry, now, &_guard)?;
+        drop(_guard);
+        drop(candidate);
+        drop(reservation);
+        Ok(receipt)
+    }
+
+    // The caller holds the publication gate and has either durably installed
+    // the payload or retained a verified indexed ReadLease. Both paths must
+    // refresh staging and invalidate client-GC epochs with the same durable ACK.
+    fn record_installed_write(
+        &self,
+        repo: &str,
+        descriptor: Descriptor,
+        requested_expiry: i64,
+        now: i64,
+        _guard: &RuntimeGuard<'_>,
+    ) -> Result<WriteReceipt> {
         let mut tx = self
             .inner
             .db
             .write_tx()
             .durability(Some(PersistMode::SyncAll));
+        let receipt = self.record_write_in_tx(repo, descriptor, requested_expiry, now, &mut tx)?;
+        self.inner.commit(tx)?;
+        Ok(receipt)
+    }
+
+    fn record_write_in_tx(
+        &self,
+        repo: &str,
+        descriptor: Descriptor,
+        requested_expiry: i64,
+        now: i64,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ) -> Result<WriteReceipt> {
         let mut repository: RepositoryRecord = decode(
             &tx.get(&self.inner.spaces.repos, repo)?
                 .ok_or(Error::UnknownRepository)?,
@@ -1021,7 +1426,7 @@ impl Store {
             }
         }
         self.inner
-            .touch_client_object(&mut tx, repo, descriptor.key, now)?;
+            .touch_client_object(tx, repo, descriptor.key, now)?;
         let staging_lease = lease_id(descriptor.key);
         let stage_key = key(repo, staging_lease.as_bytes());
         let expires_at = match tx.get(&self.inner.spaces.staging, &stage_key)? {
@@ -1042,10 +1447,6 @@ impl Store {
                 expires_at,
             })?,
         );
-        self.inner.commit(tx)?;
-        drop(_guard);
-        drop(candidate);
-        drop(reservation);
         Ok(WriteReceipt {
             descriptor,
             staging_lease,
@@ -1059,6 +1460,8 @@ impl Store {
         let path = self.inner.path(repo, descriptor.key);
         if self.inner.is_packed(repo, descriptor.key)? {
             let file = self.inner.open_backing(repo, descriptor)?;
+            let resident_lease = self.inner.resident.lease()?;
+            gate.reserve_pins(&self.inner, 0, 1)?;
             *gate
                 .readers
                 .entry((repo.to_owned(), descriptor.key))
@@ -1069,6 +1472,7 @@ impl Store {
                 descriptor,
                 repo: repo.to_owned(),
                 inner: self.inner.clone(),
+                _resident: resident_lease,
             };
             verify_stream(&mut lease.file, descriptor, self.inner.config.model_limits)?;
             return Ok(Some(lease));
@@ -1082,6 +1486,8 @@ impl Store {
             return Err(Error::Corrupt("existing object payload"));
         }
         let file = pack::Backing::Loose(File::open(path)?);
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
         *gate
             .readers
             .entry((repo.to_owned(), descriptor.key))
@@ -1092,6 +1498,7 @@ impl Store {
             descriptor,
             repo: repo.to_owned(),
             inner: Arc::clone(&self.inner),
+            _resident: resident_lease,
         };
         verify_stream(&mut lease.file, descriptor, self.inner.config.model_limits)?;
         lease.file.sync_all()?;
@@ -1398,20 +1805,35 @@ impl Store {
 }
 
 impl Inner {
-    fn lock(&self) -> Result<MutexGuard<'_, Runtime>> {
-        let guard = self.gate.lock().map_err(|_| Error::Poisoned)?;
+    fn lock(&self) -> Result<RuntimeGuard<'_>> {
+        let mut guard = self.gate.lock().map_err(|_| Error::Poisoned)?;
         if self.uncertain_commit.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
-        Ok(guard)
+        let arena = self.resident.arena()?;
+        guard.resident_arena = arena.as_ref().map(Arc::downgrade).unwrap_or_default();
+        Ok(RuntimeGuard {
+            guard,
+            _arena: arena,
+        })
     }
     fn commit(&self, tx: fjall::SingleWriterWriteTx<'_>) -> Result<()> {
         // A failed journal sync may already be visible in memory. Never turn
         // that uncertain write into a successful replay ACK in this process.
         // Reopening lets Fjall recover the durable atomic journal outcome.
-        tx.commit().map_err(|error| {
+        tx.commit().map_err(|error| match error {
+            // This exact variant is guaranteed to precede WAL Start, buffer
+            // mutation and memtable application. It is a refusal, not an
+            // uncertain durable outcome; all other failures retain poisoning.
+            fjall::Error::RecoveryAllocationLimit => Error::Limit("store recovery allocation"),
+            error => {
+                self.uncertain_commit.store(true, Ordering::Release);
+                Error::Database(error)
+            }
+        })?;
+        self.resident.committed().map_err(|error| {
             self.uncertain_commit.store(true, Ordering::Release);
-            Error::Database(error)
+            error
         })
     }
     fn repository(&self, repo: &str) -> Result<RepositoryRecord> {
@@ -1448,6 +1870,49 @@ impl Inner {
     fn require_descriptor(&self, repo: &str, expected: Descriptor) -> Result<()> {
         if self.descriptor(repo, expected.key)? != Some(expected) {
             return Err(Error::Corrupt("root descriptor missing or changed"));
+        }
+        Ok(())
+    }
+    // Caller owns the publication gate. Recheck the complete unique chunk:
+    // GC may have removed objects that were duplicates at reservation time.
+    fn check_commit_batch_quota(
+        &self,
+        repo: &str,
+        objects: &[tinytree_model::EncodedObject],
+    ) -> Result<()> {
+        let record = self.repository(repo)?;
+        let cloud = self.cloud_usage(repo)?;
+        let view = self.db.read_tx();
+        let mut bytes = record
+            .bytes
+            .checked_add(cloud.0)
+            .ok_or(Error::Limit("repository quota"))?;
+        let mut count = record
+            .objects
+            .checked_add(cloud.1)
+            .ok_or(Error::Limit("repository quota"))?;
+        for object in objects {
+            let descriptor = object.descriptor;
+            match view.get(&self.spaces.objects, object_key(repo, descriptor.key))? {
+                Some(value) => {
+                    if decode::<StoredDescriptor>(&value)?.descriptor()? != descriptor {
+                        return Err(Error::Corrupt("descriptor collision"));
+                    }
+                }
+                None => {
+                    bytes = bytes
+                        .checked_add(descriptor.size_bytes)
+                        .ok_or(Error::Limit("repository quota"))?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or(Error::Limit("repository quota"))?;
+                }
+            }
+        }
+        if bytes > self.config.max_repository_bytes
+            || count > self.config.max_objects_per_repository
+        {
+            return Err(Error::Limit("repository quota"));
         }
         Ok(())
     }
@@ -1671,6 +2136,7 @@ pub struct RootReadGuard {
     descriptor: Descriptor,
     repo: String,
     inner: Arc<Inner>,
+    _resident: Option<Arc<cloud::resident::Reservation>>,
 }
 impl RootReadGuard {
     pub fn descriptor(&self) -> Descriptor {
@@ -1683,11 +2149,19 @@ impl Drop for RootReadGuard {
     }
 }
 
+struct PreparedCommit {
+    descriptor: Descriptor,
+    temporary: Option<NamedTempFile>,
+    pin: Option<RootReadGuard>,
+    needs_directory_sync: bool,
+}
+
 pub struct ReadLease {
     file: pack::Backing,
     descriptor: Descriptor,
     repo: String,
     inner: Arc<Inner>,
+    _resident: Option<Arc<cloud::resident::Reservation>>,
 }
 impl ReadLease {
     pub fn descriptor(&self) -> Descriptor {

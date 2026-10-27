@@ -436,6 +436,12 @@ fn scope(v: p::QueryScopeReply) -> Result<QueryScope, Status> {
 }
 #[async_trait::async_trait]
 impl NativeQueryIo for BrokerQueryClient {
+    async fn blame_capabilities(&self, owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> {
+        let result = self.execute(owner, |mut client, deadline, store_id, cap| async move {
+            Ok(client.blame_capabilities(request(p::DescribeProviderRequest { store_id }, deadline, cap)?).await?.into_inner())
+        }).await?;
+        Ok(QueryReply { value: BlameCapabilities::checked(result.value)?, owner: result.owner })
+    }
     fn resources(&self) -> QueryResources {
         QueryResources {
             memory_bytes: self.inner.config.query_memory() as u64,
@@ -1022,6 +1028,91 @@ impl NativeQueryIo for BrokerQueryClient {
             owner: r.owner,
         })
     }
+    async fn annotation_capabilities(
+        &self,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<BlameCapabilities>, Status> {
+        let result = self
+            .execute(owner, |mut client, deadline, store_id, cap| async move {
+                Ok(client
+                    .annotation_capabilities(request(
+                        p::DescribeProviderRequest { store_id },
+                        deadline,
+                        cap,
+                    )?)
+                    .await?
+                    .into_inner())
+            })
+            .await?;
+        Ok(QueryReply {
+            value: BlameCapabilities::annotation_checked(result.value)?,
+            owner: result.owner,
+        })
+    }
+    async fn open_annotation_frontier(&self,input:OpenAnnotationFrontier,owner:QueryOwner)->Result<QueryReply<q::AnnotationFrontier>,Status>{
+        if input.limits.is_some(){self.open_limited_annotation_frontier(input,owner).await}
+        else{self.annotation_frontier_call(input,owner,false).await}
+    }
+    async fn open_limited_annotation_frontier(&self,input:OpenAnnotationFrontier,owner:QueryOwner)->Result<QueryReply<q::AnnotationFrontier>,Status>{
+        if input.limits.is_none(){return Err(Status::invalid_argument("limited frontier requires caps"));}
+        self.annotation_frontier_call(input,owner,true).await
+    }
+    async fn read_annotation_input(
+        &self,
+        input: ReadAnnotationInput,
+        owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationInput>, Status> {
+        input.validate(self.inner.config.max_query_bytes)?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let input = input.clone();
+                async move {
+                    let payload = p::QueryReadAnnotationRequest {
+                        store_id,
+                        scope: input.scope.to_vec(),
+                        context: input.context.to_vec(),
+                        revision: input.revision.0.to_vec(),
+                        expected: Some(input.expected),
+                    };
+                    Ok(client
+                        .read_annotation_input(request(payload, deadline, cap)?)
+                        .await?
+                        .into_inner())
+                }
+            })
+            .await?;
+        expected.check(&result.value, self.inner.config.model_limits())?;
+        Ok(result)
+    }
+    async fn close_annotation_frontier(
+        &self,
+        scope: [u8; 32],
+        owner: QueryOwner,
+    ) -> Result<QueryReply<()>, Status> {
+        let result = self
+            .execute(
+                owner,
+                move |mut client, deadline, store_id, cap| async move {
+                    Ok(client
+                        .close_annotation_frontier(request(
+                            p::QueryCloseRequest {
+                                store_id,
+                                handle: scope.to_vec(),
+                            },
+                            deadline,
+                            cap,
+                        )?)
+                        .await?
+                        .into_inner())
+                },
+            )
+            .await?;
+        Ok(QueryReply {
+            value: (),
+            owner: result.owner,
+        })
+    }
     async fn path_history(
         &self,
         input: ScopedPathQuery,
@@ -1149,5 +1240,32 @@ impl NativeQueryIo for BrokerQueryClient {
         })
         .await
         .map(|_| ())
+    }
+}
+
+impl BrokerQueryClient {
+    async fn annotation_frontier_call(&self,input:OpenAnnotationFrontier,owner:QueryOwner,limited:bool)->Result<QueryReply<q::AnnotationFrontier>,Status>{
+        input.validate(self.inner.config.max_query_bytes)?;
+        let expected = input.clone();
+        let result = self
+            .execute(owner, move |mut client, deadline, store_id, cap| {
+                let input = input.clone();
+                async move {
+                    let payload = p::QueryOpenAnnotationRequest {
+                        store_id,
+                        scope: input.scope.to_vec(),
+                        anchors: input.anchors.iter().map(|id| id.0.to_vec()).collect(),
+                        path: input.path,
+                        max_commits: input.max_commits,
+                        limits: input.limits,
+                    };
+                    let request=request(payload,deadline,cap)?;
+                    Ok(if limited {client.open_limited_annotation_frontier(request).await?}
+                        else {client.open_annotation_frontier(request).await?}.into_inner())
+                }
+            })
+            .await?;
+        expected.check(&result.value, self.inner.config.max_query_bytes)?;
+        Ok(result)
     }
 }

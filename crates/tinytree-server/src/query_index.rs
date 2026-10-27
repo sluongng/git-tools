@@ -147,10 +147,12 @@ impl Default for QueryConfig {
             max_scopes: 128,
             max_scopes_per_principal: 16,
             max_scopes_per_repository: 64,
-            max_scope_memory_bytes: 8 * 1024 * 1024,
-            max_scope_replays: 1024,
-            max_scope_replays_per_principal: 256,
-            max_scope_replays_per_repository: 512,
+            max_scope_memory_bytes: 64 * 1024 * 1024,
+            // Closed scopes retain replay bindings until expiry. Budget their
+            // short-lived command history separately from concurrent scopes.
+            max_scope_replays: 16_384,
+            max_scope_replays_per_principal: 4096,
+            max_scope_replays_per_repository: 8192,
             scope_ttl_seconds: 300,
             expiry_interval_ms: 1000,
             max_roots: 64,
@@ -227,6 +229,15 @@ impl QueryConfig {
     }
     // Only path history/blame reserve these additional buffers. Charging every
     // graph/close request would reduce existing progress while a response is held.
+    pub(crate) fn path_memory(&self) -> usize {
+        // Two decoded commits, one TREE decode/raw buffer and bounded path
+        // scratch. No FILE body or persistent per-commit cache is allocated.
+        self.max_history_object_bytes
+            .max(self.max_commit_bytes)
+            .saturating_mul(32)
+            .saturating_add(self.max_request_bytes.saturating_mul(2))
+            .saturating_add(32 * 1024)
+    }
     pub(crate) fn history_memory(&self) -> usize {
         self.max_history_object_bytes
             .max(self.max_commit_bytes)
@@ -438,6 +449,7 @@ struct FrozenGraphOwner {
 }
 pub(crate) struct Scoped {
     pub scope: Arc<Scope>,
+    pub annotation: Mutex<Option<crate::query_history::annotation::Context>>,
     cloud: Option<Arc<CloudScopeRetention>>,
     graph: Option<Arc<OverlayGraph>>,
     pub wire: q::QueryScope,
@@ -625,6 +637,33 @@ impl Work {
     }
 }
 impl QueryHost {
+    /// Additional DAG source/merge residency, acquired without waiting while
+    /// the accepted query owns its ordinary history reservation. Refusal leaves
+    /// the linear policy's admission cost and physical ownership unchanged.
+    pub(crate) fn admit_dag_history(&self) -> Result<OwnedSemaphorePermit, Status> {
+        let work_bytes = usize::try_from(self.config.max_work_bytes).unwrap_or(usize::MAX);
+        let bytes = self
+            .config
+            .max_history_read_bytes
+            .saturating_mul(4)
+            .saturating_add(work_bytes.saturating_mul(2));
+        let total = self
+            .request_memory
+            .saturating_add(self.config.history_memory())
+            .saturating_add(bytes);
+        if total > self.config.max_request_memory_bytes {
+            return Err(Status::resource_exhausted(
+                "DAG history memory exceeds configured pool",
+            ));
+        }
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| Status::resource_exhausted("DAG history memory exceeds permit range"))?;
+        self.memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("DAG history memory is busy"))
+    }
+
     pub fn new(
         index: Arc<Index>,
         store: tinytree_store::Store,
@@ -1434,6 +1473,7 @@ impl QueryHost {
 
             (
                 Arc::new(Scoped {
+                    annotation: Mutex::new(None),
                     cloud,
                     scope,
                     graph: Some(graph),
@@ -1598,6 +1638,7 @@ impl QueryHost {
             query_identity_version: header.version,
         };
         let scope = Arc::new(Scoped {
+            annotation: Mutex::new(None),
             cloud: prepared.base.cloud.clone(),
             scope: prepared.base.scope.clone(),
             graph: Some(graph),

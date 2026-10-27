@@ -17,6 +17,12 @@ pub(crate) enum Source {
     },
 }
 impl Source {
+    /// Exact roots of this captured observation/retained source. These are only
+    /// boundary candidates; the opened scope/frontier still validates authority.
+    pub(crate) fn anchors(&self) -> &[CommitId] {
+        match self { Self::Cloud(source) => &source.expected_anchors, Self::Live { roots, .. } => roots }
+    }
+
     pub(crate) fn resolve(
         index: &dyn ReadonlyIndex,
         working_copy: &Path,

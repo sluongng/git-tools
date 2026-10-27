@@ -12,6 +12,73 @@ use std::{
 use tinytree_client::{CloudRawDigest, RetainedVersionSelector, VerifiedRetainedVersion};
 use tinytree_model as m;
 
+pub(crate) fn retained_native_roots(
+    config: &crate::Config,
+    selector: RetainedVersionSelector,
+    bytes: &[u8],
+) -> Result<Vec<m::ObjectKey>> {
+    let mut limits = tinytree_cloud::ManifestV2Limits::default();
+    limits.recovery.max_manifest_bytes = config.remote.cloud.max_manifest_bytes;
+    limits.recovery.max_decode_bytes = config
+        .closure
+        .max_metadata_bytes
+        .checked_mul(8)
+        .context("cloud manifest decode budget overflow")?;
+    limits.recovery.max_native_roots = config.max_admitted_roots;
+
+    ensure!(
+        bytes.len() >= 10 && &bytes[..8] == b"TTCLOUD\0",
+        "unrecognized canonical cloud manifest"
+    );
+    let roots = match u16::from_le_bytes(bytes[8..10].try_into().unwrap()) {
+        1 => {
+            let value = tinytree_cloud::decode_manifest(
+                bytes,
+                tinytree_cloud::ManifestId(selector.manifest_id.0),
+                limits.recovery,
+            )?;
+            ensure!(
+                tinytree_cloud::encode_manifest(&value, limits.recovery)? == bytes,
+                "cloud manifest is not canonical"
+            );
+            value.native_roots
+        }
+        2 => {
+            let value = tinytree_cloud::decode_manifest_v2(
+                bytes,
+                tinytree_cloud::ManifestId(selector.manifest_id.0),
+                limits,
+            )?;
+            ensure!(
+                tinytree_cloud::encode_manifest_v2(&value, limits)? == bytes,
+                "cloud manifest is not canonical"
+            );
+            value.recovery.native_roots
+        }
+        3 => {
+            let mut captured = tinytree_cloud::ManifestV3Limits {
+                history: limits,
+                ..Default::default()
+            };
+            captured.capture.max_bytes = config.remote.cloud.max_capture_bytes;
+            let value = tinytree_cloud::decode_manifest_v3(
+                bytes,
+                tinytree_cloud::ManifestId(selector.manifest_id.0),
+                captured,
+            )?;
+            ensure!(
+                tinytree_cloud::encode_manifest_v3(&value, captured)? == bytes,
+                "cloud manifest is not canonical"
+            );
+            // Declared capture policy does not prove a live
+            // mount, restore completeness or index installation.
+            value.history.recovery.native_roots
+        }
+        _ => anyhow::bail!("unsupported canonical cloud manifest version"),
+    };
+    Ok(roots)
+}
+
 /// Receipt of canonical manifest-root admission only. It does not prove radix
 /// coverage, import an index, publish a mount or grant snapshot query authority.
 pub struct AdmittedCloudVersion {
@@ -74,68 +141,7 @@ impl RemoteRepositoryControl {
                 let inner = job.inner.clone();
                 let held = proof.clone();
                 let authority = io::blocking_owned(job.clone(), move || {
-                    let mut limits = tinytree_cloud::ManifestV2Limits::default();
-                    limits.recovery.max_manifest_bytes =
-                        inner.config.remote.cloud.max_manifest_bytes;
-                    limits.recovery.max_decode_bytes = inner
-                        .config
-                        .closure
-                        .max_metadata_bytes
-                        .checked_mul(8)
-                        .context("cloud manifest decode budget overflow")?;
-                    limits.recovery.max_native_roots = inner.config.max_admitted_roots;
-                    let bytes = held.manifest();
-                    ensure!(
-                        bytes.len() >= 10 && &bytes[..8] == b"TTCLOUD\0",
-                        "unrecognized canonical cloud manifest"
-                    );
-                    let roots = match u16::from_le_bytes(bytes[8..10].try_into().unwrap()) {
-                        1 => {
-                            let value = tinytree_cloud::decode_manifest(
-                                bytes,
-                                tinytree_cloud::ManifestId(selector.manifest_id.0),
-                                limits.recovery,
-                            )?;
-                            ensure!(
-                                tinytree_cloud::encode_manifest(&value, limits.recovery)? == bytes,
-                                "cloud manifest is not canonical"
-                            );
-                            value.native_roots
-                        }
-                        2 => {
-                            let value = tinytree_cloud::decode_manifest_v2(
-                                bytes,
-                                tinytree_cloud::ManifestId(selector.manifest_id.0),
-                                limits,
-                            )?;
-                            ensure!(
-                                tinytree_cloud::encode_manifest_v2(&value, limits)? == bytes,
-                                "cloud manifest is not canonical"
-                            );
-                            value.recovery.native_roots
-                        }
-                        3 => {
-                            let mut captured = tinytree_cloud::ManifestV3Limits {
-                                history: limits,
-                                ..Default::default()
-                            };
-                            captured.capture.max_bytes =
-                                inner.config.remote.cloud.max_capture_bytes;
-                            let value = tinytree_cloud::decode_manifest_v3(
-                                bytes,
-                                tinytree_cloud::ManifestId(selector.manifest_id.0),
-                                captured,
-                            )?;
-                            ensure!(
-                                tinytree_cloud::encode_manifest_v3(&value, captured)? == bytes,
-                                "cloud manifest is not canonical"
-                            );
-                            // Declared capture policy does not prove a live
-                            // mount, restore completeness or index installation.
-                            value.history.recovery.native_roots
-                        }
-                        _ => anyhow::bail!("unsupported canonical cloud manifest version"),
-                    };
+                    let roots = retained_native_roots(&inner.config, selector, held.manifest())?;
                     inner.ledger.install_cloud_authority(&held, &roots)
                 })
                 .await?;
@@ -227,6 +233,11 @@ impl RemoteObjectIo {
         parents: &HashMap<m::ObjectKey, m::ObjectKey>,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<tinytree_client::VerifiedMetadata> {
+        let ledger = self.inner.ledger.clone();
+        let selected = authority.clone();
+        let read =
+            io::blocking_owned(owner.clone(), move || ledger.retain_cloud_read(&selected)).await?;
+        let owner: Arc<dyn Any + Send + Sync> = Arc::new((owner, read));
         let (terminal, path) = self
             .cloud_proof(authority, requested, parents, owner.clone())
             .await?;
@@ -277,6 +288,11 @@ impl RemoteObjectIo {
         id: m::FileId,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> Result<tinytree_client::VerifiedFile> {
+        let ledger = self.inner.ledger.clone();
+        let selected = authority.clone();
+        let read =
+            io::blocking_owned(owner.clone(), move || ledger.retain_cloud_read(&selected)).await?;
+        let owner: Arc<dyn Any + Send + Sync> = Arc::new((owner, read));
         let requested = m::ObjectKey {
             kind: m::Kind::File,
             id: m::ObjectId(id.0),

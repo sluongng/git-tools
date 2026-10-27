@@ -2,6 +2,7 @@
 use crate::{Config, hex, unhex};
 mod cloud;
 mod cloud_query;
+pub(crate) mod offload;
 mod query;
 use anyhow::{Context, Result, ensure};
 pub(crate) use cloud::CloudVersionAuthority;
@@ -137,6 +138,11 @@ pub(crate) struct Ledger {
     query_grants: fjall::SingleWriterTxKeyspace,
     cloud_authorities: fjall::SingleWriterTxKeyspace,
     cloud_queries: fjall::SingleWriterTxKeyspace,
+    offload_pins: fjall::SingleWriterTxKeyspace,
+    offload_owners:
+        Mutex<std::collections::HashMap<String, std::sync::Weak<offload::OffloadPinLease>>>,
+    cloud_read_owners:
+        Mutex<std::collections::HashMap<String, std::sync::Weak<offload::CloudReadLease>>>,
     poisoned: std::sync::atomic::AtomicBool,
     gate: Mutex<()>,
     config: Config,
@@ -151,6 +157,7 @@ const SPARSE_FORMAT: &[u8] = b"tinytree-native-admission-2\n";
 const QUERY_FORMAT: &[u8] = b"tinytree-native-admission-3\n";
 const FORMAT: &[u8] = b"tinytree-native-admission-4\n";
 const CLOUD_QUERY_FORMAT: &[u8] = b"tinytree-native-admission-5\n";
+const OFFLOAD_FORMAT: &[u8] = b"tinytree-native-admission-6\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -170,7 +177,8 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             );
             let marker = std::fs::read(path.join(MARKER))?;
             ensure!(
-                marker == FORMAT
+                marker == OFFLOAD_FORMAT
+                    || marker == FORMAT
                     || marker == CLOUD_QUERY_FORMAT
                     || marker == QUERY_FORMAT
                     || marker == SPARSE_FORMAT
@@ -233,7 +241,7 @@ impl Ledger {
             .read_tx()
             .get(&self.meta, b"format")?
             .context("native feature gate missing")?;
-        if format.as_ref() == CLOUD_QUERY_FORMAT {
+        if format.as_ref() == CLOUD_QUERY_FORMAT || format.as_ref() == OFFLOAD_FORMAT {
             return Ok(());
         }
         ensure!(
@@ -299,7 +307,7 @@ impl Ledger {
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("known-references-v2")
@@ -308,7 +316,7 @@ impl Ledger {
             );
         }
         if !fresh
-            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==CLOUD_QUERY_FORMAT||value==FORMAT||value==QUERY_FORMAT)
+            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==OFFLOAD_FORMAT||value==CLOUD_QUERY_FORMAT||value==FORMAT||value==QUERY_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("query-authorities-v3") && db.keyspace_exists("query-grants-v3"),
@@ -316,15 +324,28 @@ impl Ledger {
             );
         }
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == FORMAT || value == CLOUD_QUERY_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == FORMAT || value == CLOUD_QUERY_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("cloud-authorities-v4"),
                 "recognized cloud admission keyspace missing"
             );
         }
-        let has_cloud_queries =
-            db.read_tx().get(&meta, b"format")?.as_deref() == Some(CLOUD_QUERY_FORMAT);
+        let has_offload = db.read_tx().get(&meta, b"format")?.as_deref() == Some(OFFLOAD_FORMAT);
+        let has_cloud_queries = has_offload
+            || db.read_tx().get(&meta, b"format")?.as_deref() == Some(CLOUD_QUERY_FORMAT);
+        ensure!(
+            fresh || !has_offload || db.keyspace_exists("retained-offload-pins-v6"),
+            "recognized retained offload keyspace missing"
+        );
+        let offload_pins = db.keyspace(
+            "retained-offload-pins-v6",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
+        ensure!(
+            has_offload || db.read_tx().iter(&offload_pins).next().is_none(),
+            "retained offload feature gate missing"
+        );
         ensure!(
             fresh || !has_cloud_queries || db.keyspace_exists("cloud-query-authorities-v5"),
             "recognized cloud query keyspace missing"
@@ -360,7 +381,7 @@ impl Ledger {
         if !fresh {
             let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                matches!(stored_format.as_deref(), Some(value) if value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -438,10 +459,15 @@ impl Ledger {
             client != [0; 16],
             "invalid native admission ledger client identity"
         );
+        if has_offload {
+            offload::validate_saved_pins(&db, &offload_pins, &cloud_authorities, config)?;
+        }
         let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
         // The durable database feature gate precedes the marker replacement.
         // Old readers reject the database even after a crash between these writes.
-        let format = if has_cloud_queries {
+        let format = if has_offload {
+            OFFLOAD_FORMAT
+        } else if has_cloud_queries {
             CLOUD_QUERY_FORMAT
         } else {
             FORMAT
@@ -468,6 +494,9 @@ impl Ledger {
             query_grants,
             cloud_authorities,
             cloud_queries,
+            offload_pins,
+            offload_owners: Mutex::new(Default::default()),
+            cloud_read_owners: Mutex::new(Default::default()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             gate: Mutex::new(()),
             config: config.clone(),

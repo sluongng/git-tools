@@ -76,6 +76,16 @@ impl reapi::asset::fetch_server::Fetch for Backend {
         Err(Status::unimplemented("fixture directory reached"))
     }
 }
+fn trusted_daemon_fixture() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    // Fixture launchers may provide a writable TEST_TMPDIR ancestor. Match the
+    // daemon's trusted storage ancestry rather than relaxing its checks.
+    tempfile::Builder::new()
+        .prefix("workspace-daemon-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(std::path::Path::new("/tmp").canonicalize()?)
+}
+
 fn config(dir: PathBuf, port: u16, upstream: u16) -> Config {
     let mut config = Config::default();
     config.state_dir = dir;
@@ -147,7 +157,7 @@ async fn native_read(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_control_retains_registry_and_excludes_second_owner() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = trusted_daemon_fixture()?;
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let upstream_port = upstream.local_addr()?.port();
     let server = tokio::spawn(
@@ -421,7 +431,7 @@ async fn private_control_retains_registry_and_excludes_second_owner() -> Result<
 }
 #[tokio::test]
 async fn public_state_directory_is_rejected_before_binding() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+    let dir = trusted_daemon_fixture()?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
     let config = config(dir.path().to_path_buf(), 8378, 1);
@@ -434,13 +444,7 @@ async fn public_state_directory_is_rejected_before_binding() -> Result<()> {
 async fn offline_managed_daemon_preserves_seeded_native_objects_and_requires_command_fences()
 -> Result<()> {
     use jj_native_backend::NativeObjectIo as _;
-    use std::os::unix::fs::PermissionsExt;
-    // The tool launcher may use a writable TEST_TMPDIR ancestor. Native storage
-    // requires the same trusted ancestry as production, not a relaxed test rule.
-    let dir = tempfile::Builder::new()
-        .prefix("native-daemon-")
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in("/tmp")?;
+    let dir = trusted_daemon_fixture()?;
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
     let upstream_port = unavailable.local_addr()?.port();
     drop(unavailable);
@@ -697,7 +701,7 @@ async fn offline_managed_daemon_preserves_seeded_native_objects_and_requires_com
 fn cli_reuse_binds_effective_config_and_credentials_but_not_session_settings() -> Result<()> {
     use std::process::Command;
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_workspace"));
-    let dir = tempfile::tempdir()?;
+    let dir = trusted_daemon_fixture()?;
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
     let upstream = format!("grpc://{}", unavailable.local_addr()?);
     // Keep this listener alive without serving: no real backend or credentials.
@@ -969,7 +973,7 @@ async fn daemon_recovers_from_child_only_descriptor_exhaustion() -> Result<()> {
             false,
         ),
     ] {
-        let dir = tempfile::tempdir()?;
+        let dir = trusted_daemon_fixture()?;
         // The upstream is deliberately idle. Startup and accepting an idle local
         // HTTP/2 connection must not require backend traffic or credentials.
         let upstream = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1043,6 +1047,18 @@ async fn daemon_recovers_from_child_only_descriptor_exhaustion() -> Result<()> {
         .await
         .context("daemon startup timed out")??;
         assert_eq!(status["pid"], pid);
+        // Inspect only this owned child, not unrelated tests sharing our process.
+        // Linux truncates thread names to 15 bytes in task comm records.
+        for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+            let task = task?;
+            let name = match std::fs::read_to_string(task.path().join("comm")) {
+                Ok(name) => name,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            assert!(!name.trim_end().starts_with("source-cas-brid"),
+                "source CAS bridge must remain absent before the first legacy mount");
+        }
         let limits = &status["runtime"]["open_files"];
         assert_eq!(limits["requested_target"], target, "{name}");
         assert_eq!(limits["initial_soft"], CHILD_SOFT_LIMIT);
@@ -1565,7 +1581,7 @@ impl reapi::reapi::content_addressable_storage_server::ContentAddressableStorage
 async fn grpc_alias_config_publishes_git_mapping_to_cas() -> Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir()?;
+    let dir = trusted_daemon_fixture()?;
     let git = PathBuf::from(std::env::var_os("GIT_PROXY_TEST_GIT").expect("declared Git fixture"));
     async fn git_run(git: &std::path::Path, args: &[&str]) -> Result<String> {
         let output = tokio::process::Command::new(git)

@@ -704,6 +704,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         indexed: bool,
         captured: bool,
         query: bool,
+        offload: bool,
     }
     for Case {
         name,
@@ -711,6 +712,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         indexed,
         captured,
         query,
+        offload,
     } in [
         Case {
             name: "disabled services",
@@ -718,6 +720,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
             indexed: false,
             captured: false,
             query: false,
+            offload: true,
         },
         Case {
             name: "query and legacy cloud",
@@ -725,6 +728,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
             indexed: false,
             captured: false,
             query: true,
+            offload: true,
         },
         Case {
             name: "indexed cloud without captured restore",
@@ -732,6 +736,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
             indexed: true,
             captured: false,
             query: true,
+            offload: true,
         },
         Case {
             name: "captured indexed cloud",
@@ -739,12 +744,23 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
             indexed: true,
             captured: true,
             query: true,
+            offload: true,
+        },
+        Case {
+            name: "captured backing contract disabled by policy",
+            cloud: true,
+            indexed: true,
+            captured: true,
+            query: true,
+            offload: false,
         },
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut profile: tinytree_server::Config =
             toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        assert!(profile.service.cloud.durable_retained_offload, "supported owned backing contract is enabled by default");
         profile.service.cloud.enabled = cloud;
+        profile.service.cloud.durable_retained_offload = offload;
         profile.service.cloud.indexed_versions = indexed;
         profile.service.cloud.captured_versions = captured;
         profile.service.cloud.max_capture_bytes = 128 * 1024;
@@ -770,7 +786,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let mut client = server.client().await;
         let input = p::GetCapabilitiesRequest {
             repository_id: "alpha".into(),
-            features: vec![1, 2, 3, 4, 5],
+            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13],
         };
         assert_eq!(
             client
@@ -821,13 +837,17 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         .iter()
                         .map(|f| f.feature)
                         .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 4, 5]
+                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13]
                 );
                 for feature in &result.features {
                     assert_eq!(
                         feature.supported,
-                        if feature.feature <= 3 {
+                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11) {
                             query
+                        } else if feature.feature == 13 {
+                            cloud && indexed && captured && offload
+                        } else if feature.feature >= 9 {
+                            cloud
                         } else {
                             cloud && indexed && captured
                         }
@@ -835,9 +855,9 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                     assert_eq!(
                         feature.authorized,
                         match feature.feature {
-                            1..=3 => true,
-                            4 => cloud_read,
-                            5 => cloud_write,
+                            1..=3 | 8 | 11 => true,
+                            4 | 9 | 13 => cloud_read,
+                            5 | 10 => cloud_write,
                             _ => unreachable!(),
                         }
                     );
@@ -2691,14 +2711,15 @@ async fn query_scope_expiry_and_close_release_roots_without_future_requests() {
         ))
         .await
         .unwrap();
+    let history_full = client
+        .open_scope(request(tokio_stream::iter(query_frames(&[root], 4)), ALPHA))
+        .await
+        .unwrap_err();
+    assert_eq!(history_full.code(), Code::ResourceExhausted);
     assert_eq!(
-        client
-            .open_scope(request(tokio_stream::iter(query_frames(&[root], 4)), ALPHA))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::ResourceExhausted,
-        "closed replay bindings remain bounded until their absolute expiry"
+        history_full.message(),
+        "query scope replay history quota exceeded",
+        "closed replay bindings remain bounded until expiry, independently of active scope admission"
     );
     store.gc("alpha", i64::MAX - 1).unwrap();
     assert!(store.descriptor("alpha", root).unwrap().is_some());
@@ -6089,6 +6110,17 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .iter()
             .all(|range| range.origin == Some(query_id(root(&data))))
     );
+    let frozen_dag = query.blame(request(q::BlameRequest {
+        scope: scope.key.clone(),
+        revision: Some(query_id(frozen[1].descriptor.key)),
+        path: "BUILD.bazel".into(),
+        policy: q::HistoryPolicy::JjResolvedFixedPathV1 as i32,
+        max_commits: 0,
+    }, ALPHA)).await.unwrap().into_inner();
+    assert_eq!(frozen_dag.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(frozen_dag.target, frozen_blame.target);
+    assert_eq!(frozen_dag.target_bytes, frozen_blame.target_bytes);
+    assert_eq!(frozen_dag.ranges, frozen_blame.ranges);
     let frozen_history = query
         .path_history(request(
             q::PathHistoryRequest {
@@ -6111,6 +6143,49 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     assert_eq!(
         frozen_history.entries[0].commit,
         Some(query_id(root(&data)))
+    );
+    // Retained canonical metadata participates even when absent from the public index.
+    let mut input = ids_evaluation(&scope, 216, &[frozen[1].descriptor.key, root(&data)]);
+    input.expression = Some(q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+            q::ChangedPathExpr {
+                policy_version: 1,
+                candidates: input.expression.take().map(Box::new),
+                path: "BUILD.bazel".into(),
+                exact_file: false,
+            },
+        ))),
+    });
+    let changed = query
+        .query_facts(request(
+            q::QueryFactsRequest {
+                scope: scope.key.clone(),
+                facts: [frozen[1].descriptor.key, root(&data)]
+                    .into_iter()
+                    .map(|candidate| q::GraphFact {
+                        fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                            expression: input.expression.clone(),
+                            candidate: Some(query_id(candidate)),
+                        })),
+                    })
+                    .collect(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        changed
+            .answers
+            .iter()
+            .map(|a| a.answer.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(q::graph_fact_answer::Answer::Membership(false)),
+            Some(q::graph_fact_answer::Answer::Membership(true)),
+        ]
     );
     let selected_prefix = query
         .resolve_commit_prefix(request(
@@ -6498,6 +6573,85 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .into_inner(),
         captured_publication
     );
+    let latest_request = c::GetLatestCapturedVersionRequest {
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+    };
+    assert_eq!(
+        client
+            .get_latest_captured_version(latest_request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .get_latest_captured_version(request(latest_request.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let latest = client
+        .get_latest_captured_version(request(latest_request.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.generation, 3);
+    assert_eq!(latest.manifest, captured_manifest);
+    assert!(latest.native_authority.is_some());
+    // A delayed older capture advances publication CAS but is not latest backup.
+    let mut delayed_manifest = tinytree_cloud::decode_manifest_v3(
+        &captured_manifest,
+        tinytree_cloud::ManifestId::of(&captured_manifest),
+        Default::default(),
+    )
+    .unwrap();
+    delayed_manifest.history.recovery.sequence = 2;
+    let delayed_bytes =
+        tinytree_cloud::encode_manifest_v3(&delayed_manifest, Default::default()).unwrap();
+    let delayed = c::PublishVersionRequest {
+        expected_generation: 3,
+        idempotency_key: "delayed-older-capture".into(),
+        manifest_id: tinytree_cloud::ManifestId::of(&delayed_bytes).0.to_vec(),
+        manifest: delayed_bytes,
+        ..captured_request.clone()
+    };
+    assert_eq!(
+        client
+            .publish_version(request(delayed, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .unwrap()
+            .generation,
+        4
+    );
+    assert_eq!(
+        client
+            .get_workspace(request(
+                c::GetWorkspaceRequest {
+                    repository_id: "alpha".into(),
+                    workspace_id: manifest.workspace.to_vec()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .generation,
+        4
+    );
+    assert_eq!(
+        client
+            .get_latest_captured_version(request(latest_request.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        latest
+    );
     let mut changed_capture = captured_request.clone();
     changed_capture.capture_data[0] ^= 1;
     assert_eq!(
@@ -6567,6 +6721,15 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     let mut client = WorkspaceCloudClient::new(channel)
         .send_compressed(CompressionEncoding::Zstd)
         .accept_compressed(CompressionEncoding::Zstd);
+    assert_eq!(
+        client
+            .get_latest_captured_version(request(latest_request, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .generation,
+        3
+    );
     let mut capture_stream = client
         .read_capture(request(captured_read, ALPHA))
         .await
@@ -6653,6 +6816,7 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
         toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
     profile.service.cloud.max_object_bytes = 1024;
     profile.service.cloud.max_manifest_bytes = 1024;
+    profile.service.cloud.max_capture_bytes = 1024;
     profile.service.cloud.max_staging_leases = 1;
     let mut store_config = profile
         .store
@@ -6661,6 +6825,7 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
     let store = Store::open(directory.path(), store_config).unwrap();
     store.create_repository("alpha").unwrap();
     store.create_repository("beta").unwrap();
+    let capture_limit = profile.service.cloud.max_capture_bytes;
     let server = Running::start(store, profile.service).await;
     let channel = Endpoint::from_shared(format!("http://{}", server.address))
         .unwrap()
@@ -6706,25 +6871,29 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
     assert_eq!(error.code(), Code::ResourceExhausted);
     assert!(error.details().is_empty());
     assert!(!reapi::policy::retryable(&error));
-    let error = client
-        .publish_version(request(
+    use tinytree_proto::PublicationFailureReason as Reason;
+    for (name, manifest, capture_data, staging_leases, reason) in [
+        ("manifest-bytes", vec![0; 1025], vec![], vec![], Reason::ManifestBytes),
+        ("capture-bytes", vec![], vec![0; capture_limit + 1], vec![], Reason::CaptureBytes),
+        ("staging-lease-count", vec![], vec![], vec!["a".repeat(64); 2], Reason::StagingLeaseCount),
+    ] {
+        let error = client.publish_version(request(
             c::PublishVersionRequest {
                 repository_id: "alpha".into(),
                 workspace_id: vec![1; 32],
                 expected_generation: 0,
-                idempotency_key: "oversized-manifest".into(),
+                idempotency_key: name.into(),
                 manifest_id: vec![2; 32],
-                manifest: vec![0; 1025],
-                staging_leases: vec![],
-                capture_data: vec![],
-            },
-            ALPHA,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::ResourceExhausted);
-    assert!(error.details().is_empty());
-    assert!(!reapi::policy::retryable(&error));
+                manifest,
+                staging_leases,
+                capture_data,
+            }, ALPHA,
+        )).await.unwrap_err();
+        assert_eq!(error.code(), Code::ResourceExhausted, "{name}");
+        assert_eq!(Reason::from_message(error.message()), Some(reason), "{name}");
+        assert!(error.details().is_empty());
+        assert!(!reapi::policy::retryable(&error));
+    }
     assert_eq!(
         client
             .get_workspace(request(
@@ -6745,7 +6914,7 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
             .get_publication(request(
                 c::GetPublicationRequest {
                     repository_id: "alpha".into(),
-                    idempotency_key: "oversized-manifest".into()
+                    idempotency_key: "manifest-bytes".into()
                 },
                 ALPHA
             ))
@@ -6918,6 +7087,472 @@ fn expanded_origins(result: &q::BlameResult) -> Vec<Option<(Vec<u8>, u32)>> {
             })
         })
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let copied_file = |bytes: &[u8]| {
+        let mut value = history_file(&store, bytes, false);
+        if let tinytree_model::TreeValue::File { copy_id, .. } = &mut value { *copy_id = Some(tinytree_model::CopyId([7;32])); }
+        value
+    };
+    let base = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(copied_file(b"x\n")),
+        141,
+    )
+    .descriptor
+    .key;
+    let left = history_commit(
+        &store,
+        &index,
+        &[base],
+        Some(copied_file(b"a\nx\n")),
+        142,
+    )
+    .descriptor
+    .key;
+    let right = history_commit(
+        &store,
+        &index,
+        &[base],
+        Some(copied_file(b"x\na\n")),
+        143,
+    )
+    .descriptor
+    .key;
+    let merge = history_commit(
+        &store,
+        &index,
+        &[left, right],
+        Some(copied_file(b"a\nx\na\n")),
+        144,
+    )
+    .descriptor
+    .key;
+    let mut config = ServiceConfig::default();
+    config.query.max_history_read_bytes = 16 * 1024;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[merge], 171).await;
+    let open = q::OpenAnnotationFrontierRequest {
+            limits: None,
+        scope: scope.key.clone(),
+        version: 1,
+        anchors: vec![q::CommitId {
+            value: merge.id.0.to_vec(),
+        }],
+        path: "file".into(),
+        max_commits: 0,
+    };
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(open.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let frontier = client
+        .open_annotation_frontier(request(open.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        frontier.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(frontier.scanned_commits, 4);
+    assert_eq!(frontier.nodes.len(), 5);
+    let selected = frontier
+        .nodes
+        .iter()
+        .find(|n| n.revision.as_ref().unwrap().value == merge.id.0)
+        .unwrap();
+    assert_eq!(
+        selected.affects_path,
+        Some(false),
+        "the canonical anchor is not the annotation target and MUST NOT be forced"
+    );
+    assert_eq!(
+        selected
+            .parents
+            .iter()
+            .map(|p| p.value.clone())
+            .collect::<Vec<_>>(),
+        vec![left.id.0.to_vec(), right.id.0.to_vec()]
+    );
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(open.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        frontier
+    );
+    let mut different = open.clone();
+    different.path = "different".into();
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(different, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(selected.value.as_ref().unwrap().copy_id, vec![7;32]);
+    let input = q::ReadAnnotationInputRequest {
+        scope: scope.key.clone(),
+        context: frontier.context.clone(),
+        revision: selected.revision.clone(),
+        expected: selected.value.clone(),
+    };
+    let body = client
+        .read_annotation_input(request(input.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(body.data, b"a\nx\na\n");
+    assert_eq!(body.value, selected.value);
+    let mut forged = input.clone();
+    forged.expected.as_mut().unwrap().copy_id = vec![9; 32];
+    assert_eq!(
+        client
+            .read_annotation_input(request(forged, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut forged = input.clone();
+    forged.context[0] ^= 1;
+    assert_eq!(
+        client
+            .read_annotation_input(request(forged, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    // This consumes one context's cumulative metadata+FILE allowance. Repeated
+    // open/read calls cannot turn the original limit into a per-RPC allowance.
+    let mut exhausted = false;
+    for _ in 0..128 {
+        match client
+            .read_annotation_input(request(input.clone(), ALPHA))
+            .await
+        {
+            Ok(reply) => assert_eq!(reply.into_inner().data, b"a\nx\na\n"),
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                exhausted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        exhausted,
+        "the original cumulative read budget must eventually refuse demand reads"
+    );
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(open.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        frontier
+    );
+    assert_eq!(
+        client
+            .read_annotation_input(request(input.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    client
+        .close_annotation_frontier(request(
+            q::CloseAnnotationFrontierRequest {
+                scope: scope.key.clone(),
+                context: frontier.context.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(open.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        client
+            .read_annotation_input(request(input, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+
+    // A different command has a fresh captured scope, not a renewed old context.
+    let partial_scope = query_ready(&mut client, &[merge], 172).await;
+    let partial = client
+        .open_annotation_frontier(request(
+            q::OpenAnnotationFrontierRequest {
+            limits: None,
+                scope: partial_scope.key.clone(),
+                version: 1,
+                anchors: vec![q::CommitId {
+                    value: merge.id.0.to_vec(),
+                }],
+                path: "file".into(),
+                max_commits: 2,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        partial.coverage,
+        q::HistoryCoverage::HistoryScanLimit as i32
+    );
+    assert!(
+        partial.nodes.is_empty(),
+        "a truncated canonical union must not escape as a usable frontier"
+    );
+    assert_eq!(
+        client
+            .read_annotation_input(request(
+                q::ReadAnnotationInputRequest {
+                    scope: partial_scope.key.clone(),
+                    context: partial.context,
+                    revision: selected.revision.clone(),
+                    expected: selected.value.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+
+    // Multiple canonical anchors form one ancestry union. Root is extra to the
+    // non-root scan cap; no anchor becomes a forced annotation target.
+    let union_scope = query_ready(&mut client, &[merge], 174).await;
+    let mut anchors = vec![q::CommitId { value: left.id.0.to_vec() }, q::CommitId { value: right.id.0.to_vec() }];
+    anchors.sort_by(|a,b|a.value.cmp(&b.value));
+    let union = client.open_annotation_frontier(request(q::OpenAnnotationFrontierRequest {
+            limits: None,
+        scope: union_scope.key, version: 1, anchors, path: "file".into(), max_commits: 3,
+    }, ALPHA)).await.unwrap().into_inner();
+    assert_eq!(union.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(union.scanned_commits, 3);
+    assert_eq!(union.nodes.len(), 4);
+    assert!(union.nodes.iter().all(|n|n.revision.as_ref().unwrap().value != merge.id.0));
+
+    // A command can reserve a strict remote slice. Operator caps still win;
+    // exhausted context replay never resets the accepted reservation.
+    let lowered_scope = query_ready(&mut client, &[merge], 175).await;
+    let mut lowered = open.clone();
+    lowered.scope = lowered_scope.key.clone();
+    lowered.version = 2;
+    lowered.limits = Some(q::AnnotationLimits { work_nodes:1_000_000,work_edges:1_000_000,
+        work_bytes:16*1024*1024,frontier:8192,read_bytes:1,diff_input_bytes:16*1024*1024,
+        diff_lines:1_000_000,diff_work:4_000_000,diff_allocation_bytes:16*1024*1024,diff_depth:64 });
+    let mut unsupported_shape = lowered.clone();
+    unsupported_shape.version = 1;
+    assert_eq!(client.open_annotation_frontier(request(unsupported_shape, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    let mut unsupported_shape = lowered.clone();
+    unsupported_shape.limits = None;
+    assert_eq!(client.open_annotation_frontier(request(unsupported_shape, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    let exhausted = client.open_annotation_frontier(request(lowered.clone(), ALPHA)).await.unwrap().into_inner();
+    assert_eq!(exhausted.version,2);
+    assert_eq!(exhausted.coverage, q::HistoryCoverage::HistoryReadLimit as i32);
+    assert!(exhausted.nodes.is_empty());
+    assert_eq!(exhausted.limits.as_ref().unwrap().read_bytes,1);
+    assert!(exhausted.limits.as_ref().unwrap().diff_allocation_bytes<=8*1024*1024, "operator allocation cap cannot be widened");
+    assert_eq!(client.open_annotation_frontier(request(lowered.clone(), ALPHA)).await.unwrap().into_inner(),exhausted);
+    lowered.limits.as_mut().unwrap().read_bytes=1024;
+    assert_eq!(client.open_annotation_frontier(request(lowered, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+
+    // A fresh per-RPC deadline cannot extend the first open's absolute deadline.
+    let expiry_scope = query_ready(&mut client, &[merge], 173).await;
+    let expiry_input = q::OpenAnnotationFrontierRequest {
+            limits: None,
+        scope: expiry_scope.key.clone(),
+        version: 1,
+        anchors: vec![q::CommitId {
+            value: base.id.0.to_vec(),
+        }],
+        path: "file".into(),
+        max_commits: 0,
+    };
+    let mut short = request(expiry_input.clone(), ALPHA);
+    short.set_timeout(std::time::Duration::from_secs(2));
+    let expiry = client
+        .open_annotation_frontier(short)
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(expiry_input, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    let node = expiry
+        .nodes
+        .iter()
+        .find(|n| n.revision.as_ref().unwrap().value == base.id.0)
+        .unwrap();
+    assert_eq!(
+        client
+            .read_annotation_input(request(
+                q::ReadAnnotationInputRequest {
+                    scope: expiry_scope.key.clone(),
+                    context: expiry.context,
+                    revision: node.revision.clone(),
+                    expected: node.value.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dag_blame_uses_filtered_edges_merge_lines_and_aggregate_graph_bounds() {
+    struct Case {
+        name: &'static str,
+        commits: Vec<(Vec<usize>, Option<&'static [u8]>)>,
+        origins: Vec<(usize, u32)>,
+    }
+    let cases = [
+        Case {
+            name: "unchanged parent bypass and transitive edge removal",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"x\n")),
+                (vec![0], None), (vec![2], Some(b"x\n")), (vec![1, 3], Some(b"x\n"))],
+            origins: vec![(3, 0)],
+        },
+        Case {
+            name: "automerged intermediate is filtered out",
+            commits: vec![(vec![], Some(b"base\n")), (vec![0], Some(b"left\nbase\n")),
+                (vec![0], Some(b"base\nright\n")), (vec![1, 2], Some(b"left\nbase\nright\n")),
+                (vec![3], Some(b"left\nbase\nright\n"))],
+            origins: vec![(1, 0), (0, 0), (2, 1)],
+        },
+        Case {
+            name: "repeated lines cross an unchanged merge in one filtered graph",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"a\nx\n")),
+                (vec![0], Some(b"x\na\n")), (vec![1, 2], Some(b"a\nx\na\n")),
+                (vec![3], Some(b"x\na\n"))],
+            origins: vec![(0, 0), (1, 0)],
+        },
+        Case {
+            name: "unchanged layer does not force a repeated-line boundary head",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"a\nx\n")),
+                (vec![0], Some(b"x\na\n")), (vec![1, 2], Some(b"a\nx\na\n")),
+                (vec![3], Some(b"a\nx\na\n")), (vec![4], Some(b"x\na\n"))],
+            origins: vec![(0, 0), (1, 0)],
+        },
+        Case {
+            name: "filtered merge boundary cannot invent a locally introduced line",
+            commits: vec![(vec![], Some(b"x\nkeep\nend\n")),
+                (vec![0], Some(b"x\nkeep\nP\nend\n")),
+                (vec![0], Some(b"keep\nend\n")),
+                (vec![1, 2], Some(b"keep\nP\nend\n")),
+                (vec![3], Some(b"x\n"))],
+            origins: vec![(0, 0)],
+        },
+        Case {
+            name: "two selected occurrences converge on one ancestor line",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"x\nleft\n")),
+                (vec![0], Some(b"right\nx\n")), (vec![1, 2], Some(b"x\nleft\nright\nx\n"))],
+            origins: vec![(0, 0), (1, 1), (2, 0), (0, 0)],
+        },
+        Case {
+            name: "redundant direct parents retain first parent priority",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], None),
+                (vec![1], Some(b"x\n")), (vec![0, 2], Some(b"x\n"))],
+            origins: vec![(0, 0)],
+        },
+        Case {
+            name: "reversed direct parents retain canonical order",
+            commits: vec![(vec![], Some(b"x\n")), (vec![0], None),
+                (vec![1], Some(b"x\n")), (vec![2, 0], Some(b"x\n"))],
+            origins: vec![(2, 0)],
+        },
+        Case {
+            name: "recursive criss-cross common ancestors",
+            commits: vec![(vec![], Some(b"a\nstable\nb\n")),
+                (vec![0], Some(b"A\nstable\nb\n")), (vec![0], Some(b"a\nstable\nB\n")),
+                (vec![1, 2], Some(b"A\nstable\nB\n")), (vec![2, 1], Some(b"A\nstable\nB\n")),
+                (vec![3, 4], Some(b"A\nstable\nB\n")), (vec![5], Some(b"A\nstable\nB\n"))],
+            origins: vec![(1, 0), (0, 1), (2, 2)],
+        },
+        Case {
+            name: "ordered three-parent automatic file merge",
+            commits: vec![(vec![], Some(b"a\nanchor-a\nb\nanchor-b\nc\n")),
+                (vec![0], Some(b"A\nanchor-a\nb\nanchor-b\nc\n")),
+                (vec![0], Some(b"a\nanchor-a\nB\nanchor-b\nc\n")),
+                (vec![0], Some(b"a\nanchor-a\nb\nanchor-b\nC\n")),
+                (vec![1, 2, 3], Some(b"A\nanchor-a\nB\nanchor-b\nC\n")),
+                (vec![4], Some(b"A\nanchor-a\nB\nanchor-b\nC\n"))],
+            origins: vec![(1, 0), (0, 1), (2, 2), (0, 3), (3, 4)],
+        },
+    ];
+    let (temporary, store) = setup();
+    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let mut fixtures = Vec::new();
+    let mut change = 1;
+    for case in &cases {
+        let mut commits = Vec::new();
+        for (parents, body) in &case.commits {
+            let parents = parents.iter().map(|&i| commits[i]).collect::<Vec<_>>();
+            let value = body.map(|body| history_file(&store, body, false));
+            commits.push(history_commit(&store, &index, &parents, value, change).descriptor.key);
+            change += 1;
+        }
+        fixtures.push(commits);
+    }
+    let server = Running::start_query(store, ServiceConfig::default(), index).await;
+    let mut client = server.query_client().await;
+    for (case_index, (case, commits)) in cases.iter().zip(&fixtures).enumerate() {
+        let head = *commits.last().unwrap();
+        let scope = query_ready(&mut client, &[head], 180 + case_index as u8).await;
+        let mut input = blame_request(&scope, head, 0);
+        input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+        let result = client.blame(request(input.clone(), ALPHA)).await.unwrap().into_inner();
+        assert_eq!(result.coverage, q::HistoryCoverage::HistoryComplete as i32, "{}", case.name);
+        assert_eq!(result.scanned_commits, commits.len() as u32, "{}", case.name);
+        assert_eq!(expanded_origins(&result), case.origins.iter().map(|&(index, line)| Some((commits[index].id.0.to_vec(), line))).collect::<Vec<_>>(), "{}", case.name);
+        input.max_commits = 2;
+        let partial = client.blame(request(input, ALPHA)).await.unwrap().into_inner();
+        assert_eq!(partial.coverage, q::HistoryCoverage::HistoryScanLimit as i32, "{}", case.name);
+        assert_eq!(partial.scanned_commits, 2);
+        assert!(expanded_origins(&partial).iter().all(Option::is_none));
+        assert_eq!(partial.target_bytes, result.target_bytes);
+    }
+    drop(client);
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7137,6 +7772,178 @@ async fn path_history_and_blame_pin_revision_and_distinguish_partial_attribution
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_path_graph_filters_before_selected_edges_and_refuses_unsupported_work() {
+    let (temporary, store) = setup();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("path-derived"), &Default::default())
+            .unwrap();
+    let initial = history_file(&store, b"initial\n", false);
+    let modified = history_file(&store, b"modified\n", false);
+    let executable = history_file(&store, b"modified\n", true);
+    let a = history_commit(&store, &index, &[], Some(initial.clone()), 71)
+        .descriptor
+        .key;
+    let b = history_commit(&store, &index, &[a], Some(initial), 72)
+        .descriptor
+        .key;
+    let c = history_commit(&store, &index, &[b], Some(modified.clone()), 73)
+        .descriptor
+        .key;
+    let d = history_commit(&store, &index, &[c], Some(executable), 74)
+        .descriptor
+        .key;
+    let e = history_commit(&store, &index, &[d], None, 75)
+        .descriptor
+        .key;
+    let f = history_commit(&store, &index, &[e], None, 76)
+        .descriptor
+        .key;
+    let g = history_commit(&store, &index, &[f], Some(modified.clone()), 77)
+        .descriptor
+        .key;
+    let merge = history_commit(&store, &index, &[g, c], Some(modified), 78)
+        .descriptor
+        .key;
+    let Object::Commit(mut large) = tinytree_model::decode(
+        &history_commit(&store, &index, &[merge], None, 79).bytes,
+        Limits::default(),
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    large.description = "large canonical metadata ".repeat(100);
+    let large = tinytree_model::encode(&Object::Commit(large), Limits::default()).unwrap();
+    store
+        .put("alpha", large.descriptor, &large.bytes, 0)
+        .unwrap();
+    index
+        .ingest("alpha", large.descriptor, &large.bytes)
+        .unwrap();
+    fn changed(candidates: q::GraphExpr, path: &str) -> q::GraphExpr {
+        q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                q::ChangedPathExpr {
+                    policy_version: 1,
+                    candidates: Some(Box::new(candidates)),
+                    path: path.into(),
+                    exact_file: false,
+                },
+            ))),
+        }
+    }
+    for (read_budget, expected_limit) in [(16 * 1024 * 1024, false), (1024, true)] {
+        let mut config = ServiceConfig::default();
+        config.query.max_history_read_bytes = read_budget;
+        // File-body admission cannot possibly accommodate either target body.
+        config.query.max_blame_file_bytes = 1;
+        let server = Running::start_query(store.clone(), config, index.clone()).await;
+        let mut client = server.query_client().await;
+        let scope = query_ready(&mut client, &[large.descriptor.key], 211).await;
+        if expected_limit {
+            let mut input = ids_evaluation(&scope, 212, &[large.descriptor.key]);
+            input.expression = Some(changed(input.expression.take().unwrap(), "file"));
+            assert_eq!(
+                client
+                    .evaluate(request(input, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::ResourceExhausted
+            );
+        } else {
+            let candidates = q::GraphExpr {
+                version: 1,
+                expression: Some(q::graph_expr::Expression::Ancestors(Box::new(
+                    q::AncestorsExpr {
+                        heads: ids_evaluation(&scope, 0, &[g]).expression.map(Box::new),
+                        generations: None,
+                        parents: None,
+                    },
+                ))),
+            };
+            let mut input = ids_evaluation(&scope, 213, &[]);
+            input.expression = Some(changed(candidates, "file"));
+            input.projection = q::Projection::Graph as i32;
+            input.page_size = 1;
+            let mut rows = Vec::new();
+            for _ in 0..64 {
+                let page = client
+                    .evaluate(request(input.clone(), ALPHA))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                rows.extend(page.rows);
+                if page.exhausted == Some(true) {
+                    break;
+                }
+                input.cursor = page.cursor;
+            }
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.commit.clone().unwrap())
+                    .collect::<Vec<_>>(),
+                [g, e, d, c, a]
+                    .into_iter()
+                    .map(query_id)
+                    .collect::<Vec<_>>()
+            );
+            use q::selected_edge::Edge;
+            assert_eq!(
+                rows[0].edges,
+                vec![q::SelectedEdge {
+                    edge: Some(Edge::Indirect(q::IndirectEdge {
+                        target: Some(query_id(e))
+                    }))
+                }]
+            );
+            assert_eq!(
+                rows[1].edges,
+                vec![q::SelectedEdge {
+                    edge: Some(Edge::Direct(q::DirectEdge {
+                        target: Some(query_id(d))
+                    }))
+                }]
+            );
+            assert!(
+                rows.last()
+                    .unwrap()
+                    .edges
+                    .iter()
+                    .any(|edge| matches!(edge.edge, Some(Edge::Missing(_))))
+            );
+            for (nonce, path, code) in [
+                (214, "../file", Code::InvalidArgument),
+                (215, "", Code::InvalidArgument),
+            ] {
+                let mut input = ids_evaluation(&scope, nonce, &[g]);
+                input.expression = Some(changed(input.expression.take().unwrap(), path));
+                assert_eq!(
+                    client
+                        .evaluate(request(input, ALPHA))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    code
+                );
+            }
+            let mut unsupported = ids_evaluation(&scope, 216, &[merge]);
+            unsupported.expression = Some(changed(unsupported.expression.take().unwrap(), "file"));
+            assert_eq!(
+                client
+                    .evaluate(request(unsupported, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unimplemented
+            );
+        }
+        drop(client);
+        server.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_canonical_source_excludes_private_metadata_only_overlays() {
     let (temporary, store) = setup();
     let index =
@@ -7193,6 +8000,8 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
     for key in [scope.key.clone(), overlay.key.clone()] {
         let mut input = blame_request(&overlay, draft.descriptor.key, 0);
         input.scope = key;
+        let mut dag_input = input.clone();
+        dag_input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
         if input.scope == scope.key {
             assert_eq!(
                 client
@@ -7202,6 +8011,7 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                     .code(),
                 Code::InvalidArgument
             );
+            assert_eq!(client.blame(request(dag_input, ALPHA)).await.unwrap_err().code(), Code::InvalidArgument);
         } else {
             let response = client
                 .blame(request(input, ALPHA))
@@ -7213,6 +8023,15 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                 q::HistoryCoverage::HistoryPrivateOverlay as i32
             );
             assert!(response.target.is_none());
+            let dag_response = client.blame(request(dag_input, ALPHA)).await.unwrap().into_inner();
+            assert_eq!(dag_response.coverage, q::HistoryCoverage::HistoryPrivateOverlay as i32);
+            assert!(dag_response.target.is_none() && dag_response.target_bytes.is_empty() && dag_response.ranges.is_empty());
+            let frontier = client.open_annotation_frontier(request(q::OpenAnnotationFrontierRequest {
+            limits: None,
+                scope: overlay.key.clone(), version: 1, anchors: vec![q::CommitId { value: draft.descriptor.key.id.0.to_vec() }], path: "file".into(), max_commits: 0,
+            }, ALPHA)).await.unwrap().into_inner();
+            assert_eq!(frontier.coverage, q::HistoryCoverage::HistoryPrivateOverlay as i32);
+            assert!(frontier.nodes.is_empty(), "COMMIT-only overlay cannot mint canonical path/input authority");
             let search = client
                 .search(request(
                     search_input(&overlay, draft.descriptor.key, b"selected", 1),
@@ -7242,6 +8061,26 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                 q::HistoryCoverage::HistoryPrivateOverlay as i32
             );
             assert!(response.entries.is_empty());
+            let mut input = ids_evaluation(&overlay, 217, &[draft.descriptor.key]);
+            input.expression = Some(q::GraphExpr {
+                version: 1,
+                expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                    q::ChangedPathExpr {
+                        policy_version: 1,
+                        candidates: input.expression.take().map(Box::new),
+                        path: "file".into(),
+                        exact_file: false,
+                    },
+                ))),
+            });
+            assert_eq!(
+                client
+                    .evaluate(request(input, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unimplemented
+            );
         }
     }
     assert_eq!(
@@ -7337,6 +8176,18 @@ async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
         } else {
             assert!(result.target_bytes.is_empty(), "{name}");
             assert!(result.ranges.is_empty(), "{name}");
+        }
+        let mut dag_input = blame_request(&scope, b, u32::MAX);
+        dag_input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+        let dag = client.blame(request(dag_input, ALPHA)).await.unwrap().into_inner();
+        assert_eq!(dag.coverage, expected as i32, "DAG {name}");
+        assert!(dag.boundary.is_some(), "DAG {name}");
+        assert_eq!(dag.target.is_some(), has_target, "DAG {name}");
+        if has_target {
+            assert_eq!(expanded_origins(&dag).len(), 2);
+            assert!(expanded_origins(&dag).iter().all(Option::is_none), "DAG {name}: no guessed origins");
+        } else {
+            assert!(dag.target_bytes.is_empty() && dag.ranges.is_empty());
         }
         drop(client);
         server.stop().await;
@@ -7484,6 +8335,34 @@ async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
         assert!(blame.boundary.is_some());
         assert!(blame.ranges.iter().all(|range| range.origin.is_none()));
     }
+    let mut conflict_input = blame_request(&scope, conflict.descriptor.key, 0);
+    conflict_input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+    let conflict_result = client.blame(request(conflict_input, ALPHA)).await.unwrap().into_inner();
+    assert_eq!(conflict_result.coverage, q::HistoryCoverage::HistoryConflictBoundary as i32);
+    assert!(conflict_result.boundary.is_some());
+    assert!(conflict_result.target.is_none() && conflict_result.target_bytes.is_empty() && conflict_result.ranges.is_empty());
+    drop(client);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn dag_memory_refusal_does_not_raise_linear_history_admission_cost() {
+    let (temporary, store) = setup();
+    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let head = history_commit(&store, &index, &[], Some(history_file(&store, b"selected\n", false)), 171).descriptor.key;
+    let mut config = ServiceConfig::default();
+    // A valid operator policy may allow large aggregate reads without enlarging
+    // its global residency pool. Only the new DAG policy needs the extra cache.
+    config.query.max_history_read_bytes = 256 * 1024 * 1024;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[head], 200).await;
+    let mut input = blame_request(&scope, head, 0);
+    input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+    assert_eq!(client.blame(request(input, ALPHA)).await.unwrap_err().code(), Code::ResourceExhausted);
+    let linear = client.blame(request(blame_request(&scope, head, 0), ALPHA)).await.unwrap().into_inner();
+    assert_eq!(linear.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(linear.target_bytes, b"selected\n");
     drop(client);
     server.stop().await;
 }
@@ -9804,10 +10683,135 @@ async fn unpublished_reservation_prefix_is_recovered_but_foreign_data_is_preserv
 }
 
 #[tokio::test]
+async fn landing_config_preflight_covers_enabled_and_historical_checker_catalogs() {
+    struct Case {
+        name: &'static str,
+        landing_enabled: bool,
+        checker_configured: bool,
+        historical_state: bool,
+        resident: bool,
+    }
+    for case in [
+        Case {
+            name: "enabled checker",
+            landing_enabled: true,
+            checker_configured: true,
+            historical_state: false,
+            resident: false,
+        },
+        Case {
+            name: "disabled execution with historical catalogs",
+            landing_enabled: false,
+            checker_configured: false,
+            historical_state: true,
+            resident: false,
+        },
+        Case {
+            name: "bounded resident catalog with enabled checker",
+            landing_enabled: true,
+            checker_configured: true,
+            historical_state: false,
+            resident: true,
+        },
+        Case {
+            name: "bounded resident catalog with historical checker",
+            landing_enabled: false,
+            checker_configured: false,
+            historical_state: true,
+            resident: true,
+        },
+    ] {
+        let (temporary, store, mut config, _input, _scratch) = checked_landing_setup("pass");
+        let store = if case.resident {
+            config.store.cloud.resident = Some(tinytree_store::CloudResidentLimits {
+                max_bytes: 2 * 1024 * 1024 * 1024,
+                max_entries: 65_536,
+            });
+            config.service.landing.max_buffered_bytes *= 2;
+            drop(store);
+            Store::open_existing(
+                temporary.path(),
+                config.store.materialize(config.service.max_metadata_bytes),
+            )
+            .unwrap()
+        } else {
+            store
+        };
+        config.service.landing.enabled = case.landing_enabled;
+        if !case.checker_configured {
+            config.service.landing.checker = None;
+        }
+        if case.historical_state {
+            store.enable_external_checks().unwrap();
+        }
+        // Discover the public preflight boundary instead of repeating its
+        // reservation formula. The same exact boundary must start successfully.
+        let (mut low, mut high) = (0, config.service.landing.max_buffered_bytes);
+        assert!(
+            config.validate().is_ok(),
+            "{}: initial pool is sufficient",
+            case.name
+        );
+        while low < high {
+            let midpoint = low + (high - low) / 2;
+            config.service.landing.max_buffered_bytes = midpoint;
+            if config.validate().is_ok() {
+                high = midpoint;
+            } else {
+                low = midpoint + 1;
+            }
+        }
+        config.service.landing.max_buffered_bytes = low - 1;
+        assert!(
+            config.validate().is_err(),
+            "{}: one byte below pure boundary",
+            case.name
+        );
+        assert!(
+            RepositoryService::new(
+                store.clone(),
+                config.service.clone(),
+                vec!["alpha".into(), "beta".into()],
+                landing_principals(true)
+            )
+            .is_err(),
+            "{}: runtime must retain its checker reservation",
+            case.name
+        );
+        config.service.landing.max_buffered_bytes = low;
+        assert!(
+            config.validate().is_ok(),
+            "{}: exact pure boundary",
+            case.name
+        );
+        let service = RepositoryService::new(
+            store.clone(),
+            config.service,
+            vec!["alpha".into(), "beta".into()],
+            landing_principals(true),
+        );
+        assert!(
+            service.is_ok(),
+            "{}: pure admission must cover runtime without double reservation",
+            case.name
+        );
+        drop(service);
+        assert_eq!(
+            store.external_checks_directory().unwrap().is_some(),
+            case.checker_configured || case.historical_state
+        );
+    }
+}
+
+#[tokio::test]
 async fn disabled_master_never_activates_fresh_checker_layout_on_open_or_reopen() {
     let (temporary, store, mut config, _input, _scratch) = checked_landing_setup("pass");
     config.service.landing.enabled = false;
     config.service.landing.max_buffered_bytes = 512 * 1024 * 1024;
+    assert!(
+        config.validate().is_err(),
+        "pure preflight must allow for historical checker catalogs without inspecting storage"
+    );
     let service = RepositoryService::new(
         store.clone(),
         config.service.clone(),

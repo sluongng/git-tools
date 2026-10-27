@@ -1,0 +1,15 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "tinytree-annotate",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "tinytree_annotate",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)

@@ -180,6 +180,16 @@ pub struct Registration {
     pub op_store: OpStoreId,
     pub generation: u64,
 }
+/// Read-only outbox registration census. No capture roots or payloads are cloned.
+/// Deliberately lacks formatting/serialization implementations.
+pub struct CaptureRegistrations {
+    registrations: Vec<Registration>,
+}
+impl CaptureRegistrations {
+    /// Conservative admission includes the retained row and collection overhead.
+    pub const BYTES_PER_ENTRY: usize = 128;
+    pub fn as_slice(&self) -> &[Registration] { &self.registrations }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceState {
     Dirty,
@@ -245,13 +255,40 @@ struct OwnedCheckpointResult {
 /// contain frontend fences, staging leases and admitted resource reservations.
 pub struct OwnedCaptureBundle {
     bundle: CaptureBundle,
+    verified_existing_bundle: bool,
     owner: Arc<dyn std::any::Any + Send + Sync>,
 }
 impl OwnedCaptureBundle {
     pub fn new(bundle: CaptureBundle, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
-        Self { bundle, owner }
+        Self {
+            bundle,
+            verified_existing_bundle: false,
+            owner,
+        }
+    }
+    /// Trusted-host attestation: the complete content-addressed bundle already
+    /// existed and its exact bytes and size were freshly verified. Retain its
+    /// physical owner and cleanup exclusion through the registry transaction.
+    /// A newly staged replacement for a missing bundle is not eligible.
+    pub fn with_verified_existing_bundle(mut self) -> Self {
+        self.verified_existing_bundle = true;
+        self
     }
 }
+/// A durable Dirty checkpoint either added a capsule or retained an exact
+/// still-pending capsule. Reuse never changes the historical ticket or Clean state.
+pub enum DirtyCaptureDisposition {
+    Queued(PendingCapture),
+    ReusedPending(PendingCapture),
+}
+impl DirtyCaptureDisposition {
+    pub fn into_pending(self) -> PendingCapture {
+        match self {
+            Self::Queued(pending) | Self::ReusedPending(pending) => pending,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingCapture {
     pub id: CaptureId,
@@ -316,7 +353,77 @@ pub struct CaptureCleanupTarget {
 #[serde(deny_unknown_fields)]
 pub struct CaptureUploadCleanup {
     pub job: Option<BundleDescriptor>,
+    pub published: Option<BundleDescriptor>,
+}
+/// Protected successor journals, never deletion targets. Before acknowledgement
+/// the trusted host must verify both exact files under the cleanup guard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedSuccessorWitness {
+    pub job: BundleDescriptor,
     pub published: BundleDescriptor,
+}
+pub const MAX_RETAINED_SUCCESSOR_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_RETAINED_SUCCESSOR_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
+/// Trusted-host attestation of a freshly authenticated retained successor.
+/// No field authenticates itself. The host verifies current server selection,
+/// attachment, exact raw descriptors, full pack and semantic OP/VIEW/index/DATA
+/// equivalence before construction. Bounds here are structural admission only,
+/// not semantic or authentication verification. This crate verifies ticket/root scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoveredByRetainedSuccessorV1 {
+    pub successor_binding: [u8; 32],
+    pub provider: [u8; 32],
+    pub cloud_workspace: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: [u8; 32],
+    pub manifest: BundleDescriptor,
+    pub capture: BundleDescriptor,
+    pub witness: RetainedSuccessorWitness,
+}
+/// Exact durable provider admission protected by the trusted host through
+/// precommit, unlink and ACK. These fields identify a record; they do not
+/// authenticate it. A host must retain the provider's opaque physical owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedSourceWitness {
+    pub authority: [u8; 32],
+    pub pin: [u8; 32],
+    pub binding: [u8; 32],
+    pub roots: [u8; 32],
+}
+/// Separate from successor coverage: the OLD complete capture remains retained
+/// and its canonical roots are durably readable by the original provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOldCaptureV1 {
+    pub retired_binding: [u8; 32],
+    pub provider: [u8; 32],
+    pub cloud_workspace: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: [u8; 32],
+    pub manifest: BundleDescriptor,
+    pub capture: BundleDescriptor,
+    pub source: RetainedSourceWitness,
+}
+/// Canonical direct-root obligation digest shared with the source admission.
+pub fn retained_root_set_digest(roots: &[ObjectKey]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"native-retained-offload-roots-v1\0");
+    h.update(&(roots.len() as u64).to_le_bytes());
+    for root in roots {
+        h.update(&[root.kind as u8]);
+        h.update(&root.id.0);
+    }
+    *h.finalize().as_bytes()
+}
+/// Absence on an obligation means the original old-published retirement mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CaptureCleanupBasis {
+    CoveredByRetainedSuccessorV1(CoveredByRetainedSuccessorV1),
+    RetainedOldCaptureV1(RetainedOldCaptureV1),
 }
 pub const MAX_CAPTURE_COVERAGE_OBJECTS: usize = 4096;
 pub const MAX_CAPTURE_COVERAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -353,6 +460,8 @@ pub struct CaptureCleanupObligation {
     pub retired_binding: [u8; 32],
     pub successor_binding: [u8; 32],
     pub upload: CaptureUploadCleanup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<CaptureCleanupBasis>,
     /// False whenever another pending capture names this pack digest.
     pub remove_bundle: bool,
 }
@@ -407,10 +516,45 @@ impl CaptureCleanupGuard {
     pub fn obligation(&self) -> &CaptureCleanupObligation {
         &self.obligation
     }
+    /// Trusted host: recheck old `.published` absence, exact old job and both
+    /// protected successor witnesses before ANY unlink, and keep this guard
+    /// through unlink/directory fsync. Missing witnesses must leave cleanup pending.
+    pub async fn acknowledge_capture_cleanup_with_successor_witness(
+        self,
+        witness: RetainedSuccessorWitness,
+    ) -> Result<()> {
+        storage::blocking(move || {
+            let result = self
+                .registry
+                .acknowledge_capture_cleanup(&self.obligation, Some(&witness));
+            drop(self);
+            result
+        })
+        .await
+    }
     pub async fn acknowledge_capture_cleanup(self) -> Result<()> {
         storage::blocking(move || {
-            let result = self.registry.acknowledge_capture_cleanup(&self.obligation);
+            let result = self
+                .registry
+                .acknowledge_capture_cleanup(&self.obligation, None);
             drop(self); // Keep the whole exclusive owner through actual SyncAll.
+            result
+        })
+        .await
+    }
+    /// The host must keep the original provider's opaque admission owner and
+    /// recheck it without network access or blocking fences through this ACK.
+    pub async fn acknowledge_capture_cleanup_with_retained_source(
+        self,
+        witness: RetainedSourceWitness,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<()> {
+        storage::blocking(move || {
+            let result = self
+                .registry
+                .acknowledge_retained_capture_cleanup(&self.obligation, &witness);
+            drop(self);
+            drop(owner);
             result
         })
         .await
@@ -924,6 +1068,37 @@ impl Registry {
         C: FnOnce() -> F + Send + 'static,
         F: std::future::Future<Output = Result<OwnedCaptureBundle>> + Send + 'static,
     {
+        self.capture_dirty_inner(token, capture, false)
+            .await
+            .map(DirtyCaptureDisposition::into_pending)
+    }
+    /// Seal and drain exactly like `capture_dirty_owned`, but permit reuse when
+    /// the trusted callback freshly verified an already-existing complete pack.
+    /// Matching is atomic against current same-registration pending membership,
+    /// full bundle descriptor and canonical checkpoint. The current workspace
+    /// remains Dirty and receives its own durable checkpoint; old ticket epochs,
+    /// roots and upload intents are not changed. Unknown matches queue normally.
+    pub async fn capture_dirty_or_reuse_pending_owned<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+    ) -> Result<DirtyCaptureDisposition>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<OwnedCaptureBundle>> + Send + 'static,
+    {
+        self.capture_dirty_inner(token, capture, true).await
+    }
+    async fn capture_dirty_inner<C, F>(
+        &self,
+        token: CommandToken,
+        capture: C,
+        allow_reuse: bool,
+    ) -> Result<DirtyCaptureDisposition>
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = Result<OwnedCaptureBundle>> + Send + 'static,
+    {
         self.inner.check()?;
         let context = self.lookup(token)?;
         let runtime = storage::runtime()?;
@@ -943,7 +1118,11 @@ impl Registry {
                 let captured = capture().await?;
                 let commit = context.clone();
                 storage::blocking(move || {
-                    let OwnedCaptureBundle { bundle, owner } = captured;
+                    let OwnedCaptureBundle {
+                        bundle,
+                        verified_existing_bundle,
+                        owner,
+                    } = captured;
                     let result = (|| {
                         let checkpoint =
                             storage::canonical(bundle.checkpoint, &commit.registry.limits)?;
@@ -952,6 +1131,7 @@ impl Registry {
                             commit.epoch,
                             checkpoint,
                             bundle.bundle,
+                            allow_reuse && verified_existing_bundle,
                         )
                     })();
                     // Explicitly after the transaction, on success AND error.
@@ -972,8 +1152,17 @@ impl Registry {
         });
         worker.await.map_err(|_| Error::Poisoned)?
     }
+
     /// Bounded immutable local outbox inventory. No upload or acknowledgement is
     /// implied, and this API intentionally cannot remove pending root claims.
+    /// Snapshot only loaded immutable registration fields, admitting count and
+    /// conservative retained bytes before allocating the result vector.
+    pub async fn pending_capture_registrations(
+        &self, max_entries: usize, max_bytes: usize,
+    ) -> Result<CaptureRegistrations> {
+        let inner = self.inner.clone();
+        storage::blocking(move || inner.pending_capture_registrations(max_entries,max_bytes)).await
+    }
     pub async fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         let inner = self.inner.clone();
         storage::blocking(move || inner.pending_captures()).await
@@ -1020,10 +1209,112 @@ impl Registry {
                 &expected_old,
                 &expected_successor,
                 upload,
+                None,
                 &coverage.objects,
             );
             drop(coverage); // Retain full payload/admission through actual commit.
             result
+        })
+        .await
+    }
+    /// Separate trusted-host mode for an unpublished old capture covered by a
+    /// freshly authenticated retained newer capture. `upload.published` MUST be
+    /// None (ExpectedAbsent), and the exact old job MUST be Some. Drop physical
+    /// read owners before calling. The proof owner survives verification/commit.
+    /// `precommit` runs under the exclusive maintenance fence immediately before
+    /// logical retirement. The trusted host must recheck old publication absence,
+    /// exact old job and protected successor journals there. Keep checks bounded
+    /// to immutable journal files: no networking or payload decoding. The library
+    /// does not parse host paths. An error leaves registry state unchanged.
+    pub async fn retire_capture_covered_by_retained_successor(
+        &self,
+        expected_old: PendingCapture,
+        expected_successor: PendingCapture,
+        upload: CaptureUploadCleanup,
+        attestation: CoveredByRetainedSuccessorV1,
+        coverage: OwnedCaptureCoverage,
+        precommit: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<CaptureCleanupObligation> {
+        self.inner.check()?;
+        let write = self.try_capture_maintenance()?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _write = write;
+            let result = (|| {
+                precommit()?;
+                inner.retire_redundant_capture(
+                    &expected_old,
+                    &expected_successor,
+                    upload,
+                    Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(
+                        attestation,
+                    )),
+                    &coverage.objects,
+                )
+            })();
+            drop(coverage);
+            result
+        })
+        .await
+    }
+    /// Trusted-host retained-only mode. The old complete capsule and exact
+    /// retained selection must be verified, and the ORIGINAL provider must
+    /// durably admit its full canonical root set before this call. The newer
+    /// ticket is an ordering/current-workspace fence, not a coverage claim.
+    /// `owner` must protect that provider admission, never a CaptureReadGuard.
+    /// `precommit` is bounded local validation only: no networking or waiting on
+    /// provider/metadata locks while the registry maintenance fence is held.
+    pub async fn retire_capture_backed_by_retained_version(
+        &self,
+        expected_old: PendingCapture,
+        expected_successor: PendingCapture,
+        upload: CaptureUploadCleanup,
+        attestation: RetainedOldCaptureV1,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        precommit: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<CaptureCleanupObligation> {
+        self.inner.check()?;
+        let write = self.try_capture_maintenance()?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _write = write;
+            let result = (|| {
+                precommit()?;
+                inner.retire_redundant_capture(
+                    &expected_old,
+                    &expected_successor,
+                    upload,
+                    Some(CaptureCleanupBasis::RetainedOldCaptureV1(attestation)),
+                    &[],
+                )
+            })();
+            drop(_write);
+            drop(owner);
+            result
+        })
+        .await
+    }
+    /// Complete pending/cleanup binding snapshot for the single trusted host
+    /// offload producer. It must serialize offload admission/reconciliation and
+    /// release this registry fence before touching provider metadata. Busy is a
+    /// nonblocking refusal, never a partial inventory.
+    pub async fn offload_protected_bindings(&self) -> Result<Vec<[u8; 32]>> {
+        self.inner.check()?;
+        let write = self.try_capture_maintenance()?;
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            let _write = write;
+            let mut bindings = inner
+                .pending_captures()?
+                .into_iter()
+                .map(|c| c.binding())
+                .collect::<Vec<_>>();
+            if let Some(cleanup) = inner.capture_cleanup()? {
+                bindings.push(cleanup.retired_binding);
+            }
+            bindings.sort_unstable();
+            bindings.dedup();
+            Ok(bindings)
         })
         .await
     }

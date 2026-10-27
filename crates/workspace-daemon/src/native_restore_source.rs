@@ -230,7 +230,34 @@ pub(crate) async fn collect(
                             .context("restore count overflow")?,
                 "restore source inventory count limit"
             );
-            let mut requests = 2usize;
+            // Older servers can still serve a primary encoding, but it must
+            // match the immutable manifest descriptor byte-for-byte. Never
+            // substitute an eager clone or another encoding on mismatch.
+            let feature = tinytree_client::CapabilityFeature::ExactCloudRepresentationRead;
+            let exact_reads = match client.capabilities(&[feature]).await {
+                Ok(caps) => {
+                    let state = &caps.features[0];
+                    ensure!(
+                        state.authorized,
+                        "exact cloud representation read unauthorized"
+                    );
+                    state.supported
+                }
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        tonic::Code::Unimplemented | tonic::Code::InvalidArgument
+                    ) =>
+                {
+                    false
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut requests = 3usize;
+            ensure!(
+                requests <= limits.max_requests,
+                "restore request count limit"
+            );
             let mut selected = selection
                 .manifest
                 .size_bytes
@@ -255,15 +282,18 @@ pub(crate) async fn collect(
                     c::ObjectId::Operation(id) => CloudObjectId::Operation(id),
                     c::ObjectId::View(id) => CloudObjectId::View(id),
                 };
-                let payload = client
-                    .cloud_read_object(CloudDescriptor {
-                        id,
-                        selected: CloudRawDigest {
-                            blake3: member.selected.blake3,
-                            size_bytes: member.selected.size_bytes,
-                        },
-                    })
-                    .await?;
+                let expected = CloudDescriptor {
+                    id,
+                    selected: CloudRawDigest {
+                        blake3: member.selected.blake3,
+                        size_bytes: member.selected.size_bytes,
+                    },
+                };
+                let payload = if exact_reads {
+                    client.cloud_read_object_representation(expected).await?
+                } else {
+                    client.cloud_read_object(expected).await?
+                };
                 let raw = payload.payload().to_vec();
                 drop(payload);
                 let id = member.id;
@@ -546,6 +576,37 @@ mod tests {
         path::Path,
         sync::atomic::{AtomicUsize, Ordering},
     };
+    #[derive(Clone)]
+    struct CountRestoreRequests<S> {
+        inner: S,
+        native: Arc<AtomicUsize>,
+        capabilities: Arc<AtomicUsize>,
+    }
+    impl<S: tonic::server::NamedService> tonic::server::NamedService for CountRestoreRequests<S> {
+        const NAME: &'static str = S::NAME;
+    }
+    impl<S, B> tower::Service<tonic::codegen::http::Request<B>> for CountRestoreRequests<S>
+    where
+        S: tower::Service<tonic::codegen::http::Request<B>>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+        fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+            if request.uri().path() == "/tinytree.v1.Repository/GetCapabilities" {
+                self.capabilities.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.native.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.call(request)
+        }
+    }
     struct NoFiles;
     #[async_trait::async_trait]
     impl BlobSource for NoFiles {
@@ -619,14 +680,12 @@ max_manifest_members=1024
         // Supported safe-local mode, not a TLS/authentication acceptance claim.
         // Native API calls are counted independently from cloud/query service.
         let native_calls = Arc::new(AtomicUsize::new(0));
-        let counted = native_calls.clone();
-        let native = tonic::service::interceptor::InterceptedService::new(
-            service.grpc_service(),
-            move |request: tonic::Request<()>| {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Ok(request)
-            },
-        );
+        let capability_calls = Arc::new(AtomicUsize::new(0));
+        let native = CountRestoreRequests {
+            inner: service.grpc_service(),
+            native: native_calls.clone(),
+            capabilities: capability_calls.clone(),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -856,6 +915,11 @@ max_manifest_members=1024
         .await?;
         assert_eq!(restored.source_identity().manifest_id(), prepared.id().0);
         assert_eq!(restored.projection_seed(), &data.working_copy);
+        assert_eq!(
+            capability_calls.load(Ordering::SeqCst),
+            1,
+            "exact representation support is negotiated by one read-only capability RPC"
+        );
         assert_eq!(
             native_calls.load(Ordering::SeqCst),
             0,

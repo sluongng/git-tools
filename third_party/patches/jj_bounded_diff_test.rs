@@ -56,6 +56,82 @@ fn bounded_line_diff_matches_literal_policy() {
     compare(&b"a\n".repeat(120), &b"a\n".repeat(121));
     compare(&b"a\n".repeat(120), &b"b\n".repeat(121));
 }
+
+#[test]
+fn bounded_multi_input_diff_matches_stock_intersections() {
+    let mut texts = vec![vec![]];
+    for len in 1..=2 {
+        for mut value in 0..2usize.pow(len) {
+            let mut text = Vec::new();
+            for _ in 0..len {
+                text.push(b'a' + (value % 2) as u8);
+                text.push(b'\n');
+                value /= 2;
+            }
+            texts.push(text);
+        }
+    }
+    let compare = |inputs: &[&[u8]]| {
+        let expected = ContentDiff::by_line(inputs.iter().copied())
+            .hunks().collect::<Vec<_>>();
+        let actual = ContentDiff::by_line_bounded_many(
+            inputs, &mut LineDiffBudget::new(limits()), || true,
+        ).unwrap();
+        assert_eq!(actual.hunks().collect::<Vec<_>>(), expected, "{inputs:?}");
+    };
+    for a in &texts {
+        compare(&[a]);
+        for b in &texts {
+            for c in &texts {
+                compare(&[a, b, c]);
+                for d in &texts {
+                    compare(&[a, b, c, d]);
+                }
+            }
+        }
+    }
+    compare(&[b"x\na\nb\nx\n", b"a\nx\nb\n", b"x\nb\na\n", b"a\nb\nx\n", b"x\na\nx\n"]);
+    compare(&[b"no newline", b"no newline\n", b"\0\xff\nno newline"]);
+    compare(&[&b"same\n".repeat(120), &b"same\n".repeat(121), &b"same\n".repeat(122)]);
+}
+
+#[test]
+fn bounded_multi_input_diff_refuses_cancellation_and_aggregate_limits() {
+    assert_eq!(
+        ContentDiff::by_line_bounded_many(&[], &mut LineDiffBudget::new(limits()), || true).unwrap_err(),
+        LineDiffError::LimitExceeded,
+    );
+    let inputs = [b"a\nx\nb\n".as_slice(), b"a\ny\nb\n", b"x\na\nb\n"];
+    let mut generous = LineDiffBudget::new(limits());
+    ContentDiff::by_line_bounded_many(&inputs, &mut generous, || true).unwrap();
+    // A third input must not reuse the pair's input/allocation charge for free.
+    // Work includes seeded histogram probes, so use a fixed exhausted budget
+    // rather than assuming two independent calls perform identical probe work.
+    for constraint in ["input", "work", "allocation"] {
+        let mut cap = limits();
+        match constraint {
+            "input" => cap.max_input_bytes = generous.usage().input_bytes - 1,
+            "work" => cap.max_work = 0,
+            "allocation" => cap.max_allocation_bytes = generous.usage().allocation_bytes - 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            ContentDiff::by_line_bounded_many(&inputs, &mut LineDiffBudget::new(cap), || true).unwrap_err(),
+            LineDiffError::LimitExceeded, "{constraint}",
+        );
+    }
+    let text = (0..60).map(|i| format!("line {}\n", i % 23)).collect::<String>();
+    let inputs = [text.as_bytes(), text.as_bytes(), text.as_bytes()];
+    for stop_at in 1..=512 {
+        let mut checks = 0;
+        let result = ContentDiff::by_line_bounded_many(&inputs, &mut LineDiffBudget::new(limits()), || {
+            checks += 1;
+            checks < stop_at
+        });
+        assert_eq!(result.unwrap_err(), LineDiffError::Cancelled);
+        assert_eq!(checks, stop_at);
+    }
+}
 #[test]
 fn bounded_line_diff_rejects_before_unadmitted_allocations() {
     let mut l = limits();

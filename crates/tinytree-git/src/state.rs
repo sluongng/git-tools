@@ -366,3 +366,54 @@ pub(crate) fn mapped_checkpoint(
     ensure!(mapping.git == git, "selected delivered mapping differs");
     Ok(mapping.clone())
 }
+
+/// Locate an initial remote head only in the frozen pending commit's exported
+/// public-parent graph. Unrelated mappings and local Git objects grant nothing.
+/// This is a reader snapshot, not an exporter writer lease or a new position.
+pub(crate) fn mapped_public_ancestor(
+    path: &Path,
+    scope: [u8; 32],
+    limits: &crate::Limits,
+    native: &str,
+    git: &str,
+    ancestor_git: &str,
+    mut checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Option<Mapping>> {
+    checkpoint()?;
+    let directory = PrivateDir::open_existing(path)?;
+    let state = decode(&directory, limits.max_state_bytes)?;
+    validate(&state, limits.max_commits)?;
+    ensure!(state.scope == scope, "export checkpoint identity differs");
+    let selected = state
+        .mappings
+        .get(native)
+        .context("selected delivered mapping absent")?;
+    ensure!(selected.git == git, "selected delivered mapping differs");
+    let mut discovered = std::collections::BTreeSet::from([native]);
+    let mut stack = vec![native];
+    let mut work = limits.max_commits.saturating_mul(4096);
+    while let Some(current) = stack.pop() {
+        checkpoint()?;
+        let mapping = state
+            .mappings
+            .get(current)
+            .context("public parent mapping absent")?;
+        if mapping.git == ancestor_git {
+            return Ok(Some(mapping.clone()));
+        }
+        for parent in &mapping.parents {
+            checkpoint()?;
+            work = work
+                .checked_sub(1)
+                .context("bootstrap ancestry work bound exceeded")?;
+            if discovered.insert(parent.as_str()) {
+                ensure!(
+                    discovered.len() <= limits.max_commits,
+                    "bootstrap ancestry commit bound exceeded"
+                );
+                stack.push(parent.as_str());
+            }
+        }
+    }
+    Ok(None)
+}

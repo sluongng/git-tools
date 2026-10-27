@@ -21,7 +21,10 @@ max_frame_bytes = 65536
 [service.query]
 scope_ttl_seconds = 300
 max_scopes_per_principal = 16
-max_scope_replays_per_principal = 256
+max_scope_memory_bytes = 67108864
+max_scope_replays = 16384
+max_scope_replays_per_principal = 4096
+max_scope_replays_per_repository = 8192
 max_overlay_memory_bytes = 134217728
 max_scope_overlay_bytes = 16777216
 max_scope_overlay_nodes = 4096

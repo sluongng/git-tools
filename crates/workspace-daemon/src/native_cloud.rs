@@ -105,20 +105,11 @@ pub(crate) async fn select(
     let id = workspace(id)?;
     ensure!(generation != Some(0), "cloud generation must be positive");
     let client = client(&source, deadline).await?;
-    let latest = if generation.is_none() {
-        Some(client.cloud_workspace(id).await?)
-    } else {
-        None
+    let version = match generation {
+        Some(generation) => client.cloud_version(id, generation).await?,
+        None => client.cloud_latest_captured_version(id).await?,
     };
-    let generation = generation.unwrap_or_else(|| latest.as_ref().unwrap().generation);
-    ensure!(generation > 0, "cloud workspace has no published backup");
-    let version = client.cloud_version(id, generation).await?;
-    if let Some(latest) = latest {
-        ensure!(
-            latest.manifest_id == Some(version.manifest_id),
-            "cloud latest manifest differs from the selected generation"
-        );
-    }
+    let generation = version.generation;
     // This is an exact, hash-verified selector. The existing restore collector
     // verifies v3 structure, capture DATA and retained dependencies before writes.
     let raw = CloudRawDigest::of(version.manifest());

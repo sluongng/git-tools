@@ -6,6 +6,38 @@ use tinytree_model::CommitId;
 use tinytree_proto::query_v1 as q;
 use tonic::Status;
 
+/// Authenticated configured support is separate from grants and selected roots.
+/// A legacy vocabulary proves neither support nor authorization for feature11.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlameCapabilities {
+    LegacyUnnegotiated,
+    Explicit { supported: bool, authorized: bool },
+}
+impl BlameCapabilities {
+    pub(crate) fn wire(self) -> crate::proto::BlameCapabilitiesReply { self.wire_feature(11) }
+    pub(crate) fn annotation_wire(self) -> crate::proto::BlameCapabilitiesReply { self.wire_feature(12) }
+    fn wire_feature(self, feature: u32) -> crate::proto::BlameCapabilitiesReply {
+        let (legacy_unnegotiated, supported, authorized) = match self {
+            Self::LegacyUnnegotiated => (true, false, false),
+            Self::Explicit { supported, authorized } => (false, supported, authorized),
+        };
+        crate::proto::BlameCapabilitiesReply { schema_version: 1, feature,
+            legacy_unnegotiated, supported, authorized,
+            root_readiness: tinytree_proto::v1::RootReadiness::NotChecked as u32 }
+    }
+    pub(crate) fn checked(value: crate::proto::BlameCapabilitiesReply) -> Result<Self, Status> { Self::checked_feature(value, 11) }
+    pub(crate) fn annotation_checked(value: crate::proto::BlameCapabilitiesReply) -> Result<Self, Status> { Self::checked_feature(value, 12) }
+    fn checked_feature(value: crate::proto::BlameCapabilitiesReply, feature: u32) -> Result<Self, Status> {
+        if value.schema_version != 1 || value.feature != feature
+            || value.root_readiness != tinytree_proto::v1::RootReadiness::NotChecked as u32
+            || (value.legacy_unnegotiated && (value.supported || value.authorized)) {
+            return Err(Status::data_loss("invalid native blame capability reply"));
+        }
+        Ok(if value.legacy_unnegotiated { Self::LegacyUnnegotiated }
+            else { Self::Explicit { supported: value.supported, authorized: value.authorized } })
+    }
+}
+
 /// Creation policy is not part of provider security identity. Existing stores
 /// always load their recorded index/type rather than applying this preference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,7 +254,28 @@ pub struct CloudQuerySource {
     pub index_root_ids: Vec<[u8; 32]>,
     pub expected_anchors: Vec<CommitId>,
 }
+/// Common immutable selection for one authorization pass. This is provenance,
+/// not authority: each selected root still requires its own server scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudAuthorizationSource {
+    pub provider_identity: [u8; 32],
+    pub workspace_id: [u8; 32],
+    pub generation: u64,
+    pub manifest_id: [u8; 32],
+    pub manifest_blake3: [u8; 32],
+    pub manifest_size_bytes: u64,
+}
 impl CloudQuerySource {
+    pub fn authorization_source(&self) -> CloudAuthorizationSource {
+        CloudAuthorizationSource {
+            provider_identity: self.provider_identity,
+            workspace_id: self.workspace_id,
+            generation: self.generation,
+            manifest_id: self.manifest_id,
+            manifest_blake3: self.manifest_blake3,
+            manifest_size_bytes: self.manifest_size_bytes,
+        }
+    }
     /// Public selection provenance, never an authorization or completeness proof.
     pub fn digest(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
@@ -319,7 +372,7 @@ pub struct ScopedPathQuery {
 impl ScopedPathQuery {
     pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
         crate::query_service::bounded_input(self.path.len().saturating_add(128), cap)?;
-        if self.policy != q::HistoryPolicy::LinearFixedPathV1 {
+        if !matches!(self.policy, q::HistoryPolicy::LinearFixedPathV1 | q::HistoryPolicy::JjResolvedFixedPathV1) {
             return Err(Status::unimplemented("native history policy unsupported"));
         }
         if self.path.is_empty()
@@ -472,6 +525,207 @@ fn path_state(value: &q::HistoryPathState) -> Result<(), Status> {
         3 if value.native_id.len() == 32 && !value.executable => Ok(()),
         4 if value.native_id.len() == 32 && value.size_bytes == 0 && !value.executable => Ok(()),
         _ => Err(history_integrity()),
+    }
+}
+/// One exact path and canonical anchor union in a command-owned local scope.
+#[derive(Clone, Debug)]
+pub struct OpenAnnotationFrontier {
+    pub scope: [u8; 32],
+    pub anchors: Vec<CommitId>,
+    pub path: String,
+    pub max_commits: u32,
+    pub limits: Option<q::AnnotationLimits>,
+}
+pub fn annotation_limits_valid(value: &q::AnnotationLimits) -> bool {
+    [value.work_nodes, value.work_edges, value.work_bytes, value.frontier,
+     value.read_bytes, value.diff_input_bytes, value.diff_lines, value.diff_work,
+     value.diff_allocation_bytes, value.diff_depth].into_iter().all(|n| n > 0 && n <= usize::MAX as u64)
+}
+fn annotation_limits_lowered(effective: &q::AnnotationLimits, requested: &q::AnnotationLimits) -> bool {
+    annotation_limits_valid(effective) && annotation_limits_valid(requested) &&
+    [effective.work_nodes, effective.work_edges, effective.work_bytes, effective.frontier,
+     effective.read_bytes, effective.diff_input_bytes, effective.diff_lines, effective.diff_work,
+     effective.diff_allocation_bytes, effective.diff_depth].into_iter().zip([
+     requested.work_nodes, requested.work_edges, requested.work_bytes, requested.frontier,
+     requested.read_bytes, requested.diff_input_bytes, requested.diff_lines, requested.diff_work,
+     requested.diff_allocation_bytes, requested.diff_depth]).all(|(a,b)| a<=b)
+}
+fn annotation_value(value: Option<&q::AnnotationPathValue>) -> Result<(), Status> {
+    let value = value.ok_or_else(history_integrity)?;
+    let state = value.state.as_ref().ok_or_else(history_integrity)?;
+    path_state(state)?;
+    if !(value.copy_id.is_empty() || value.copy_id.len() == 32)
+        || (!value.copy_id.is_empty() && state.kind != 2)
+    {
+        return Err(history_integrity());
+    }
+    Ok(())
+}
+impl OpenAnnotationFrontier {
+    pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
+        if self.limits.as_ref().is_some_and(|limits| !annotation_limits_valid(limits)) {
+            return Err(Status::invalid_argument("positive annotation limits required"));
+        }
+        if self.anchors.is_empty()
+            || self.anchors.len() > 4096
+            || self.anchors.windows(2).any(|v| v[0] >= v[1])
+        {
+            return Err(Status::invalid_argument(
+                "annotation anchors must be bounded sorted unique IDs",
+            ));
+        }
+        crate::query_service::bounded_input(
+            self.path
+                .len()
+                .saturating_add(self.anchors.len().saturating_mul(40))
+                .saturating_add(128),
+            cap,
+        )?;
+        ScopedPathQuery {
+            scope: self.scope,
+            revision: CommitId::ROOT,
+            path: self.path.clone(),
+            policy: q::HistoryPolicy::LinearFixedPathV1,
+            max_commits: self.max_commits,
+        }
+        .validate(cap)
+    }
+    pub(crate) fn check(&self, value: &q::AnnotationFrontier, cap: usize) -> Result<(), Status> {
+        match (&self.limits, &value.limits) {
+            (None, None) => {},
+            (Some(requested), Some(effective)) if annotation_limits_lowered(effective, requested) => {},
+            _ => return Err(history_integrity()),
+        }
+        if value.context != self.scope
+            || value.scope_digest.len() != 32
+            || value.index_epoch.len() != 16
+            || value.version != if self.limits.is_some() { 2 } else { 1 }
+            || value.path != self.path
+            || value.expires_at_unix_seconds <= 0
+            || value
+                .anchors
+                .iter()
+                .map(|v| v.value.as_slice())
+                .ne(self.anchors.iter().map(|v| v.0.as_slice()))
+            || !(1..=7).contains(&value.coverage)
+            || (self.max_commits != 0 && value.scanned_commits > self.max_commits)
+            || (value.coverage != 1 && !value.nodes.is_empty())
+            || (value.coverage == 1 && value.nodes.len() != value.scanned_commits as usize + 1)
+        {
+            return Err(history_integrity());
+        }
+        let mut positions = std::collections::BTreeMap::new();
+        let mut previous = None;
+        let mut edges = 0usize;
+        for node in &value.nodes {
+            let id: [u8; 32] = node
+                .revision
+                .as_ref()
+                .ok_or_else(history_integrity)?
+                .value
+                .as_slice()
+                .try_into()
+                .map_err(|_| history_integrity())?;
+            let key = (node.source_layer, node.topological_key);
+            if node.source_layer > 1
+                || previous.is_some_and(|old| old >= key)
+                || positions.insert(id, key).is_some()
+                || node.affects_path.is_none()
+            {
+                return Err(history_integrity());
+            }
+            annotation_value(node.value.as_ref())?;
+            previous = Some(key);
+            edges = edges.saturating_add(node.parents.len());
+            if edges.saturating_mul(32) > cap {
+                return Err(Status::resource_exhausted(
+                    "annotation frontier edge memory exceeded",
+                ));
+            }
+            if id == [0; 32] {
+                if !node.parents.is_empty()
+                    || node.affects_path != Some(false)
+                    || node.value.as_ref().unwrap().state.as_ref().unwrap().kind != 1
+                {
+                    return Err(history_integrity());
+                }
+            } else if node.parents.is_empty() {
+                return Err(history_integrity());
+            }
+            for parent in &node.parents {
+                let parent: [u8; 32] = parent
+                    .value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| history_integrity())?;
+                if positions.get(&parent).is_none_or(|p| *p >= key) {
+                    return Err(history_integrity());
+                }
+            }
+        }
+        if value.coverage == 1
+            && (!positions.contains_key(&[0; 32])
+                || self.anchors.iter().any(|v| !positions.contains_key(&v.0)))
+        {
+            return Err(history_integrity());
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ReadAnnotationInput {
+    pub scope: [u8; 32],
+    pub context: [u8; 32],
+    pub revision: CommitId,
+    pub expected: q::AnnotationPathValue,
+}
+impl ReadAnnotationInput {
+    pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
+        crate::query_service::bounded_input(512, cap)?;
+        if self.context != self.scope {
+            return Err(Status::invalid_argument(
+                "annotation context belongs to another local scope",
+            ));
+        }
+        annotation_value(Some(&self.expected))?;
+        if self.expected.state.as_ref().unwrap().kind != 2 {
+            return Err(Status::invalid_argument(
+                "annotation input must be a regular FILE",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn check(
+        &self,
+        value: &q::AnnotationInput,
+        limits: tinytree_model::Limits,
+    ) -> Result<(), Status> {
+        if value.context != self.context
+            || value
+                .revision
+                .as_ref()
+                .is_none_or(|id| id.value != self.revision.0)
+            || value.value.as_ref() != Some(&self.expected)
+            || value.data.len() > limits.max_object_bytes
+        {
+            return Err(history_integrity());
+        }
+        let described = tinytree_model::describe_file(&value.data);
+        let descriptor = value.descriptor.as_ref().ok_or_else(history_integrity)?;
+        let state = self.expected.state.as_ref().unwrap();
+        if descriptor
+            .key
+            .as_ref()
+            .is_none_or(|key| key.kind != 1 || key.native_id != described.key.id.0)
+            || descriptor.content_blake3 != described.key.id.0
+            || descriptor.size_bytes != described.size_bytes
+            || descriptor.object_format_version != described.format_version as u32
+            || state.native_id != described.key.id.0
+            || state.size_bytes != described.size_bytes
+        {
+            return Err(history_integrity());
+        }
+        Ok(())
     }
 }
 /// Indexed content search against one captured immutable source. The cursor is
@@ -637,7 +891,18 @@ fn search_integrity() -> Status {
 /// or ordinary-root fallback is permitted.
 #[async_trait]
 pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
+    async fn annotation_capabilities(&self, _owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> { Err(Status::unimplemented("annotation frontier negotiation unavailable")) }
+    async fn open_annotation_frontier(&self, _input: OpenAnnotationFrontier, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationFrontier>, Status> { Err(Status::unimplemented("annotation frontier unavailable")) }
+    /// Explicit opt-in: old providers must refuse BEFORE admitting unbounded
+    /// frontier work, rather than erase lowering fields and fail on the echo.
+    async fn open_limited_annotation_frontier(&self, _input: OpenAnnotationFrontier, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationFrontier>, Status> { Err(Status::unimplemented("limited annotation frontier unavailable")) }
+    async fn read_annotation_input(&self, _input: ReadAnnotationInput, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationInput>, Status> { Err(Status::unimplemented("annotation input unavailable")) }
+    async fn close_annotation_frontier(&self, _scope: [u8;32], _owner: QueryOwner) -> Result<QueryReply<()>, Status> { Err(Status::unimplemented("annotation context cleanup unavailable")) }
+
     fn resources(&self) -> QueryResources;
+    async fn blame_capabilities(&self, _owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> {
+        Err(Status::unimplemented("native blame capability negotiation unavailable"))
+    }
     /// Read-only upstream checks, without retaining a broker scope or granting
     /// an anchor. The configured host chooses requirements, never the caller.
     async fn preflight_creation(
@@ -654,6 +919,17 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
         Err(Status::unimplemented(
             "native creation preflight unsupported",
         ))
+    }
+
+    /// Optionally prepare one fresh, bounded retained proof for this pass.
+    /// None retains the original per-root authorization path. An error must
+    /// propagate, never select that compatibility path. No wire RPC is added.
+    async fn prepare_cloud_authorization(
+        &self,
+        _source: CloudAuthorizationSource,
+        _owner: QueryOwner,
+    ) -> Result<Option<QueryReply<Arc<dyn NativeQueryIo>>>, Status> {
+        Ok(None)
     }
 
     /// Explicit retained snapshot support; unsupported providers must not
@@ -777,9 +1053,284 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
     async fn close_scope(&self, scope: [u8; 32], owner: QueryOwner) -> Result<(), Status>;
 }
 
+/// Static diagnostic categories only. These do not authorize replay, fetching or
+/// recovery, and never retain arbitrary provider messages or connection metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryFailureReason {
+    LocalScopeUnavailable,
+    LocalScopeClosedOrExpired,
+    LocalScopeCountExceeded,
+    LocalReplayCountExceeded,
+    CachedCreationOutcomeUnavailable,
+    CloudReplaySourceChanged,
+    ClientScopeExpired,
+    ServerScopeUnavailable,
+    ServerScopeExpired,
+    ServerScopeClosed,
+    ServerReplayExpired,
+    ServerReplayClosed,
+    ServerCursorExpired,
+    ServerCursorUnavailable,
+    ServerQueryClosed,
+    CloudSourceReplayUnavailable,
+    ServerActiveScopeQuota,
+    ServerScopeReplayHistoryQuota,
+    ServerActiveQueryQuota,
+    ServerQueryReplayHistoryQuota,
+    LocalRegistryBytesExceeded,
+    LocalRegistryBytesExhausted,
+    ServerExactGraphWorkBudget,
+    ServerDerivedIndexModelLimit,
+    ServerScopeMemory,
+    ServerScopeHandleMemory,
+    ServerCloudScopeMemory,
+    ServerFrozenGraphMemory,
+    ServerOverlayMemory,
+    ServerOverlayMemoryOverflow,
+    ServerLogicalOverlayLimit,
+    ServerQueryHistoryMemory,
+    ServerQueryCursorMemory,
+    ServerMembershipMemory,
+    ServerSelectedPrefixMemory,
+    ClientOverlayBytes,
+    ClientOverlayMemory,
+    ClientScopeSourceMemory,
+    BrokerRetainedReplyMemory,
+    BrokerReplyBytes,
+    ServerRequestMemoryBudget,
+    ServerSelectedPrefixMemoryBudget,
+    ServerQueryCursorMemoryBudget,
+    ServerMembershipMemoryBudget,
+    ServerMembershipStepBudget,
+    ServerClosedQueryMetadataMemory,
+    ServerQueryHistoryMemoryBudget,
+    ServerOverlayLayerOverflow,
+}
+impl QueryFailureReason {
+    /// Classify exact source literals before a provider sanitizes its error.
+    pub fn from_source_message(message: &str) -> Option<Self> {
+        match message {
+            "native query scope unavailable" => Some(Self::LocalScopeUnavailable),
+            "native query scope closed or expired" => Some(Self::LocalScopeClosedOrExpired),
+            "native query scope count exceeded" => Some(Self::LocalScopeCountExceeded),
+            "native query replay count exceeded" => Some(Self::LocalReplayCountExceeded),
+            "native query creation outcome unavailable; preserve the original intent" => Some(Self::CachedCreationOutcomeUnavailable),
+            "cloud scope replay source changed" => Some(Self::CloudReplaySourceChanged),
+            "native query scope expired" => Some(Self::ClientScopeExpired),
+            "query scope unavailable or expired" => Some(Self::ServerScopeUnavailable),
+            "query scope expired" => Some(Self::ServerScopeExpired),
+            "query scope is closed" => Some(Self::ServerScopeClosed),
+            "scope replay expired" => Some(Self::ServerReplayExpired),
+            "scope replay is closed" => Some(Self::ServerReplayClosed),
+            "query cursor expired" => Some(Self::ServerCursorExpired),
+            "query cursor unavailable" => Some(Self::ServerCursorUnavailable),
+            "query is closed" => Some(Self::ServerQueryClosed),
+            "cloud source replay no longer available" => Some(Self::CloudSourceReplayUnavailable),
+            "active query scope quota exceeded" => Some(Self::ServerActiveScopeQuota),
+            "query scope replay history quota exceeded" => Some(Self::ServerScopeReplayHistoryQuota),
+            "active query quota exceeded" => Some(Self::ServerActiveQueryQuota),
+            "query replay history quota exceeded" => Some(Self::ServerQueryReplayHistoryQuota),
+            "native query registry bytes exceeded" => Some(Self::LocalRegistryBytesExceeded),
+            "native query registry bytes exhausted" => Some(Self::LocalRegistryBytesExhausted),
+            "exact graph work budget exhausted" => Some(Self::ServerExactGraphWorkBudget),
+            "derived index model limit exceeded" => Some(Self::ServerDerivedIndexModelLimit),
+            "scope memory exceeded" => Some(Self::ServerScopeMemory),
+            "scope handle memory exceeded" => Some(Self::ServerScopeHandleMemory),
+            "cloud scope retained memory exceeded" => Some(Self::ServerCloudScopeMemory),
+            "frozen graph memory exceeded" => Some(Self::ServerFrozenGraphMemory),
+            "overlay memory exceeded" => Some(Self::ServerOverlayMemory),
+            "overlay memory overflow" => Some(Self::ServerOverlayMemoryOverflow),
+            "logical overlay limits exceeded" => Some(Self::ServerLogicalOverlayLimit),
+            "query history memory exhausted" => Some(Self::ServerQueryHistoryMemory),
+            "query cursor memory exhausted" => Some(Self::ServerQueryCursorMemory),
+            "query membership memory exhausted" => Some(Self::ServerMembershipMemory),
+            "selected prefix memory unavailable" => Some(Self::ServerSelectedPrefixMemory),
+            "query overlay bytes exceed budget" => Some(Self::ClientOverlayBytes),
+            "query overlay memory exceeds budget" => Some(Self::ClientOverlayMemory),
+            "query scope source memory exceeds budget" => Some(Self::ClientScopeSourceMemory),
+            "native query retained reply budget exhausted" => Some(Self::BrokerRetainedReplyMemory),
+            "query client reply exceeds limit" => Some(Self::BrokerReplyBytes),
+            "overlay layer overflow" => Some(Self::ServerOverlayLayerOverflow),
+            "query history memory exceeds budget" => Some(Self::ServerQueryHistoryMemoryBudget),
+            "closed query metadata exceeds budget" => Some(Self::ServerClosedQueryMetadataMemory),
+            "query membership step budget exhausted" => Some(Self::ServerMembershipStepBudget),
+            "query membership memory budget exceeded" => Some(Self::ServerMembershipMemoryBudget),
+            "query cursor memory exceeds budget" => Some(Self::ServerQueryCursorMemoryBudget),
+            "selected prefix memory exceeds budget" => Some(Self::ServerSelectedPrefixMemoryBudget),
+            "requested query memory exceeds configured pool" => Some(Self::ServerRequestMemoryBudget),
+            _ => None,
+        }
+    }
+    pub fn code(self) -> tonic::Code {
+        match self {
+            Self::LocalScopeUnavailable => tonic::Code::FailedPrecondition,
+            Self::LocalScopeClosedOrExpired => tonic::Code::FailedPrecondition,
+            Self::LocalScopeCountExceeded => tonic::Code::FailedPrecondition,
+            Self::LocalReplayCountExceeded => tonic::Code::FailedPrecondition,
+            Self::CachedCreationOutcomeUnavailable => tonic::Code::FailedPrecondition,
+            Self::CloudReplaySourceChanged => tonic::Code::FailedPrecondition,
+            Self::ClientScopeExpired => tonic::Code::FailedPrecondition,
+            Self::ServerScopeUnavailable => tonic::Code::FailedPrecondition,
+            Self::ServerScopeExpired => tonic::Code::FailedPrecondition,
+            Self::ServerScopeClosed => tonic::Code::FailedPrecondition,
+            Self::ServerReplayExpired => tonic::Code::FailedPrecondition,
+            Self::ServerReplayClosed => tonic::Code::FailedPrecondition,
+            Self::ServerCursorExpired => tonic::Code::FailedPrecondition,
+            Self::ServerCursorUnavailable => tonic::Code::FailedPrecondition,
+            Self::ServerQueryClosed => tonic::Code::FailedPrecondition,
+            Self::CloudSourceReplayUnavailable => tonic::Code::FailedPrecondition,
+            Self::ServerActiveScopeQuota => tonic::Code::ResourceExhausted,
+            Self::ServerScopeReplayHistoryQuota => tonic::Code::ResourceExhausted,
+            Self::ServerActiveQueryQuota => tonic::Code::ResourceExhausted,
+            Self::ServerQueryReplayHistoryQuota => tonic::Code::ResourceExhausted,
+            Self::LocalRegistryBytesExceeded => tonic::Code::ResourceExhausted,
+            Self::LocalRegistryBytesExhausted => tonic::Code::ResourceExhausted,
+            Self::ServerExactGraphWorkBudget => tonic::Code::ResourceExhausted,
+            Self::ServerDerivedIndexModelLimit => tonic::Code::ResourceExhausted,
+            Self::ServerScopeMemory => tonic::Code::ResourceExhausted,
+            Self::ServerScopeHandleMemory => tonic::Code::ResourceExhausted,
+            Self::ServerCloudScopeMemory => tonic::Code::ResourceExhausted,
+            Self::ServerFrozenGraphMemory => tonic::Code::ResourceExhausted,
+            Self::ServerOverlayMemory => tonic::Code::ResourceExhausted,
+            Self::ServerOverlayMemoryOverflow => tonic::Code::ResourceExhausted,
+            Self::ServerLogicalOverlayLimit => tonic::Code::ResourceExhausted,
+            Self::ServerQueryHistoryMemory => tonic::Code::ResourceExhausted,
+            Self::ServerQueryCursorMemory => tonic::Code::ResourceExhausted,
+            Self::ServerMembershipMemory => tonic::Code::ResourceExhausted,
+            Self::ServerSelectedPrefixMemory => tonic::Code::ResourceExhausted,
+            Self::ClientOverlayBytes => tonic::Code::ResourceExhausted,
+            Self::ClientOverlayMemory => tonic::Code::ResourceExhausted,
+            Self::ClientScopeSourceMemory => tonic::Code::ResourceExhausted,
+            Self::BrokerRetainedReplyMemory => tonic::Code::ResourceExhausted,
+            Self::BrokerReplyBytes => tonic::Code::ResourceExhausted,
+            Self::ServerRequestMemoryBudget => tonic::Code::ResourceExhausted,
+            Self::ServerSelectedPrefixMemoryBudget => tonic::Code::ResourceExhausted,
+            Self::ServerQueryCursorMemoryBudget => tonic::Code::ResourceExhausted,
+            Self::ServerMembershipMemoryBudget => tonic::Code::ResourceExhausted,
+            Self::ServerMembershipStepBudget => tonic::Code::ResourceExhausted,
+            Self::ServerClosedQueryMetadataMemory => tonic::Code::ResourceExhausted,
+            Self::ServerQueryHistoryMemoryBudget => tonic::Code::ResourceExhausted,
+            Self::ServerOverlayLayerOverflow => tonic::Code::ResourceExhausted,
+        }
+    }
+    pub fn diagnostic(self) -> &'static str {
+        match self {
+            Self::LocalScopeUnavailable => "native query precondition: LocalScopeUnavailable",
+            Self::LocalScopeClosedOrExpired => "native query precondition: LocalScopeClosedOrExpired",
+            Self::LocalScopeCountExceeded => "native query precondition: LocalScopeCountExceeded",
+            Self::LocalReplayCountExceeded => "native query precondition: LocalReplayCountExceeded",
+            Self::CachedCreationOutcomeUnavailable => "native query precondition: CachedCreationOutcomeUnavailable",
+            Self::CloudReplaySourceChanged => "native query precondition: CloudReplaySourceChanged",
+            Self::ClientScopeExpired => "native query precondition: ClientScopeExpired",
+            Self::ServerScopeUnavailable => "native query precondition: ServerScopeUnavailable",
+            Self::ServerScopeExpired => "native query precondition: ServerScopeExpired",
+            Self::ServerScopeClosed => "native query precondition: ServerScopeClosed",
+            Self::ServerReplayExpired => "native query precondition: ServerReplayExpired",
+            Self::ServerReplayClosed => "native query precondition: ServerReplayClosed",
+            Self::ServerCursorExpired => "native query precondition: ServerCursorExpired",
+            Self::ServerCursorUnavailable => "native query precondition: ServerCursorUnavailable",
+            Self::ServerQueryClosed => "native query precondition: ServerQueryClosed",
+            Self::CloudSourceReplayUnavailable => "native query precondition: CloudSourceReplayUnavailable",
+            Self::ServerActiveScopeQuota => "native query resource: ServerActiveScopeQuota",
+            Self::ServerScopeReplayHistoryQuota => "native query resource: ServerScopeReplayHistoryQuota",
+            Self::ServerActiveQueryQuota => "native query resource: ServerActiveQueryQuota",
+            Self::ServerQueryReplayHistoryQuota => "native query resource: ServerQueryReplayHistoryQuota",
+            Self::LocalRegistryBytesExceeded => "native query resource: LocalRegistryBytesExceeded",
+            Self::LocalRegistryBytesExhausted => "native query resource: LocalRegistryBytesExhausted",
+            Self::ServerExactGraphWorkBudget => "native query resource: ServerExactGraphWorkBudget",
+            Self::ServerDerivedIndexModelLimit => "native query resource: ServerDerivedIndexModelLimit",
+            Self::ServerScopeMemory => "native query resource: ServerScopeMemory",
+            Self::ServerScopeHandleMemory => "native query resource: ServerScopeHandleMemory",
+            Self::ServerCloudScopeMemory => "native query resource: ServerCloudScopeMemory",
+            Self::ServerFrozenGraphMemory => "native query resource: ServerFrozenGraphMemory",
+            Self::ServerOverlayMemory => "native query resource: ServerOverlayMemory",
+            Self::ServerOverlayMemoryOverflow => "native query resource: ServerOverlayMemoryOverflow",
+            Self::ServerLogicalOverlayLimit => "native query resource: ServerLogicalOverlayLimit",
+            Self::ServerQueryHistoryMemory => "native query resource: ServerQueryHistoryMemory",
+            Self::ServerQueryCursorMemory => "native query resource: ServerQueryCursorMemory",
+            Self::ServerMembershipMemory => "native query resource: ServerMembershipMemory",
+            Self::ServerSelectedPrefixMemory => "native query resource: ServerSelectedPrefixMemory",
+            Self::ClientOverlayBytes => "native query resource: ClientOverlayBytes",
+            Self::ClientOverlayMemory => "native query resource: ClientOverlayMemory",
+            Self::ClientScopeSourceMemory => "native query resource: ClientScopeSourceMemory",
+            Self::BrokerRetainedReplyMemory => "native query resource: BrokerRetainedReplyMemory",
+            Self::BrokerReplyBytes => "native query resource: BrokerReplyBytes",
+            Self::ServerRequestMemoryBudget => "native query resource: ServerRequestMemoryBudget",
+            Self::ServerSelectedPrefixMemoryBudget => "native query resource: ServerSelectedPrefixMemoryBudget",
+            Self::ServerQueryCursorMemoryBudget => "native query resource: ServerQueryCursorMemoryBudget",
+            Self::ServerMembershipMemoryBudget => "native query resource: ServerMembershipMemoryBudget",
+            Self::ServerMembershipStepBudget => "native query resource: ServerMembershipStepBudget",
+            Self::ServerClosedQueryMetadataMemory => "native query resource: ServerClosedQueryMetadataMemory",
+            Self::ServerQueryHistoryMemoryBudget => "native query resource: ServerQueryHistoryMemoryBudget",
+            Self::ServerOverlayLayerOverflow => "native query resource: ServerOverlayLayerOverflow",
+        }
+    }
+    /// Accept only our canonical static categories and their original status code.
+    pub fn from_status(error: &Status) -> Option<Self> {
+        let reason = match error.message() {
+            "native query precondition: LocalScopeUnavailable" => Self::LocalScopeUnavailable,
+            "native query precondition: LocalScopeClosedOrExpired" => Self::LocalScopeClosedOrExpired,
+            "native query precondition: LocalScopeCountExceeded" => Self::LocalScopeCountExceeded,
+            "native query precondition: LocalReplayCountExceeded" => Self::LocalReplayCountExceeded,
+            "native query precondition: CachedCreationOutcomeUnavailable" => Self::CachedCreationOutcomeUnavailable,
+            "native query precondition: CloudReplaySourceChanged" => Self::CloudReplaySourceChanged,
+            "native query precondition: ClientScopeExpired" => Self::ClientScopeExpired,
+            "native query precondition: ServerScopeUnavailable" => Self::ServerScopeUnavailable,
+            "native query precondition: ServerScopeExpired" => Self::ServerScopeExpired,
+            "native query precondition: ServerScopeClosed" => Self::ServerScopeClosed,
+            "native query precondition: ServerReplayExpired" => Self::ServerReplayExpired,
+            "native query precondition: ServerReplayClosed" => Self::ServerReplayClosed,
+            "native query precondition: ServerCursorExpired" => Self::ServerCursorExpired,
+            "native query precondition: ServerCursorUnavailable" => Self::ServerCursorUnavailable,
+            "native query precondition: ServerQueryClosed" => Self::ServerQueryClosed,
+            "native query precondition: CloudSourceReplayUnavailable" => Self::CloudSourceReplayUnavailable,
+            "native query resource: ServerActiveScopeQuota" => Self::ServerActiveScopeQuota,
+            "native query resource: ServerScopeReplayHistoryQuota" => Self::ServerScopeReplayHistoryQuota,
+            "native query resource: ServerActiveQueryQuota" => Self::ServerActiveQueryQuota,
+            "native query resource: ServerQueryReplayHistoryQuota" => Self::ServerQueryReplayHistoryQuota,
+            "native query resource: LocalRegistryBytesExceeded" => Self::LocalRegistryBytesExceeded,
+            "native query resource: LocalRegistryBytesExhausted" => Self::LocalRegistryBytesExhausted,
+            "native query resource: ServerExactGraphWorkBudget" => Self::ServerExactGraphWorkBudget,
+            "native query resource: ServerDerivedIndexModelLimit" => Self::ServerDerivedIndexModelLimit,
+            "native query resource: ServerScopeMemory" => Self::ServerScopeMemory,
+            "native query resource: ServerScopeHandleMemory" => Self::ServerScopeHandleMemory,
+            "native query resource: ServerCloudScopeMemory" => Self::ServerCloudScopeMemory,
+            "native query resource: ServerFrozenGraphMemory" => Self::ServerFrozenGraphMemory,
+            "native query resource: ServerOverlayMemory" => Self::ServerOverlayMemory,
+            "native query resource: ServerOverlayMemoryOverflow" => Self::ServerOverlayMemoryOverflow,
+            "native query resource: ServerLogicalOverlayLimit" => Self::ServerLogicalOverlayLimit,
+            "native query resource: ServerQueryHistoryMemory" => Self::ServerQueryHistoryMemory,
+            "native query resource: ServerQueryCursorMemory" => Self::ServerQueryCursorMemory,
+            "native query resource: ServerMembershipMemory" => Self::ServerMembershipMemory,
+            "native query resource: ServerSelectedPrefixMemory" => Self::ServerSelectedPrefixMemory,
+            "native query resource: ClientOverlayBytes" => Self::ClientOverlayBytes,
+            "native query resource: ClientOverlayMemory" => Self::ClientOverlayMemory,
+            "native query resource: ClientScopeSourceMemory" => Self::ClientScopeSourceMemory,
+            "native query resource: BrokerRetainedReplyMemory" => Self::BrokerRetainedReplyMemory,
+            "native query resource: BrokerReplyBytes" => Self::BrokerReplyBytes,
+            "native query resource: ServerRequestMemoryBudget" => Self::ServerRequestMemoryBudget,
+            "native query resource: ServerSelectedPrefixMemoryBudget" => Self::ServerSelectedPrefixMemoryBudget,
+            "native query resource: ServerQueryCursorMemoryBudget" => Self::ServerQueryCursorMemoryBudget,
+            "native query resource: ServerMembershipMemoryBudget" => Self::ServerMembershipMemoryBudget,
+            "native query resource: ServerMembershipStepBudget" => Self::ServerMembershipStepBudget,
+            "native query resource: ServerClosedQueryMetadataMemory" => Self::ServerClosedQueryMetadataMemory,
+            "native query resource: ServerQueryHistoryMemoryBudget" => Self::ServerQueryHistoryMemoryBudget,
+            "native query resource: ServerOverlayLayerOverflow" => Self::ServerOverlayLayerOverflow,
+            _ => return None,
+        };
+        (reason.code() == error.code()).then_some(reason)
+    }
+}
+
 /// Do not reflect upstream diagnostics, handles or connection metadata at the
-/// local facade boundary. Preserve only the typed status category.
+/// local facade boundary. Preserve typed codes and allowlisted static categories.
 pub(crate) fn status(error: Status) -> Status {
+    if let Some(reason) = QueryFailureReason::from_status(&error).or_else(|| {
+        QueryFailureReason::from_source_message(error.message())
+            .filter(|reason| reason.code() == error.code())
+    }) {
+        return Status::new(error.code(), reason.diagnostic());
+    }
     Status::new(
         if error.code() == tonic::Code::Ok {
             tonic::Code::Internal

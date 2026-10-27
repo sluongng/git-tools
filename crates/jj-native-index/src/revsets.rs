@@ -182,6 +182,33 @@ pub(super) fn compile(
                 candidates,
                 predicate:
                     jj_lib::revset::ResolvedPredicateExpression::Filter(
+                        jj_lib::revset::RevsetFilterPredicate::File(fileset),
+                    ),
+            } => {
+                use jj_lib::fileset::{FilePattern, FilesetExpression};
+                let (path, exact_file) = match fileset {
+                    FilesetExpression::Pattern(FilePattern::FilePath(path)) => (path, true),
+                    FilesetExpression::Pattern(FilePattern::PrefixPath(path)) => (path, false),
+                    _ => return Err(Error::UnsupportedExpression("fileset_not_exact_path")),
+                };
+                let path = path.as_internal_file_string();
+                if path.is_empty()
+                    || path.len() > 4096
+                    || path.split('/').count() > limits.max_depth
+                {
+                    return Err(Error::UnsupportedExpression("fileset_not_exact_path"));
+                }
+                expr(Q::ChangedPath(Box::new(q::ChangedPathExpr {
+                    policy_version: 1,
+                    candidates: Some(Box::new(child(candidates, left, literals)?)),
+                    path: path.to_owned(),
+                    exact_file,
+                })))
+            }
+            R::FilterWithin {
+                candidates,
+                predicate:
+                    jj_lib::revset::ResolvedPredicateExpression::Filter(
                         jj_lib::revset::RevsetFilterPredicate::HasConflict,
                     ),
             } => expr(Q::HasConflict(Box::new(q::UnaryExpr {
@@ -278,6 +305,9 @@ pub(super) fn compile(
                 todo.push((v.roots.as_deref().ok_or(Error::Corrupt)?, depth + 1));
                 todo.push((v.heads.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
+            Q::ChangedPath(v) => {
+                todo.push((v.candidates.as_deref().ok_or(Error::Corrupt)?, depth + 1))
+            }
             Q::Heads(v) | Q::Roots(v) | Q::HasConflict(v) => {
                 todo.push((v.input.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
@@ -319,7 +349,7 @@ pub(super) struct NativeRevset {
     pub(super) expression: q::GraphExpr,
     pub(super) file_all: Option<Arc<Store>>,
 }
-struct Cursor {
+pub(super) struct Cursor {
     index: NativeReadonlyIndex,
     scope: Arc<CachedScope>,
     handle: [u8; 32],
@@ -337,6 +367,24 @@ impl Cursor {
         projection: q::Projection,
     ) -> Result<Self, Error> {
         let scope = index.scope().await?;
+        let (expression, owner) = crate::path_filter::prepare(&index, &scope, expression).await?;
+        Self::start_owned(index, scope, expression, projection, owner).await
+    }
+    pub(super) async fn start(
+        index: NativeReadonlyIndex,
+        scope: Arc<CachedScope>,
+        expression: q::GraphExpr,
+        projection: q::Projection,
+    ) -> Result<Self, Error> {
+        Self::start_owned(index, scope, expression, projection, None).await
+    }
+    async fn start_owned(
+        index: NativeReadonlyIndex,
+        scope: Arc<CachedScope>,
+        expression: q::GraphExpr,
+        projection: q::Projection,
+        preparation: Option<Arc<crate::path_filter::Preparation>>,
+    ) -> Result<Self, Error> {
         let reply = index
             .core
             .query
@@ -349,12 +397,15 @@ impl Cursor {
                     replay_key: scope
                         .value
                         .bound_query_id(random()[..16].try_into().expect("fixed nonce width"))
-                        .map_err(status)?,
+                        .map_err(status_at(QueryStage::GraphBegin))?,
                 },
-                Arc::new((index.core.owner(), scope.clone())),
+                Arc::new((index.core.owner(), scope.clone(), preparation.clone())),
             )
             .await
-            .map_err(status)?;
+            .map_err(status_at(QueryStage::GraphBegin))?;
+        if let Some(preparation) = preparation {
+            preparation.complete();
+        }
         Ok(Self {
             index,
             scope,
@@ -370,7 +421,9 @@ impl Cursor {
     fn owner(&self) -> QueryOwner {
         Arc::new((self.index.core.owner(), self.scope.clone()))
     }
-    async fn page(&mut self) -> Result<native_broker::QueryReply<native_broker::QueryPage>, Error> {
+    pub(super) async fn page(
+        &mut self,
+    ) -> Result<native_broker::QueryReply<native_broker::QueryPage>, Error> {
         if self.pages >= self.index.core.limits.max_query_pages {
             return Err(Error::Limit);
         }
@@ -380,7 +433,7 @@ impl Cursor {
             .query
             .page(self.handle, self.sequence, self.owner())
             .await
-            .map_err(status)?;
+            .map_err(status_at(QueryStage::GraphPage))?;
         if reply.value.sequence != self.sequence
             || reply.value.rows.len() > self.index.core.limits.page_size as usize
         {
@@ -478,7 +531,7 @@ impl Cursor {
         self.pages += 1;
         Ok(reply)
     }
-    async fn close(&mut self) {
+    pub(super) async fn close(&mut self) {
         if self
             .index
             .core
@@ -538,7 +591,7 @@ fn rows(
 }
 // Separate from the sync boolean bridge: all four sync workers may await
 // selected work concurrently, so sharing their blocking pool would deadlock.
-fn selected_runtime() -> Result<&'static SyncRuntime, Error> {
+pub(super) fn selected_runtime() -> Result<&'static SyncRuntime, Error> {
     static STATE: std::sync::OnceLock<Result<SyncRuntime, std::io::Error>> =
         std::sync::OnceLock::new();
     STATE
@@ -617,7 +670,7 @@ impl Revset for NativeRevset {
     fn prefix_disambiguation_index(
         &self,
     ) -> IndexResult<Option<Arc<dyn jj_lib::id_prefix::PrefixDisambiguationIndex>>> {
-        if self.file_all.is_some() {
+        if self.file_all.is_some() || crate::path_filter::has_path(&self.expression) {
             return Ok(None);
         }
         Ok(Some(Arc::new(
@@ -730,6 +783,19 @@ impl Revset for NativeRevset {
                 {
                     return Ok(false);
                 }
+                if crate::path_filter::has_path(&expression) {
+                    let exact = expr(q::graph_expr::Expression::Intersection(q::SetExpr {
+                        inputs: vec![
+                            expression,
+                            commits(std::slice::from_ref(&id)).map_err(rev_err)?,
+                        ],
+                    }));
+                    return rows(index, exact, q::Projection::Ids, None)
+                        .next()
+                        .await
+                        .transpose()
+                        .map(|row| row.is_some());
+                }
                 // A pure immutable membership fact needs no resumable query
                 // identity or replay tombstone for every rendered template row.
                 let fact = q::graph_fact::Fact::Membership(q::Membership {
@@ -760,9 +826,9 @@ impl Revset for NativeRevset {
     }
 }
 
-struct SyncRuntime {
-    runtime: tokio::runtime::Runtime,
-    jobs: Arc<tokio::sync::Semaphore>,
+pub(super) struct SyncRuntime {
+    pub(super) runtime: tokio::runtime::Runtime,
+    pub(super) jobs: Arc<tokio::sync::Semaphore>,
 }
 fn sync_runtime() -> Result<&'static SyncRuntime, Error> {
     static STATE: std::sync::OnceLock<Result<SyncRuntime, std::io::Error>> =

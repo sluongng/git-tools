@@ -25,7 +25,7 @@ impl CloudKey {
 pub(crate) struct CloudVersionAuthority {
     version: u8,
     id: String,
-    binding: String,
+    pub(super) binding: String,
     workspace: [u8; 32],
     generation: u64,
     manifest: [u8; 32],
@@ -39,6 +39,9 @@ impl CloudVersionAuthority {
     /// Saved keys are selection hints only until a fresh selected proof agrees.
     pub fn native_root_hints(&self) -> impl Iterator<Item = Result<ObjectKey>> + '_ {
         self.roots.iter().map(|root| root.key())
+    }
+    pub fn id(&self) -> &str {
+        &self.id
     }
     pub fn root_count(&self) -> usize {
         self.roots.len()
@@ -68,7 +71,7 @@ impl CloudVersionAuthority {
     pub fn terminal(&self, key: ObjectKey) -> Result<bool> {
         Ok(self.roots.binary_search(&CloudKey::new(key)).is_ok())
     }
-    fn identity(&self) -> Result<String> {
+    pub(super) fn identity(&self) -> Result<String> {
         let mut h = blake3::Hasher::new();
         h.update(b"native-cloud-version-authority-v1\0");
         h.update(&serde_json::to_vec(&(
@@ -103,6 +106,24 @@ impl Ledger {
                 .all(|p| { (p[0].kind as u8, p[0].id.0) < (p[1].kind as u8, p[1].id.0) }),
             "cloud native roots are not canonical"
         );
+        self.install_cloud_record(self.make_cloud_authority(proof, roots)?)
+    }
+    pub(super) fn make_cloud_authority(
+        &self,
+        proof: &tinytree_client::VerifiedRetainedVersion,
+        roots: &[ObjectKey],
+    ) -> Result<CloudVersionAuthority> {
+        ensure!(
+            roots.len() <= self.config.max_admitted_roots
+                && roots.len() <= self.config.closure.max_edges,
+            "cloud native root count exceeded"
+        );
+        ensure!(
+            roots
+                .windows(2)
+                .all(|p| (p[0].kind as u8, p[0].id.0) < (p[1].kind as u8, p[1].id.0)),
+            "cloud native roots are not canonical"
+        );
         let selector = proof.selector();
         let selected = proof.manifest_selected();
         let mut authority = CloudVersionAuthority {
@@ -119,7 +140,7 @@ impl Ledger {
             roots: roots.iter().copied().map(CloudKey::new).collect(),
         };
         authority.id = authority.identity()?;
-        self.install_cloud_record(authority)
+        Ok(authority)
     }
     fn install_cloud_record(
         &self,

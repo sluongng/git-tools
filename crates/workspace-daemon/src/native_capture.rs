@@ -57,6 +57,7 @@ pub(crate) struct Coordinator {
     refresh_lock: tokio::sync::Mutex<()>,
     attempted: AtomicU64,
     queued: AtomicU64,
+    reused_pending: AtomicU64,
     skipped: AtomicU64,
     failed: AtomicU64,
     last: Mutex<&'static str>,
@@ -95,6 +96,7 @@ impl Coordinator {
             refresh_lock: tokio::sync::Mutex::new(()),
             attempted: AtomicU64::new(0),
             queued: AtomicU64::new(0),
+            reused_pending: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             last: Mutex::new("disabled"),
@@ -163,6 +165,24 @@ impl Coordinator {
         self.queued.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut last) = self.last.lock() {
             *last = "queued";
+        }
+    }
+    pub(crate) fn record_dirty_capture(
+        &self,
+        disposition: &native_retention::DirtyCaptureDisposition,
+    ) {
+        match disposition {
+            native_retention::DirtyCaptureDisposition::Queued(_) => self.queued(),
+            native_retention::DirtyCaptureDisposition::ReusedPending(_) => self.reused_pending(),
+        }
+    }
+    fn reused_pending(&self) {
+        if let Ok(mut inventory) = self.inventory.lock() {
+            inventory.available = false;
+        }
+        self.reused_pending.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = self.last.lock() {
+            *last = "reused_pending_exact";
         }
     }
     pub(crate) async fn select_until(
@@ -243,7 +263,7 @@ impl Coordinator {
     }
     pub(crate) fn status(&self) -> serde_json::Value {
         let value = self.inventory.lock().unwrap_or_else(|e| e.into_inner());
-        serde_json::json!({"policy":self.config.policy,"pending_count":value.count,"pending_bytes":value.bytes,"pending_dirty":value.dirty,"pending_clean":value.clean,"pending_unavailable":value.unavailable,"pending_root_claims":value.root_claims,"inventory_available":value.available,"charged_spool_bytes":self.directory.as_ref().map(|_|self.disk_bytes.load(Ordering::Relaxed)),"attempted":self.attempted.load(Ordering::Relaxed),"queued":self.queued.load(Ordering::Relaxed),"skipped":self.skipped.load(Ordering::Relaxed),"failed":self.failed.load(Ordering::Relaxed),"last_disposition":*self.last.lock().unwrap_or_else(|e|e.into_inner())})
+        serde_json::json!({"policy":self.config.policy,"pending_count":value.count,"pending_bytes":value.bytes,"pending_dirty":value.dirty,"pending_clean":value.clean,"pending_unavailable":value.unavailable,"pending_root_claims":value.root_claims,"inventory_available":value.available,"charged_spool_bytes":self.directory.as_ref().map(|_|self.disk_bytes.load(Ordering::Relaxed)),"attempted":self.attempted.load(Ordering::Relaxed),"queued":self.queued.load(Ordering::Relaxed),"reused_pending":self.reused_pending.load(Ordering::Relaxed),"skipped":self.skipped.load(Ordering::Relaxed),"failed":self.failed.load(Ordering::Relaxed),"last_disposition":*self.last.lock().unwrap_or_else(|e|e.into_inner())})
     }
 }
 pub(crate) struct SpoolCleanupGuard {
@@ -470,7 +490,11 @@ impl LocalCaptureSink for Writer {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn verify_existing(directory: &PrivateDir, name: &str, descriptor: BundleDescriptor) -> Result<()> {
+fn verify_existing(
+    directory: &PrivateDir,
+    name: &str,
+    descriptor: BundleDescriptor,
+) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut file = OpenOptions::new()
         .read(true)
@@ -502,7 +526,8 @@ fn verify_existing(directory: &PrivateDir, name: &str, descriptor: BundleDescrip
         read == descriptor.size_bytes && hash.finalize().as_bytes() == &descriptor.blake3,
         "existing capture pack digest differs"
     );
-    Ok(())
+    file.sync_all()?;
+    Ok(file)
 }
 impl Writer {
     async fn finish(self, capture: QuiescentCapture) -> Result<OwnedCaptureBundle> {
@@ -587,30 +612,39 @@ impl Writer {
             };
             writer.file.sync_all()?;
             let name = format!("{}.pack", hex(&descriptor.blake3));
-            match std::fs::hard_link(
+            let existing = match std::fs::hard_link(
                 writer.directory.path().join(&writer.temporary),
                 writer.directory.path().join(&name),
             ) {
                 Ok(()) => {
                     writer.disk_files.fetch_add(1, Ordering::AcqRel);
+                    None
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    verify_existing(&writer.directory, &name, descriptor)?
+                    Some(verify_existing(&writer.directory, &name, descriptor)?)
                 }
                 Err(error) => return Err(error.into()),
-            }
+            };
             File::open(writer.directory.path())?.sync_all()?;
             std::fs::remove_file(writer.directory.path().join(&writer.temporary))?;
             writer.disk_files.fetch_sub(1, Ordering::AcqRel);
             File::open(writer.directory.path())?.sync_all()?;
             drop(writer);
-            Ok(OwnedCaptureBundle::new(
+            let verified_existing = existing.is_some();
+            let bundle = OwnedCaptureBundle::new(
                 native_retention::CaptureBundle {
                     checkpoint,
                     bundle: descriptor,
                 },
-                Arc::new((capture, pack)),
-            ))
+                // Close the verified old file before the lifetime signals final
+                // physical teardown through the last pack owner.
+                Arc::new((existing, capture, pack)),
+            );
+            Ok(if verified_existing {
+                bundle.with_verified_existing_bundle()
+            } else {
+                bundle
+            })
         })
         .await
         .context("capture finalizer worker failed")?

@@ -11,6 +11,12 @@ pub enum CapabilityFeature {
     CapturedIndexedCloudWrite = 5,
     LandingRecoveryCloudRead = 6,
     LandingRecoveryCloudWrite = 7,
+    ExactPathGraphV1 = 8,
+    ExactCloudRepresentationRead = 9,
+    ExactCloudRepresentationWrite = 10,
+    JjResolvedBlameV1 = 11,
+    AnnotationFrontierV1 = 12,
+    DurableRetainedOffloadV1 = 13,
 }
 impl CapabilityFeature {
     pub const ALL: [Self; 5] = [
@@ -40,6 +46,74 @@ pub struct Capabilities {
     pub root_readiness: RootReadiness,
 }
 impl NativeClient {
+    /// Probe only the additive resolved-blame feature. Servers implementing an
+    /// older capability vocabulary reject this exact singleton as InvalidArgument;
+    /// pre-capability servers return Unimplemented. Neither proves a grant or
+    /// selected-root readiness. All other failures remain failures.
+    pub async fn resolved_blame_capability(&self) -> Result<Option<FeatureCapability>, Status> {
+        match self
+            .capabilities(&[CapabilityFeature::JjResolvedBlameV1])
+            .await
+        {
+            Ok(capabilities) => Ok(Some(capabilities.features[0])),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Exact singleton feature12 negotiation. Legacy vocabulary absence is not
+    /// authorization, selected-source readiness, or a failed-query fallback.
+    pub async fn annotation_frontier_capability(
+        &self,
+    ) -> Result<Option<FeatureCapability>, Status> {
+        match self
+            .capabilities(&[CapabilityFeature::AnnotationFrontierV1])
+            .await
+        {
+            Ok(capabilities) => Ok(Some(capabilities.features[0])),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Negotiate the full retained backing contract, independently of exact
+    /// representation reads (feature9). Legacy singleton vocabulary absence is
+    /// unsupported, not a grant. Denial, corruption, quota and transport errors
+    /// remain errors. No result is cached across clients, selections or restarts.
+    pub async fn durable_retained_offload_capability(
+        &self,
+    ) -> Result<Option<FeatureCapability>, Status> {
+        match self
+            .capabilities(&[CapabilityFeature::DurableRetainedOffloadV1])
+            .await
+        {
+            Ok(capabilities) => Ok(Some(capabilities.features[0])),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Request a nonempty ascending feature set. Old servers return explicit
     /// UNIMPLEMENTED; this method never substitutes an eager/legacy workflow.
     pub async fn capabilities(
@@ -47,7 +121,7 @@ impl NativeClient {
         features: &[CapabilityFeature],
     ) -> Result<Capabilities, Status> {
         if features.is_empty()
-            || features.len() > 7
+            || features.len() > 13
             || features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(

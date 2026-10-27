@@ -2558,6 +2558,436 @@ async fn lazy_authoritative_payload_recovery_keeps_same_size_and_growing_edits_d
     }
 }
 
+fn recovery_allocation_disk_snapshot(
+    root: &Path,
+) -> std::collections::BTreeMap<PathBuf, (bool, u64, [u8; 32], std::time::SystemTime, u32)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        out: &mut std::collections::BTreeMap<
+            PathBuf,
+            (bool, u64, [u8; 32], std::time::SystemTime, u32),
+        >,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            };
+            #[cfg(not(unix))]
+            let mode = u32::from(metadata.permissions().readonly());
+            let hash = if metadata.is_file() {
+                let mut hash = blake3::Hasher::new();
+                let mut file = File::open(&path).unwrap();
+                let mut bytes = [0; 65536];
+                loop {
+                    let n = file.read(&mut bytes).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&bytes[..n]);
+                }
+                *hash.finalize().as_bytes()
+            } else {
+                assert!(metadata.is_dir());
+                [0; 32]
+            };
+            out.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                (
+                    metadata.is_dir(),
+                    if metadata.is_dir() { 0 } else { metadata.len() },
+                    hash,
+                    metadata.modified().unwrap(),
+                    mode,
+                ),
+            );
+            if metadata.is_dir() {
+                visit(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[test]
+fn shared_recovery_allocation_refuses_before_wal_and_keeps_valid_writes_usable() {
+    use fjall::{Database, RecoveryAllocationLimits};
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("database");
+    let limits = RecoveryAllocationLimits {
+        max_record_bytes: 4096,
+        max_batch_bytes: 1024,
+        max_batch_items: 4,
+        max_journals: 2,
+    };
+    let db = Database::builder(&root)
+        .recovery_allocation_limits(Some(limits))
+        .open()
+        .unwrap();
+    let namespace = db
+        .keyspace("namespace", KeyspaceCreateOptions::default)
+        .unwrap();
+    namespace.insert(b"before", b"accepted").unwrap();
+    db.persist(PersistMode::SyncAll).unwrap();
+    for behavior in ["record bytes", "batch bytes", "batch items", "clear"] {
+        let before = recovery_allocation_disk_snapshot(&root);
+        let result = match behavior {
+            "record bytes" => namespace.insert(b"oversized", vec![1; 4096]),
+            "batch bytes" => {
+                let mut batch = db.batch();
+                batch.insert(&namespace, b"first", vec![1; 600]);
+                batch.insert(&namespace, b"second", vec![2; 600]);
+                batch.commit()
+            }
+            "batch items" => {
+                let mut batch = db.batch();
+                for n in 0..5u8 {
+                    batch.insert(&namespace, [n], b"small");
+                }
+                batch.commit()
+            }
+            "clear" => namespace.clear(),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(fjall::Error::RecoveryAllocationLimit)),
+            "{behavior}: {result:?}"
+        );
+        assert_eq!(
+            recovery_allocation_disk_snapshot(&root),
+            before,
+            "{behavior}"
+        );
+        assert_eq!(
+            namespace.get(b"before").unwrap().unwrap().as_ref(),
+            b"accepted"
+        );
+    }
+    // A pre-WAL policy refusal is not an uncertain commit and must not poison.
+    namespace.insert(b"after", b"still-usable").unwrap();
+    db.persist(PersistMode::SyncAll).unwrap();
+    drop(namespace);
+    drop(db);
+    let before = recovery_allocation_disk_snapshot(&root);
+    let inspected = Database::builder(&root)
+        .recovery_allocation_limits(Some(limits))
+        .strict_existing_recovery(true)
+        // Shared allocation policy deliberately does not inherit a physical-IO quota.
+        .strict_recovery_max_scan_bytes(1)
+        .open()
+        .unwrap();
+    let namespace = inspected
+        .keyspace("namespace", KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(
+        namespace.get(b"after").unwrap().unwrap().as_ref(),
+        b"still-usable"
+    );
+    drop(namespace);
+    drop(inspected);
+    assert_eq!(recovery_allocation_disk_snapshot(&root), before);
+    let reopened = Database::builder(&root)
+        .recovery_allocation_limits(Some(limits))
+        .strict_existing_recovery(true)
+        .open()
+        .unwrap();
+    reopened.finish_recovery_validation().unwrap();
+    let namespace = reopened
+        .keyspace("namespace", KeyspaceCreateOptions::default)
+        .unwrap();
+    namespace.insert(b"finished", b"new-write").unwrap();
+    reopened.persist(PersistMode::SyncAll).unwrap();
+}
+
+#[test]
+fn shared_recovery_allocation_refuses_incompatible_history_without_repair() {
+    use fjall::{Database, RecoveryAllocationLimits};
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("database");
+    {
+        let db = Database::builder(&root).open().unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        namespace.insert(b"historical", vec![1; 8192]).unwrap();
+        db.persist(PersistMode::SyncAll).unwrap();
+    }
+    let limits = RecoveryAllocationLimits {
+        max_record_bytes: 4096,
+        max_batch_bytes: 16384,
+        max_batch_items: 100,
+        max_journals: 2,
+    };
+    let before = recovery_allocation_disk_snapshot(&root);
+    assert!(matches!(
+        Database::builder(&root)
+            .recovery_allocation_limits(Some(limits))
+            .strict_existing_recovery(true)
+            .open(),
+        Err(fjall::Error::RecoveryAllocationLimit)
+    ));
+    assert_eq!(recovery_allocation_disk_snapshot(&root), before);
+    // Configuration refusal precedes even fresh-root creation.
+    let absent = directory.path().join("absent");
+    assert!(matches!(
+        Database::builder(&absent)
+            .recovery_allocation_limits(Some(RecoveryAllocationLimits {
+                max_journals: 0,
+                ..limits
+            }))
+            .open(),
+        Err(fjall::Error::RecoveryAllocationLimit)
+    ));
+    assert!(!absent.exists());
+}
+
+#[test]
+fn shared_recovery_journal_cap_continues_flush_and_reopens_accepted_writes() {
+    use fjall::{CompressionType, Database, RecoveryAllocationLimits};
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("database");
+    let limits = RecoveryAllocationLimits {
+        max_record_bytes: 16 * 1024 * 1024,
+        max_batch_bytes: 32 * 1024 * 1024,
+        max_batch_items: 100,
+        max_journals: 1,
+    };
+    {
+        let db = Database::builder(&root)
+            .recovery_allocation_limits(Some(limits))
+            .journal_compression(CompressionType::None)
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", || {
+                KeyspaceCreateOptions::default().max_memtable_size(1024 * 1024)
+            })
+            .unwrap();
+        for revision in 0..9u8 {
+            namespace
+                .insert(b"overwritten", vec![revision; 8 * 1024 * 1024])
+                .unwrap();
+            namespace.rotate_memtable_and_wait().unwrap();
+        }
+        // Keep a real unflushed suffix after the much larger persisted prefix.
+        namespace.insert(b"pending-tail", vec![9; 65536]).unwrap();
+        db.persist(PersistMode::SyncAll).unwrap();
+        let journals: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "jnl"))
+            .collect();
+        assert_eq!(
+            journals.len(),
+            1,
+            "flushing must not create an unadmitted fragment"
+        );
+        assert!(fs::metadata(&journals[0]).unwrap().len() > 64 * 1024 * 1024);
+        assert!(
+            namespace.table_count() > 0,
+            "journal cap must not suppress flush work"
+        );
+    }
+    let db = Database::builder(&root)
+        .recovery_allocation_limits(Some(limits))
+        .strict_existing_recovery(true)
+        .open()
+        .unwrap();
+    assert!(
+        db.write_buffer_size() > 0 && db.write_buffer_size() < 1024 * 1024,
+        "recovery retains the unflushed suffix, not the 72 MiB flushed history"
+    );
+    let namespace = db
+        .keyspace("namespace", KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(
+        namespace.get(b"pending-tail").unwrap().unwrap().as_ref(),
+        vec![9; 65536]
+    );
+    assert_eq!(
+        namespace.get(b"overwritten").unwrap().unwrap().as_ref(),
+        vec![8; 8 * 1024 * 1024]
+    );
+}
+
+#[test]
+fn shared_recovery_inventory_is_ordered_bounded_and_rejects_gaps_without_repair() {
+    use fjall::{Database, RecoveryAllocationLimits};
+    let directory = TempDir::new().unwrap();
+    let root = directory.path().join("database");
+    let limits = RecoveryAllocationLimits {
+        max_record_bytes: 4096,
+        max_batch_bytes: 16384,
+        max_batch_items: 100,
+        max_journals: 2,
+    };
+    {
+        let db = Database::builder(&root)
+            .recovery_allocation_limits(Some(limits))
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        namespace.insert(b"kept", b"value").unwrap();
+        namespace.rotate_memtable_and_wait().unwrap();
+        db.persist(PersistMode::SyncAll).unwrap();
+    }
+    // An empty next fragment is a valid just-rotated journal, not a clone of data.
+    fs::File::create_new(root.join("1.jnl"))
+        .unwrap()
+        .set_len(65536)
+        .unwrap();
+    let before = recovery_allocation_disk_snapshot(&root);
+    {
+        let db = Database::builder(&root)
+            .recovery_allocation_limits(Some(limits))
+            .strict_existing_recovery(true)
+            .open()
+            .unwrap();
+        let namespace = db
+            .keyspace("namespace", KeyspaceCreateOptions::default)
+            .unwrap();
+        assert_eq!(namespace.get(b"kept").unwrap().unwrap().as_ref(), b"value");
+    }
+    assert_eq!(recovery_allocation_disk_snapshot(&root), before);
+    for strict in [false, true] {
+        assert!(matches!(
+            Database::builder(&root)
+                .recovery_allocation_limits(Some(RecoveryAllocationLimits {
+                    max_journals: 1,
+                    ..limits
+                }))
+                .strict_existing_recovery(strict)
+                .open(),
+            Err(fjall::Error::RecoveryAllocationLimit)
+        ));
+        assert_eq!(recovery_allocation_disk_snapshot(&root), before);
+    }
+    for invalid_name in ["2.jnl", "01.jnl"] {
+        fs::rename(root.join("1.jnl"), root.join(invalid_name)).unwrap();
+        let before = recovery_allocation_disk_snapshot(&root);
+        assert!(matches!(
+            Database::builder(&root)
+                .recovery_allocation_limits(Some(limits))
+                .strict_existing_recovery(true)
+                .open(),
+            Err(fjall::Error::Unrecoverable)
+        ));
+        assert_eq!(recovery_allocation_disk_snapshot(&root), before);
+        fs::rename(root.join(invalid_name), root.join("1.jnl")).unwrap();
+    }
+}
+
+#[test]
+fn shared_recovery_filters_each_persisted_frontier_but_keeps_pending_values_and_deletions() {
+    use fjall::{Database, RecoveryAllocationLimits};
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            assert!(!entry.file_type().unwrap().is_symlink());
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    fn inspect(
+        root: &Path,
+        policy: Option<RecoveryAllocationLimits>,
+    ) -> (Vec<Option<Vec<u8>>>, u64) {
+        let db = Database::builder(root)
+            .recovery_allocation_limits(policy)
+            .strict_existing_recovery(true)
+            .open()
+            .unwrap();
+        let first = db
+            .keyspace("first", KeyspaceCreateOptions::default)
+            .unwrap();
+        let second = db
+            .keyspace("second", KeyspaceCreateOptions::default)
+            .unwrap();
+        let values = [
+            first.get(b"overwritten").unwrap(),
+            first.get(b"deleted").unwrap(),
+            first.get(b"suffix").unwrap(),
+            second.get(b"overwritten").unwrap(),
+            second.get(b"suffix").unwrap(),
+        ]
+        .into_iter()
+        .map(|value| value.map(|value| value.to_vec()))
+        .collect();
+        (values, db.write_buffer_size())
+    }
+    let directory = TempDir::new().unwrap();
+    let source = directory.path().join("source");
+    let limits = RecoveryAllocationLimits {
+        max_record_bytes: 4096,
+        max_batch_bytes: 16384,
+        max_batch_items: 100,
+        max_journals: 2,
+    };
+    {
+        let db = Database::builder(&source)
+            .recovery_allocation_limits(Some(limits))
+            .open()
+            .unwrap();
+        let first = db
+            .keyspace("first", KeyspaceCreateOptions::default)
+            .unwrap();
+        let second = db
+            .keyspace("second", KeyspaceCreateOptions::default)
+            .unwrap();
+        first.insert(b"overwritten", b"old-first").unwrap();
+        first.insert(b"deleted", b"must-disappear").unwrap();
+        second.insert(b"overwritten", b"old-second").unwrap();
+        first.rotate_memtable_and_wait().unwrap();
+        first.insert(b"overwritten", b"new-first").unwrap();
+        first.remove(b"deleted").unwrap();
+        second.insert(b"overwritten", b"new-second").unwrap();
+        // The second keyspace now has a higher persisted frontier, but the
+        // first keyspace's smaller unflushed sequence numbers are still live.
+        second.rotate_memtable_and_wait().unwrap();
+        first.insert(b"suffix", b"first-tail").unwrap();
+        second.insert(b"suffix", b"second-tail").unwrap();
+        db.persist(PersistMode::SyncAll).unwrap();
+    }
+    let legacy_root = directory.path().join("legacy");
+    let bounded_root = directory.path().join("bounded");
+    copy_tree(&source, &legacy_root);
+    copy_tree(&source, &bounded_root);
+    let before = recovery_allocation_disk_snapshot(&bounded_root);
+    let legacy = inspect(&legacy_root, None);
+    let bounded = inspect(&bounded_root, Some(limits));
+    assert_eq!(bounded.0, legacy.0);
+    assert_eq!(
+        bounded.0,
+        vec![
+            Some(b"new-first".to_vec()),
+            None,
+            Some(b"first-tail".to_vec()),
+            Some(b"new-second".to_vec()),
+            Some(b"second-tail".to_vec()),
+        ]
+    );
+    assert!(
+        bounded.1 > 0 && bounded.1 < legacy.1,
+        "only unflushed per-keyspace suffixes belong in recovered memtables"
+    );
+    assert_eq!(recovery_allocation_disk_snapshot(&bounded_root), before);
+}
+
 #[test]
 fn strict_database_recovery_preserves_rejected_bytes_and_finishes_before_new_synced_writes() {
     use std::collections::BTreeMap;

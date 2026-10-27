@@ -91,6 +91,13 @@ fn now() -> BackendResult<i64> {
     )
     .map_err(other)
 }
+/// Bounded source-checked private metadata; no FILE body is retained.
+pub struct LocalAnnotationPath {
+    pub parents: Vec<m::CommitId>,
+    pub value: Option<m::TreeValue>,
+    pub charged_bytes: usize,
+    pub objects: usize,
+}
 impl NativeBackend {
     pub const NAME: &'static str = "tinytree-native-v1";
     pub fn init(path: &Path, config: Config) -> Result<Self, BackendInitError> {
@@ -154,6 +161,66 @@ impl NativeBackend {
     }
     async fn put_object(&self, object: m::Object) -> BackendResult<m::Descriptor> {
         self.io.write_metadata(object).await
+    }
+    /// Read a source-checked private path value only from resident local data.
+    /// Provider opt-in fences the exact size before any spool/body work. This
+    /// intentionally refuses unsupported/nonresident inputs rather than using
+    /// generic canonical FILE authority or hydrating a different path.
+    pub async fn local_annotation_file(
+        &self, value:&m::TreeValue, max_bytes:u64,
+        owner:Arc<dyn std::any::Any+Send+Sync>,
+    )->BackendResult<Pin<Box<dyn AsyncRead+Send>>> {
+        let m::TreeValue::File{id,size_bytes,..}=value else {return Err(invalid("annotation input is not a FILE"));};
+        if *size_bytes>max_bytes {return Err(invalid("annotation FILE exceeds caller limit"));}
+        let expected=m::Descriptor {key:m::ObjectKey{kind:m::Kind::File,id:m::ObjectId(id.0)},size_bytes:*size_bytes,format_version:m::FORMAT_VERSION};
+        let read=self.io.read_local_file_bounded(expected,*size_bytes,owner).await?;
+        let (actual,reader)=read.into_parts();
+        if actual!=expected {return Err(invalid("bounded annotation FILE descriptor changed"));}
+        Ok(reader)
+    }
+    /// Read one private COMMIT/path projection without reading any FILE body.
+    /// The caller first establishes local operation-checkpoint membership. Every
+    /// immutable descriptor is charged before metadata decode/clone; this does
+    /// not grant canonical authority to graph overlays or arbitrary FILE IDs.
+    pub async fn local_annotation_path(
+        &self, id: m::CommitId, path: &[&str], max_charged_bytes: usize, max_objects: usize,
+    ) -> BackendResult<LocalAnnotationPath> {
+        if id == m::CommitId::ROOT || path.is_empty() || path.len() > 128 || path.iter().any(|p|p.is_empty() || *p == "." || *p == ".." || p.contains('/')) {
+            return Err(invalid("invalid private annotation path"));
+        }
+        let mut charged = 0usize;
+        let mut objects = 0usize;
+        let mut read = async |key| {
+            let descriptor = self.descriptor(key).await?;
+            let amount = usize::try_from(descriptor.size_bytes).ok()
+                .and_then(|n| n.checked_mul(128)).and_then(|n|n.checked_add(4096))
+                .ok_or_else(|| invalid("private annotation metadata bound overflow"))?;
+            charged = charged.checked_add(amount).filter(|n|*n<=max_charged_bytes)
+                .ok_or_else(||invalid("private annotation metadata reservation exhausted"))?;
+            objects = objects.checked_add(1).filter(|n|*n<=max_objects)
+                .ok_or_else(||invalid("private annotation object reservation exhausted"))?;
+            let verified = self.io.read_metadata(key).await?;
+            if verified.descriptor() != descriptor {return Err(invalid("private annotation metadata descriptor changed"));}
+            Ok::<_, BackendError>(verified.into_object())
+        };
+        let m::Object::Commit(commit) = read(m::ObjectKey {kind:m::Kind::Commit,id:m::ObjectId(id.0)}).await? else {
+            return Err(invalid("private annotation COMMIT kind mismatch"));
+        };
+        let [tree] = commit.root_tree.terms.as_slice() else {return Err(invalid("private annotation conflicted tree unsupported"));};
+        let mut tree = *tree;
+        let mut value = None;
+        for (n, part) in path.iter().enumerate() {
+            let m::Object::Tree(entries) = read(m::ObjectKey {kind:m::Kind::Tree,id:m::ObjectId(tree.0)}).await? else {
+                return Err(invalid("private annotation TREE kind mismatch"));
+            };
+            let entry = entries.entries.into_iter().find(|entry|entry.name==*part);
+            let Some(entry) = entry else {break;};
+            if n+1==path.len() {value=Some(entry.value);break;}
+            let m::TreeValue::Tree(next)=entry.value else {break;};
+            tree=next;
+        }
+        drop(read);
+        Ok(LocalAnnotationPath {parents:commit.parents,value,charged_bytes:charged,objects})
     }
     async fn descriptor(&self, object: m::ObjectKey) -> BackendResult<m::Descriptor> {
         let descriptor = self

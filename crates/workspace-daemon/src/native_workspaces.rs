@@ -164,6 +164,120 @@ pub struct Mounted {
     pub registry_path: PathBuf,
 }
 
+pub(crate) struct ProviderEnrollment {
+    pub workspace_id: [u8; 32],
+    pub store: String,
+    pub root: PathBuf,
+    pub pending: bool,
+    pub retired: bool,
+    pub intent_only: bool,
+}
+/// Read committed identity reservations only; no recovery, root probing, or
+/// object access. Every source is bounded by the same startup census budget.
+pub(crate) fn inspect_provider_enrollments(
+    config: &Config,
+    census: &mut crate::provider_identity::Census,
+) -> Result<Vec<ProviderEnrollment>> {
+    let mut known = BTreeMap::new();
+    let path = config.state_dir.join("native-workspaces");
+    if path.try_exists()? {
+        let directory = PrivateDir::open_existing(path)?;
+        for item in fs::read_dir(directory.path())? {
+            census.entry()?;
+            let item = item?;
+            ensure!(item.file_type()?.is_dir(), "unknown provider workspace census entry");
+            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider workspace census name"))?;
+            let id = unhex(&name)?;
+            let child = PrivateDir::open_existing(item.path())?;
+            if !child.path().join("workspace.json").try_exists()? {
+                // An exact cloud reservation below must account for this ID.
+                census.charge(4096)?;
+                known.insert(id, None);
+                continue;
+            }
+            let bytes = census.read(&child, "workspace.json", MAX_RECORD)?;
+            let record = read_record(&bytes).map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
+            validate_record(&record).map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
+            ensure!(record.workspace_id == id, "provider workspace census identity differs");
+            census_record(&record, census)?;
+            census.charge(4096)?;
+            known.insert(id, Some(ProviderEnrollment {workspace_id: id, store: record.store, root: record.root,
+                pending: matches!(record.state, Lifecycle::Pending | Lifecycle::RecoveryRequired), retired: false, intent_only: false}));
+        }
+    }
+    let path = config.state_dir.join("native-cloud-restores");
+    if path.try_exists()? {
+        let directory = PrivateDir::open_existing(path)?;
+        for item in fs::read_dir(directory.path())? {
+            census.entry()?;
+            let item = item?;
+            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider restore census name"))?;
+            let bytes = census.read(&directory, &name, MAX_RECORD)?;
+            if is_retirement_temporary(&name) { continue; }
+            let key = name.strip_suffix(".json").context("unknown provider restore census entry")?;
+            unhex(key)?;
+            let intent: CloudRestoreIntent = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid provider restore census record"))?;
+            validate_cloud_intent(&intent).map_err(|_| anyhow::anyhow!("invalid provider restore census record"))?;
+            ensure!(cloud_intent_key(&intent.root)? == key, "provider restore census filename differs");
+            census.identity(&intent.store, intent.provider_identity)?;
+            census.charge(4096)?;
+            if let Some(Some(existing)) = known.get(&intent.workspace_id) {
+                ensure!(existing.store == intent.store && existing.root == intent.root,
+                    "provider restore census enrollment conflicts");
+            }
+            let intent_only = !known.contains_key(&intent.workspace_id);
+            known.entry(intent.workspace_id).or_insert(None).get_or_insert(ProviderEnrollment {
+                workspace_id: intent.workspace_id, store: intent.store, root: intent.root, pending: true, retired: false, intent_only,
+            });
+        }
+    }
+    let path = config.state_dir.join("native-candidate-retirements");
+    if path.try_exists()? {
+        let directory = PrivateDir::open_existing(path)?;
+        for item in fs::read_dir(directory.path())? {
+            census.entry()?;
+            let item = item?;
+            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider retirement census name"))?;
+            let bytes = census.read(&directory, &name, MAX_RECORD)?;
+            if is_retirement_temporary(&name) { continue; }
+            let id = unhex(name.strip_suffix(".json").context("unknown provider retirement census entry")?)?;
+            let receipt: CandidateRetirement = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid provider retirement census record"))?;
+            validate_retirement(&receipt, id).map_err(|_| anyhow::anyhow!("invalid provider retirement census record"))?;
+            census_record(&receipt.record, census)?;
+            ensure!(!receipt.complete || !known.contains_key(&id),
+                "completed provider retirement retains workspace state");
+            census.charge(4096)?;
+            if let Some(Some(existing)) = known.get_mut(&id) {
+                ensure!(existing.store == receipt.record.store && existing.root == receipt.record.root
+                    && !receipt.complete, "provider retirement census enrollment conflicts");
+                existing.pending = true;
+                existing.intent_only = false;
+            } else {
+                known.insert(id, Some(ProviderEnrollment {
+                    workspace_id:id, store:receipt.record.store, root:receipt.record.root,
+                    pending:!receipt.complete, retired:receipt.complete, intent_only:false,
+                }));
+            }
+        }
+    }
+    ensure!(known.values().all(Option::is_some), "unreserved provider workspace census entry");
+    Ok(known.into_values().flatten().collect())
+}
+fn census_record(record: &Record, census: &mut crate::provider_identity::Census) -> Result<()> {
+    census.scope(&record.store, &record.scope)?;
+    if let Some(bytes) = &record.creation_plan {
+        let plan = native_broker::CreationPlan::decode(bytes)
+            .map_err(|_| anyhow::anyhow!("invalid provider creation census record"))?;
+        census.identity(&record.store, plan.provider_identity)?;
+    }
+    if let Origin::Restore {source,..} = &record.origin {
+        census.identity(&record.store, source.provider_identity())?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Manager {
     config: Config,
     directory: PrivateDir,
@@ -1630,9 +1744,11 @@ impl Manager {
         controller_config.source_limits = source_limits;
         controller_config.max_file_bytes = settings.max_file_bytes;
         controller_config.max_snapshot_bytes = settings.max_snapshot_bytes;
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=controller_open state=start\n");
         let controller = Arc::new(
             Controller::open(mount.clone(), repository.io.clone(), controller_config).await?,
         );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=controller_open state=complete\n");
         self.entries.get_mut(workspace_id).unwrap().controller = Some(controller.clone());
         let metadata = restore_locator(self.config.state_dir.join("rbe.sock"), store.clone());
         if current {
@@ -1658,7 +1774,8 @@ impl Manager {
                 .restore_intent
                 .take()
             {
-                native_workspace_admin::restore::initialize_restored(
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=initialize_stage state=start\n");
+                let receipt = native_workspace_admin::restore::initialize_restored(
                     intent,
                     restore,
                     native_workspace_admin::restore::RestoreHost {
@@ -1673,7 +1790,9 @@ impl Manager {
                         backend_metadata: metadata.0.clone(),
                     },
                 )
-                .await?
+                .await?;
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=initialize_stage state=complete\n");
+                receipt
             } else {
                 native_workspace_admin::restore::reopen_staged_restore(
                     registry.clone(),
@@ -1700,6 +1819,7 @@ impl Manager {
                 .restore_receipt
                 .take()
                 .unwrap();
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=finalize_stage state=start\n");
             let ready = native_workspace_admin::restore::finalize_staged_restore(
                 receipt,
                 native_workspace_admin::restore::RestoreReadbackHost {
@@ -1714,6 +1834,7 @@ impl Manager {
                 },
             )
             .await?;
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=finalize_stage state=complete\n");
             let Origin::Restore { source, .. } = &record.origin else {
                 unreachable!()
             };
@@ -1758,6 +1879,7 @@ impl Manager {
             .take()
             .context("native restore command reservation missing")?
             .validate_for_activation(&commands, &binding, repository.identity)?;
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=activation state=start\n");
         entry
             .startup
             .as_mut()
@@ -1765,9 +1887,10 @@ impl Manager {
             .activate()
             .await?;
         activation.commit();
-        // Only infallible owner movement follows opening. This fence is already
-        // active and its mount remains owned separately by the Entry/controller.
+        // Only infallible owner movement and best-effort diagnostics follow
+        // opening. The active mount remains owned by the Entry/controller.
         entry.startup.take();
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=activation state=complete\n");
         Ok(Mounted {
             binding,
             registry_path: registry.path().to_owned(),
@@ -3024,6 +3147,39 @@ mod tests {
         assert!(check(&alias).is_err());
         Ok(())
     }
+    #[test]
+    fn pre_registry_cloud_intent_preserves_legacy_identity_without_adopting_per_id_state() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state = PrivateDir::create(temporary.path().join("state"))?;
+        let native = PrivateDir::create(state.path().join("native"))?;
+        PrivateDir::create(native.path().join("example"))?;
+        let mut config = Config::default(); config.state_dir = state.path().to_owned();
+        config.native.workspaces.registry_path = Some(temporary.path().join("absent-registry"));
+        let mut repository = crate::config::NativeRepository::default();
+        repository.remote = Some(Default::default());
+        repository.remote.as_mut().unwrap().query.max_replays = 256;
+        config.native.repositories.insert("example".into(),repository);
+        let old = crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None)?["example"];
+        let intent = CloudRestoreIntent { version:1,root:temporary.path().join("restored"),store:"example".into(),
+            workspace_id:[7;32],provider_identity:old,requested_policy:None,
+            source:crate::control::NativeRestoreSelection {workspace_id:[1;32],generation:1,
+                manifest_id:[2;32],manifest_blake3:[3;32],manifest_size_bytes:256} };
+        let intents = PrivateDir::create(state.path().join("native-cloud-restores"))?;
+        persist_cloud_intent(&intents,&intent)?;
+        let name = format!("{}.json",cloud_intent_key(&intent.root)?);
+        let before = intents.read(&name,MAX_RECORD)?;
+        config.native.repositories.get_mut("example").unwrap().remote.as_mut().unwrap().query.max_replays = 4096;
+        assert_eq!(crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None)?["example"],old);
+        assert_eq!(intents.read(&name,MAX_RECORD)?,before);
+        assert_eq!(config.native.repositories["example"].remote.as_ref().unwrap().query.max_replays,4096);
+        assert!(!intent.root.exists()); assert!(!config.native.workspaces.registry_path.as_ref().unwrap().exists());
+        let workspaces = PrivateDir::create(state.path().join("native-workspaces"))?;
+        PrivateDir::create(workspaces.path().join(hex(&intent.workspace_id)))?;
+        assert!(crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None).is_err(),
+            "an intent cannot excuse unaccounted per-ID state when its registry is missing");
+        assert_eq!(intents.read(&name,MAX_RECORD)?,before);
+        Ok(())
+    }
     struct NoRemoteContent;
     #[async_trait::async_trait]
     impl local_cas::BlobSource for NoRemoteContent {
@@ -3675,10 +3831,10 @@ mod tests {
                 tickets[1].clone(),
                 native_retention::CaptureUploadCleanup {
                     job: None,
-                    published: native_retention::BundleDescriptor {
+                    published: Some(native_retention::BundleDescriptor {
                         blake3: [92; 32],
                         size_bytes: 64,
-                    },
+                    }),
                 },
             )
             .await?;

@@ -13,6 +13,10 @@ mod ledger;
 mod metadata;
 mod provider;
 mod query;
+mod retained_offload;
+pub use retained_offload::{
+    DurableRetainedOffloadContract, PinnedRetainedVersion, RetainedOffloadWitness,
+};
 mod restore_io;
 pub use restore_io::RemoteRestoreIo;
 mod snapshot;
@@ -34,7 +38,7 @@ use std::{
     time::Duration,
 };
 use tinytree_client::NativeClient;
-pub use transfer::{NativeTransferLimits, NativeTransferReceipt, NativeTransferStage};
+pub use transfer::{NativeCaptureFailure, NativeCaptureReason, NativeCaptureStage, NativeTransferLimits, NativeTransferReceipt, NativeTransferStage};
 
 pub struct RemoteRepository {
     pub io: Arc<RemoteObjectIo>,

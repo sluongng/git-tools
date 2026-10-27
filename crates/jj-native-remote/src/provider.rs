@@ -195,6 +195,15 @@ impl RemoteObjectIo {
         id: m::FileId,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<Option<FileRead>> {
+        let owner = if let Some(authority) = self.cloud_file_authority(id, owner.clone()).await? {
+            let ledger = self.inner.ledger.clone();
+            let read =
+                io::blocking_owned(owner.clone(), move || ledger.retain_cloud_read(&authority))
+                    .await?;
+            Arc::new((owner, read)) as Arc<dyn std::any::Any + Send + Sync>
+        } else {
+            owner
+        };
         if let Some(descriptor) = self.resident_cloud_descriptor(id, owner.clone()).await? {
             if let Some(blob) = io::cached(
                 self.inner
@@ -335,6 +344,18 @@ impl NativeObjectIo for RemoteObjectIo {
             .await
     }
 
+    async fn read_local_file_bounded(
+        &self, expected:m::Descriptor, max_bytes:u64,
+        owner:Arc<dyn std::any::Any+Send+Sync>,
+    )->BackendResult<FileRead> {
+        // Preserve the ordinary resident-read ledger/source binding check.
+        // This local validation does not resolve promises or hydrate any body.
+        self.snapshot_file_authority(m::FileId(expected.key.id.0),owner.clone())
+            .await.map_err(backend_error)?;
+        // Deliberately bypass promise/cloud/cache resolution: a lazy rename or
+        // nonresident private input is refused, never hydrated through FILE id.
+        self.inner.local.read_local_file_bounded(expected,max_bytes,owner).await
+    }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         self.snapshot_file_authority(id, Arc::new(()))
             .await
@@ -347,12 +368,21 @@ impl NativeObjectIo for RemoteObjectIo {
             return self.inner.local.read_file(id).await;
         }
         let result = async {
+            // Ordinary cached delivery must retain the source just like owned
+            // raw delivery. Compaction may not invalidate a live FILE reader.
+            let owner: Arc<dyn std::any::Any + Send + Sync> =
+                if let Some(authority) = self.cloud_file_authority(id, Arc::new(())).await? {
+                    let ledger = self.inner.ledger.clone();
+                    io::blocking(move || ledger.retain_cloud_read(&authority)).await?
+                } else {
+                    Arc::new(())
+                };
             let descriptor = self
                 .promise(id)
                 .await?
                 .context("native file has no admitted canonical provenance")?;
             let blob = self.cached_file(descriptor).await?;
-            let reader = io::Reader::open(blob).await?;
+            let reader = io::Reader::open_for_delivery(blob, owner).await?;
             FileRead::from_preverified_pinned_source(descriptor, Box::pin(reader)).map_err(backend)
         }
         .await;

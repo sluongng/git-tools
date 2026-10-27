@@ -276,6 +276,16 @@ fn expression_hash(
                 push!(v.right.as_deref());
                 push!(v.left.as_deref());
             }
+            E::ChangedPath(v) => {
+                number(h, 12);
+                number(h, v.policy_version as u64);
+                number(h, u64::from(v.exact_file));
+                raw(h, v.path.as_bytes());
+                if v.policy_version != 1 || v.path.is_empty() || v.path.len() > 4096 {
+                    return Err(Error::Invalid);
+                }
+                push!(v.candidates.as_deref());
+            }
             E::Latest(v) => {
                 number(h, 11);
                 number(h, v.count);

@@ -381,149 +381,11 @@ impl NativeObjectIo for BrokerObjectIo {
         self.read_file_with_owner(id, Arc::new(())).await
     }
     async fn read_file_with_owner(
-        &self,
-        id: tinytree_model::FileId,
-        owner: Arc<dyn std::any::Any + Send + Sync>,
-    ) -> BackendResult<FileRead> {
-        let inner = self.clone().with_physical_owner(owner.clone()).inner;
-        run_owned(owner.clone(), async move {
-            let deadline = inner.deadline();
-            reapi::policy::timeout(deadline, async {
-                let budget = inner.budget(inner.config.file_memory()).await?;
-                let disk = Arc::new(
-                    inner
-                        .disk
-                        .clone()
-                        .acquire_many_owned(inner.config.max_file_bytes as u32)
-                        .await
-                        .map_err(|_| Status::unavailable("broker client closed"))?,
-                );
-                let create_spool = inner.spool.clone();
-                // Retain the inspected directory chain in the physical worker,
-                // not only the caller future: cancellation can drop Inner while
-                // spawn_blocking is still queued or creating the tempfile.
-                #[cfg(windows)]
-                let create_directory = inner._spool_directory.clone();
-                let create_disk = disk.clone();
-                let create_budget = budget.clone();
-                let create_owner = owner.clone();
-                let mut spool = tokio::task::spawn_blocking(move || {
-                    let held_budget = create_budget.clone();
-                    let _budget = create_budget;
-                    crate::transport::private_directory(&create_spool)?;
-                    let file = tempfile::tempfile_in(create_spool)
-                        .map_err(|_| Status::internal("cannot create native broker spool"))?;
-                    Ok::<_, Status>(Spool {
-                        file,
-                        _disk: create_disk,
-                        _reader_memory: None,
-                        _owner: create_owner,
-                        _pending_budget: Some(held_budget),
-                        #[cfg(windows)]
-                        _directory: create_directory,
-                    })
-                })
-                .await
-                .map_err(|_| Status::internal("broker spool worker failed"))??;
-                let key = tinytree_model::ObjectKey {
-                    kind: tinytree_model::Kind::File,
-                    id: tinytree_model::ObjectId(id.0),
-                };
-                let mut stream = inner
-                    .client(inner.config.max_frame_bytes + 4096, budget.clone())
-                    .read_file(inner.request(inner.object(key), deadline)?)
-                    .await?
-                    .into_inner();
-                let first = next(&mut stream, deadline, &inner.config)
-                    .await?
-                    .ok_or_else(|| Status::data_loss("missing broker file header"))?;
-                let Some(p::read_frame::Frame::Descriptor(raw)) = first.frame else {
-                    return Err(Status::data_loss("missing broker file header"));
-                };
-                let descriptor = wire::descriptor(raw)?;
-                if descriptor.key != key || descriptor.size_bytes > inner.config.max_file_bytes {
-                    return Err(Status::data_loss("invalid broker file descriptor"));
-                }
-                let mut hash = blake3::Hasher::new();
-                let mut offset = 0u64;
-                let mut count = 0u64;
-                let mut complete = false;
-                while let Some(frame) = next(&mut stream, deadline, &inner.config).await? {
-                    match frame.frame {
-                        Some(p::read_frame::Frame::Chunk(chunk)) if !complete => {
-                            if chunk.offset != offset
-                                || chunk.data.is_empty()
-                                || chunk.data.len() > inner.config.max_frame_bytes
-                                || chunk.data.len() as u64
-                                    > descriptor.size_bytes.saturating_sub(offset)
-                            {
-                                return Err(Status::data_loss("invalid broker file chunk"));
-                            }
-                            offset += chunk.data.len() as u64;
-                            count += 1;
-                            hash.update(&chunk.data);
-                            let work = SpoolWrite {
-                                data: chunk.data,
-                                spool,
-                                _budget: budget.clone(),
-                            };
-                            spool = tokio::task::spawn_blocking(move || work.execute())
-                                .await
-                                .map_err(|_| Status::internal("broker spool worker failed"))??;
-                        }
-                        Some(p::read_frame::Frame::Complete(end)) if !complete => {
-                            if end.count != count
-                                || end.size_bytes != offset
-                                || end.digest != id.0
-                                || offset != descriptor.size_bytes
-                                || hash.finalize().as_bytes() != &id.0
-                            {
-                                return Err(Status::data_loss("broker file verification failed"));
-                            }
-                            complete = true;
-                        }
-                        _ => return Err(Status::data_loss("invalid broker file sequence")),
-                    }
-                }
-                if !complete {
-                    return Err(Status::data_loss("broker file did not complete"));
-                }
-                let b = budget.clone();
-                spool = tokio::task::spawn_blocking(move || {
-                    let _budget = b;
-                    spool
-                        .file
-                        .seek(SeekFrom::Start(0))
-                        .map_err(|_| Status::internal("broker spool seek failed"))?;
-                    Ok::<_, Status>(spool)
-                })
-                .await
-                .map_err(|_| Status::internal("broker spool worker failed"))??;
-                let buffer_bytes = inner
-                    .config
-                    .max_frame_bytes
-                    .min(64 * 1024)
-                    .min(descriptor.size_bytes.max(1) as usize);
-                drop(stream);
-                spool._reader_memory = Some(
-                    budget
-                        ._memory
-                        .lock()
-                        .map_err(|_| Status::internal("broker reader reservation unavailable"))?
-                        .split(buffer_bytes.saturating_mul(2).saturating_add(1024))
-                        .ok_or_else(|| Status::internal("broker reader reservation missing"))?,
-                );
-                spool._pending_budget.take();
-                FileRead::from_preverified_pinned_source(
-                    descriptor,
-                    Box::pin(SpoolReader::new(spool, buffer_bytes)),
-                )
-                .map_err(wire::backend)
-            })
-            .await
-        })
-        .await
-    }
+        &self,id:tinytree_model::FileId,owner:Arc<dyn std::any::Any+Send+Sync>,
+    )->BackendResult<FileRead>{self.read_file_inner(id,owner,None).await}
+    async fn read_local_file_bounded(
+        &self,expected:tinytree_model::Descriptor,max_bytes:u64,owner:Arc<dyn std::any::Any+Send+Sync>,
+    )->BackendResult<FileRead>{self.read_file_inner(tinytree_model::FileId(expected.key.id.0),owner,Some((expected,max_bytes))).await}
     async fn write_file(
         &self,
         input: &mut (dyn AsyncRead + Send + Unpin),
@@ -1012,5 +874,160 @@ mod windows_tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+}
+
+impl BrokerObjectIo {
+    async fn read_file_inner(&self,id:tinytree_model::FileId,owner:Arc<dyn std::any::Any+Send+Sync>,bounded:Option<(tinytree_model::Descriptor,u64)>)->BackendResult<FileRead>{
+        let inner = self.clone().with_physical_owner(owner.clone()).inner;
+        if let Some((expected,max_bytes))=bounded {
+            if expected.key.kind!=tinytree_model::Kind::File || expected.key.id.0!=id.0
+                || expected.format_version!=tinytree_model::FORMAT_VERSION
+                || expected.size_bytes>max_bytes || max_bytes>inner.config.max_file_bytes {
+                return Err(wire::other(Status::invalid_argument("bounded local FILE request invalid")));
+            }
+        }
+        let file_limit=bounded.map_or(inner.config.max_file_bytes,|(_,cap)|cap);
+        run_owned(owner.clone(), async move {
+            let deadline = inner.deadline();
+            reapi::policy::timeout(deadline, async {
+                let budget = inner.budget(inner.config.file_memory()).await?;
+                let disk = Arc::new(
+                    inner
+                        .disk
+                        .clone()
+                        .acquire_many_owned(file_limit as u32)
+                        .await
+                        .map_err(|_| Status::unavailable("broker client closed"))?,
+                );
+                let create_spool = inner.spool.clone();
+                // Retain the inspected directory chain in the physical worker,
+                // not only the caller future: cancellation can drop Inner while
+                // spawn_blocking is still queued or creating the tempfile.
+                #[cfg(windows)]
+                let create_directory = inner._spool_directory.clone();
+                let create_disk = disk.clone();
+                let create_budget = budget.clone();
+                let create_owner = owner.clone();
+                let mut spool = tokio::task::spawn_blocking(move || {
+                    let held_budget = create_budget.clone();
+                    let _budget = create_budget;
+                    crate::transport::private_directory(&create_spool)?;
+                    let file = tempfile::tempfile_in(create_spool)
+                        .map_err(|_| Status::internal("cannot create native broker spool"))?;
+                    Ok::<_, Status>(Spool {
+                        file,
+                        _disk: create_disk,
+                        _reader_memory: None,
+                        _owner: create_owner,
+                        _pending_budget: Some(held_budget),
+                        #[cfg(windows)]
+                        _directory: create_directory,
+                    })
+                })
+                .await
+                .map_err(|_| Status::internal("broker spool worker failed"))??;
+                let key = tinytree_model::ObjectKey {
+                    kind: tinytree_model::Kind::File,
+                    id: tinytree_model::ObjectId(id.0),
+                };
+                let mut client=inner.client(inner.config.max_frame_bytes+4096,budget.clone());
+                let mut stream=if let Some((expected,max_bytes))=bounded {
+                    client.read_local_file(inner.request(p::LocalFileRequest {
+                        store_id:inner.store.clone(),expected:Some(wire::describe(expected)),max_bytes,
+                    },deadline)?).await?.into_inner()
+                } else {
+                    client.read_file(inner.request(inner.object(key),deadline)?).await?.into_inner()
+                };
+                let first = next(&mut stream, deadline, &inner.config)
+                    .await?
+                    .ok_or_else(|| Status::data_loss("missing broker file header"))?;
+                let Some(p::read_frame::Frame::Descriptor(raw)) = first.frame else {
+                    return Err(Status::data_loss("missing broker file header"));
+                };
+                let descriptor = wire::descriptor(raw)?;
+                if descriptor.key != key || descriptor.size_bytes > file_limit
+                    || bounded.is_some_and(|(expected,_)|descriptor!=expected) {
+                    return Err(Status::data_loss("invalid broker file descriptor"));
+                }
+                let mut hash = blake3::Hasher::new();
+                let mut offset = 0u64;
+                let mut count = 0u64;
+                let mut complete = false;
+                while let Some(frame) = next(&mut stream, deadline, &inner.config).await? {
+                    match frame.frame {
+                        Some(p::read_frame::Frame::Chunk(chunk)) if !complete => {
+                            if chunk.offset != offset
+                                || chunk.data.is_empty()
+                                || chunk.data.len() > inner.config.max_frame_bytes
+                                || chunk.data.len() as u64
+                                    > descriptor.size_bytes.saturating_sub(offset)
+                            {
+                                return Err(Status::data_loss("invalid broker file chunk"));
+                            }
+                            offset += chunk.data.len() as u64;
+                            count += 1;
+                            hash.update(&chunk.data);
+                            let work = SpoolWrite {
+                                data: chunk.data,
+                                spool,
+                                _budget: budget.clone(),
+                            };
+                            spool = tokio::task::spawn_blocking(move || work.execute())
+                                .await
+                                .map_err(|_| Status::internal("broker spool worker failed"))??;
+                        }
+                        Some(p::read_frame::Frame::Complete(end)) if !complete => {
+                            if end.count != count
+                                || end.size_bytes != offset
+                                || end.digest != id.0
+                                || offset != descriptor.size_bytes
+                                || hash.finalize().as_bytes() != &id.0
+                            {
+                                return Err(Status::data_loss("broker file verification failed"));
+                            }
+                            complete = true;
+                        }
+                        _ => return Err(Status::data_loss("invalid broker file sequence")),
+                    }
+                }
+                if !complete {
+                    return Err(Status::data_loss("broker file did not complete"));
+                }
+                let b = budget.clone();
+                spool = tokio::task::spawn_blocking(move || {
+                    let _budget = b;
+                    spool
+                        .file
+                        .seek(SeekFrom::Start(0))
+                        .map_err(|_| Status::internal("broker spool seek failed"))?;
+                    Ok::<_, Status>(spool)
+                })
+                .await
+                .map_err(|_| Status::internal("broker spool worker failed"))??;
+                let buffer_bytes = inner
+                    .config
+                    .max_frame_bytes
+                    .min(64 * 1024)
+                    .min(descriptor.size_bytes.max(1) as usize);
+                drop(stream);
+                spool._reader_memory = Some(
+                    budget
+                        ._memory
+                        .lock()
+                        .map_err(|_| Status::internal("broker reader reservation unavailable"))?
+                        .split(buffer_bytes.saturating_mul(2).saturating_add(1024))
+                        .ok_or_else(|| Status::internal("broker reader reservation missing"))?,
+                );
+                spool._pending_budget.take();
+                FileRead::from_preverified_pinned_source(
+                    descriptor,
+                    Box::pin(SpoolReader::new(spool, buffer_bytes)),
+                )
+                .map_err(wire::backend)
+            })
+            .await
+        })
+        .await
     }
 }

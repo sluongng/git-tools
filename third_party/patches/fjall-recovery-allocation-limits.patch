@@ -1,0 +1,915 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Storage Maintainers <26684313+sluongng@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:28:00 +0000
+Subject: [PATCH] storage: share allocation admission with strict WAL recovery
+
+Read-only recovery limits must not reject WAL batches that the same policy
+previously accepted. Logical live-catalog quotas also cannot bound physical
+journal history: preallocation, overwritten records and delayed maintenance
+can exceed those quotas without increasing the live catalog.
+
+Add an optional allocation policy checked by every WAL writer before any
+batch bytes are written and by normal and strict recovery before decoding.
+Reject unsupported Clear operations before WAL changes, preserve the policy
+across rotation, and distinguish pre-write allocation refusal from uncertain
+I/O failure. Bound journal inventory at creation by postponing rotation at
+the configured cap while continuing ordinary flush work. Historical journal
+bytes remain streamed rather than charged as simultaneously resident data.
+On recovery, skip each keyspace's persisted prefix after decoding and checksum
+validation, retaining only unflushed suffixes instead of replaying old history
+into memtables. Unset-policy recovery keeps its existing behavior.
+
+Leaving the policy unset preserves existing writer and recovery behavior. Existing
+state above a newly selected policy is incompatible and strict inspection
+refuses it without repair; the policy does not claim a total database heap
+bound or make arbitrary historical data compatible.
+
+---
+diff --git a/src/batch/mod.rs b/src/batch/mod.rs
+index cd0aad2..50a7f6d 100644
+--- a/src/batch/mod.rs
++++ b/src/batch/mod.rs
+@@ -116,17 +116,15 @@ impl WriteBatch {
+         journal_writer
+             .write_batch(self.data.iter(), self.data.len(), batch_seqno)
+             .inspect_err(|e| {
+-                log::error!(
+-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+-                );
+-                self.db.is_poisoned.poison();
++                if !matches!(e, crate::Error::RecoveryAllocationLimit) {
++                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
++                    self.db.is_poisoned.poison();
++                }
+             })?;
+ 
+         if let Some(mode) = self.durability {
+             journal_writer.persist(mode).inspect_err(|e| {
+-                log::error!(
+-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+-                );
++                log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
+                 self.db.is_poisoned.poison();
+             })?;
+         }
+diff --git a/src/builder.rs b/src/builder.rs
+index 5766104..4b24583 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -32,9 +32,24 @@ impl<O: Openable> Builder<O> {
+     ///
+     /// Errors if an I/O error occurred, or if the database can not be opened.
+     pub fn open(self) -> crate::Result<O> {
++        if let Some(limits) = self.inner.recovery_allocation_limits {
++            limits.validate()?;
++        }
+         O::open(self.inner)
+     }
+ 
++    /// Apply one allocation policy to normal WAL writers and strict recovery.
++    /// With a policy, legacy strict-only allocation/physical-scan knobs are ignored.
++    /// Historical bytes are streamed; journal rotation pauses at the inventory cap.
++    #[must_use]
++    pub fn recovery_allocation_limits(
++        mut self,
++        limits: Option<crate::RecoveryAllocationLimits>,
++    ) -> Self {
++        self.inner.recovery_allocation_limits = limits;
++        self
++    }
++
+     /// Inspect an existing database without repair, cleanup or background writes.
+     /// Call `finish_recovery_validation` after application-level validation.
+     /// Missing state, invalid WAL batches and Clear records are rejected.
+diff --git a/src/db.rs b/src/db.rs
+index 5ec6c73..c21f603 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -404,6 +404,20 @@ impl Database {
+     /// Should not be user-facing.
+     #[doc(hidden)]
+     pub fn create_or_recover(config: Config) -> crate::Result<Self> {
++        if let Some(limits) = config.recovery_allocation_limits {
++            limits.validate()?;
++            if !config.path.join(VERSION_MARKER).try_exists()? && config.path.try_exists()? {
++                for entry in std::fs::read_dir(&config.path)? {
++                    if entry?
++                        .path()
++                        .extension()
++                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jnl"))
++                    {
++                        return Err(crate::Error::RecoveryAllocationLimit);
++                    }
++                }
++            }
++        }
+         if config.strict_existing_recovery && config.clean_path_on_drop {
+             return Err(crate::Error::Unrecoverable);
+         }
+@@ -610,16 +624,27 @@ impl Database {
+                 &config.path,
+                 config.journal_compression_type,
+                 config.journal_compression_threshold,
+-                config.strict_recovery_max_scan_bytes,
+-                config.strict_recovery_max_journals,
++                config
++                    .recovery_allocation_limits
++                    .map_or(config.strict_recovery_max_scan_bytes, |_| u64::MAX),
++                config
++                    .recovery_allocation_limits
++                    .map_or(config.strict_recovery_max_journals, |limits| {
++                        limits.max_journals
++                    }),
++                config.recovery_allocation_limits.is_some(),
+             )?
+         } else {
+-            Journal::recover(
++            Journal::recover_with_policy(
+                 &config.path,
+                 config.journal_compression_type,
+                 config.journal_compression_threshold,
++                config
++                    .recovery_allocation_limits
++                    .map(|limits| limits.max_journals),
+             )?
+         };
++        journal_recovery.active.get_writer()?.allocation_limits = config.recovery_allocation_limits;
+         log::debug!("journal recovery result: {journal_recovery:#?}");
+ 
+         let active_journal = Arc::new(journal_recovery.active);
+@@ -738,14 +763,13 @@ impl Database {
+                 let reader = if db.config.strict_existing_recovery {
+                     db.supervisor.journal.get_strict_reader(
+                         db.recovery_trims.clone(),
+-                        (
+-                            db.config.strict_recovery_max_record_bytes,
+-                            db.config.strict_recovery_max_batch_bytes,
+-                            db.config.strict_recovery_max_batch_items,
+-                        ),
++                        db.config.recovery_record_limits(),
++                        db.config.recovery_allocation_limits.is_some(),
+                     )?
+                 } else {
+-                    db.supervisor.journal.get_reader()?
++                    db.supervisor
++                        .journal
++                        .get_reader_with_allocation(db.config.recovery_allocation_limits)?
+                 };
+ 
+                 for batch in reader {
+@@ -766,6 +790,16 @@ impl Database {
+ 
+                         let tree = &keyspace.tree;
+ 
++                        // The persisted per-keyspace frontier includes every older write.
++                        // Decode/checksum every record, but do not retain flushed WAL history.
++                        if db.config.recovery_allocation_limits.is_some()
++                            && tree
++                                .get_highest_persisted_seqno()
++                                .is_some_and(|seqno| batch.seqno <= seqno)
++                        {
++                            continue;
++                        }
++
+                         match item.value_type {
+                             lsm_tree::ValueType::Value => {
+                                 tree.insert(item.key, item.value, batch.seqno);
+@@ -961,6 +995,7 @@ impl Database {
+             config.journal_compression_type,
+             config.journal_compression_threshold,
+         );
++        journal.get_writer()?.allocation_limits = config.recovery_allocation_limits;
+         let journal = Arc::new(journal);
+ 
+         // NOTE: Lastly, fsync version marker, which contains the version
+diff --git a/src/db_config.rs b/src/db_config.rs
+index 47d92a6..6f8ec71 100644
+--- a/src/db_config.rs
++++ b/src/db_config.rs
+@@ -38,6 +38,7 @@ pub struct Config {
+ 
+     pub(crate) manual_journal_persist: bool,
+     pub(crate) strict_existing_recovery: bool,
++    pub(crate) recovery_allocation_limits: Option<crate::RecoveryAllocationLimits>,
+     pub(crate) strict_recovery_max_record_bytes: usize,
+     pub(crate) strict_recovery_max_batch_bytes: usize,
+     pub(crate) strict_recovery_max_batch_items: usize,
+@@ -85,6 +86,7 @@ impl Config {
+             // journal_recovery_mode: RecoveryMode::default(),
+             manual_journal_persist: false,
+             strict_existing_recovery: false,
++            recovery_allocation_limits: None,
+             strict_recovery_max_record_bytes: 64 * 1024 * 1024,
+             strict_recovery_max_batch_bytes: 256 * 1024 * 1024,
+             strict_recovery_max_batch_items: 1_000_000,
+@@ -105,3 +107,22 @@ impl Config {
+         }
+     }
+ }
++
++impl Config {
++    pub(crate) fn recovery_record_limits(&self) -> (usize, usize, usize) {
++        self.recovery_allocation_limits.map_or(
++            (
++                self.strict_recovery_max_record_bytes,
++                self.strict_recovery_max_batch_bytes,
++                self.strict_recovery_max_batch_items,
++            ),
++            |limits| {
++                (
++                    limits.max_record_bytes,
++                    limits.max_batch_bytes,
++                    limits.max_batch_items,
++                )
++            },
++        )
++    }
++}
+diff --git a/src/error.rs b/src/error.rs
+index b99a2c4..e5b9f08 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -46,6 +46,10 @@ pub enum Error {
+     /// Database is locked.
+     Locked,
+ 
++    /// A configured WAL allocation bound refused an operation before WAL writes.
++    /// During strict open this instead denotes incompatible existing data.
++    RecoveryAllocationLimit,
++
+     /// Database is unrecoverable, see logs for details
+     Unrecoverable,
+ }
+diff --git a/src/journal/batch_reader.rs b/src/journal/batch_reader.rs
+index c4ca141..53d9219 100644
+--- a/src/journal/batch_reader.rs
++++ b/src/journal/batch_reader.rs
+@@ -108,10 +108,10 @@ impl Iterator for JournalBatchReader {
+                         return None;
+                     }
+ 
+-                    if self.reader.strict_trims.is_some()
++                    if (self.reader.strict_trims.is_some() || self.reader.shared_policy)
+                         && item_count as usize > self.reader.strict_limits.2
+                     {
+-                        return Some(Err(crate::Error::Unrecoverable));
++                        return Some(Err(self.reader.allocation_error()));
+                     }
+                     self.retained_bytes = 0;
+                     self.is_in_batch = true;
+@@ -166,15 +166,16 @@ impl Iterator for JournalBatchReader {
+                     value_type,
+                     compression,
+                 } => {
+-                    if self.reader.strict_trims.is_some() {
+-                        let charged = key
+-                            .len()
+-                            .checked_add(value.len())
+-                            .and_then(|n| n.checked_add(std::mem::size_of::<ReadBatchItem>() + 64))
+-                            .and_then(|n| self.retained_bytes.checked_add(n));
+-                        let Some(charged) = charged.filter(|n| *n <= self.reader.strict_limits.1)
++                    if self.reader.strict_trims.is_some() || self.reader.shared_policy {
++                        let charged = crate::recovery_allocation::batch_charge(
++                            self.retained_bytes,
++                            key.len(),
++                            value.len(),
++                        );
++                        let Some(charged) =
++                            charged.ok().filter(|n| *n <= self.reader.strict_limits.1)
+                         else {
+-                            return Some(Err(crate::Error::Unrecoverable));
++                            return Some(Err(self.reader.allocation_error()));
+                         };
+                         self.retained_bytes = charged;
+                     }
+@@ -214,8 +215,8 @@ impl Iterator for JournalBatchReader {
+                     });
+                 }
+                 Entry::Clear { keyspace_id } => {
+-                    if self.reader.strict_trims.is_some() {
+-                        return Some(Err(crate::Error::Unrecoverable));
++                    if self.reader.strict_trims.is_some() || self.reader.shared_policy {
++                        return Some(Err(self.reader.allocation_error()));
+                     }
+                     let entry = Entry::Clear { keyspace_id };
+                     let mut bytes = Vec::with_capacity(16);
+diff --git a/src/journal/mod.rs b/src/journal/mod.rs
+index e55ba08..b53f99c 100644
+--- a/src/journal/mod.rs
++++ b/src/journal/mod.rs
+@@ -135,7 +135,13 @@ impl Journal {
+     }
+ 
+     pub fn get_reader(&self) -> crate::Result<JournalBatchReader> {
+-        let raw_reader = JournalReader::new(self.path()?)?;
++        self.get_reader_with_allocation(None)
++    }
++    pub(crate) fn get_reader_with_allocation(
++        &self,
++        limits: Option<crate::RecoveryAllocationLimits>,
++    ) -> crate::Result<JournalBatchReader> {
++        let raw_reader = JournalReader::new_with_allocation(self.path()?, limits)?;
+         Ok(JournalBatchReader::new(raw_reader))
+     }
+ 
+@@ -149,12 +155,11 @@ impl Journal {
+         &self,
+         trims: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>,
+         limits: (usize, usize, usize),
++        shared_policy: bool,
+     ) -> crate::Result<JournalBatchReader> {
+-        Ok(JournalBatchReader::new(JournalReader::new_strict(
+-            self.path()?,
+-            trims,
+-            limits,
+-        )?))
++        Ok(JournalBatchReader::new(
++            JournalReader::new_strict_with_policy(self.path()?, trims, limits, shared_policy)?,
++        ))
+     }
+ 
+     pub fn recover_existing<P: AsRef<Path>>(
+@@ -163,6 +168,7 @@ impl Journal {
+         compression_threshold: usize,
+         max_scan_bytes: u64,
+         max_journals: usize,
++        shared_policy: bool,
+     ) -> crate::Result<RecoveryResult> {
+         recover_journals(
+             path,
+@@ -171,6 +177,7 @@ impl Journal {
+             true,
+             max_scan_bytes,
+             max_journals,
++            shared_policy,
+         )
+     }
+ 
+@@ -178,6 +185,14 @@ impl Journal {
+         path: P,
+         compression: CompressionType,
+         compression_threshold: usize,
++    ) -> crate::Result<RecoveryResult> {
++        Self::recover_with_policy(path, compression, compression_threshold, None)
++    }
++    pub(crate) fn recover_with_policy<P: AsRef<Path>>(
++        path: P,
++        compression: CompressionType,
++        compression_threshold: usize,
++        max_journals: Option<usize>,
+     ) -> crate::Result<RecoveryResult> {
+         recover_journals(
+             path,
+@@ -185,7 +200,8 @@ impl Journal {
+             compression_threshold,
+             false,
+             u64::MAX,
+-            usize::MAX,
++            max_journals.unwrap_or(usize::MAX),
++            max_journals.is_some(),
+         )
+     }
+ }
+diff --git a/src/journal/reader.rs b/src/journal/reader.rs
+index 42558ea..411719d 100644
+--- a/src/journal/reader.rs
++++ b/src/journal/reader.rs
+@@ -23,20 +23,39 @@ pub struct JournalReader {
+     original_len: u64,
+     finished: bool,
+     pub(crate) strict_limits: (usize, usize, usize),
++    pub(crate) shared_policy: bool,
+ }
+ 
+ impl JournalReader {
+     pub fn new<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
++        Self::new_with_allocation(path, None)
++    }
++    pub(crate) fn new_with_allocation<P: AsRef<Path>>(
++        path: P,
++        limits: Option<crate::RecoveryAllocationLimits>,
++    ) -> crate::Result<Self> {
+         let file = OpenOptions::new().read(true).write(true).open(&path)?;
++        let original_len = if limits.is_some() {
++            file.metadata()?.len()
++        } else {
++            0
++        };
+ 
+         Ok(Self {
+             path: path.as_ref().into(),
+             reader: BufReader::new(file),
+             last_valid_pos: 0,
+             strict_trims: None,
+-            original_len: 0,
++            original_len,
+             finished: false,
+-            strict_limits: (usize::MAX, usize::MAX, usize::MAX),
++            strict_limits: limits.map_or((usize::MAX, usize::MAX, usize::MAX), |limits| {
++                (
++                    limits.max_record_bytes,
++                    limits.max_batch_bytes,
++                    limits.max_batch_items,
++                )
++            }),
++            shared_policy: limits.is_some(),
+         })
+     }
+ 
+@@ -44,6 +63,14 @@ impl JournalReader {
+         path: P,
+         trims: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>,
+         limits: (usize, usize, usize),
++    ) -> crate::Result<Self> {
++        Self::new_strict_with_policy(path, trims, limits, false)
++    }
++    pub(crate) fn new_strict_with_policy<P: AsRef<Path>>(
++        path: P,
++        trims: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u64, u64)>>>,
++        limits: (usize, usize, usize),
++        shared_policy: bool,
+     ) -> crate::Result<Self> {
+         let file = OpenOptions::new().read(true).open(&path)?;
+         let original_len = file.metadata()?.len();
+@@ -55,9 +82,18 @@ impl JournalReader {
+             original_len,
+             finished: false,
+             strict_limits: limits,
++            shared_policy,
+         })
+     }
+ 
++    pub(crate) fn allocation_error(&self) -> crate::Error {
++        if self.shared_policy {
++            crate::Error::RecoveryAllocationLimit
++        } else {
++            crate::Error::Unrecoverable
++        }
++    }
++
+     pub(crate) fn record_valid_end(&self, end: u64) -> crate::Result<()> {
+         if let Some(trims) = &self.strict_trims {
+             trims.lock().map_err(|_| crate::Error::Poisoned)?.push((
+@@ -94,7 +130,7 @@ impl Iterator for JournalReader {
+         if self.finished {
+             return None;
+         }
+-        if self.strict_trims.is_some() {
++        if self.strict_trims.is_some() || self.shared_policy {
+             let pos = fail_iter!(self.reader.stream_position());
+             let mut first = [0u8; 1];
+             let count = fail_iter!(self.reader.read(&mut first));
+@@ -103,7 +139,7 @@ impl Iterator for JournalReader {
+                 return None;
+             }
+             let [first_byte] = first;
+-            if first_byte == 0 {
++            if first_byte == 0 && self.strict_trims.is_some() {
+                 let mut chunk = [0u8; 8192];
+                 loop {
+                     let n = fail_iter!(self.reader.read(&mut chunk));
+@@ -132,11 +168,20 @@ impl Iterator for JournalReader {
+                 let key = u64::from(u16::from_le_bytes([k0, k1]));
+                 let value = u64::from(u32::from_le_bytes([v0, v1, v2, v3]));
+                 let packed = u64::from(u32::from_le_bytes([p0, p1, p2, p3]));
+-                let cap = self.strict_limits.0 as u64;
+-                let encoded = 21 + key + packed;
+-                if encoded > cap
+-                    || 21 + key + value > cap
+-                    || encoded > self.original_len.saturating_sub(pos)
++                let policy = crate::RecoveryAllocationLimits {
++                    max_record_bytes: self.strict_limits.0,
++                    max_batch_bytes: self.strict_limits.1,
++                    max_batch_items: self.strict_limits.2,
++                    max_journals: 1,
++                };
++                if policy
++                    .record(key as usize, value as usize, packed as usize)
++                    .is_err()
++                {
++                    self.finished = true;
++                    return Some(Err(self.allocation_error()));
++                }
++                if 21 + key + packed > self.original_len.saturating_sub(pos)
+                     || (compression == 0 && value != packed)
+                 {
+                     self.finished = true;
+diff --git a/src/journal/recovery.rs b/src/journal/recovery.rs
+index 550733c..e58fd37 100644
+--- a/src/journal/recovery.rs
++++ b/src/journal/recovery.rs
+@@ -22,6 +22,7 @@ pub fn recover_journals<P: AsRef<Path>>(
+     strict: bool,
+     max_scan_bytes: u64,
+     max_journals: usize,
++    shared_policy: bool,
+ ) -> crate::Result<RecoveryResult> {
+     let path = path.as_ref();
+ 
+@@ -34,7 +35,7 @@ pub fn recover_journals<P: AsRef<Path>>(
+ 
+     for dirent in std::fs::read_dir(path)? {
+         let dirent = dirent?;
+-        if strict {
++        if strict && !shared_policy {
+             entries = entries.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
+             if entries > max_journals.saturating_add(16) {
+                 return Err(crate::Error::Unrecoverable);
+@@ -57,10 +58,17 @@ pub fn recover_journals<P: AsRef<Path>>(
+             continue;
+         }
+ 
+-        if strict {
+-            if !dirent.file_type()?.is_file() || journal_fragments.len() >= max_journals {
++        if strict || shared_policy {
++            if !dirent.file_type()?.is_file() {
+                 return Err(crate::Error::Unrecoverable);
+             }
++            if journal_fragments.len() >= max_journals {
++                return Err(if shared_policy {
++                    crate::Error::RecoveryAllocationLimit
++                } else {
++                    crate::Error::Unrecoverable
++                });
++            }
+             physical_bytes = physical_bytes
+                 .checked_add(dirent.metadata()?.len())
+                 .ok_or(crate::Error::Unrecoverable)?;
+@@ -83,6 +91,9 @@ pub fn recover_journals<P: AsRef<Path>>(
+             crate::Error::JournalRecovery(crate::JournalRecoveryError::InvalidFileName)
+         })?;
+ 
++        if shared_policy && filename != format!("{journal_id}.jnl") {
++            return Err(crate::Error::Unrecoverable);
++        }
+         max_journal_id = max_journal_id.max(journal_id);
+ 
+         journal_fragments.push((journal_id, path));
+@@ -90,6 +101,13 @@ pub fn recover_journals<P: AsRef<Path>>(
+ 
+     // NOTE: Sort ascending, so the last item is the active journal
+     journal_fragments.sort_by_key(|(a, _)| *a);
++    if shared_policy
++        && journal_fragments
++            .windows(2)
++            .any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
++    {
++        return Err(crate::Error::Unrecoverable);
++    }
+ 
+     log::trace!("Recovered {journal_fragments:#?}");
+ 
+diff --git a/src/journal/writer.rs b/src/journal/writer.rs
+index 2534659..d7da810 100644
+--- a/src/journal/writer.rs
++++ b/src/journal/writer.rs
+@@ -25,6 +25,7 @@ pub struct Writer {
+     file: BufWriter<File>,
+     buf: Vec<u8>,
+     is_buffer_dirty: bool,
++    pub(crate) allocation_limits: Option<crate::RecoveryAllocationLimits>,
+     pub(crate) validation_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+ 
+     compression: CompressionType,
+@@ -61,6 +62,55 @@ impl Writer {
+         Ok(())
+     }
+ 
++    pub(crate) fn can_rotate(&self) -> crate::Result<bool> {
++        let Some(limits) = self.allocation_limits else {
++            return Ok(true);
++        };
++        let folder = self.path.parent().ok_or(crate::Error::Unrecoverable)?;
++        let mut count = 0usize;
++        for item in std::fs::read_dir(folder)? {
++            let item = item?;
++            if item
++                .path()
++                .extension()
++                .is_some_and(|extension| extension.eq_ignore_ascii_case("jnl"))
++            {
++                if !item.file_type()?.is_file() {
++                    return Err(crate::Error::Unrecoverable);
++                }
++                count = count
++                    .checked_add(1)
++                    .ok_or(crate::Error::RecoveryAllocationLimit)?;
++                if count >= limits.max_journals {
++                    return Ok(false);
++                }
++            }
++        }
++        Ok(true)
++    }
++    fn check_item(&self, key: &[u8], value: &[u8], total: usize) -> crate::Result<usize> {
++        let Some(limits) = self.allocation_limits else {
++            return Ok(total);
++        };
++        // Check raw lengths before the codec's wire-size arithmetic.
++        limits.record(key.len(), value.len(), value.len())?;
++        let mut packed = value.len();
++        #[cfg(feature = "lz4")]
++        if self.compression == CompressionType::Lz4
++            && self.compression_threshold > 0
++            && value.len() >= self.compression_threshold
++        {
++            packed = usize::try_from(20 + (value.len() as u64 * 110 / 100))
++                .map_err(|_| crate::Error::RecoveryAllocationLimit)?;
++        }
++        limits.record(key.len(), value.len(), packed)?;
++        let total = crate::recovery_allocation::batch_charge(total, key.len(), value.len())?;
++        if total > limits.max_batch_bytes {
++            return Err(crate::Error::RecoveryAllocationLimit);
++        }
++        Ok(total)
++    }
++
+     pub fn set_compression(&mut self, comp: CompressionType, threshold: usize) {
+         self.compression = comp;
+         self.compression_threshold = threshold;
+@@ -76,6 +126,9 @@ impl Writer {
+ 
+     pub fn rotate(&mut self) -> crate::Result<(PathBuf, PathBuf)> {
+         self.ensure_writes_enabled()?;
++        if !self.can_rotate()? {
++            return Err(crate::Error::RecoveryAllocationLimit);
++        }
+         self.persist(PersistMode::SyncAll)?;
+ 
+         log::debug!(
+@@ -124,7 +177,9 @@ impl Writer {
+ 
+         let comp = self.compression;
+         let compt = self.compression_threshold;
++        let allocation_limits = self.allocation_limits;
+         *self = Self::create_new(new_path.clone())?;
++        self.allocation_limits = allocation_limits;
+         self.set_compression(comp, compt);
+ 
+         // IMPORTANT: fsync folder on Unix
+@@ -156,6 +211,7 @@ impl Writer {
+             file: BufWriter::new(file),
+             buf: Vec::new(),
+             is_buffer_dirty: false,
++            allocation_limits: None,
+             validation_pending: Default::default(),
+             compression: CompressionType::None,
+             compression_threshold: 0,
+@@ -197,6 +253,7 @@ impl Writer {
+                 file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
+                 buf: Vec::new(),
+                 is_buffer_dirty: false,
++                allocation_limits: None,
+                 validation_pending: Default::default(),
+                 compression: CompressionType::None,
+                 compression_threshold: 0,
+@@ -215,6 +272,7 @@ impl Writer {
+             file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
+             buf: Vec::new(),
+             is_buffer_dirty: false,
++            allocation_limits: None,
+             validation_pending: Default::default(),
+             compression: CompressionType::None,
+             compression_threshold: 0,
+@@ -292,6 +350,7 @@ impl Writer {
+         seqno: u64,
+     ) -> crate::Result<usize> {
+         self.ensure_writes_enabled()?;
++        self.check_item(key, value, 0)?;
+         self.is_buffer_dirty = true;
+ 
+         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+@@ -332,6 +391,9 @@ impl Writer {
+         seqno: SeqNo,
+     ) -> crate::Result<usize> {
+         self.ensure_writes_enabled()?;
++        if self.allocation_limits.is_some() {
++            return Err(crate::Error::RecoveryAllocationLimit);
++        }
+         self.is_buffer_dirty = true;
+ 
+         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
+@@ -355,7 +417,7 @@ impl Writer {
+ 
+     pub fn write_batch<'a>(
+         &mut self,
+-        items: impl Iterator<Item = &'a BatchItem>,
++        items: impl Iterator<Item = &'a BatchItem> + Clone,
+         batch_size: usize,
+         seqno: SeqNo,
+     ) -> crate::Result<usize> {
+@@ -364,6 +426,22 @@ impl Writer {
+         }
+ 
+         self.ensure_writes_enabled()?;
++        if let Some(limits) = self.allocation_limits {
++            if batch_size > limits.max_batch_items || batch_size > u32::MAX as usize {
++                return Err(crate::Error::RecoveryAllocationLimit);
++            }
++            let mut count = 0usize;
++            let mut total = 0usize;
++            for item in items.clone() {
++                count = count
++                    .checked_add(1)
++                    .ok_or(crate::Error::RecoveryAllocationLimit)?;
++                total = self.check_item(&item.key, &item.value, total)?;
++            }
++            if count != batch_size {
++                return Err(crate::Error::RecoveryAllocationLimit);
++            }
++        }
+         self.is_buffer_dirty = true;
+ 
+         self.buf.clear();
+diff --git a/src/keyspace/mod.rs b/src/keyspace/mod.rs
+index d927810..8cf3a93 100644
+--- a/src/keyspace/mod.rs
++++ b/src/keyspace/mod.rs
+@@ -249,10 +249,10 @@ impl Keyspace {
+         journal_writer
+             .write_clear(self.id, seqno)
+             .inspect_err(|e| {
+-                log::error!(
+-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+-                );
+-                self.is_poisoned.poison();
++                if !matches!(e, crate::Error::RecoveryAllocationLimit) {
++                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
++                    self.is_poisoned.poison();
++                }
+             })?;
+ 
+         if !self.config.manual_journal_persist {
+@@ -940,8 +940,10 @@ impl Keyspace {
+ 
+         journal_writer
+             .write_raw(self.id, &key, &value, lsm_tree::ValueType::Value, seqno)
+-            .inspect_err(|_| {
+-                self.is_poisoned.poison();
++            .inspect_err(|e| {
++                if !matches!(e, crate::Error::RecoveryAllocationLimit) {
++                    self.is_poisoned.poison();
++                }
+             })?;
+ 
+         if !self.config.manual_journal_persist {
+@@ -1015,8 +1017,10 @@ impl Keyspace {
+ 
+         journal_writer
+             .write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)
+-            .inspect_err(|_| {
+-                self.is_poisoned.poison();
++            .inspect_err(|e| {
++                if !matches!(e, crate::Error::RecoveryAllocationLimit) {
++                    self.is_poisoned.poison();
++                }
+             })?;
+ 
+         if !self.config.manual_journal_persist {
+@@ -1108,8 +1112,10 @@ impl Keyspace {
+                 lsm_tree::ValueType::WeakTombstone,
+                 seqno,
+             )
+-            .inspect_err(|_| {
+-                self.is_poisoned.poison();
++            .inspect_err(|e| {
++                if !matches!(e, crate::Error::RecoveryAllocationLimit) {
++                    self.is_poisoned.poison();
++                }
+             })?;
+ 
+         if !self.config.manual_journal_persist {
+diff --git a/src/lib.rs b/src/lib.rs
+index c241516..42b8503 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -121,6 +121,7 @@ mod path;
+ mod poison;
+ mod readable;
+ mod recovery;
++mod recovery_allocation;
+ mod snapshot;
+ mod snapshot_nonce;
+ mod snapshot_tracker;
+@@ -154,6 +155,7 @@ pub use {
+     journal::{error::RecoveryError as JournalRecoveryError, writer::PersistMode},
+     keyspace::{options::CreateOptions as KeyspaceCreateOptions, Keyspace},
+     readable::Readable,
++    recovery_allocation::RecoveryAllocationLimits,
+     snapshot::Snapshot,
+     version::FormatVersion,
+ };
+diff --git a/src/recovery.rs b/src/recovery.rs
+index 3703ef7..bccb394 100644
+--- a/src/recovery.rs
++++ b/src/recovery.rs
+@@ -153,17 +153,14 @@ pub fn recover_sealed_memtables(
+         log::debug!("Replaying sealed journal at {}", journal_path.display());
+ 
+         let raw_reader = if db.config.strict_existing_recovery {
+-            JournalReader::new_strict(
++            JournalReader::new_strict_with_policy(
+                 journal_path,
+                 db.recovery_trims.clone(),
+-                (
+-                    db.config.strict_recovery_max_record_bytes,
+-                    db.config.strict_recovery_max_batch_bytes,
+-                    db.config.strict_recovery_max_batch_items,
+-                ),
++                db.config.recovery_record_limits(),
++                db.config.recovery_allocation_limits.is_some(),
+             )?
+         } else {
+-            JournalReader::new(journal_path)?
++            JournalReader::new_with_allocation(journal_path, db.config.recovery_allocation_limits)?
+         };
+         let reader = JournalBatchReader::new(raw_reader);
+ 
+@@ -196,6 +193,16 @@ pub fn recover_sealed_memtables(
+                         lsn: batch.seqno,
+                     });
+ 
++                // The persisted per-keyspace frontier includes every older write.
++                // Decode/checksum every record, but do not retain flushed WAL history.
++                if db.config.recovery_allocation_limits.is_some()
++                    && tree
++                        .get_highest_persisted_seqno()
++                        .is_some_and(|seqno| batch.seqno <= seqno)
++                {
++                    continue;
++                }
++
+                 match item.value_type {
+                     lsm_tree::ValueType::Value => {
+                         tree.insert(item.key, item.value, batch.seqno);
+diff --git a/src/recovery_allocation.rs b/src/recovery_allocation.rs
+new file mode 100644
+index 0000000..72a82c5
+--- /dev/null
++++ b/src/recovery_allocation.rs
+@@ -0,0 +1,52 @@
++//! Optional WAL allocation policy shared by writers and strict recovery.
++use crate::journal::batch_reader::ReadBatchItem;
++
++/// Allocation limits for every newly written WAL batch and strict recovery.
++/// Existing data exceeding a newly selected policy is incompatible, not repaired.
++/// Total historical journal bytes are streamed and are not a live-memory quota.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct RecoveryAllocationLimits {
++    /// Maximum encoded or decoded item bytes, including its 21-byte header.
++    pub max_record_bytes: usize,
++    /// Maximum sum of retained decoded item charges in a batch.
++    pub max_batch_bytes: usize,
++    /// Maximum item count in a batch.
++    pub max_batch_items: usize,
++    /// Includes the active journal. Rotation pauses at this bound; flushing does not.
++    pub max_journals: usize,
++}
++impl RecoveryAllocationLimits {
++    pub(crate) fn validate(self) -> crate::Result<()> {
++        if self.max_record_bytes < 21
++            || self.max_batch_bytes == 0
++            || self.max_batch_items == 0
++            || self.max_journals == 0
++        {
++            return Err(crate::Error::RecoveryAllocationLimit);
++        }
++        Ok(())
++    }
++    pub(crate) fn record(self, key: usize, value: usize, packed: usize) -> crate::Result<()> {
++        let fits = |n: usize| {
++            key.checked_add(n)
++                .and_then(|n| n.checked_add(21))
++                .is_some_and(|n| n <= self.max_record_bytes)
++        };
++        if key > u16::MAX as usize
++            || value > u32::MAX as usize
++            || packed > u32::MAX as usize
++            || !fits(value)
++            || !fits(packed)
++        {
++            return Err(crate::Error::RecoveryAllocationLimit);
++        }
++        Ok(())
++    }
++}
++/// The same retained-vector/slack charge is used before WAL writes and decode pushes.
++pub(crate) fn batch_charge(total: usize, key: usize, value: usize) -> crate::Result<usize> {
++    key.checked_add(value)
++        .and_then(|n| n.checked_add(std::mem::size_of::<ReadBatchItem>() + 64))
++        .and_then(|n| total.checked_add(n))
++        .ok_or(crate::Error::RecoveryAllocationLimit)
++}
+diff --git a/src/worker_pool.rs b/src/worker_pool.rs
+index 6b87e61..318f495 100644
+--- a/src/worker_pool.rs
++++ b/src/worker_pool.rs
+@@ -191,7 +191,7 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
+                 log::trace!("acquiring journal lock to maybe rotate journal");
+                 let mut journal_writer = ctx.supervisor.journal.get_writer()?;
+ 
+-                if journal_writer.pos()? > 64_000_000 {
++                if journal_writer.pos()? > 64_000_000 && journal_writer.can_rotate()? {
+                     #[expect(clippy::expect_used)]
+                     let mut journal_manager = ctx
+                         .supervisor

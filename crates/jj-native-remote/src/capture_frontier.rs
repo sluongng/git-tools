@@ -112,10 +112,14 @@ impl Frontier<'_> {
         // Never use the generic provider descriptor/hydrator for a COMMIT or a
         // copy-history root. Those routes can install an entire ancestry.
         if !matches!(key.kind, m::Kind::Tree | m::Kind::Symlink) {
-            return Err(Status::unimplemented(
-                "uncovered native capture history is not locally available",
+            return Err(crate::NativeCaptureFailure::new(
+                crate::NativeCaptureStage::FrontierCollect,
+                crate::NativeCaptureReason::NonresidentHistoryUnavailable,
             )
-            .into());
+            .attach(
+                Status::unimplemented("uncovered native capture history is not locally available")
+                    .into(),
+            ));
         }
         let cap = self.control.inner.config.remote.limits.max_metadata_bytes;
         self.memory(cap)?;
@@ -398,8 +402,15 @@ pub(super) async fn collect(
                 .await
                 .map_err(backend)?
                 .ok_or_else(|| {
-                    Status::unimplemented(
-                        "uncovered native capture FILE root is not locally available",
+                    crate::NativeCaptureFailure::new(
+                        crate::NativeCaptureStage::FrontierCollect,
+                        crate::NativeCaptureReason::NonresidentFileRootUnavailable,
+                    )
+                    .attach(
+                        Status::unimplemented(
+                            "uncovered native capture FILE root is not locally available",
+                        )
+                        .into(),
                     )
                 })?;
             ensure!(

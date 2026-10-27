@@ -29,6 +29,7 @@ struct FixtureIo {
     remote: Mutex<Vec<m::Commit>>,
     admitted: Mutex<BTreeSet<m::CommitId>>,
     root_errors: Mutex<BTreeMap<m::CommitId, tonic::Code>>,
+    scope_failure: Mutex<Option<tonic::Status>>,
     fork_overlays: Mutex<Vec<Vec<m::CommitId>>>,
     pause_pages: AtomicBool,
     page_waiters: Mutex<Vec<futures::channel::oneshot::Sender<()>>>,
@@ -162,6 +163,14 @@ fn selected(expr: &q::GraphExpr, nodes: &[m::Commit]) -> BTreeSet<m::CommitId> {
                     .any(|n| model_commit_id(n) == *id && n.root_tree.terms.len() > 1)
             });
             selected
+        }
+        X::ChangedPath(v) => {
+            // This fixture only sees the canonical branch after the exact-path
+            // adapter has excluded every selected private ID. The real server
+            // metadata comparison is covered by RPC/native acceptance tests.
+            let remaining = selected(v.candidates.as_deref().unwrap(), nodes);
+            assert!(remaining.is_empty(), "fixture has no canonical path reader");
+            remaining
         }
         X::Intersection(v) => {
             let mut sets = v.inputs.iter().map(|e| selected(e, nodes));
@@ -329,6 +338,9 @@ impl NativeQueryIo for FixtureIo {
         o: QueryOwner,
     ) -> Result<QueryReply<QueryScope>, tonic::Status> {
         self.live_opens.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.scope_failure.lock().unwrap().clone() {
+            return Err(error);
+        }
         let remote = self.remote.lock().unwrap().clone();
         let all: BTreeMap<_, _> = remote
             .iter()
@@ -692,6 +704,9 @@ impl NativeQueryIo for FixtureIo {
                 q::graph_expr::Expression::Heads(v) | q::graph_expr::Expression::HasConflict(v) => {
                     pending.push(v.input.as_deref().unwrap())
                 }
+                q::graph_expr::Expression::ChangedPath(v) => {
+                    pending.push(v.candidates.as_deref().unwrap());
+                }
                 q::graph_expr::Expression::Difference(v) => {
                     pending.push(v.left.as_deref().unwrap());
                     pending.push(v.right.as_deref().unwrap());
@@ -890,8 +905,46 @@ fn fixture() -> (
     (directory, objects_directory, store, io, objects, config)
 }
 #[test]
+fn query_failures_report_static_scope_stage_without_reflecting_provider_details() {
+    let (_directory, _objects_directory, store, io, _objects, _config) = fixture();
+    let reason = native_broker::QueryFailureReason::LocalScopeCountExceeded;
+    let resource = native_broker::QueryFailureReason::ServerScopeReplayHistoryQuota;
+    for (code, message, expected) in [
+        (reason.code(), reason.diagnostic().to_owned(), Some(reason)),
+        (resource.code(), resource.diagnostic().to_owned(), Some(resource)),
+        (tonic::Code::FailedPrecondition, resource.diagnostic().to_owned(), None),
+        (tonic::Code::ResourceExhausted, reason.diagnostic().to_owned(), None),
+        (resource.code(), format!("{}; private fixture detail", resource.diagnostic()), None),
+        (reason.code(), "fixture private connection detail".to_owned(), None),
+        (resource.code(), "fixture private resource detail".to_owned(), None),
+    ] {
+        *io.scope_failure.lock().unwrap() = Some(tonic::Status::new(code, message));
+        let index = store.seed_index().unwrap();
+        let error = block_on(index.has_id(&CommitId::from_bytes(&[42; 32]))).unwrap_err();
+        let IndexError::Other(source) = error else { panic!("unexpected error category") };
+        let failure = source.downcast_ref::<Error>().unwrap();
+        assert_eq!(failure.query_code(), Some(code));
+        assert!(matches!(failure, Error::QueryFailure { code: actual, stage: QueryStage::ScopeOpen, reason }
+            if *actual == code && *reason == expected));
+        assert!(!format!("{failure:?} {failure}").contains("private"));
+    }
+    *io.scope_failure.lock().unwrap() = None;
+    let index = store.seed_index().unwrap();
+    assert!(!block_on(index.has_id(&CommitId::from_bytes(&[42; 32]))).unwrap());
+}
+
+#[test]
 fn immutable_operation_associations_reopen_and_reject_missing_transplanted_or_foreign_state() {
     let (directory, _objects_directory, store, io, objects, config) = fixture();
+    let manifest = directory.path().join("index/manifest");
+    let before = std::fs::read(&manifest).unwrap();
+    assert_eq!(NativeIndexStore::inspect_config(&directory.path().join("index")).unwrap(), config);
+    assert_eq!(std::fs::read(&manifest).unwrap(), before, "inspection is read-only");
+    let corrupt = private_fs::PrivateDir::create(directory.path().join("corrupt-manifest")).unwrap();
+    let mut damaged = before.clone(); damaged[13] ^= 1;
+    corrupt.replace("manifest", &damaged).unwrap();
+    assert!(matches!(NativeIndexStore::inspect_config(corrupt.path()), Err(Error::Corrupt)));
+    assert_eq!(std::fs::read(corrupt.path().join("manifest")).unwrap(), damaged);
     let foreign_dir =
         private_fs::PrivateDir::create(directory.path().join("foreign-index")).unwrap();
     std::fs::write(foreign_dir.path().join("sentinel"), b"untouched").unwrap();
@@ -2165,7 +2218,7 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             &directory.path().join("index"),
             &config,
             short,
-            io,
+            io.clone(),
             paused.clone(),
         )
         .unwrap();
@@ -2240,6 +2293,159 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
                 Err(e) => panic!("selected workers did not recover: {e}"),
             }
         }
+
+        // Exercise the distinct ordinary exact-path rewrite route, not the
+        // HasConflict/FileAll resolver above. Its private COMMIT reply must stay
+        // owned while the actual TREE provider is paused after cancellation.
+        let exact = ResolvedExpression::FilterWithin {
+            candidates: Box::new(ResolvedExpression::Commits(vec![
+                file_commits[1].id().clone(),
+            ])),
+            predicate: P::Filter(F::File(FilesetExpression::Pattern(
+                jj_lib::fileset::FilePattern::FilePath(
+                    jj_lib::repo_path::RepoPathBuf::from_internal_string("file").unwrap(),
+                ),
+            ))),
+        };
+        let exact_short = limited.evaluate_revset(&exact, &jj_store).unwrap();
+        let exact_long = concurrent_index.evaluate_revset(&exact, &jj_store).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io
+            .reply_owners
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|owner| owner.upgrade().is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "previous selected reply owners did not close"
+            );
+            std::thread::yield_now();
+        }
+        let tree_reads = paused.reads.lock().unwrap().len();
+        let file_reads = paused.files.load(Ordering::SeqCst);
+        paused.pause_metadata.store(true, Ordering::SeqCst);
+        let mut canceled = exact_long.stream();
+        let waiting = canceled.next();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let registered = futures::future::poll_fn(|cx| {
+            if !paused.metadata_waiters.lock().unwrap().is_empty() {
+                return std::task::Poll::Ready(());
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exact-path TREE read never started"
+            );
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        match futures::future::select(waiting, registered).await {
+            futures::future::Either::Right(((), waiting)) => drop(waiting),
+            futures::future::Either::Left(_) => {
+                panic!("paused exact-path request completed before cancellation")
+            }
+        }
+        drop(canceled);
+        for _ in 0..3 {
+            let error = exact_short
+                .stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            let RevsetEvaluationError::Other(source) = error else {
+                panic!("wrong exact-path timeout category")
+            };
+            assert!(matches!(
+                source.downcast_ref::<Error>(),
+                Some(Error::Query(tonic::Code::DeadlineExceeded))
+            ));
+        }
+        let error = exact_short
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        let RevsetEvaluationError::Other(source) = error else {
+            panic!("wrong exact-path admission category")
+        };
+        assert!(
+            matches!(source.downcast_ref::<Error>(), Some(Error::Limit)),
+            "cancelled/timed-out exact-path physical jobs must retain all four permits"
+        );
+        assert_eq!(paused.metadata_waiters.lock().unwrap().len(), 4);
+        assert_eq!(
+            io.reply_owners
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|owner| owner.upgrade().is_some())
+                .count(),
+            4,
+            "each paused TREE read must retain its private canonical COMMIT reply owner"
+        );
+        assert!(
+            paused.reads.lock().unwrap()[tree_reads..]
+                .iter()
+                .all(|key| key.kind == m::Kind::Tree)
+        );
+        assert_eq!(paused.files.load(Ordering::SeqCst), file_reads);
+        paused.resume_metadata();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io
+            .reply_owners
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|owner| owner.upgrade().is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exact-path physical reply owners were not released"
+            );
+            std::thread::yield_now();
+        }
+        // Reoccupy all four slots through the public synchronous API. A single
+        // succeeding request would not detect three leaked helper permits.
+        paused.pause_metadata.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let index = concurrent_index.clone();
+                let store = jj_store.clone();
+                let expression = exact.clone();
+                workers.push(scope.spawn(move || {
+                    index
+                        .evaluate_revset(&expression, &store)
+                        .unwrap()
+                        .is_empty()
+                }));
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while paused.metadata_waiters.lock().unwrap().len() < 4
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let reached = paused.metadata_waiters.lock().unwrap().len();
+            paused.resume_metadata();
+            let results: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            assert!(
+                reached == 4 && results.iter().all(|result| matches!(result, Ok(false))),
+                "all four exact-path helper slots must recover after physical closure: reached={reached}, results={results:?}"
+            );
+        });
+        assert!(
+            io.reply_owners
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|owner| owner.upgrade().is_none())
+        );
+        assert_eq!(paused.files.load(Ordering::SeqCst), file_reads);
     });
 }
 
@@ -3416,6 +3622,13 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
         assert_eq!(pins.index_root_ids.len(), 3);
         assert_eq!(pins.manifest_id, version.manifest_id);
         assert_eq!(merged_heads.checkpoint.baseline.len(), 2);
+        for id in &merged_heads.checkpoint.baseline {
+            assert!(merged_heads.local_query_parents(*id).is_none(), "authenticated frozen baseline is never a private overlay");
+        }
+        let (local_order, local_parents)=updated.local_query_parents(model_id(delta.id()).unwrap()).unwrap();
+        assert_eq!(local_parents, delta.parent_ids().iter().map(|id|model_id(id).unwrap()).collect::<Vec<_>>());
+        assert!(local_order < updated.checkpoint.drafts.len() as u64);
+
         let opens_before = io.cloud_opens.load(Ordering::SeqCst);
         let rows = merged_heads
             .evaluate_revset(&expression, &jj_store)

@@ -151,6 +151,7 @@ pub struct CloudIndexReadLease {
     repo: String,
     owner: CloudOwner,
     inner: Arc<Inner>,
+    _resident: Option<Arc<resident::Reservation>>,
 }
 impl CloudIndexReadLease {
     pub fn descriptor(&self) -> IndexArtifactDescriptor {
@@ -335,6 +336,8 @@ impl Store {
             return Err(Error::Corrupt("cloud index backing type or size"));
         }
         let file = File::open(path)?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 2, 1)?;
         let count = gate
             .index_artifact_readers
             .entry((repo.into(), owner.principal, id))
@@ -342,6 +345,7 @@ impl Store {
         *count = count
             .checked_add(1)
             .ok_or(Error::Limit("cloud index active readers"))?;
+        drop(record);
         drop(gate);
         let mut lease = CloudIndexReadLease {
             file,
@@ -349,6 +353,7 @@ impl Store {
             repo: repo.into(),
             owner,
             inner: self.inner.clone(),
+            _resident: resident_lease,
         };
         let mut bytes = Vec::new();
         (&mut lease.file)

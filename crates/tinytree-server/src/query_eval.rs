@@ -17,6 +17,7 @@ pub(crate) enum EvalError {
     Graph(GraphError),
     Invalid(&'static str),
     Unsupported(&'static str),
+    Read(tonic::Status),
 }
 impl From<GraphError> for EvalError {
     fn from(error: GraphError) -> Self {
@@ -29,6 +30,7 @@ impl fmt::Display for EvalError {
             Self::Graph(error) => error.fmt(f),
             Self::Invalid(message) => write!(f, "invalid graph expression: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported graph expression: {message}"),
+            Self::Read(status) => status.fmt(f),
         }
     }
 }
@@ -129,8 +131,24 @@ impl Memory {
         self.used.intervals -= count.intervals;
     }
 }
+pub(crate) trait PathPredicate {
+    fn changed(
+        &mut self,
+        id: m::CommitId,
+        path: &str,
+        exact_file: bool,
+        budget: &mut WorkBudget,
+    ) -> Result<bool>;
+}
+pub(crate) struct NoPathPredicate;
+impl PathPredicate for NoPathPredicate {
+    fn changed(&mut self, _: m::CommitId, _: &str, _: bool, _: &mut WorkBudget) -> Result<bool> {
+        Err(EvalError::Unsupported("path metadata reader unavailable"))
+    }
+}
 struct Context<'a> {
     graph: &'a Arc<OverlayGraph>,
+    path: &'a mut dyn PathPredicate,
     budget: &'a mut WorkBudget,
     memory: &'a mut Memory,
     remaining: usize,
@@ -257,11 +275,19 @@ impl Evaluator {
         self.steps
     }
     pub fn step(&mut self, budget: &mut WorkBudget) -> Result<EvalStep> {
+        self.step_with_path(budget, &mut NoPathPredicate)
+    }
+    pub fn step_with_path(
+        &mut self,
+        budget: &mut WorkBudget,
+        path: &mut dyn PathPredicate,
+    ) -> Result<EvalStep> {
         if self.failed {
             return Err(GraphError::Unavailable.into());
         }
         let mut context = Context {
             graph: &self.graph,
+            path,
             budget,
             memory: &mut self.memory,
             remaining: self.limits.max_step_work,
@@ -672,6 +698,39 @@ impl HasConflict {
                 intervals: 0,
             });
             if node.has_conflict() {
+                return Ok(EvalStep::Row(node));
+            }
+        }
+    }
+}
+struct ChangedPath {
+    input: Box<Operator>,
+    path: String,
+    exact_file: bool,
+    look: Option<GraphNode>,
+    done: bool,
+}
+impl ChangedPath {
+    fn poll(&mut self, ctx: &mut Context<'_>) -> Result<EvalStep> {
+        loop {
+            if !fill(&mut self.input, &mut self.look, &mut self.done, ctx)? {
+                return Ok(EvalStep::Progress);
+            }
+            if self.done && self.look.is_none() {
+                return Ok(EvalStep::Done);
+            }
+            if !ctx.tick()? {
+                return Ok(EvalStep::Progress);
+            }
+            let node = self.look.take().ok_or(GraphError::Corrupt)?;
+            ctx.memory.release(Counts {
+                slots: 1,
+                intervals: 0,
+            });
+            if ctx
+                .path
+                .changed(node.commit(), &self.path, self.exact_file, ctx.budget)?
+            {
                 return Ok(EvalStep::Row(node));
             }
         }
@@ -1117,6 +1176,7 @@ enum Operator {
     Ancestors(Ancestors),
     Heads(Heads),
     HasConflict(HasConflict),
+    ChangedPath(ChangedPath),
     Roots(Roots),
     DagRange(DagRange),
     Set(SetOperator),
@@ -1172,6 +1232,10 @@ impl Operator {
                 slots: usize::from(state.look.is_some()),
                 intervals: 0,
             }),
+            Self::ChangedPath(state) => state.input.counts().add(Counts {
+                slots: usize::from(state.look.is_some()),
+                intervals: 0,
+            }),
             Self::Roots(state) => state.input.counts().add(Counts {
                 slots: state.candidates.len() + usize::from(state.look.is_some()),
                 intervals: 0,
@@ -1214,6 +1278,7 @@ impl Operator {
             Self::Ancestors(state) => state.poll(ctx),
             Self::Heads(state) => state.poll(ctx),
             Self::HasConflict(state) => state.poll(ctx),
+            Self::ChangedPath(state) => state.poll(ctx),
             Self::Roots(state) => state.poll(ctx),
             Self::DagRange(state) => state.poll(ctx),
             Self::Set(state) => state.poll(ctx),
@@ -1225,6 +1290,54 @@ impl Operator {
         }
         Ok(result)
     }
+}
+pub(crate) fn validate_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.contains(['\\', '\0'])
+        || path.split('/').count() > 512
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Err(EvalError::Invalid("invalid exact path"));
+    }
+    Ok(())
+}
+pub(crate) fn has_path(expression: &q::GraphExpr) -> bool {
+    use q::graph_expr::Expression as X;
+    let mut todo = vec![expression];
+    let mut seen = 0;
+    while let Some(value) = todo.pop() {
+        seen += 1;
+        if seen > 1024 || todo.len() > 1024 {
+            return true;
+        }
+        match value.expression.as_ref() {
+            Some(X::ChangedPath(_)) => return true,
+            Some(X::Ancestors(v)) => todo.extend(v.heads.as_deref()),
+            Some(X::Range(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(X::DagRange(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(X::Heads(v) | X::Roots(v) | X::HasConflict(v)) => todo.extend(v.input.as_deref()),
+            Some(X::Union(v) | X::Intersection(v)) => {
+                if v.inputs.len() > 1024 {
+                    return true;
+                }
+                todo.extend(&v.inputs);
+            }
+            Some(X::Difference(v)) => {
+                todo.extend(v.left.as_deref());
+                todo.extend(v.right.as_deref());
+            }
+            Some(X::Latest(v)) => todo.extend(v.candidates.as_deref()),
+            _ => {}
+        }
+    }
+    false
 }
 struct Compiler<'a> {
     limits: &'a EvalLimits,
@@ -1427,6 +1540,19 @@ impl Compiler<'_> {
                     done: false,
                     excluded: BTreeMap::new(),
                     expansion: None,
+                }))
+            }
+            X::ChangedPath(value) => {
+                if value.policy_version != 1 {
+                    return Err(EvalError::Unsupported("path policy version"));
+                }
+                validate_path(&value.path)?;
+                Ok(Operator::ChangedPath(ChangedPath {
+                    input: Box::new(self.compile(child(&value.candidates)?, depth + 1)?),
+                    path: value.path.clone(),
+                    exact_file: value.exact_file,
+                    look: None,
+                    done: false,
                 }))
             }
             X::HasConflict(value) => {

@@ -35,6 +35,19 @@ fn set(value: q::CommitSet, limit: usize) -> Result<Vec<CommitId>, Error> {
     Ok(result)
 }
 impl NativeReadonlyIndex {
+    /// Upper bound on entries examined by one local overlay lookup. This lets
+    /// a command charge its immutable linear scan before requesting metadata.
+    pub fn local_query_lookup_items(&self) -> usize { self.checkpoint.drafts.len().saturating_add(1) }
+
+    /// Locally retained COMMIT overlay metadata at this exact operation. Frozen
+    /// baseline entries are excluded. Absence is NOT canonical read authority:
+    /// a caller must still validate each boundary against its captured source.
+    pub fn local_query_parents(&self, id: m::CommitId) -> Option<(u64, &[m::CommitId])> {
+        if self.checkpoint.baseline.contains(&id) { return None; }
+        self.checkpoint.drafts.iter().enumerate().find(|(_, draft)| draft.id() == id)
+            .map(|(position, draft)| (position as u64, draft.parents.as_slice()))
+    }
+
     /// Exact retained baseline for independent file queries. Local index deltas
     /// are deliberately excluded: COMMIT overlays do not authorize FILE reads.
     pub fn cloud_query_source(&self) -> Option<native_broker::CloudQuerySource> {
@@ -148,7 +161,7 @@ impl NativeReadonlyIndex {
                     .await
             }
         }
-        .map_err(status)?;
+        .map_err(status_at(QueryStage::ScopeOpen))?;
         self.lease(reply, None)
     }
     async fn classify(
@@ -177,7 +190,7 @@ impl NativeReadonlyIndex {
                     Arc::new((self.core.owner(), base.clone())),
                 )
                 .await
-                .map_err(status)?;
+                .map_err(status_at(QueryStage::ScopeClassify))?;
             if reply.value.answers.len() != ids.len() {
                 return Err(Error::Corrupt);
             }
@@ -419,7 +432,7 @@ impl NativeReadonlyIndex {
         let covered = match self.classify(&base, &ids).await {
             Ok(known) => known,
             Err(error) => {
-                if matches!(error, Error::Query(tonic::Code::FailedPrecondition)) {
+                if error.query_code() == Some(tonic::Code::FailedPrecondition) {
                     state.root_only = None;
                     state.replay = random();
                 }
@@ -479,7 +492,7 @@ impl NativeReadonlyIndex {
                         state.root_only = None;
                         state.replay = random();
                     }
-                    return Err(status(error));
+                    return Err(status_at(QueryStage::ScopeFork)(error));
                 }
             }
         };
@@ -541,7 +554,7 @@ impl NativeReadonlyIndex {
                 Err(e) if attempt == 0 && e.code() == tonic::Code::FailedPrecondition => {
                     self.invalidate(scope.value.handle).await
                 }
-                Err(e) => return Err(status(e)),
+                Err(e) => return Err(status_at(QueryStage::Fact)(e)),
             }
         }
         Err(Error::Corrupt)
@@ -564,7 +577,7 @@ impl NativeReadonlyIndex {
                 Arc::new((self.core.owner(), scope)),
             )
             .await
-            .map_err(status)?;
+            .map_err(status_at(QueryStage::Prefix))?;
         if reply.value.kind != kind as i32 || reply.value.hex_length > width {
             return Err(Error::Corrupt);
         }

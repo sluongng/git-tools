@@ -28,6 +28,8 @@ const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_JOURNALS: usize = 256;
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECODE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_REMOTE_BYTES: usize = 1024 * 1024;
+const MAX_CLEANUP_NAME: usize = 160;
 
 /// Explicit source-codec/allocation-work ceilings, not a measured RSS promise.
 /// Lower caps are supported; no field may exceed the existing native reader cap.
@@ -100,7 +102,20 @@ impl WorkingLimits {
             mul(add(mul(self.max_proof_bytes, 32)?, 4096)?, 4)?,
             mul(self.max_proof_bytes, 4)?,
         )?;
-        add(registry.max(proof), self.max_retained_bytes)
+        // Cleanup decodes one bounded sidecar and one journal at a time. A
+        // second raw sidecar freshness read and the bounded filename/hash plan
+        // coexist; no decoded historical record collection is retained.
+        let cleanup = add(
+            add(mul(MAX_REMOTE_BYTES, 34)?, mul(record, 2)?)?,
+            add(
+                add(
+                    mul(MAX_JOURNALS, MAX_CLEANUP_NAME + 128)?,
+                    self.max_record_bytes,
+                )?,
+                128 * 1024,
+            )?,
+        )?;
+        add(registry.max(proof).max(cleanup), self.max_retained_bytes)
     }
 }
 #[derive(Default)]
@@ -119,6 +134,8 @@ pub struct ReadAdmission {
     _owner: Arc<dyn Any + Send + Sync>,
     retained: Mutex<Retained>,
     work: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    cleanup_interrupt_after: std::sync::atomic::AtomicUsize,
 }
 impl std::fmt::Debug for ReadAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,10 +157,17 @@ impl ReadAdmission {
             _owner: owner,
             retained: Mutex::new(Retained::default()),
             work: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            cleanup_interrupt_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }))
     }
     pub fn limits(&self) -> &WorkingLimits {
         &self.limits
+    }
+    #[cfg(test)]
+    pub(crate) fn interrupt_cleanup_after(&self, removed: usize) {
+        self.cleanup_interrupt_after
+            .store(removed, std::sync::atomic::Ordering::SeqCst);
     }
     fn enter(
         self: &Arc<Self>,
@@ -374,6 +398,93 @@ impl Purpose {
         );
         Ok(())
     }
+}
+struct ResolutionDigest(blake3::Hasher);
+impl ResolutionDigest {
+    fn new(domain: &[u8]) -> Self {
+        let mut value = Self(blake3::Hasher::new());
+        value.field(domain);
+        value
+    }
+    fn number(&mut self, value: u64) {
+        self.0.update(&value.to_le_bytes());
+    }
+    fn field(&mut self, bytes: &[u8]) {
+        self.number(bytes.len() as u64);
+        self.0.update(bytes);
+    }
+    fn finish(self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
+    }
+}
+/// Canonical local equality recipe shared with the CLI. The broker's immutable
+/// native request uses an empty repository_id; provider/scope bind it separately.
+/// observed_job is deliberately excluded. This grants no remote authority.
+pub fn request_digest(intent: &native_broker::LandingIntent) -> Result<[u8; 32]> {
+    intent.validate()?;
+    let request = &intent.request;
+    let mut hash = ResolutionDigest::new(b"tinytree.landing-resolution.request.v1");
+    hash.field(request.repository_id.as_bytes());
+    hash.field(request.idempotency_key.as_bytes());
+    hash.field(&request.source_base);
+    hash.field(&request.source_head);
+    hash.field(request.destination.as_bytes());
+    hash.number(request.expected_generation);
+    hash.field(&request.expected_head);
+    hash.field(request.profile_name.as_bytes());
+    hash.field(request.expected_profile_version.as_bytes());
+    hash.number(intent.source_stack.len() as u64);
+    for commit in &intent.source_stack {
+        hash.field(&commit.0);
+    }
+    Ok(hash.finish())
+}
+/// Exact existing candidate equality recipe. Callers must first validate and
+/// fund their canonical candidate bounds; this is not candidate admission.
+pub fn candidate_digest(candidate: &native_broker::landing_protocol::Candidate) -> [u8; 32] {
+    let mut hash = ResolutionDigest::new(b"tinytree.landing-resolution.candidate.v1");
+    hash.field(&candidate.head);
+    hash.field(&candidate.root_tree);
+    let mut rows = candidate.rewrites.iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.old_commit.cmp(&b.old_commit));
+    hash.number(rows.len() as u64);
+    for row in rows {
+        hash.field(&row.old_commit);
+        hash.field(&row.new_commit);
+        hash.field(&row.change_id);
+    }
+    hash.finish()
+}
+fn bytes32(value: &str) -> Result<[u8; 32]> {
+    ensure!(valid_hex(value, 64), "invalid landing identity");
+    let mut id = [0; 32];
+    for (slot, pair) in id.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    Ok(id)
+}
+fn immutable_intent(
+    p: &crate::remote_state::LandingPending,
+) -> Result<native_broker::LandingIntent> {
+    Ok(native_broker::LandingIntent {
+        request: native_broker::landing_protocol::StartLandingRequest {
+            repository_id: String::new(),
+            idempotency_key: p.request_id.clone(),
+            source_base: bytes32(&p.source_base)?.to_vec(),
+            source_head: bytes32(&p.source_head)?.to_vec(),
+            destination: p.reference.clone(),
+            expected_generation: p.generation,
+            expected_head: bytes32(&p.expected_head)?.to_vec(),
+            profile_name: p.profile_name.clone(),
+            expected_profile_version: p.profile_version.clone(),
+        },
+        source_stack: p
+            .source_stack
+            .iter()
+            .map(|id| bytes32(id).map(native_broker::CommitId))
+            .collect::<Result<_>>()?,
+        observed_job: None,
+    })
 }
 /// Fresh caller-selected remote identity. Digests bind the complete canonical
 /// request and candidate, not moving job status or expiry. Use domain-separated
@@ -1104,6 +1215,111 @@ impl Registry {
         File::open(directory.path())?.sync_all()?;
         Ok(result)
     }
+    /// Remove only this durably closed request's host provenance. Caller MUST
+    /// retain native-remote.lock and the command fence across the final save and
+    /// this call, after fresh canonical job/current-state classification. A job
+    /// DTO, captured acknowledgement, or file fingerprint is not remote authority.
+    /// No OP/VIEW/index/native objects are removed or adopted. Uncertain active
+    /// records fail closed even if the sidecar claims acknowledgement.
+    pub async fn cleanup_closed_landing_resolution(
+        &self,
+        binding: &Binding,
+        context: &CommonContext,
+        expected_sidecar: [u8; 32],
+        fresh_job: &native_broker::landing_protocol::LandingJob,
+        admission: &Arc<ReadAdmission>,
+    ) -> Result<usize> {
+        let _work = admission.enter(&[])?;
+        context
+            .with_purpose(Purpose::Freeze { observed_job: None })
+            .saved()?;
+        let _lock = self.resolution_lock().await?;
+        self.resolution_binding(binding)?;
+        let wc = PrivateDir::open_existing(&binding.working_copy)?;
+        let sidecar = wc.read("native-remote.toml", MAX_REMOTE_BYTES)?;
+        ensure!(
+            *blake3::hash(&sidecar).as_bytes() == expected_sidecar,
+            "closed landing sidecar changed"
+        );
+        let state = crate::remote_state::decode(&sidecar, &context.scope)?;
+        let pending = state
+            .landing
+            .as_ref()
+            .context("closed landing intent missing")?;
+        ensure!(
+            pending.request_id == context.request_id
+                && request_digest(&immutable_intent(pending)?)? == context.request_digest,
+            "closed landing original request differs"
+        );
+        let expected = closed_job(pending, fresh_job)?;
+        let Some(directory) = self.resolution_directory(binding, false)? else {
+            // Even an empty retry confirms the saved sidecar's durability.
+            sync_closed_sidecar(&wc, expected_sidecar)?;
+            return Ok(0);
+        };
+        let prefix = format!("{}-", context.request_id);
+        let mut plan = Vec::new();
+        let entries = fs::read_dir(directory.path())?
+            .take(MAX_JOURNALS + 1)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(
+            entries.len() <= MAX_JOURNALS,
+            "landing resolution journal limit exceeded"
+        );
+        for entry in entries {
+            let name = entry.file_name();
+            if !name.as_encoded_bytes().starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            let name = name
+                .to_str()
+                .context("invalid closed landing journal name")?;
+            ensure!(
+                name.len() <= MAX_CLEANUP_NAME,
+                "closed landing journal name exceeds bound"
+            );
+            let bytes = directory.read(name, admission.limits.max_record_bytes)?;
+            let record: Record = serde_json::from_slice(&bytes)?;
+            validate_cleanup_record(binding, context, pending, &expected, name, &record)?;
+            plan.push((name.to_owned(), *blake3::hash(&bytes).as_bytes()));
+        }
+        // Validate every record before any deletion, then recheck all exact
+        // bytes. Locks fence supported writers; hashes refuse unexpected drift.
+        sync_closed_sidecar(&wc, expected_sidecar)?;
+        for (name, hash) in &plan {
+            ensure!(
+                *blake3::hash(&directory.read(name, admission.limits.max_record_bytes)?).as_bytes()
+                    == *hash,
+                "closed landing journal changed before cleanup"
+            );
+        }
+        plan.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut removed = 0;
+        for (name, _) in plan {
+            #[cfg(test)]
+            ensure!(
+                removed
+                    != admission
+                        .cleanup_interrupt_after
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                "injected closed cleanup interruption"
+            );
+            fs::remove_file(directory.path().join(name))?;
+            removed += 1;
+        }
+        #[cfg(test)]
+        ensure!(
+            removed
+                != admission
+                    .cleanup_interrupt_after
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            "injected closed cleanup interruption"
+        );
+        // Also repeat this barrier on empty retries after unlink succeeded but
+        // its directory sync failed. No permanent tombstone consumes capacity.
+        File::open(directory.path())?.sync_all()?;
+        Ok(removed)
+    }
     /// Select only the actual WC operation's commit and an exact locally owned
     /// result. This breaks the metadata bootstrap cycle after record-before-
     /// sidecar crashes; callers must still obtain canonical CommitProofs and
@@ -1321,6 +1537,145 @@ impl Registry {
         save(&directory, &record, admission)?;
         classify(binding, record, proofs, admission).await
     }
+}
+fn closed_job(
+    pending: &crate::remote_state::LandingPending,
+    job: &native_broker::landing_protocol::LandingJob,
+) -> Result<crate::remote_state::HistoricalLandingJob> {
+    ensure!(
+        job.profile_name.len() <= 64
+            && job.profile_version.len() <= 128
+            && job.conflict_path.as_ref().is_none_or(|p| p.len() <= 4096)
+            && job
+                .candidate
+                .as_ref()
+                .is_none_or(|c| c.rewrites.len() <= 128)
+            && job.receipt.as_ref().is_none_or(|r| r.rewrites.len() <= 128
+                && r.reference.as_ref().is_none_or(|v| v.name.len() <= 512)),
+        "closed landing job exceeds bounds"
+    );
+    let expected = crate::remote_state::historical_landing_job(job)?;
+    expected.validate(pending)?;
+    ensure!(
+        pending.observed.as_ref() == Some(&expected)
+            && !pending.restored_lookup_only
+            && pending.operation_writing.is_none()
+            && pending.fork_acknowledged
+            && pending.candidate_head.is_none()
+            && pending.result_roots.is_empty(),
+        "landing request is not durably closed"
+    );
+    use crate::remote_state::HistoricalLandingPhase as P;
+    if expected.phase == P::Committed {
+        ensure!(
+            pending.acknowledged && pending.terminal.is_none() && pending.apply_operation.is_some(),
+            "committed landing acknowledgement missing"
+        );
+    } else {
+        ensure!(
+            matches!(
+                expected.phase,
+                P::Conflict
+                    | P::Unsupported
+                    | P::CheckFailed
+                    | P::CheckUnavailable
+                    | P::StaleTarget
+                    | P::Expired
+            ) && !expected.roots_retained
+                && !pending.acknowledged
+                && pending.terminal.is_some()
+                && pending.apply_operation.is_none()
+                && pending.fork_operation.as_ref() == Some(&pending.source_operation),
+            "nonapplicable terminal closure missing"
+        );
+    }
+    Ok(expected)
+}
+fn validate_cleanup_record(
+    binding: &Binding,
+    context: &CommonContext,
+    pending: &crate::remote_state::LandingPending,
+    job: &crate::remote_state::HistoricalLandingJob,
+    name: &str,
+    record: &Record,
+) -> Result<()> {
+    let purpose = record.context.purpose.name();
+    validate_common_record(binding, context, record, purpose)?;
+    match &record.context.purpose {
+        Purpose::Freeze { observed_job } => ensure!(
+            observed_job
+                .as_ref()
+                .is_none_or(|id| Some(id) == pending.job_id.as_ref()),
+            "closed freeze job differs"
+        ),
+        Purpose::Apply {
+            job_id,
+            candidate_head,
+            candidate_digest: digest,
+        } => {
+            let candidate = job
+                .candidate
+                .as_ref()
+                .context("closed apply candidate missing")?;
+            let value = native_broker::landing_protocol::Candidate {
+                head: candidate.head.to_vec(),
+                root_tree: candidate.root_tree.to_vec(),
+                rewrites: candidate
+                    .rewrites
+                    .iter()
+                    .map(|r| native_broker::landing_protocol::Rewrite {
+                        old_commit: r.old_commit.to_vec(),
+                        new_commit: r.new_commit.to_vec(),
+                        change_id: r.change_id.to_vec(),
+                    })
+                    .collect(),
+            };
+            ensure!(
+                Some(job_id) == pending.job_id.as_ref()
+                    && candidate_head == &hex(&candidate.head)
+                    && *digest == candidate_digest(&value),
+                "closed apply context differs"
+            );
+        }
+    }
+    if name == journal_name(&record.context) {
+        let SavedStage::Completed { operation, .. } = &record.stage else {
+            anyhow::bail!("uncertain active resolution must be preserved");
+        };
+        let selected = match record.context.purpose {
+            Purpose::Freeze { .. } => &pending.fork_operation,
+            Purpose::Apply { .. } => &pending.apply_operation,
+        };
+        // A terminal sentinel no longer selects the historical freeze result;
+        // its host Completed proof is still closed, never replay authority.
+        ensure!(
+            pending.terminal.is_some() && purpose == "freeze"
+                || selected.as_ref() == Some(operation),
+            "closed acknowledgement selects another owned operation"
+        );
+    } else {
+        ensure!(
+            matches!(record.stage, SavedStage::Prepared),
+            "only prepared archives may be cleaned"
+        );
+        let base = format!("{}-{}-{}-", context.request_id, purpose, hex(&record.nonce));
+        ensure!(
+            name == format!("{base}superseded.json")
+                || purpose == "freeze" && name == format!("{base}retired.json"),
+            "unrecognized closed landing archive"
+        );
+    }
+    Ok(())
+}
+fn sync_closed_sidecar(wc: &PrivateDir, expected: [u8; 32]) -> Result<()> {
+    ensure!(
+        *blake3::hash(&wc.read("native-remote.toml", MAX_REMOTE_BYTES)?).as_bytes() == expected,
+        "closed landing sidecar changed before cleanup"
+    );
+    wc.open_existing_file("native-remote.toml", MAX_REMOTE_BYTES as u64)?
+        .sync_all()?;
+    File::open(wc.path())?.sync_all()?;
+    Ok(())
 }
 fn archive_record(
     directory: &PrivateDir,

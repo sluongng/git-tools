@@ -3122,6 +3122,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-annotate",
  "tinytree-client",
  "tinytree-cloud",
  "tinytree-fixture",
@@ -5595,6 +5596,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-annotate"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "jj-lib",
+ "tinytree-model",
+]
+
+[[package]]
 name = "tinytree-check-runner"
 version = "0.1.0"
 dependencies = [
@@ -5623,12 +5633,14 @@ dependencies = [
  "getrandom 0.3.4",
  "http",
  "hyper-util",
+ "jj-lib",
  "libc",
  "private-fs",
  "prost",
  "reapi",
  "serde",
  "tempfile",
+ "tinytree-cloud",
  "tinytree-fixture",
  "tinytree-index",
  "tinytree-model",
@@ -5796,6 +5808,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tinytree-annotate",
  "tinytree-cloud",
  "tinytree-check-runner",
  "tinytree-fixture",

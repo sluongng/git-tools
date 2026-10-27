@@ -1,4 +1,5 @@
 //! Atomic workspace versions. All published history is retained in this format.
+mod latest;
 use super::artifacts::{IndexStage, artifact_key};
 use super::*;
 use tinytree_cloud::{
@@ -76,13 +77,24 @@ impl ExtraWork {
         Ok(())
     }
     fn check(&self, inner: &Inner) -> Result<()> {
-        if self.records > inner.config.max_retention_validation_records as u64
-            || self.metadata > inner.config.max_retention_validation_bytes
-            || self.payload > inner.config.cloud.max_validation_payload_bytes
-        {
-            return Err(Error::Limit("cloud index proof work"));
-        }
-        Ok(())
+        // Report every exceeded category without exposing counters or limits.
+        // Checked-arithmetic failures retain the separate generic work error.
+        let exceeded =
+            u8::from(self.records > inner.config.max_retention_validation_records as u64)
+                | (u8::from(self.metadata > inner.config.max_retention_validation_bytes) << 1)
+                | (u8::from(self.payload > inner.config.cloud.max_validation_payload_bytes) << 2);
+        let reason = match exceeded {
+            0 => return Ok(()),
+            1 => "cloud index proof work exceeded: records",
+            2 => "cloud index proof work exceeded: metadata",
+            3 => "cloud index proof work exceeded: records_metadata",
+            4 => "cloud index proof work exceeded: payload",
+            5 => "cloud index proof work exceeded: records_payload",
+            6 => "cloud index proof work exceeded: metadata_payload",
+            7 => "cloud index proof work exceeded: records_metadata_payload",
+            _ => "cloud index proof work",
+        };
+        Err(Error::Limit(reason))
     }
     fn charge(&self, inner: &Inner, scan: &mut Scan) -> Result<()> {
         scan.records = scan
@@ -557,6 +569,7 @@ struct ValidationGuard {
     repo: String,
     owner: CloudOwner,
     inner: Arc<Inner>,
+    _resident: Option<Arc<resident::Reservation>>,
 }
 impl Drop for ValidationGuard {
     fn drop(&mut self) {
@@ -741,11 +754,19 @@ impl Inner {
         owner: CloudOwner,
         manifest: &RecoveryManifest,
         gate: &mut Runtime,
+        version: Option<([u8; 32], u64)>,
     ) -> Result<ValidationGuard> {
         self.check_version_work(manifest)?;
         for member in &manifest.members {
             let record = self
-                .cloud_object(repo, owner, member.id)?
+                .cloud_representation(
+                    repo,
+                    owner,
+                    CloudObjectDescriptor {
+                        id: member.id,
+                        selected: member.selected,
+                    },
+                )?
                 .ok_or(Error::Invalid("cloud manifest member unavailable"))?;
             if record.selected.descriptor()?.selected != member.selected {
                 return Err(Error::Invalid(
@@ -794,6 +815,51 @@ impl Inner {
         }
         let native = manifest.native_roots.clone();
         let cloud = manifest.members.iter().map(|m| m.id).collect::<Vec<_>>();
+        let native_missing = manifest
+            .native_roots
+            .iter()
+            .filter(|key| !gate.readers.contains_key(&(repo.to_owned(), **key)))
+            .count();
+        let cloud_missing = manifest
+            .members
+            .iter()
+            .filter(|member| {
+                !gate
+                    .cloud_readers
+                    .contains_key(&(repo.to_owned(), owner.principal, member.id))
+            })
+            .count();
+        let artifact_missing = artifacts
+            .iter()
+            .filter(|id| {
+                !gate
+                    .index_artifact_readers
+                    .contains_key(&(repo.to_owned(), owner.principal, **id))
+            })
+            .count();
+        let version_key = version.map(|(workspace, generation)| {
+            (repo.to_owned(), owner.principal, workspace, generation)
+        });
+        if version_key
+            .as_ref()
+            .is_some_and(|key| gate.cloud_version_readers.get(key) == Some(&usize::MAX))
+        {
+            return Err(Error::Limit("cloud version readers"));
+        }
+        let version_missing = usize::from(
+            version_key
+                .as_ref()
+                .is_some_and(|key| !gate.cloud_version_readers.contains_key(key)),
+        );
+        gate.reserve_pin_growth(
+            self,
+            [
+                native_missing,
+                cloud_missing,
+                artifact_missing,
+                version_missing,
+            ],
+        )?;
         for key in &native {
             *gate.readers.entry((repo.into(), *key)).or_default() += 1;
         }
@@ -809,14 +875,18 @@ impl Inner {
                 .entry((repo.into(), owner.principal, *id))
                 .or_default() += 1;
         }
+        if let Some(key) = version_key {
+            *gate.cloud_version_readers.entry(key).or_default() += 1;
+        }
         Ok(ValidationGuard {
             native,
             cloud,
             artifacts,
-            version: None,
+            version,
             repo: repo.into(),
             owner,
             inner: self.clone(),
+            _resident: gate.resident_arena.upgrade(),
         })
     }
     fn validate_manifest(
@@ -915,11 +985,15 @@ impl Inner {
                 selected.check_deadline()?;
             }
             let (record, metadata_scratch) = if manifest.indexed().is_some() {
-                let key = object_key(repo, owner, member.id);
-                let bytes = self
-                    .db
-                    .read_tx()
-                    .get(&self.spaces.cloud.objects, &key)?
+                let (_, bytes) = self
+                    .cloud_representation_row(
+                        repo,
+                        owner,
+                        CloudObjectDescriptor {
+                            id: member.id,
+                            selected: member.selected,
+                        },
+                    )?
                     .ok_or(Error::Corrupt("retained cloud member missing"))?;
                 let scratch = bytes
                     .len()
@@ -939,8 +1013,15 @@ impl Inner {
                 (record, scratch)
             } else {
                 (
-                    self.cloud_object(repo, owner, member.id)?
-                        .ok_or(Error::Corrupt("retained cloud member missing"))?,
+                    self.cloud_representation(
+                        repo,
+                        owner,
+                        CloudObjectDescriptor {
+                            id: member.id,
+                            selected: member.selected,
+                        },
+                    )?
+                    .ok_or(Error::Corrupt("retained cloud member missing"))?,
                     0,
                 )
             };
@@ -1679,6 +1760,17 @@ impl ValidationGuard {
                 return Err(Error::Limit("cloud artifact readers"));
             }
         }
+        let missing = descriptors
+            .iter()
+            .filter(|d| {
+                !gate.index_artifact_readers.contains_key(&(
+                    self.repo.clone(),
+                    self.owner.principal,
+                    d.id,
+                ))
+            })
+            .count();
+        gate.reserve_pins(&self.inner, 2, missing)?;
         for d in descriptors {
             if !existing.contains(&d.id) {
                 *gate
@@ -1976,11 +2068,23 @@ impl Store {
             // All fallible attachment reads must precede guard construction:
             // dropping a pin guard while this gate is held would reacquire it.
             let capture = self.inner.capture_record(&key, manifest.capture())?;
-            let mut guard = self.inner.pin_manifest(repo, owner, &manifest, &mut gate)?;
-            *gate.cloud_version_readers.entry(reader).or_default() += 1;
-            guard.version = Some((workspace, generation));
+            let guard = self.inner.pin_manifest(
+                repo,
+                owner,
+                &manifest,
+                &mut gate,
+                Some((workspace, generation)),
+            )?;
             (record, bytes, manifest, guard, indexed, capture)
         };
+        #[cfg(test)]
+        {
+            let pause = self.inner.cloud_version_read_pause.lock().unwrap().clone();
+            if let Some((entered, release)) = pause {
+                entered.send(()).unwrap();
+                release.wait();
+            }
+        }
         let verified = self.inner.validate_manifest_selection(
             repo,
             owner,
@@ -2075,7 +2179,8 @@ impl Store {
             if current.generation != request.expected_generation {
                 return Err(Error::StaleCloudWorkspace(current));
             }
-            self.inner.pin_manifest(repo, owner, &manifest, &mut gate)?
+            self.inner
+                .pin_manifest(repo, owner, &manifest, &mut gate, None)?
         };
         let roots = self.inner.validate_manifest(
             repo,
@@ -2114,19 +2219,30 @@ impl Store {
         // publication. The validation guard has protected them from collection.
         let mut member_metadata_work = 0u64;
         for member in &manifest.members {
-            let member_key = object_key(repo, owner, member.id);
-            let member_bytes = self
+            let (member_key, member_bytes) = self
                 .inner
-                .db
-                .read_tx()
-                .get(&self.inner.spaces.cloud.objects, &member_key)?
+                .cloud_representation_row(
+                    repo,
+                    owner,
+                    CloudObjectDescriptor {
+                        id: member.id,
+                        selected: member.selected,
+                    },
+                )?
                 .ok_or(Error::Corrupt("validated cloud member disappeared"))?;
             member_metadata_work = member_metadata_work
                 .checked_add((member_key.len() + member_bytes.len()) as u64 * 2)
                 .ok_or(Error::Limit("cloud version validation metadata"))?;
             let selected = self
                 .inner
-                .cloud_object(repo, owner, member.id)?
+                .cloud_representation(
+                    repo,
+                    owner,
+                    CloudObjectDescriptor {
+                        id: member.id,
+                        selected: member.selected,
+                    },
+                )?
                 .ok_or(Error::Corrupt("validated cloud member disappeared"))?
                 .selected
                 .descriptor()?;
@@ -2343,6 +2459,7 @@ fn manifest_key_for(repo: &str, owner: CloudOwner, id: ManifestId) -> Vec<u8> {
 pub(super) struct RetainedPlan {
     pub native: HashSet<ObjectKey>,
     pub cloud: HashSet<(CloudOwner, CloudId)>,
+    pub variants: HashSet<(CloudOwner, CloudId, [u8; 32])>,
     pub index: HashSet<(CloudOwner, IndexArtifactId)>,
     blobs: HashMap<(CloudOwner, [u8; 32]), u64>,
     versions: HashMap<Vec<u8>, VersionRecord>,
@@ -2373,6 +2490,7 @@ impl Inner {
         let mut plan = RetainedPlan {
             native: HashSet::new(),
             cloud: HashSet::new(),
+            variants: HashSet::new(),
             index: HashSet::new(),
             blobs: HashMap::new(),
             versions: HashMap::new(),
@@ -2458,10 +2576,35 @@ impl Inner {
             let mut payload_work = 0u64;
             let mut member_metadata_work = 0u64;
             for member in &manifest.members {
-                let member_key = object_key(actual, principal, member.id);
-                let member_bytes = view
-                    .get(&self.spaces.cloud.objects, &member_key)?
+                let (member_key, member_bytes) = self
+                    .cloud_representation_row(
+                        actual,
+                        principal,
+                        CloudObjectDescriptor {
+                            id: member.id,
+                            selected: member.selected,
+                        },
+                    )?
                     .ok_or(Error::Corrupt("retained cloud member missing"))?;
+                if member_key != object_key(actual, principal, member.id) {
+                    plan.variants
+                        .insert((principal, member.id, member.selected.blake3));
+                    let anchor = self
+                        .cloud_object(actual, principal, member.id)?
+                        .ok_or(Error::Corrupt("cloud primary anchor missing"))?
+                        .selected
+                        .descriptor()?;
+                    if plan
+                        .blobs
+                        .insert(
+                            (principal, anchor.selected.blake3),
+                            anchor.selected.size_bytes,
+                        )
+                        .is_some_and(|n| n != anchor.selected.size_bytes)
+                    {
+                        return Err(Error::Corrupt("cloud promised anchor length"));
+                    }
+                }
                 // Descriptor selection and the subsequent decoded-DAG verifier
                 // each read this bounded row. Charge both passes prospectively.
                 scan.visit(self, &member_key, &member_bytes)?;
@@ -2471,7 +2614,10 @@ impl Inner {
                     .ok_or(Error::Limit("cloud version validation metadata"))?;
                 let record: ObjectRecord = decode(&member_bytes)?;
                 let selected = record.selected.descriptor()?;
-                if selected.selected != member.selected {
+                if record.version != 1
+                    || selected.id != member.id
+                    || selected.selected != member.selected
+                {
                     return Err(Error::Corrupt(
                         "retained cloud member representation changed",
                     ));
@@ -2657,7 +2803,12 @@ impl Inner {
         let plan =
             self.retained_cloud_plan(Some(repo), Some(CloudOwner { principal }), false, &mut scan)?;
         if plan.native.len() > maximum
-            || plan.cloud.len().saturating_add(plan.index.len()) > maximum
+            || plan
+                .cloud
+                .len()
+                .saturating_add(plan.variants.len())
+                .saturating_add(plan.index.len())
+                > maximum
         {
             return Err(Error::Limit("cloud promise quota scan"));
         }
@@ -2745,6 +2896,32 @@ impl Inner {
         )?);
         for member in &manifest.members {
             plan.cloud.insert((owner, member.id));
+            let (key, _) = self
+                .cloud_representation_row(
+                    repo,
+                    owner,
+                    CloudObjectDescriptor {
+                        id: member.id,
+                        selected: member.selected,
+                    },
+                )?
+                .ok_or(Error::Invalid("cloud manifest member unavailable"))?;
+            if key != object_key(repo, owner, member.id) {
+                plan.variants
+                    .insert((owner, member.id, member.selected.blake3));
+                let anchor = self
+                    .cloud_object(repo, owner, member.id)?
+                    .ok_or(Error::Corrupt("cloud primary anchor missing"))?
+                    .selected
+                    .descriptor()?;
+                if plan
+                    .blobs
+                    .insert((owner, anchor.selected.blake3), anchor.selected.size_bytes)
+                    .is_some_and(|n| n != anchor.selected.size_bytes)
+                {
+                    return Err(Error::Corrupt("cloud promised anchor length"));
+                }
+            }
             if let Some(old) = plan
                 .blobs
                 .insert((owner, member.selected.blake3), member.selected.size_bytes)
@@ -2765,7 +2942,12 @@ impl Inner {
             }
         }
         if plan.native.len() > limits.max_quota_scan_roots
-            || plan.cloud.len().saturating_add(plan.index.len()) > limits.max_quota_scan_roots
+            || plan
+                .cloud
+                .len()
+                .saturating_add(plan.variants.len())
+                .saturating_add(plan.index.len())
+                > limits.max_quota_scan_roots
         {
             // An oversized owner plan must not suppress validation of the
             // required repository post-state. Walk only that bounded union:

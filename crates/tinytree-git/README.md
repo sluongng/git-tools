@@ -181,13 +181,51 @@ URLs must not contain user information, query strings, fragments, or control
 characters. SSH, custom protocol helpers and option-like destinations are not
 supported. TLS verification is enabled and redirects are disabled. Ambient Git
 configuration, credential helpers, prompts, and native source credentials are
-not forwarded. The built-in command does **not** provision authenticated hosting
-access. An explicitly selected `--git` executable is trusted code and may be a
-narrow operator-managed authentication wrapper outside this repository. Such a
-wrapper must preserve the configured arguments, owned process session, inherited
-ownership descriptors, and environment isolation; it must not daemonize or close
-those descriptors before its descendants exit. Credentials must not be embedded
-in the remote URL. Status and errors omit the URL and raw transport diagnostics.
+not forwarded. Anonymous transport remains the default. For authenticated HTTPS,
+opt in with `--credential-helper-config /private/push-helper.json`:
+
+```json
+{
+  "program": "/absolute/canonical/path/to/helper",
+  "program_blake3": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+  "arguments": ["public-subcommand", "public-option"],
+  "environment_names": ["HELPER_AUTH_CONFIG_DIR"]
+}
+```
+
+This is a nonsecret JSON policy, not a credential file. Select one existing
+trusted helper executable implementing Git's `get`/`store`/`erase` protocol.
+Arguments are literal public words, never shell snippets or token values. The
+program must be canonical, regular, executable, owner/root-owned, non-writable
+by group/other, and match its BLAKE3 pin. It is reverified before each Git worker.
+Keep it and its dependencies immutable while running; this does not defend
+against hostile same-UID replacement between verification and execution.
+
+Only explicitly named environment variables are captured into worker memory.
+Their values are neither serialized nor hashed into helper policy identity.
+For a helper using a private auth configuration directory, the launcher must
+explicitly supply its supported directory-selector variable and list that name
+in this policy; merely exporting it without opting in will not forward it.
+Reserved Git/configuration, loader, shell, interpreter and path variables are
+rejected. Git configuration inheritance remains disabled, including with a
+helper; noninteractive prompt/TLS/redirect guards remain unchanged. The helper
+must already have noninteractive access to its separately provisioned private
+auth store. That store's permissions, provisioning and helper-specific trust
+rules remain the operator/helper contract; this feature neither checks nor reads
+its contents. No login, credential provisioning or token retrieval command is run
+by configuration loading. Pin the helper policy in the service launcher too.
+
+Changing helper program/pin, public arguments or environment names changes the
+outbox identity and requires explicit migration; credential-value rotation alone
+does not change helper policy identity. No raw helper/transport diagnostics enter
+status. Test a new policy with a separate private outbox until its binding and
+remote ancestry reconciliation are accepted.
+
+Both the selected `--git` executable and opt-in helper are trusted code. They must
+preserve the owned process session and inherited ownership descriptors until
+supported descendants exit; do not daemonize or close those descriptors early.
+Credentials must not be embedded in a URL or public argument. Status and errors
+omit the URL and raw transport diagnostics.
 
 The fixed-size, checksummed, fsynced outbox holds at most a latest desired
 position, one immutable pending position, and the last verified delivery.
@@ -200,9 +238,33 @@ before compare-and-swap removal of the private pin. Missing, divergent, or
 unavailable remote state preserves pending evidence. A previously acknowledged
 but unfinished cleanup is also read back before pin removal.
 
-The remote must initially have no selected branch, or already match the selected
-pending OID. Later pushes require the last acknowledged OID observed at that
-branch. The actual push is an ordinary non-force update: the receiver enforces
+By default, the remote must initially have no selected branch, or already match
+the selected pending OID. To initialize a **new** private outbox against a known
+older public ancestor, explicitly pass `--bootstrap-remote-head <full-git-oid>`.
+Only a full, nonzero, lowercase 40-hex SHA-1 Git OID is accepted; abbreviated,
+uppercase, SHA-256/native IDs and option-like values are rejected. Obtain the
+actual exact remote branch observation independently; counts or local object
+presence are not ancestry proof.
+
+With this option, the initial branch must exist at exactly the pin unless it
+already equals the verified pending target (the ordinary ambiguous-success
+recovery path). The pin must be reachable through the **frozen pending native
+commit's exported public-parent mappings**, pass mapped commit payload/integrity
+verification, and be an actual Git ancestor of that pending target. Private
+predecessors, unrelated mappings and arbitrary local objects do not authorize
+adoption. No foreign graph is fetched. A missing or different remote branch
+fails closed; there is no absent-branch creation fallback when a pin is supplied.
+
+The bootstrap OID is launch policy, never an acknowledged previous position or
+invented native generation. It remains permanently bound into this outbox's
+identity even after the first ACK. Changing/removing it requires explicit
+migration; adding it to an existing default outbox also rejects that identity.
+Preserve failed outbox evidence and use a fresh private directory. Default
+outboxes without the option retain their existing identity bytes.
+
+After the first actual ACK, bootstrap is never a rewind/deletion fallback.
+Later pushes require the last acknowledged OID observed at that branch. The
+actual push is an ordinary non-force update: the receiver enforces
 fast-forward ancestry, not a lease spanning the preceding observation. Concurrent
 foreign updates that are ancestors of the selected commit are not fenced by an
 atomic expected-old lease. Unrelated branches are never selected.

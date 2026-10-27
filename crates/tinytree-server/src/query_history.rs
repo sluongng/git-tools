@@ -14,6 +14,9 @@ use tonic::Status;
 use q::HistoryCoverage as Coverage;
 use q::HistoryPathKind as PathKind;
 
+pub(crate) mod annotation;
+mod dag;
+
 const MAX_PATH_BYTES: usize = 4096;
 
 enum Failure {
@@ -49,6 +52,7 @@ struct Reader<'a> {
     budget: &'a mut WorkBudget,
     deadline: Instant,
     read_bytes: usize,
+    read_limit: Option<usize>,
 }
 impl Reader<'_> {
     fn check(&self) -> Step<()> {
@@ -87,7 +91,7 @@ impl Reader<'_> {
             .read_bytes
             .checked_add(size)
             .ok_or(Failure::Boundary(Coverage::HistoryReadLimit))?;
-        if size > maximum || total > self.host.config.max_history_read_bytes {
+        if size > maximum || total > self.read_limit.unwrap_or(self.host.config.max_history_read_bytes) {
             return Err(Failure::Boundary(Coverage::HistoryReadLimit));
         }
         self.budget.charge(1, 0, size as u64).map_err(index_error)?;
@@ -183,7 +187,7 @@ impl Reader<'_> {
         }
         Ok(commit)
     }
-    fn path(&mut self, commit: &m::Commit, path: &[&str]) -> Step<q::HistoryPathState> {
+    fn path_entry(&mut self, commit: &m::Commit, path: &[&str]) -> Step<Option<m::TreeValue>> {
         if commit.root_tree.terms.len() != 1 {
             return Err(Failure::Boundary(Coverage::HistoryConflictBoundary));
         }
@@ -205,41 +209,45 @@ impl Reader<'_> {
                 .into_iter()
                 .find(|entry| entry.name == *component)
             else {
-                return Ok(absent());
+                return Ok(None);
             };
             if position + 1 == path.len() {
-                return Ok(match entry.value {
-                    m::TreeValue::File {
-                        id,
-                        executable,
-                        size_bytes,
-                        ..
-                    } => q::HistoryPathState {
-                        kind: PathKind::HistoryPathFile as i32,
-                        native_id: id.0.to_vec(),
-                        size_bytes,
-                        executable,
-                    },
-                    m::TreeValue::Symlink { id, target_bytes } => q::HistoryPathState {
-                        kind: PathKind::HistoryPathSymlink as i32,
-                        native_id: id.0.to_vec(),
-                        size_bytes: target_bytes,
-                        executable: false,
-                    },
-                    m::TreeValue::Tree(id) => q::HistoryPathState {
-                        kind: PathKind::HistoryPathTree as i32,
-                        native_id: id.0.to_vec(),
-                        size_bytes: 0,
-                        executable: false,
-                    },
-                });
+                return Ok(Some(entry.value));
             }
             match entry.value {
                 m::TreeValue::Tree(child) => id = child,
-                _ => return Ok(absent()),
+                _ => return Ok(None),
             }
         }
         Err(Status::internal("empty validated history path").into())
+    }
+    fn path(&mut self, commit: &m::Commit, path: &[&str]) -> Step<q::HistoryPathState> {
+        Ok(match self.path_entry(commit, path)? {
+            None => absent(),
+            Some(m::TreeValue::File {
+                id,
+                executable,
+                size_bytes,
+                ..
+            }) => q::HistoryPathState {
+                kind: PathKind::HistoryPathFile as i32,
+                native_id: id.0.to_vec(),
+                size_bytes,
+                executable,
+            },
+            Some(m::TreeValue::Symlink { id, target_bytes }) => q::HistoryPathState {
+                kind: PathKind::HistoryPathSymlink as i32,
+                native_id: id.0.to_vec(),
+                size_bytes: target_bytes,
+                executable: false,
+            },
+            Some(m::TreeValue::Tree(id)) => q::HistoryPathState {
+                kind: PathKind::HistoryPathTree as i32,
+                native_id: id.0.to_vec(),
+                size_bytes: 0,
+                executable: false,
+            },
+        })
     }
     fn file(&mut self, state: &q::HistoryPathState) -> Step<(m::Descriptor, Vec<u8>)> {
         let key = m::ObjectKey {
@@ -361,6 +369,97 @@ fn finish_failure(failure: Failure) -> Result<Coverage, Status> {
     }
 }
 
+pub(crate) struct CanonicalPathPredicate<'a> {
+    pub host: &'a QueryHost,
+    pub scope: &'a Scoped,
+    pub repository: &'a str,
+    pub deadline: Instant,
+}
+impl crate::query_eval::PathPredicate for CanonicalPathPredicate<'_> {
+    fn changed(
+        &mut self,
+        id: m::CommitId,
+        path: &str,
+        exact_file: bool,
+        budget: &mut WorkBudget,
+    ) -> Result<bool, crate::query_eval::EvalError> {
+        changed_path(
+            self.host,
+            self.scope,
+            self.repository,
+            id,
+            path,
+            exact_file,
+            budget,
+            self.deadline,
+        )
+        .map_err(crate::query_eval::EvalError::Read)
+    }
+}
+fn changed_path(
+    host: &QueryHost,
+    scope: &Scoped,
+    repository: &str,
+    id: m::CommitId,
+    path: &str,
+    exact_file: bool,
+    budget: &mut WorkBudget,
+    deadline: Instant,
+) -> Result<bool, Status> {
+    let (path, _) = validate(
+        path,
+        q::HistoryPolicy::LinearFixedPathV1 as i32,
+        1,
+        &host.config,
+    )?;
+    let mut reader = Reader {
+        host,
+        scope,
+        repository,
+        budget,
+        deadline,
+        read_bytes: 0,
+        read_limit: None,
+    };
+    let change = (|| -> Step<bool> {
+        // Root is a real scope selection but has no changed path.
+        if id == m::CommitId::ROOT {
+            reader.canonical_source(id)?;
+            return Ok(false);
+        }
+        let commit = reader.commit(id)?;
+        if commit.parents.len() > 1 {
+            return Err(Failure::Boundary(Coverage::HistoryMergeBoundary));
+        }
+        let current = reader.path_entry(&commit, &path)?;
+        let parent = match commit.parents.first() {
+            None | Some(&m::CommitId::ROOT) => None,
+            Some(parent) => {
+                let parent = reader.commit(*parent)?;
+                reader.path_entry(&parent, &path)?
+            }
+        };
+        if exact_file
+            && [&current, &parent]
+                .iter()
+                .any(|value| matches!(value, Some(m::TreeValue::Tree(_))))
+        {
+            return Err(Status::unimplemented("exact file filter encountered a directory").into());
+        }
+        Ok(current != parent)
+    })();
+    match change {
+        Ok(changed) => Ok(changed),
+        Err(Failure::Status(status)) => Err(status),
+        Err(Failure::Boundary(Coverage::HistoryReadLimit)) => Err(Status::resource_exhausted(
+            "path filter metadata budget exhausted",
+        )),
+        Err(Failure::Boundary(_)) => Err(Status::unimplemented(
+            "path filter requires resolved linear canonical ancestry",
+        )),
+    }
+}
+
 pub(crate) fn path_history(
     host: &QueryHost,
     scope: &Scoped,
@@ -389,6 +488,7 @@ pub(crate) fn path_history(
         budget,
         deadline,
         read_bytes: 0,
+        read_limit: None,
     };
     let mut current = revision;
     let mut cached = None;
@@ -465,6 +565,9 @@ pub(crate) fn blame(
     budget: &mut WorkBudget,
     deadline: Instant,
 ) -> Result<q::BlameResult, Status> {
+    if input.policy == q::HistoryPolicy::JjResolvedFixedPathV1 as i32 {
+        return dag::blame(host, scope, repository, input, budget, deadline);
+    }
     let (path, maximum) = validate(&input.path, input.policy, input.max_commits, &host.config)?;
     let revision = parse_revision(input.revision.clone())?;
     let mut result = q::BlameResult {
@@ -487,6 +590,7 @@ pub(crate) fn blame(
         budget,
         deadline,
         read_bytes: 0,
+        read_limit: None,
     };
     if revision == m::CommitId([0; 32]) {
         match reader.canonical_source(revision) {
@@ -777,6 +881,7 @@ pub(crate) fn search_root(
         budget,
         deadline,
         read_bytes: 0,
+        read_limit: None,
     };
     let commit = if id == m::CommitId::ROOT {
         reader.canonical_source(id).map_err(search_failure)?;

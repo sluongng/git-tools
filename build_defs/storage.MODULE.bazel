@@ -11,6 +11,9 @@ crate.annotation(
 crate.annotation(
     crate = "fjall",
     version = "3.1.12",
-    patches = ["//third_party/patches:fjall-strict-existing-recovery.patch"],
+    patches = [
+        "//third_party/patches:fjall-strict-existing-recovery.patch",
+        "//third_party/patches:fjall-recovery-allocation-limits.patch",
+    ],
     patch_args = ["-p1"],
 )

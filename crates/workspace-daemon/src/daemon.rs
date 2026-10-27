@@ -48,7 +48,9 @@ struct State {
     registry: Registry,
     mounts: BTreeMap<PathBuf, Mount>,
     #[cfg(target_os = "linux")]
-    source_cas: Arc<workspace_core::source_cas::SourceCas>,
+    source_cas: Option<Arc<workspace_core::source_cas::SourceCas>>,
+    #[cfg(target_os = "linux")]
+    source_backend_identity: String,
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {
@@ -209,7 +211,7 @@ impl State {
         }
     }
     #[cfg(target_os = "linux")]
-    fn mount_inner(&self, request: &agent_session::MountRequest) -> Result<Mount> {
+    fn mount_inner(&mut self, request: &agent_session::MountRequest) -> Result<Mount> {
         use workspace_fuse::filesystem::Snapshot;
         use workspace_fuse::{
             backend::{ContentConfig, GitRepo, SizeFallback, SizeWarmOptions},
@@ -229,7 +231,19 @@ impl State {
             SizeFallback::Error,
         )
         .context("opening source repository")?;
-        repo.set_shared_cas(self.source_cas.clone());
+        let source_cas = match &self.source_cas {
+            Some(source_cas) => source_cas.clone(),
+            None => {
+                let source_cas = workspace_core::source_cas::SourceCas::new(
+                    self.cache.clone(),
+                    self.source_backend_identity.clone(),
+                    self.config.cache.instance_name.clone(),
+                )?;
+                self.source_cas = Some(source_cas.clone());
+                source_cas
+            }
+        };
+        repo.set_shared_cas(source_cas);
         let snapshot =
             Snapshot::load(&repo, &request.revision).context("loading pinned source snapshot")?;
         repo.warm_blake3_snapshot(&snapshot, &request.proxy_url, &request.proxy_repo)
@@ -263,7 +277,7 @@ impl State {
         .context("starting source mount host")
     }
     #[cfg(not(target_os = "linux"))]
-    fn mount_inner(&self, _: &agent_session::MountRequest) -> Result<Mount> {
+    fn mount_inner(&mut self, _: &agent_session::MountRequest) -> Result<Mount> {
         anyhow::bail!("source mount host not yet supported on this platform")
     }
     fn recover(&mut self, path: &Path) -> Result<serde_json::Value> {
@@ -550,7 +564,7 @@ fn open_native_repositories(
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
 ) -> Result<Option<native_broker::BrokerService>> {
-    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new(), None)?.0)
+    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new(), None, &[])?.0)
 }
 fn open_native_host(
     config: &Config,
@@ -558,6 +572,7 @@ fn open_native_host(
     native_ca: &BTreeMap<String, Arc<[u8]>>,
     native_credentials: &BTreeMap<String, Option<String>>,
     command_host: Option<Arc<crate::native_commands::NativeCommandHost>>,
+    pending_registrations: &[native_retention::Registration],
 ) -> Result<(
     Option<native_broker::BrokerService>,
     BTreeMap<String, crate::native_workspaces::Repository>,
@@ -567,12 +582,18 @@ fn open_native_host(
     }
 
     let root = config.state_dir.join("native");
-    private_dir(&root)?;
-    // Persist directory names as well as the files subsequently acknowledged
-    // by the authoritative store. Existing ancestors are not chmodded/changed.
-    for ancestor in root.ancestors() {
-        File::open(ancestor)?.sync_all()?;
+    // Publish only new links up to the nearest already-durable trusted anchor.
+    // Unrelated ancestors may be metadata-only under filesystem confinement.
+    let _native_directory = private_fs::PrivateDir::create_all_durable(&root)?;
+    for alias in config.native.repositories.keys() {
+        let path = root.join(alias);
+        private_dir(&path)?;
+        File::open(&path)?.sync_all()?;
     }
+    File::open(&root)?.sync_all()?;
+    let identities = crate::provider_identity::resolve_with_pending(
+        config, native_ca, native_credentials, command_host.as_deref(), pending_registrations,
+    )?;
     let mut stores: std::collections::HashMap<String, Arc<dyn jj_native_backend::NativeObjectIo>> =
         std::collections::HashMap::new();
     let mut controls: std::collections::HashMap<
@@ -636,24 +657,7 @@ fn open_native_host(
     let mut descriptions = std::collections::HashMap::new();
     let mut scopes = BTreeMap::new();
     for (alias, settings) in &config.native.repositories {
-        let store_path = root.join(alias).canonicalize()?;
-        let mut fingerprint = blake3::Hasher::new();
-        fingerprint.update(b"native-workspace-provider-scope-v1\0");
-        // Length-delimited private material is hashed in memory only. Neither
-        // credential values nor this material are recorded in public output.
-        for bytes in [
-            serde_json::to_vec(settings)?,
-            serde_json::to_vec(&store_path)?,
-            serde_json::to_vec(&config.reapi)?,
-            serde_json::to_vec(&native_credentials.get(alias))?,
-            native_ca
-                .get(alias)
-                .map_or_else(Vec::new, |bytes| bytes.to_vec()),
-        ] {
-            fingerprint.update(&(bytes.len() as u64).to_le_bytes());
-            fingerprint.update(&bytes);
-        }
-        let identity = *fingerprint.finalize().as_bytes();
+        let identity = identities[alias];
         let scope = native_workspace::Scope::from_configured_identity(alias, &identity)?;
         scopes.insert(alias.clone(), scope);
         descriptions.insert(
@@ -724,7 +728,10 @@ pub async fn serve(mut config: Config) -> Result<()> {
         .sync_to_cas
         .then(|| git_cas_endpoint(&config.cache.upstream))
         .transpose()?;
-    private_dir(&config.state_dir)?;
+    // Pre-existing state ancestry must come from durable provisioning or a
+    // successful prior creation; this does not repair a failed startup's links.
+    let _state_directory = private_fs::PrivateDir::create_all_durable(&config.state_dir)
+        .context("daemon state directory must be trusted and owner-only (mode 0700)")?;
     config.state_dir = config.state_dir.canonicalize()?;
     let lock = OpenOptions::new()
         .read(true)
@@ -849,6 +856,16 @@ pub async fn serve(mut config: Config) -> Result<()> {
             .await?,
         ))
     };
+    if native_commands.is_some() {
+        // Command-host initialization may have just created native-commands.
+        // Publish that link even when the separate native store already exists.
+        File::open(&config.state_dir)?.sync_all()?;
+    }
+    let pending_registrations = if let Some(commands) = &native_commands {
+        let (entries,bytes) = crate::provider_identity::snapshot_bounds(&config);
+        Some(Arc::new(commands.pending_provider_registrations(entries,bytes).await?))
+    } else { None };
+    let startup_pending = pending_registrations.clone();
     let startup_commands = native_commands.clone();
     let (native, native_repositories) = tokio::task::spawn_blocking(move || {
         open_native_host(
@@ -857,6 +874,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
             &native_ca,
             &native_credentials,
             startup_commands,
+            startup_pending.as_ref().map(|snapshot|snapshot.as_slice()).unwrap_or(&[]),
         )
     })
     .await
@@ -875,6 +893,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
             .add_service(broker.query_rpc_service());
     }
 
+    let expected_native_identities = native_repositories.iter()
+        .map(|(alias, repository)| (alias.clone(), repository.identity))
+        .collect::<BTreeMap<_, _>>();
     let mut native_workspaces = if native_repositories.is_empty() {
         None
     } else {
@@ -893,6 +914,15 @@ pub async fn serve(mut config: Config) -> Result<()> {
     };
     if let Some(manager) = &native_workspaces {
         rbe_router = rbe_router.add_service(manager.rpc());
+    }
+
+    if !expected_native_identities.is_empty() {
+        let checked = crate::provider_identity::resolve_with_pending(
+            &config, &credentials.native_ca, &credentials.native, native_commands.as_deref(),
+            pending_registrations.as_ref().map(|snapshot|snapshot.as_slice()).unwrap_or(&[]),
+        )?;
+        ensure!(checked == expected_native_identities,
+            "native provider enrollment changed before exposure");
     }
 
     let bes = if config.bes.enabled {
@@ -1046,12 +1076,6 @@ pub async fn serve(mut config: Config) -> Result<()> {
             .await
             .map_err(anyhow::Error::from)
     });
-    #[cfg(target_os = "linux")]
-    let source_cas = workspace_core::source_cas::SourceCas::new(
-        cache.clone(),
-        backend_identity,
-        config.cache.instance_name.clone(),
-    )?;
     if let Some(manager) = &mut native_workspaces {
         manager.restore_ready().await;
     }
@@ -1068,7 +1092,9 @@ pub async fn serve(mut config: Config) -> Result<()> {
         registry,
         mounts: BTreeMap::new(),
         #[cfg(target_os = "linux")]
-        source_cas,
+        source_cas: None,
+        #[cfg(target_os = "linux")]
+        source_backend_identity: backend_identity,
     };
 
     let mut state_slot = Some(state);
@@ -1321,8 +1347,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
     }
     state.proxy.wait_for_reads_idle().await?;
     #[cfg(target_os = "linux")]
-    {
-        let source = state.source_cas.clone();
+    if let Some(source) = state.source_cas.clone() {
         tokio::task::spawn_blocking(move || {
             let result = source.shutdown();
             drop(source);
@@ -1500,8 +1525,7 @@ mod tests {
             CacheConfig::default(),
         )?;
         let mut config = Config::default();
-        config.state_dir = directory.path().join("state");
-        private_dir(&config.state_dir)?;
+        config.state_dir = directory.path().join("actor/daemon");
         assert!(open_native_repositories(&config, &cache, &BTreeMap::new())?.is_none());
         assert!(!config.state_dir.join("native").exists());
         config
@@ -1533,7 +1557,7 @@ mod tests {
         drop(reopened);
 
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None)?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[])?;
         assert_eq!(providers.len(), 1);
         let scope = providers["example"].scope.backend().to_owned();
         drop(broker);
@@ -1543,7 +1567,7 @@ mod tests {
         );
         drop(providers);
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None)?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[])?;
         assert_eq!(providers["example"].scope.backend(), scope);
         config.native.workspaces.registry_path = Some(directory.path().join("registry"));
         let mut manager =
@@ -1813,6 +1837,15 @@ mod tests {
             host.status()["capture_upload"]["last_disposition"],
             "inventory_unavailable"
         );
+        assert_eq!(
+            host.status()["capture_upload"]["last_upload_outcome"]["stage"],
+            "inventory"
+        );
+        assert_eq!(
+            host.status()["capture_upload"]["last_upload_outcome"]["error_class"],
+            "local_validation"
+        );
+        assert!(host.status()["capture_upload"]["last_retirement_outcome"].is_null());
         assert_eq!(
             host.status()["capture_upload"]["attempted"],
             0,

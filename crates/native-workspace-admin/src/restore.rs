@@ -698,6 +698,26 @@ async fn authorize(
         .find(|entry| entry.operation == wc_operation)
         .context("restore snapshot operation lacks index association")?
         .root;
+    let prepared = call(
+        deadline,
+        "cloud_authorization_prepare",
+        provider.query.prepare_cloud_authorization(
+            native_broker::CloudAuthorizationSource {
+                provider_identity: provider.config.provider_fingerprint,
+                workspace_id: selected.workspace_id,
+                generation: selected.generation,
+                manifest_id: selected.manifest_id.0,
+                manifest_blake3: raw.blake3,
+                manifest_size_bytes: raw.size_bytes,
+            },
+            owner.clone(),
+        ),
+    ).await?;
+    let query = prepared.as_ref().map_or(&provider.query, |reply| &reply.value);
+    let owner: QueryOwner = match &prepared {
+        Some(reply) => Arc::new((owner, reply.owner.clone())),
+        None => owner,
+    };
     let mut wc_verified = false;
     for root in &manifest.history.index_roots {
         check_time(deadline)?;
@@ -718,7 +738,7 @@ async fn authorize(
         let reply = call(
             deadline,
             "cloud_scope_open",
-            provider.query.open_cloud_scope(
+            query.open_cloud_scope(
                 native_broker::OpenCloudQueryScope {
                     source: source.clone(),
                     overlay: vec![],
@@ -754,7 +774,7 @@ async fn authorize(
                 let result = call(
                     deadline,
                     "frozen_membership",
-                    provider.query.facts(scope.handle, facts, physical.clone()),
+                    query.facts(scope.handle, facts, physical.clone()),
                 )
                 .await?;
                 ensure!(
@@ -780,8 +800,7 @@ async fn authorize(
                     let result = call(
                         deadline,
                         "commit_read",
-                        provider
-                            .query
+                        query
                             .read_commit(scope.handle, commit, physical.clone()),
                     )
                     .await?;
@@ -821,7 +840,7 @@ async fn authorize(
         let closed = call(
             deadline,
             "cloud_scope_close",
-            provider.query.close_scope(scope.handle, physical),
+            query.close_scope(scope.handle, physical),
         )
         .await;
         validation?;
@@ -1042,8 +1061,13 @@ pub async fn initialize_restored(
 ) -> Result<StagedRestoreReceipt> {
     let deadline = prepared.source.deadline.min(intent.deadline);
     check_time(deadline)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_admission state=start\n");
     owned_job(deadline, move || {
-        futures::executor::block_on(stage(intent, prepared, host, deadline))
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_admission state=complete\n");
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_execute state=start\n");
+        let result = futures::executor::block_on(stage(intent, prepared, host, deadline));
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_execute state=complete\n");
+        result
     })
     .await
 }
@@ -1091,8 +1115,10 @@ async fn stage(
         matches!(intent.journal.phase, Phase::Reserved),
         "restore journal already contains staged state"
     );
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=marker_validation state=start\n");
     intent.registry.validate(&intent.journal.binding)?;
     validate_marker(&intent.journal.binding)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=marker_validation state=complete\n");
     let binding = intent.journal.binding.clone();
     let mut peak = source.retained_bytes;
     add(
@@ -1151,6 +1177,7 @@ async fn stage(
             .context("restore ordering memory overflow")?,
         source.limits.max_working_bytes,
     )?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=projection_inspect state=start\n");
     let projected = host.connector.connect(&binding.projection())?.inspect()?;
     let expected_tree = jj_vfs::native::NativeTree {
         terms: source.data.working_copy.tree.terms.clone(),
@@ -1160,19 +1187,25 @@ async fn stage(
         projected.repository == binding.repository && projected.tree == expected_tree,
         "restore lazy projection mismatch"
     );
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=projection_inspect state=complete\n");
     // All asynchronous backend preparation precedes jj's synchronous factory.
     let objects: Arc<dyn NativeObjectIo> = Arc::new(RestoreObjectIo {
         inner: source.provider.objects.clone(),
         owner: source.clone(),
     });
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=backend_empty_tree state=start\n");
     let backend = NativeBackend::from_io(objects.clone(), host.backend_config).await?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=backend_empty_tree state=complete\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=artifact_graph state=start\n");
     let graph = c::verify_index_artifact_graph(
         &source.manifest.history.index_roots,
         &source.inputs.artifacts,
         source.limits.manifest.history.artifacts,
     )?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=artifact_graph state=complete\n");
     // Reauthorize again immediately before stage mutation: a retained version may
     // have expired since preparation. No reference/root fallback is permitted.
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=reauthorize state=start\n");
     authorize(
         &source.inputs,
         &source.manifest,
@@ -1183,9 +1216,12 @@ async fn stage(
         deadline,
     )
     .await?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=reauthorize state=complete\n");
     check_time(deadline)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=stage_create state=start\n");
     let staging = PrivateDir::create(intent.admin.path().join("restore-staging"))?;
     sync_directory(intent.admin.path())?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=stage_create state=complete\n");
     let op_path = staging.path().join("op_store");
     let op_directory = PrivateDir::create(&op_path)?;
     let root_data = || RootOperationData {
@@ -1196,12 +1232,15 @@ async fn stage(
         op_store.root_operation_id().as_bytes() == [0; 64],
         "restore intrinsic operation convention mismatch"
     );
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=views_import state=start\n");
     for object in &source.inputs.objects {
         if matches!(object.id(), c::ObjectId::View(_)) {
             check_time(deadline)?;
             object.import(&op_store).await?;
         }
     }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=views_import state=complete\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=operations_import state=start\n");
     let mut installed = BTreeSet::from([[0; 64]]);
     let mut pending: BTreeMap<_, _> = source
         .inputs
@@ -1244,6 +1283,8 @@ async fn stage(
     sync_directory(&op_path)?;
     sync_directory(staging.path())?;
     intent.advance(Phase::ObjectsStaged)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=operations_import state=complete\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=index_import state=start\n");
     let index_path = staging.path().join("index");
     let imported = NativeIndexStore::import_fresh_operation_indexes(
         &index_path,
@@ -1266,7 +1307,9 @@ async fn stage(
     drop(graph);
     intent.journal.index_fingerprint = Some(index_fingerprint(&index_path, &source)?);
     intent.advance(Phase::IndexStaged)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=index_import state=complete\n");
     check_time(deadline)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=repository_install state=start\n");
     let repository = PrivateDir::create(&binding.repo)?;
     let backend = RefCell::new(Some(backend));
     let backend_initializer: &BackendInitializer<'_> = &|_, path| {
@@ -1334,6 +1377,8 @@ async fn stage(
     )
     .await?;
     intent.advance(Phase::RepositoryInstalled)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=repository_install state=complete\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=metadata_readback state=start\n");
     let op_store = repo.op_store();
     for object in &source.inputs.objects {
         match object.id() {
@@ -1369,6 +1414,8 @@ async fn stage(
             .await?;
         drop(index);
     }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=metadata_readback state=complete\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=working_copy_restore state=start\n");
     let working_copy = PrivateDir::create(&binding.working_copy)?;
     let factory = NativeVfsWorkingCopyFactory::new(binding.repository.clone(), host.connector);
     let wc_operation = array::<64>(&source.data.working_copy.wc_operation)?;
@@ -1433,6 +1480,7 @@ async fn stage(
     sync_directory(intent.admin.path())?;
     check_time(deadline)?;
     intent.advance(Phase::WorkingCopyStaged)?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=working_copy_restore state=complete\n");
     Ok(StagedRestoreReceipt {
         binding,
         operation_heads: heads

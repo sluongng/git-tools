@@ -141,6 +141,7 @@ impl ServiceConfig {
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudStoreConfig {
+    pub resident: Option<tinytree_store::CloudResidentLimits>,
     pub max_object_bytes: usize,
     pub max_decode_bytes: usize,
     pub max_version_decode_bytes: usize,
@@ -152,6 +153,7 @@ impl Default for CloudStoreConfig {
     fn default() -> Self {
         let c = tinytree_store::CloudConfig::default();
         Self {
+            resident: c.resident,
             max_object_bytes: c.max_object_bytes,
             max_decode_bytes: c.max_decode_bytes,
             max_version_decode_bytes: c.max_version_decode_bytes,
@@ -202,6 +204,7 @@ impl StoreConfig {
     pub fn materialize(&self, metadata_bytes: usize) -> tinytree_store::Config {
         let mut config = tinytree_store::Config::default();
         config.model_limits.max_object_bytes = metadata_bytes;
+        config.cloud.resident = self.cloud.resident;
         config.cloud.max_object_bytes = self.cloud.max_object_bytes;
         config.cloud.max_field_bytes = config
             .cloud
@@ -227,6 +230,11 @@ impl StoreConfig {
         config
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(limits) = self.cloud.resident {
+            limits
+                .validate()
+                .map_err(|_| ConfigError("invalid native store resident limits"))?;
+        }
         if !(1024..=64 * 1024 * 1024).contains(&self.cloud.max_object_bytes)
             || self.cloud.max_decode_bytes < self.cloud.max_object_bytes
             || self.cloud.max_decode_bytes > 1024 * 1024 * 1024
@@ -329,9 +337,9 @@ impl Config {
                 .validate_store_profile(&self.store.materialize(self.service.max_metadata_bytes))?;
         }
         self.service.validate_repositories(&self.repositories)?;
-        self.service
-            .landing
-            .validate_store(&self.store.materialize(self.service.max_metadata_bytes))?;
+        self.service.landing.validate_store_with_checker_history(
+            &self.store.materialize(self.service.max_metadata_bytes),
+        )?;
         if self.repositories.is_empty()
             || self.repositories.len() > 1024
             || self.gc_interval_seconds > 86400

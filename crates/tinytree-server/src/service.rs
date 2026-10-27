@@ -443,8 +443,8 @@ impl Repository for RepositoryService {
             .admit(&identity, &input.repository_id, false, deadline)
             .await?;
         if input.features.is_empty()
-            || input.features.len() > 7
-            || input.features.iter().any(|id| !(1..=7).contains(id))
+            || input.features.len() > 13
+            || input.features.iter().any(|id| !(1..=13).contains(id))
             || input.features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(
@@ -463,7 +463,7 @@ impl Repository for RepositoryService {
             .into_iter()
             .map(|feature| {
                 let (supported, authorized) = match feature {
-                    1..=3 => (query, true),
+                    1..=3 | 8 | 11 | 12 => (query, true),
                     4 | 6 => (
                         captured,
                         identity
@@ -472,6 +472,24 @@ impl Repository for RepositoryService {
                     ),
                     5 | 7 => (
                         captured,
+                        identity.authorize_cloud(&input.repository_id, true).is_ok(),
+                    ),
+                    9 => (
+                        self.cloud.is_some(),
+                        identity
+                            .authorize_cloud(&input.repository_id, false)
+                            .is_ok(),
+                    ),
+                    13 => (
+                        captured
+                            && self.inner.config.cloud.durable_retained_offload
+                            && self.inner.store.supports_durable_retained_offload(),
+                        identity
+                            .authorize_cloud(&input.repository_id, false)
+                            .is_ok(),
+                    ),
+                    10 => (
+                        self.cloud.is_some(),
                         identity.authorize_cloud(&input.repository_id, true).is_ok(),
                     ),
                     _ => unreachable!("validated feature"),

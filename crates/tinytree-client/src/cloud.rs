@@ -339,12 +339,22 @@ fn lease(value: &str) -> bool {
 }
 impl NativeClient {
     fn cloud_memory(&self, cap: usize) -> Result<usize, Status> {
+        self.cloud_memory_at(cap, None)
+    }
+    fn cloud_memory_at(
+        &self,
+        cap: usize,
+        reason: Option<tinytree_proto::PublicationFailureReason>,
+    ) -> Result<usize, Status> {
         cap.checked_mul(8)
             .and_then(|n| n.checked_add(128 * 1024))
             .filter(|n| {
                 *n <= self.inner.config.limits.max_buffered_bytes && *n <= u32::MAX as usize
             })
-            .ok_or_else(limit)
+            .ok_or_else(|| match reason {
+                Some(reason) => Status::resource_exhausted(reason.message()),
+                None => limit(),
+            })
     }
     async fn cloud_admit(&self, deadline: Instant, bytes: usize) -> Result<Arc<Budget>, Status> {
         self.cloud_memory(0)?;
@@ -458,6 +468,22 @@ impl NativeClient {
         id: CloudObjectId,
         payload: &[u8],
     ) -> Result<CloudWriteReceipt, Status> {
+        self.cloud_put_object_inner(id, payload, false).await
+    }
+    /// Stage this exact raw encoding without changing primary selection.
+    pub async fn cloud_put_object_representation(
+        &self,
+        id: CloudObjectId,
+        payload: &[u8],
+    ) -> Result<CloudWriteReceipt, Status> {
+        self.cloud_put_object_inner(id, payload, true).await
+    }
+    async fn cloud_put_object_inner(
+        &self,
+        id: CloudObjectId,
+        payload: &[u8],
+        exact: bool,
+    ) -> Result<CloudWriteReceipt, Status> {
         id.check()?;
         let limits = &self.inner.config.cloud;
         if payload.len() > limits.max_object_bytes {
@@ -477,7 +503,11 @@ impl NativeClient {
         let (receipt, _budget) = self
             .cloud_call(
                 deadline,
-                "/tinytree.cloud.v1.WorkspaceCloud/PutObject",
+                if exact {
+                    "/tinytree.cloud.v1.WorkspaceCloud/PutObjectRepresentation"
+                } else {
+                    "/tinytree.cloud.v1.WorkspaceCloud/PutObject"
+                },
                 Shape::CloudReceipt,
                 4096,
                 maximum,
@@ -496,6 +526,7 @@ impl NativeClient {
             limits.max_object_bytes,
         )?;
         if actual.id != expected.id
+            || (exact && actual != expected)
             || !lease(&receipt.staging_lease)
             || receipt.expires_at_unix_seconds <= 0
         {
@@ -562,6 +593,20 @@ impl NativeClient {
         &self,
         expected: CloudDescriptor,
     ) -> Result<CloudObject, Status> {
+        self.cloud_read_object_inner(expected, false).await
+    }
+    /// Fetch the exact named raw representation, not semantic primary fallback.
+    pub async fn cloud_read_object_representation(
+        &self,
+        expected: CloudDescriptor,
+    ) -> Result<CloudObject, Status> {
+        self.cloud_read_object_inner(expected, true).await
+    }
+    async fn cloud_read_object_inner(
+        &self,
+        expected: CloudDescriptor,
+        exact: bool,
+    ) -> Result<CloudObject, Status> {
         expected.id.check()?;
         let l = &self.inner.config.cloud;
         if expected.selected.size_bytes > l.max_object_bytes as u64 {
@@ -576,8 +621,20 @@ impl NativeClient {
             .retry(deadline, true, |allowance| async move {
                 let budget = self.cloud_admit(deadline, memory).await?;
                 let mut grpc = self.rpc_client(budget.clone());
-                let mut stream = grpc
-                    .cloud_read(
+                let mut stream = if exact {
+                    grpc.cloud_representation_read(
+                        self.request(
+                            c::ReadObjectRepresentationRequest {
+                                repository_id: self.inner.config.repository_id.clone(),
+                                descriptor: Some(expected.wire()),
+                            },
+                            allowance,
+                        ),
+                        l,
+                    )
+                    .await?
+                } else {
+                    grpc.cloud_read(
                         self.request(
                             c::ReadObjectRequest {
                                 repository_id: self.inner.config.repository_id.clone(),
@@ -588,7 +645,8 @@ impl NativeClient {
                         l,
                     )
                     .await?
-                    .into_inner();
+                }
+                .into_inner();
                 let mut bytes = Vec::new();
                 bytes.try_reserve_exact(maximum).map_err(|_| limit())?;
                 let mut eof = false;
@@ -856,12 +914,26 @@ impl NativeClient {
     ) -> Result<CloudPublication, Status> {
         key(&intent.idempotency_key)?;
         let l = &self.inner.config.cloud;
-        if intent.manifest.len() > l.max_manifest_bytes
-            || capture_data.len() > l.max_capture_bytes
-            || intent.staging_leases.len() > l.max_staging_leases
-            || intent.staging_leases.iter().any(|s| !lease(s))
-        {
-            return Err(limit());
+        use tinytree_proto::PublicationFailureReason as Reason;
+        if intent.manifest.len() > l.max_manifest_bytes {
+            return Err(Status::resource_exhausted(
+                Reason::ClientManifestBytes.message(),
+            ));
+        }
+        if capture_data.len() > l.max_capture_bytes {
+            return Err(Status::resource_exhausted(
+                Reason::ClientCaptureBytes.message(),
+            ));
+        }
+        if intent.staging_leases.len() > l.max_staging_leases {
+            return Err(Status::resource_exhausted(
+                Reason::ClientStagingLeaseCount.message(),
+            ));
+        }
+        if intent.staging_leases.iter().any(|s| !lease(s)) {
+            return Err(Status::resource_exhausted(
+                Reason::ClientStagingLeaseFormat.message(),
+            ));
         }
         let generation = intent
             .expected_generation
@@ -873,11 +945,11 @@ impl NativeClient {
             .checked_add(capture_data.len())
             .and_then(|n| n.checked_add(intent.staging_leases.len() * 68))
             .and_then(|n| n.checked_add(4096))
-            .ok_or_else(limit)?;
+            .ok_or_else(|| Status::resource_exhausted(Reason::ClientRequestSize.message()))?;
         let deadline = self.deadline();
-        let verify_budget = self
-            .cloud_admit(deadline, self.cloud_memory(bound)?)
-            .await?;
+        let verification_memory =
+            self.cloud_memory_at(bound, Some(Reason::ClientPublicationMemory))?;
+        let verify_budget = self.cloud_admit(deadline, verification_memory).await?;
         let bytes = intent.manifest.clone();
         let expected = blocking_owned(deadline, verify_budget, None, move || {
             Ok(CloudManifestId::of(&bytes))
@@ -953,6 +1025,19 @@ impl NativeClient {
         id: [u8; 32],
         generation: u64,
     ) -> Result<CloudVersion, Status> {
+        let maximum = self.cloud_version_maximum()?;
+        self.cloud_version_bounded(id, generation, maximum).await
+    }
+    /// Greatest logical capture sequence; an unsupported server fails explicitly.
+    /// This never falls back to publication order or the workspace head.
+    pub async fn cloud_latest_captured_version(
+        &self,
+        id: [u8; 32],
+    ) -> Result<CloudVersion, Status> {
+        let maximum = self.cloud_version_maximum()?;
+        self.cloud_selected_version(id, None, maximum).await
+    }
+    fn cloud_version_maximum(&self) -> Result<usize, Status> {
         // Unknown-size discovery uses a static effective cap within the existing
         // physical and retained pools. Available permits must not change which
         // version sizes a configured client accepts.
@@ -984,7 +1069,7 @@ impl NativeClient {
         if low == 0 {
             return Err(limit());
         }
-        self.cloud_version_bounded(id, generation, low).await
+        Ok(low)
     }
     async fn cloud_version_bounded(
         &self,
@@ -992,19 +1077,28 @@ impl NativeClient {
         generation: u64,
         maximum: usize,
     ) -> Result<CloudVersion, Status> {
-        if maximum > self.inner.config.cloud.max_manifest_bytes {
-            return Err(limit());
-        }
         if generation == 0 {
             return Err(Status::invalid_argument(
                 "cloud version generation must be positive",
             ));
         }
+        self.cloud_selected_version(id, Some(generation), maximum)
+            .await
+    }
+    async fn cloud_selected_version(
+        &self,
+        id: [u8; 32],
+        generation: Option<u64>,
+        maximum: usize,
+    ) -> Result<CloudVersion, Status> {
+        if maximum > self.inner.config.cloud.max_manifest_bytes {
+            return Err(limit());
+        }
         let deadline = self.deadline();
         self.cloud_payload_fits(maximum, self.cloud_memory(maximum + 4096)?)?;
         let retained = self.cloud_retained(maximum)?;
-        let (value, budget) = self
-            .cloud_call(
+        let (value, budget) = if let Some(generation) = generation {
+            self.cloud_call(
                 deadline,
                 "/tinytree.cloud.v1.WorkspaceCloud/GetVersion",
                 Shape::CloudVersion,
@@ -1016,14 +1110,30 @@ impl NativeClient {
                     generation,
                 },
             )
-            .await?;
+            .await?
+        } else {
+            self.cloud_call(
+                deadline,
+                "/tinytree.cloud.v1.WorkspaceCloud/GetLatestCapturedVersion",
+                Shape::CloudVersion,
+                maximum + 4096,
+                4096,
+                || c::GetLatestCapturedVersionRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    workspace_id: id.to_vec(),
+                },
+            )
+            .await?
+        };
         let value: c::Version = value;
         if array::<32>(&value.workspace_id)? != id
-            || value.generation != generation
+            || value.generation == 0
+            || generation.is_some_and(|generation| value.generation != generation)
             || value.manifest.len() > maximum
         {
             return Err(corrupt());
         }
+        let generation = value.generation;
         let expected = CloudManifestId(array(&value.manifest_id)?);
         let previous = value
             .previous_manifest_id

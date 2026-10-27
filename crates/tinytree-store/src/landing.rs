@@ -443,6 +443,7 @@ impl WorkGuard {
             return Ok(());
         }
         let mut gate = self.inner.lock()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
         *gate.readers.entry((self.repo.clone(), key)).or_default() += 1;
         self.keys.insert(key);
         Ok(())
@@ -804,14 +805,16 @@ impl Inner {
     ) -> Result<WorkGuard> {
         let mut gate = self.lock()?;
         self.repository(repo)?;
-        if let Some(id) = id {
-            if !gate.landing_builders.insert((repo.to_owned(), id)) {
-                return Err(Error::Invalid("landing construction already active"));
-            }
-        }
         let mut keys = HashSet::new();
         for root in roots(r) {
             keys.insert(root);
+        }
+        if id.is_some_and(|id| gate.landing_builders.contains(&(repo.to_owned(), id))) {
+            return Err(Error::Invalid("landing construction already active"));
+        }
+        gate.reserve_pins(self, 0, keys.len())?;
+        if let Some(id) = id {
+            gate.landing_builders.insert((repo.to_owned(), id));
         }
         for root in &keys {
             *gate.readers.entry((repo.to_owned(), *root)).or_default() += 1;
@@ -1096,10 +1099,12 @@ impl Store {
             if r.intent.expires_at <= now {
                 return Err(Error::Invalid("landing requires explicit expiry"));
             }
-            if !gate.landing_builders.insert((repo.to_owned(), id)) {
+            let keys: HashSet<_> = roots(&r.intent).collect();
+            if gate.landing_builders.contains(&(repo.to_owned(), id)) {
                 return Err(Error::Invalid("landing construction already active"));
             }
-            let keys: HashSet<_> = roots(&r.intent).collect();
+            gate.reserve_pins(&self.inner, 0, keys.len())?;
+            gate.landing_builders.insert((repo.to_owned(), id));
             for root in &keys {
                 *gate.readers.entry((repo.to_owned(), *root)).or_default() += 1;
             }
@@ -1806,6 +1811,8 @@ impl Store {
             .inner
             .descriptor(repo, key)?
             .ok_or(Error::MissingObject(key))?;
+        let resident_lease = self.inner.resident.lease()?;
+        gate.reserve_pins(&self.inner, 0, 1)?;
         let readers = gate.readers.entry((repo.to_owned(), key)).or_default();
         *readers = readers.checked_add(1).ok_or(Error::Limit("reader roots"))?;
         Ok(LandingCandidateLease {
@@ -1818,6 +1825,7 @@ impl Store {
                 descriptor,
                 repo: repo.to_owned(),
                 inner: Arc::clone(&self.inner),
+                _resident: resident_lease,
             },
         })
     }

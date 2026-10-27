@@ -184,6 +184,15 @@ impl Fixture {
 fn native_initialization_keeps_all_jj_administration_external_and_loader_is_native_only() {
     futures::executor::block_on(async {
         let fixture = Fixture::new();
+        fixture.registry.provision(&fixture.binding).unwrap();
+        let pending = std::collections::BTreeSet::from([fixture.binding.workspace_id]);
+        let initializer = fixture.registry.initialization_lock(&fixture.binding).unwrap();
+        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&pending,128,1024*1024,8).is_err(),
+            "initializer before journal publication must be fenced");
+        drop(initializer);
+        let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&pending,128,1024*1024,8).unwrap();
+        assert_eq!(census.lock_count(),2); assert!(census.bindings.is_empty()); drop(census);
+        assert!(!fixture.binding.admin.join(JOURNAL).exists());
         let captured_root = std::cell::RefCell::new(None);
         let backend_initializer =
             |_: &UserSettings,
@@ -219,6 +228,34 @@ fn native_initialization_keeps_all_jj_administration_external_and_loader_is_nati
         )
         .await
         .unwrap();
+        let before = fs::read(fixture.binding.admin.join(JOURNAL)).unwrap();
+        let calls = fixture.connector.calls.load(Ordering::SeqCst);
+        {
+            let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1024 * 1024, 8).unwrap();
+            assert_eq!(census.bindings, vec![fixture.binding.clone()]);
+            assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1024 * 1024, 8).is_err(), "census fences concurrent initialization");
+        }
+        assert_eq!(fixture.connector.calls.load(Ordering::SeqCst), calls, "census must not query a projection");
+        assert_eq!(fs::read(fixture.binding.admin.join(JOURNAL)).unwrap(), before);
+        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1, 8).is_err());
+        let admin = PrivateDir::open_existing(&fixture.binding.admin).unwrap();
+        let records = PrivateDir::open_existing(fixture.registry.path().join("records")).unwrap();
+        let row_name = record_name(&fixture.binding.workspace_id);
+        let row_before = records.read(&row_name,MAX_RECORD).unwrap();
+        let mut foreign = fixture.binding.clone();
+        foreign.endpoint = Endpoint::UnixSocket {path:fixture._directory.path().join("foreign.sock")};
+        let mut journal:Initialization = serde_json::from_slice(&before).unwrap();
+        journal.binding = foreign.clone();
+        admin.replace(JOURNAL,&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).is_err(),
+            "same-ID ready record and foreign journal must conflict before filtering");
+        records.replace(&row_name,&serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).unwrap();
+        assert!(census.bindings.is_empty(),"coherent foreign enrollment is excluded"); drop(census);
+        admin.replace(JOURNAL,&before).unwrap();
+        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).is_err(),
+            "foreign ready record and our journal must also conflict");
+        records.replace(&row_name,&row_before).unwrap();
         assert_eq!(
             captured_root.borrow().as_ref(),
             Some(repo.op_store().root_operation_id())
@@ -650,6 +687,10 @@ fn remote_capture_inputs_retain_archived_operation_ancestry_without_a_command() 
 // during capture is observable immediately, rather than returning invented data.
 #[derive(Debug, Default)]
 struct NoCaptureQueries {
+    deny_prepare: AtomicBool,
+    deny_close: AtomicBool,
+    bad_cloud_echo: AtomicBool,
+    closes: AtomicUsize,
     deny_cloud: AtomicBool,
     capture: AtomicBool,
     calls: AtomicUsize,
@@ -671,6 +712,17 @@ impl native_broker::NativeQueryIo for NoCaptureQueries {
             temporary_bytes: 0,
             persistent_memory_bytes: 4096,
         }
+    }
+    async fn prepare_cloud_authorization(
+        &self,
+        _: native_broker::CloudAuthorizationSource,
+        _: native_broker::QueryOwner,
+    ) -> std::result::Result<Option<native_broker::QueryReply<Arc<dyn native_broker::NativeQueryIo>>>, tonic::Status> {
+        self.setup_call();
+        if self.deny_prepare.load(Ordering::Acquire) {
+            return Err(tonic::Status::permission_denied("fixture authorization preparation denied"));
+        }
+        Ok(None)
     }
     async fn open_cloud_scope(
         &self,
@@ -694,7 +746,8 @@ impl native_broker::NativeQueryIo for NoCaptureQueries {
                 handle: input.replay_key,
                 expires_at_unix_seconds: i64::MAX,
                 query_identity_version: 2,
-                cloud_source_digest: Some(input.source.digest()),
+                cloud_source_digest: (!self.bad_cloud_echo.load(Ordering::Acquire))
+                    .then(|| input.source.digest()),
             },
             owner: Arc::new(()),
         })
@@ -838,6 +891,10 @@ impl native_broker::NativeQueryIo for NoCaptureQueries {
         _o: native_broker::QueryOwner,
     ) -> std::result::Result<(), tonic::Status> {
         self.setup_call();
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        if self.deny_close.load(Ordering::Acquire) {
+            return Err(tonic::Status::unavailable("fixture close ACK unavailable"));
+        }
         Ok(())
     }
 }
@@ -1680,6 +1737,28 @@ struct RestoreCloudFixture {
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud
     for RestoreCloudFixture
 {
+    async fn put_object_representation(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::PutObjectRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::WriteReceipt>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "fixture has no exact representation writer",
+        ))
+    }
+    type ReadObjectRepresentationStream = Self::ReadObjectStream;
+    async fn read_object_representation(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::ReadObjectRepresentationRequest>,
+    ) -> std::result::Result<tonic::Response<Self::ReadObjectRepresentationStream>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "fixture has no exact representation reader",
+        ))
+    }
+
     async fn list_workspaces(
         &self,
         _: tonic::Request<tinytree_client::cloud_protocol::ListWorkspacesRequest>,
@@ -1812,6 +1891,15 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud
         &self,
         _: tonic::Request<tinytree_client::cloud_protocol::ReadNativeClosureRequest>,
     ) -> std::result::Result<tonic::Response<Self::ReadNativeClosureStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "fixture does not serve this method",
+        ))
+    }
+    async fn get_latest_captured_version(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::GetLatestCapturedVersionRequest>,
+    ) -> std::result::Result<tonic::Response<tinytree_client::cloud_protocol::Version>, tonic::Status>
+    {
         Err(tonic::Status::unimplemented(
             "fixture does not serve this method",
         ))
@@ -2203,47 +2291,67 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     };
     // A configured provider refusal must occur before journal/admin creation,
     // even though the authenticated selected version and raw proof are valid.
-    let denied_version = client
-        .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
-        .unwrap();
-    let denied_objects = objects
-        .iter()
-        .map(|object| {
-            c::VerifiedObject::verify(
-                object.id(),
-                object.digest().unwrap(),
-                object.payload().unwrap(),
-                Default::default(),
-            )
-            .unwrap()
-        })
-        .collect();
-    let denied_artifacts = encoded
-        .artifacts
-        .iter()
-        .map(|artifact| {
-            c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+    for (name, deny_prepare, deny_cloud, bad_echo, deny_close, expected_closes) in [
+        ("prepare_refusal_no_fallback", true, false, false, false, 0),
+        ("unprepared_scope_refusal", false, true, false, false, 0),
+        ("validation_refusal_closes_scope", false, false, true, false, 1),
+        ("close_ack_refusal", false, false, false, true, 1),
+    ] {
+        queries.deny_prepare.store(deny_prepare, Ordering::Release);
+        queries.deny_cloud.store(deny_cloud, Ordering::Release);
+        queries.bad_cloud_echo.store(bad_echo, Ordering::Release);
+        queries.deny_close.store(deny_close, Ordering::Release);
+        let calls_before = queries.calls.load(Ordering::SeqCst);
+        let closes_before = queries.closes.load(Ordering::SeqCst);
+        let denied_version = client
+            .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
+            .unwrap();
+        let denied_objects = objects
+            .iter()
+            .map(|object| {
+                c::VerifiedObject::verify(
+                    object.id(),
+                    object.digest().unwrap(),
+                    object.payload().unwrap(),
+                    Default::default(),
+                )
                 .unwrap()
-        })
-        .collect();
-    queries.deny_cloud.store(true, Ordering::Release);
-    assert!(
-        restore::prepare_restore(
-            client.clone(),
-            restore::RestoreInputs {
-                version: denied_version,
-                objects: denied_objects,
-                artifacts: denied_artifacts
-            },
-            provider.clone(),
-            Default::default(),
-            Arc::new(()),
-        )
-        .await
-        .is_err()
-    );
-    assert!(!fixture.binding.admin.exists());
+            })
+            .collect();
+        let denied_artifacts = encoded
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                c::decode_index_artifact(&artifact.bytes, artifact.descriptor, Default::default())
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            restore::prepare_restore(
+                client.clone(),
+                restore::RestoreInputs {
+                    version: denied_version,
+                    objects: denied_objects,
+                    artifacts: denied_artifacts
+                },
+                provider.clone(),
+                Default::default(),
+                Arc::new(()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(!fixture.binding.admin.exists(), "{name}");
+        assert_eq!(queries.closes.load(Ordering::SeqCst) - closes_before, expected_closes, "{name}");
+        if deny_prepare {
+            assert_eq!(queries.calls.load(Ordering::SeqCst) - calls_before, 1,
+                "preparation error cannot invoke the per-root fallback");
+        }
+    }
+    queries.deny_prepare.store(false, Ordering::Release);
     queries.deny_cloud.store(false, Ordering::Release);
+    queries.bad_cloud_echo.store(false, Ordering::Release);
+    queries.deny_close.store(false, Ordering::Release);
     let version = client
         .cloud_captured_version(client.cloud_retained_version([42; 32], 1).await.unwrap())
         .unwrap();
@@ -4644,4 +4752,552 @@ async fn prepared_freeze_retirement_requires_exact_archive_and_preserves_other_r
                 .is_err()
         );
     }
+}
+
+fn cleanup_pending(
+    base: &landing_resolution::Base,
+    request_id: String,
+) -> remote_state::LandingPending {
+    remote_state::LandingPending {
+        observed: None,
+        restored_lookup_only: false,
+        request_id,
+        source_base: hex(&[0; 32]),
+        source_head: base.working_copy_commit().into(),
+        reference: "main".into(),
+        bookmark: "main".into(),
+        generation: 1,
+        expected_head: hex(&[6; 32]),
+        profile_name: "checks".into(),
+        profile_version: "v1".into(),
+        source_operation: base.operation().into(),
+        source_stack: vec![base.working_copy_commit().into()],
+        fork_operation: Some(base.operation().into()),
+        fork_acknowledged: true,
+        job_id: Some(hex(&[3; 32])),
+        result_roots: vec![],
+        candidate_head: None,
+        apply_operation: None,
+        operation_writing: None,
+        acknowledged: false,
+        terminal: None,
+    }
+}
+fn cleanup_intent(p: &remote_state::LandingPending) -> native_broker::LandingIntent {
+    let decode = |id: &str| -> Vec<u8> {
+        id.as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    };
+    native_broker::LandingIntent {
+        request: native_broker::landing_protocol::StartLandingRequest {
+            repository_id: String::new(),
+            idempotency_key: p.request_id.clone(),
+            source_base: decode(&p.source_base),
+            source_head: decode(&p.source_head),
+            destination: p.reference.clone(),
+            expected_generation: p.generation,
+            expected_head: decode(&p.expected_head),
+            profile_name: p.profile_name.clone(),
+            expected_profile_version: p.profile_version.clone(),
+        },
+        source_stack: p
+            .source_stack
+            .iter()
+            .map(|id| native_broker::CommitId(decode(id).try_into().unwrap()))
+            .collect(),
+        observed_job: p.job_id.as_deref().map(|id| decode(id).try_into().unwrap()),
+    }
+}
+fn cleanup_context(
+    fixture: &Fixture,
+    p: &remote_state::LandingPending,
+) -> landing_resolution::CommonContext {
+    let original = resolution_context(fixture);
+    landing_resolution::CommonContext {
+        provider_identity: original.provider_identity,
+        scope: original.scope,
+        request_id: p.request_id.clone(),
+        request_digest: landing_resolution::request_digest(&cleanup_intent(p)).unwrap(),
+    }
+}
+fn cleanup_job(
+    p: &remote_state::LandingPending,
+    tree: [u8; 32],
+    committed: bool,
+) -> native_broker::landing_protocol::LandingJob {
+    use native_broker::landing_protocol as l;
+    let mut job = l::LandingJob {
+        id: vec![3; 32],
+        phase: if committed {
+            l::Phase::Committed
+        } else {
+            l::Phase::Unsupported
+        } as i32,
+        roots_retained: committed,
+        expires_at_seconds: 100,
+        profile_name: p.profile_name.clone(),
+        profile_version: p.profile_version.clone(),
+        candidate: None,
+        receipt: None,
+        conflict_path: None,
+        preparation: l::PreparationAvailability::ProfileConfigured as i32,
+    };
+    if committed {
+        let head = cleanup_intent(p).request.source_head;
+        job.candidate = Some(l::Candidate {
+            head: head.clone(),
+            root_tree: tree.to_vec(),
+            rewrites: vec![],
+        });
+        let mut receipt = l::Receipt {
+            reference: Some(Default::default()),
+            rewrites: vec![],
+            evidence: vec![8; 32],
+        };
+        let reference = receipt.reference.as_mut().unwrap();
+        reference.name = p.reference.clone();
+        reference.generation = 2;
+        reference.commit = Some(Default::default());
+        let descriptor = reference.commit.as_mut().unwrap();
+        descriptor.size_bytes = 128;
+        descriptor.object_format_version = tinytree_model::FORMAT_VERSION.into();
+        descriptor.content_blake3 = head.clone();
+        descriptor.key = Some(Default::default());
+        let key = descriptor.key.as_mut().unwrap();
+        key.kind = 3;
+        key.native_id = head;
+        job.receipt = Some(receipt);
+    }
+    job
+}
+fn save_closed_state(
+    binding: &Binding,
+    scope: &remote_state::RemoteScope,
+    mut p: remote_state::LandingPending,
+    job: &native_broker::landing_protocol::LandingJob,
+) -> [u8; 32] {
+    use std::io::Write as _;
+    p.acknowledged = job.phase == native_broker::landing_protocol::Phase::Committed as i32;
+    p.terminal = (!p.acknowledged).then(|| "unsupported".into());
+    p.observed = Some(remote_state::historical_landing_job(job).unwrap());
+    let mut state = remote_state::State::new(scope);
+    state.begin_landing(p).unwrap();
+    let bytes = toml::to_string(&state).unwrap();
+    let mut temporary = tempfile::NamedTempFile::new_in(&binding.working_copy).unwrap();
+    temporary.write_all(bytes.as_bytes()).unwrap();
+    temporary.as_file().sync_all().unwrap();
+    temporary
+        .persist(binding.working_copy.join("native-remote.toml"))
+        .unwrap();
+    fs::File::open(&binding.working_copy)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    *blake3::hash(bytes.as_bytes()).as_bytes()
+}
+fn cleanup_files(path: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, path: &Path, result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &entry.path(), result);
+            } else {
+                result.insert(
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = Default::default();
+    walk(path, path, &mut result);
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_terminal_cleanup_keeps_one_workspace_bounded_beyond_journal_capacity() {
+    use landing_resolution::Purpose;
+    let fixture = Fixture::new();
+    let (_workspace, _, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let operations = cleanup_files(&fixture.binding.repo.join("op_store"));
+    let indexes = cleanup_files(&fixture.binding.repo.join("index"));
+    let calls = fixture.connector.calls.load(Ordering::SeqCst);
+    for sequence in 1..=257u64 {
+        let p = cleanup_pending(&base, format!("{sequence:032x}"));
+        let common = cleanup_context(&fixture, &p);
+        let context = landing_resolution::Context {
+            provider_identity: common.provider_identity,
+            scope: common.scope.clone(),
+            request_id: common.request_id.clone(),
+            request_digest: common.request_digest,
+            purpose: Purpose::Freeze { observed_job: None },
+        };
+        let first = fixture
+            .registry
+            .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+            .await
+            .unwrap();
+        let next = fixture
+            .registry
+            .replace_prepared_landing_resolution(
+                &fixture.binding,
+                &context,
+                first.nonce(),
+                &base,
+                &proofs,
+                &admission,
+            )
+            .await
+            .unwrap();
+        fixture
+            .registry
+            .retire_prepared_freeze_resolution(&fixture.binding, &context, next.nonce(), &admission)
+            .await
+            .unwrap();
+        let job = cleanup_job(&p, base.tree().terms[0], false);
+        let saved = save_closed_state(&fixture.binding, &common.scope, p, &job);
+        assert_eq!(
+            fixture
+                .registry
+                .cleanup_closed_landing_resolution(
+                    &fixture.binding,
+                    &common,
+                    saved,
+                    &job,
+                    &admission
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        let namespace = fixture
+            .registry
+            .path()
+            .join("landing-resolutions")
+            .join(fixture.binding.id());
+        assert_eq!(fs::read_dir(namespace).unwrap().count(), 0);
+        assert_eq!(
+            fixture
+                .registry
+                .cleanup_closed_landing_resolution(
+                    &fixture.binding,
+                    &common,
+                    saved,
+                    &job,
+                    &admission
+                )
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        cleanup_files(&fixture.binding.repo.join("op_store")),
+        operations
+    );
+    assert_eq!(cleanup_files(&fixture.binding.repo.join("index")), indexes);
+    assert_eq!(
+        fixture.connector.calls.load(Ordering::SeqCst),
+        calls,
+        "cleanup never contacts the projection provider"
+    );
+    let after = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    assert_eq!(after[0].id(), proofs[0].id());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_cleanup_validates_all_records_and_retries_partial_physical_deletion() {
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    use landing_resolution::Purpose;
+    let fixture = Fixture::new();
+    let (mut workspace, _, objects) = resolution_initialize(&fixture).await;
+    let admission = resolution_admission();
+    let proofs = resolution_proofs(&fixture.binding, &objects, &admission).await;
+    let base = fixture
+        .registry
+        .landing_resolution_base(&fixture.binding, &proofs, &admission)
+        .await
+        .unwrap();
+    let mut pending = cleanup_pending(&base, hex(&[1; 16]));
+    let common = cleanup_context(&fixture, &pending);
+    let job = cleanup_job(&pending, base.tree().terms[0], true);
+    let mut context = landing_resolution::Context {
+        provider_identity: common.provider_identity,
+        scope: common.scope.clone(),
+        request_id: common.request_id.clone(),
+        request_digest: common.request_digest,
+        purpose: Purpose::Freeze { observed_job: None },
+    };
+    let freeze = fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    fixture
+        .registry
+        .retire_prepared_freeze_resolution(&fixture.binding, &context, freeze.nonce(), &admission)
+        .await
+        .unwrap();
+    context.purpose = Purpose::Apply {
+        job_id: hex(&job.id),
+        candidate_head: hex(&job.candidate.as_ref().unwrap().head),
+        candidate_digest: landing_resolution::candidate_digest(job.candidate.as_ref().unwrap()),
+    };
+    let first = fixture
+        .registry
+        .begin_landing_resolution(&fixture.binding, &context, &base, &proofs, &admission)
+        .await
+        .unwrap();
+    let current = fixture
+        .registry
+        .replace_prepared_landing_resolution(
+            &fixture.binding,
+            &context,
+            first.nonce(),
+            &base,
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    let operation = resolution_operation(&fixture, &current, true).await;
+    pending.apply_operation = Some(operation.hex());
+    let saved = save_closed_state(&fixture.binding, &common.scope, pending.clone(), &job);
+    let directory = PrivateDir::open_existing(
+        fixture
+            .registry
+            .path()
+            .join("landing-resolutions")
+            .join(fixture.binding.id()),
+    )
+    .unwrap();
+    let unchanged = cleanup_files(directory.path());
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err(),
+        "portable acknowledgement cannot discard a Prepared host attempt"
+    );
+    assert_eq!(cleanup_files(directory.path()), unchanged);
+    fixture
+        .registry
+        .record_landing_resolution_operation(
+            &fixture.binding,
+            &context,
+            current.nonce(),
+            &operation.hex(),
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err(),
+        "Written ownership must be reconciled, not discarded"
+    );
+    workspace
+        .start_working_copy_mutation()
+        .await
+        .unwrap()
+        .finish(operation.clone())
+        .await
+        .unwrap();
+    jj_lib::simple_op_heads_store::SimpleOpHeadsStore::load(&fixture.binding.repo.join("op_heads"))
+        .update_op_heads(
+            &[OperationId::try_from_hex(base.operation()).unwrap()],
+            &operation,
+        )
+        .await
+        .unwrap();
+    fixture
+        .registry
+        .complete_landing_resolution(
+            &fixture.binding,
+            &context,
+            current.nonce(),
+            &proofs,
+            &admission,
+        )
+        .await
+        .unwrap();
+    let operations = cleanup_files(&fixture.binding.repo.join("op_store"));
+    let indexes = cleanup_files(&fixture.binding.repo.join("index"));
+    let original = cleanup_files(directory.path());
+    for changed in [
+        landing_resolution::CommonContext {
+            provider_identity: [8; 32],
+            ..common.clone()
+        },
+        landing_resolution::CommonContext {
+            request_digest: [8; 32],
+            ..common.clone()
+        },
+        landing_resolution::CommonContext {
+            scope: remote_state::RemoteScope::new(common.scope.socket.clone(), "other".into())
+                .unwrap(),
+            ..common.clone()
+        },
+    ] {
+        assert!(
+            fixture
+                .registry
+                .cleanup_closed_landing_resolution(
+                    &fixture.binding,
+                    &changed,
+                    saved,
+                    &job,
+                    &admission
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(cleanup_files(directory.path()), original);
+    }
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, [8; 32], &job, &admission)
+            .await
+            .is_err()
+    );
+    let unknown = format!("{}-unknown.json", common.request_id);
+    directory.replace(&unknown, b"{}").unwrap();
+    let unknown_state = cleanup_files(directory.path());
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        cleanup_files(directory.path()),
+        unknown_state,
+        "all records validate before any deletion"
+    );
+    fs::remove_file(directory.path().join(unknown)).unwrap();
+    let archive = format!(
+        "{}-apply-{}-superseded.json",
+        common.request_id,
+        hex(&first.nonce())
+    );
+    let bytes = directory.read(&archive, 65536).unwrap();
+    directory.replace(&archive, b"{").unwrap();
+    let malformed = cleanup_files(directory.path());
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(cleanup_files(directory.path()), malformed);
+    directory.replace(&archive, &bytes).unwrap();
+    admission.interrupt_cleanup_after(1);
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    admission.interrupt_cleanup_after(2);
+    assert!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .is_err(),
+        "interruption after all unlinks precedes directory durability acknowledgement"
+    );
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    admission.interrupt_cleanup_after(usize::MAX);
+    assert_eq!(
+        fixture
+            .registry
+            .cleanup_closed_landing_resolution(&fixture.binding, &common, saved, &job, &admission)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        cleanup_files(&fixture.binding.repo.join("op_store")),
+        operations
+    );
+    assert_eq!(cleanup_files(&fixture.binding.repo.join("index")), indexes);
+}
+
+#[test]
+fn shared_landing_digests_preserve_v1_wire_recipe_and_ignore_observed_job() {
+    use native_broker::landing_protocol as l;
+    let mut intent = native_broker::LandingIntent {
+        request: l::StartLandingRequest {
+            repository_id: String::new(),
+            idempotency_key: "01".repeat(16),
+            source_base: vec![0; 32],
+            source_head: vec![3; 32],
+            destination: "main".into(),
+            expected_generation: 7,
+            expected_head: vec![4; 32],
+            profile_name: "checks".into(),
+            expected_profile_version: "v1".into(),
+        },
+        source_stack: vec![
+            native_broker::CommitId([2; 32]),
+            native_broker::CommitId([3; 32]),
+        ],
+        observed_job: None,
+    };
+    // Independent v1 vectors fix the domain, field framing, numeric encoding,
+    // empty broker repository field and ordered source stack across migration.
+    assert_eq!(
+        hex(&landing_resolution::request_digest(&intent).unwrap()),
+        "283238ee6b4ec9bd69e5c376f528cfd596b554667a6c2b52207e3bb011e9885b"
+    );
+    intent.observed_job = Some([5; 32]);
+    assert_eq!(
+        hex(&landing_resolution::request_digest(&intent).unwrap()),
+        "283238ee6b4ec9bd69e5c376f528cfd596b554667a6c2b52207e3bb011e9885b"
+    );
+    let mut candidate = l::Candidate {
+        head: vec![9; 32],
+        root_tree: vec![8; 32],
+        rewrites: vec![
+            l::Rewrite {
+                old_commit: vec![3; 32],
+                new_commit: vec![9; 32],
+                change_id: vec![6; 16],
+            },
+            l::Rewrite {
+                old_commit: vec![2; 32],
+                new_commit: vec![7; 32],
+                change_id: vec![5; 16],
+            },
+        ],
+    };
+    assert_eq!(
+        hex(&landing_resolution::candidate_digest(&candidate)),
+        "391d55607ba06b7401be6b91c5413c84f42d5b3c207324027750ecbbf71c6d42"
+    );
+    candidate.rewrites.reverse();
+    assert_eq!(
+        hex(&landing_resolution::candidate_digest(&candidate)),
+        "391d55607ba06b7401be6b91c5413c84f42d5b3c207324027750ecbbf71c6d42"
+    );
 }

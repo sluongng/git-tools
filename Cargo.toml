@@ -20,6 +20,7 @@ members = [
     "crates/native-retention",
     "crates/native-capture-pack",
     "crates/packblob",
+    "crates/tinytree-annotate",
     "crates/tinytree-proto",
     "crates/tinytree-model",
     "crates/tinytree-landing",

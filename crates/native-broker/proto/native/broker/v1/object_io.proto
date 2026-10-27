@@ -9,9 +9,11 @@ service ObjectIo {
   rpc ReadMetadata(ObjectRequest) returns (Metadata);
   rpc WriteMetadata(MetadataWrite) returns (ObjectDescriptor);
   rpc ReadFile(ObjectRequest) returns (stream ReadFrame);
+  rpc ReadLocalFile(LocalFileRequest) returns (stream ReadFrame);
   rpc WriteFile(stream WriteFrame) returns (ObjectDescriptor);
   rpc CopyCatalog(CatalogRequest) returns (stream CatalogFrame);
 }
+message LocalFileRequest { string store_id = 1; ObjectDescriptor expected = 2; uint64 max_bytes = 3; }
 message ObjectRequest { string store_id = 1; uint32 kind = 2; bytes id = 3; }
 message ObjectDescriptor { uint32 kind = 1; bytes id = 2; uint64 size_bytes = 3; uint32 format_version = 4; }
 message DescriptorReply { optional ObjectDescriptor descriptor = 1; }
@@ -53,6 +55,12 @@ message PublicationReply {
 // broker-local and never carry upstream connection settings or cursor tokens.
 service QueryIo {
   rpc DescribeProvider(DescribeProviderRequest) returns (ProviderDescription);
+  rpc BlameCapabilities(DescribeProviderRequest) returns (BlameCapabilitiesReply);
+  rpc AnnotationCapabilities(DescribeProviderRequest) returns (BlameCapabilitiesReply);
+  rpc OpenAnnotationFrontier(QueryOpenAnnotationRequest) returns (tinytree.query.v1.AnnotationFrontier);
+  rpc OpenLimitedAnnotationFrontier(QueryOpenAnnotationRequest) returns (tinytree.query.v1.AnnotationFrontier);
+  rpc ReadAnnotationInput(QueryReadAnnotationRequest) returns (tinytree.query.v1.AnnotationInput);
+  rpc CloseAnnotationFrontier(QueryCloseRequest) returns (QueryCloseReply);
   rpc PreflightCreation(CreationRequest) returns (CreationPlan);
   rpc OpenCloudScope(QueryOpenCloudScopeRequest) returns (QueryScopeReply);
   rpc OpenScope(QueryOpenScopeRequest) returns (QueryScopeReply);
@@ -69,6 +77,15 @@ service QueryIo {
   rpc Search(QuerySearchRequest) returns (tinytree.query.v1.SearchResult);
   rpc CloseQuery(QueryCloseRequest) returns (QueryCloseReply);
   rpc CloseScope(QueryCloseRequest) returns (QueryCloseReply);
+}
+// Singleton upstream feature11 negotiation, not a scope or read capability.
+message BlameCapabilitiesReply {
+  uint32 schema_version = 1; // Exactly1.
+  uint32 feature = 2; // Exactly11, never inferred from legacy Blame3.
+  bool legacy_unnegotiated = 3; // If true, supported/authorized MUST both be false.
+  bool supported = 4;
+  bool authorized = 5;
+  uint32 root_readiness = 6; // Exactly1=NOT_CHECKED; no root supplied.
 }
 message NativeCloudQuerySource {
   bytes provider_identity = 1;
@@ -193,4 +210,16 @@ message CreationPlan {
   bytes root = 3;
   ProviderIndexMode index_mode = 4;
   CreationPolicy policy = 5;
+}
+
+// Annotation contexts use the captured LOCAL scope handle on this facade.
+// Upstream context/scope tokens remain owned by the provider adapter.
+message QueryOpenAnnotationRequest {
+  string store_id = 1; bytes scope = 2; repeated bytes anchors = 3;
+  string path = 4; uint32 max_commits = 5;
+  tinytree.query.v1.AnnotationLimits limits = 6;
+}
+message QueryReadAnnotationRequest {
+  string store_id = 1; bytes scope = 2; bytes context = 3;
+  bytes revision = 4; tinytree.query.v1.AnnotationPathValue expected = 5;
 }

@@ -246,10 +246,19 @@ enum CapabilityFeature {
   CAPTURED_INDEXED_CLOUD_WRITE = 5;
   LANDING_RECOVERY_CLOUD_READ = 6;
   LANDING_RECOVERY_CLOUD_WRITE = 7;
+  EXACT_PATH_GRAPH_V1 = 8;
+  EXACT_CLOUD_REPRESENTATION_READ = 9;
+  EXACT_CLOUD_REPRESENTATION_WRITE = 10;
+  JJ_RESOLVED_BLAME_V1 = 11;
+  ANNOTATION_FRONTIER_V1 = 12;
+  // Store-owned, non-evicting retained backing: every published selection keeps
+  // its exact manifest/DATA/raw/index artifacts and canonical native closure
+  // through GC. Not root readiness, current availability, or infinite quota.
+  DURABLE_RETAINED_OFFLOAD_V1 = 13;
 }
 message GetCapabilitiesRequest {
   string repository_id = 1;
-  repeated CapabilityFeature features = 2; // Required, 1..7, unique ascending IDs.
+  repeated CapabilityFeature features = 2; // Required, 1..13, unique ascending IDs.
 }
 message FeatureCapability {
   CapabilityFeature feature = 1;

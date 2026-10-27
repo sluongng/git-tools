@@ -18,6 +18,28 @@ struct OwnedHistory<T> {
 }
 #[derive(Clone)]
 pub struct CheckedPathHistory(Arc<OwnedHistory<q::PathHistoryResult>>);
+/// A bounded composition of checked exact-path queries, not a single server
+/// reply or a portable continuation token. `result().revision` is the original
+/// selection; each contributing RPC was checked against its own start revision.
+#[derive(Clone)]
+pub struct CheckedPathHistoryCollection(Arc<OwnedHistory<HistoryCollection>>);
+struct HistoryCollection {
+    value: q::PathHistoryResult,
+    _scope: CheckedScopeHandle,
+}
+impl CheckedPathHistoryCollection {
+    pub fn result(&self) -> &q::PathHistoryResult {
+        &self.0.value.value
+    }
+}
+impl std::fmt::Debug for CheckedPathHistoryCollection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedPathHistoryCollection")
+            .field("entries", &self.result().entries.len())
+            .field("coverage", &self.result().coverage)
+            .finish_non_exhaustive()
+    }
+}
 #[derive(Clone)]
 pub struct CheckedBlame(Arc<OwnedHistory<q::BlameResult>>);
 impl CheckedPathHistory {
@@ -136,7 +158,11 @@ impl NativeClient {
         maximum: u32,
     ) -> Result<(), Status> {
         self.checked_scope(scope, false)?;
-        if policy != q::HistoryPolicy::LinearFixedPathV1 || !valid_path(path) {
+        if !matches!(
+            policy,
+            q::HistoryPolicy::LinearFixedPathV1 | q::HistoryPolicy::JjResolvedFixedPathV1
+        ) || !valid_path(path)
+        {
             return Err(Status::invalid_argument(
                 "invalid fixed-path history request",
             ));
@@ -306,6 +332,150 @@ impl NativeClient {
             self.retain_history(reply, retained?, &window)?,
         ))
     }
+    /// Collect exact fixed-path history within one checked live/cloud scope.
+    /// Only a positive-progress scan boundary can start another query. This
+    /// does not resume after scope expiry, relocate paths, or continue blame.
+    /// Server read/work caps remain per RPC, not aggregate byte-budget claims.
+    pub async fn collect_path_history(
+        &self,
+        scope: &CheckedScopeHandle,
+        revision: CommitId,
+        path: &str,
+        policy: q::HistoryPolicy,
+        max_commits: u32,
+    ) -> Result<CheckedPathHistoryCollection, Status> {
+        self.history_input(scope, path, policy, max_commits)?;
+        // Keep this explicit even if the one-reply API later gains a policy
+        // that follows renames: a boundary alone cannot prove relocated paths.
+        if max_commits == 0 || policy != q::HistoryPolicy::LinearFixedPathV1 {
+            return Err(Status::invalid_argument(
+                "collection requires a positive exact-path scan bound",
+            ));
+        }
+        let deadline = self.deadline();
+        let client = self.clone().with_operation_deadline(deadline);
+        // Fresh clones below contain at most three 32-byte IDs per entry.
+        // Charge vector capacity and both progress/entry hash tables before
+        // allocating; decoded pages keep their separate measured owners until
+        // copying finishes. Idle aggregate storage cannot consume RPC headroom.
+        let retained = (max_commits as usize)
+            .checked_mul(1024)
+            .and_then(|n| path.len().checked_mul(2).and_then(|p| n.checked_add(p)))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or_else(integrity)?;
+        if retained > self.inner.config.limits.max_batch_bytes.saturating_mul(2) {
+            return Err(Status::resource_exhausted(
+                "history collection allocation exceeds budget",
+            ));
+        }
+        let amount = u32::try_from(retained).map_err(|_| integrity())?;
+        let state = self
+            .inner
+            .query_state
+            .clone()
+            .try_acquire_many_owned(amount)
+            .map_err(|_| {
+                Status::resource_exhausted("history collection exhausts query headroom")
+            })?;
+        let bytes = self
+            .inner
+            .bytes
+            .clone()
+            .try_acquire_many_owned(amount)
+            .map_err(|_| Status::resource_exhausted("history collection exhausts byte headroom"))?;
+        let memory = HistoryMemory {
+            _guards: self.guards.clone(),
+            _state: state,
+            _bytes: bytes,
+        };
+        let mut result = q::PathHistoryResult {
+            scope_digest: scope.content_digest().to_vec(),
+            index_epoch: scope.index_epoch().to_vec(),
+            revision: Some(q::CommitId {
+                value: revision.0.to_vec(),
+            }),
+            path: path.to_owned(),
+            policy: policy as i32,
+            coverage: q::HistoryCoverage::HistoryScanLimit as i32,
+            scanned_commits: 0,
+            entries: Vec::with_capacity(max_commits as usize),
+            boundary: Some(q::CommitId {
+                value: revision.0.to_vec(),
+            }),
+        };
+        let mut starts = HashSet::with_capacity(max_commits as usize);
+        let mut entries = HashSet::with_capacity(max_commits as usize);
+        let mut start = revision;
+        starts.insert(start);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "history collection deadline exceeded",
+                ));
+            }
+            let remaining = max_commits
+                .checked_sub(result.scanned_commits)
+                .filter(|n| *n != 0)
+                .ok_or_else(integrity)?;
+            let page = client
+                .path_history(scope, start, path, policy, remaining)
+                .await?;
+            let value = page.result();
+            let scanned = result
+                .scanned_commits
+                .checked_add(value.scanned_commits)
+                .filter(|n| *n <= max_commits)
+                .ok_or_else(integrity)?;
+            let boundary = value
+                .boundary
+                .as_ref()
+                .map(|value| id(Some(value)))
+                .transpose()?;
+            for entry in &value.entries {
+                let entry_id = id(entry.commit.as_ref())?;
+                if boundary == Some(entry_id)
+                    || (entry_id != start && starts.contains(&entry_id))
+                    || !entries.insert(entry_id)
+                {
+                    return Err(integrity());
+                }
+            }
+            let more = value.coverage == q::HistoryCoverage::HistoryScanLimit as i32;
+            if more {
+                let next = boundary.ok_or_else(integrity)?;
+                if value.scanned_commits == 0
+                    || next == CommitId::ROOT
+                    || entries.contains(&next)
+                    || !starts.insert(next)
+                {
+                    return Err(integrity());
+                }
+            }
+            // Clone bounded-length fields, not retained capacities from decoded
+            // overwritten protobuf fields. The aggregate reservation predates it.
+            result.entries.extend(value.entries.iter().cloned());
+            result.scanned_commits = scanned;
+            result.coverage = value.coverage;
+            result.boundary = value.boundary.clone();
+            drop(page);
+            if !more || scanned == max_commits {
+                break;
+            }
+            start = boundary.ok_or_else(integrity)?;
+        }
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded(
+                "history collection deadline exceeded",
+            ));
+        }
+        Ok(CheckedPathHistoryCollection(Arc::new(OwnedHistory {
+            value: HistoryCollection {
+                value: result,
+                _scope: scope.clone(),
+            },
+            _memory: memory,
+        })))
+    }
     /// Verify target bytes and complete/partial line partition. Origins and
     /// completeness are authenticated assertions, not proofs from FILE hashes.
     pub async fn blame(
@@ -318,6 +488,26 @@ impl NativeClient {
     ) -> Result<CheckedBlame, Status> {
         self.history_input(scope, path, policy, max_commits)?;
         let deadline = self.deadline();
+        if policy == q::HistoryPolicy::JjResolvedFixedPathV1 {
+            let capability = self
+                .clone()
+                .with_operation_deadline(deadline)
+                .resolved_blame_capability()
+                .await?
+                .ok_or_else(|| {
+                    Status::unimplemented("server resolved-blame capability unavailable")
+                })?;
+            if !capability.authorized {
+                return Err(Status::permission_denied(
+                    "resolved blame is not authorized",
+                ));
+            }
+            if !capability.supported {
+                return Err(Status::unimplemented(
+                    "server resolved-blame capability unavailable",
+                ));
+            }
+        }
         let (budget, window) = self.history_budget(deadline).await?;
         let request = q::BlameRequest {
             scope: Some(scope.key()),
@@ -439,3 +629,7 @@ impl NativeClient {
         ))
     }
 }
+
+#[path = "history/annotation.rs"]
+mod annotation;
+pub use annotation::{CheckedAnnotationFrontier, CheckedAnnotationInput};

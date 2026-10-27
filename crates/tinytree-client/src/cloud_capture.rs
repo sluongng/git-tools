@@ -163,7 +163,9 @@ impl NativeClient {
         intent: &CloudCapturedPublishIntent,
     ) -> Result<CloudPublication, Status> {
         if intent.capture.selected.size_bytes > self.inner.config.cloud.max_capture_bytes as u64 {
-            return Err(limit());
+            return Err(Status::resource_exhausted(
+                tinytree_proto::PublicationFailureReason::ClientCaptureBytes.message(),
+            ));
         }
         self.cloud_publish_at(&intent.version, &intent.capture_data, true)
             .await

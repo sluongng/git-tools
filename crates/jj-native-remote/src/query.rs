@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use jj_native_backend::NativeObjectIo;
 use native_broker::{
     BeginQuery, ForkQueryScope, NativeQueryIo, OpenCloudQueryScope, OpenQueryScope, QueryHandle,
-    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, ScopedPathQuery,
+    QueryOwner, QueryPage, QueryReply, QueryResources, QueryScope, ScopedPathQuery, OpenAnnotationFrontier, ReadAnnotationInput,
     ScopedSearchQuery, query_protocol as q,
 };
 use prost::Message;
@@ -28,7 +28,16 @@ pub struct RemoteQueryIo {
     memory: Arc<Semaphore>,
     operations: Arc<Semaphore>,
     restore_bound: Option<Arc<crate::restore_io::RestoreBound>>,
+    cloud_authorization: Option<Arc<CloudAuthorization>>,
     search_cursor_key: [u8; 32],
+}
+// This pass owns only SDK result memory and bounded adapter overhead, never a
+// physical operation slot or a transient RPC-lifetime-guarded client.
+struct CloudAuthorization {
+    source: native_broker::CloudAuthorizationSource,
+    _client: NativeClient,
+    proof: Arc<tinytree_client::VerifiedRetainedVersion>,
+    _memory: OwnedSemaphorePermit,
 }
 impl std::fmt::Debug for RemoteQueryIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,7 +82,13 @@ struct ScopeRecord {
     query_identity_version: u32,
     cloud_source_digest: Option<[u8; 32]>,
 }
+#[derive(Default)]
+struct AnnotationRecord {
+    checked: Option<tinytree_client::CheckedAnnotationFrontier>,
+    closed: bool,
+}
 struct CapturedScope {
+    annotation: Mutex<AnnotationRecord>,
     client: NativeClient,
     checked: CheckedScopeHandle,
     authority: Authority,
@@ -170,7 +185,18 @@ fn status(error: anyhow::Error) -> tonic::Status {
     let code = error
         .downcast_ref::<tonic::Status>()
         .map_or(tonic::Code::FailedPrecondition, tonic::Status::code);
-    tonic::Status::new(code, "native repository query operation failed")
+    let message = if matches!(code, tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted) {
+        let source = error.downcast_ref::<tonic::Status>()
+            .map(|status| status.message().to_owned())
+            .unwrap_or_else(|| error.root_cause().to_string());
+        native_broker::QueryFailureReason::from_source_message(&source)
+            .filter(|reason| reason.code() == code)
+            .map(native_broker::QueryFailureReason::diagnostic)
+            .unwrap_or("native repository query operation failed")
+    } else {
+        "native repository query operation failed"
+    };
+    tonic::Status::new(code, message)
 }
 fn random() -> [u8; 32] {
     let mut id = [0; 32];
@@ -610,6 +636,7 @@ impl RemoteQueryIo {
             memory,
             operations,
             restore_bound: None,
+            cloud_authorization: None,
             search_cursor_key: random(),
         })
     }
@@ -803,6 +830,8 @@ impl RemoteQueryIo {
         owner: QueryOwner,
     ) -> Result<()> {
         let mut nodes = Vec::new();
+        let mut canonical_bytes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for row in page.rows() {
             if row.commit == m::CommitId::ROOT || scope.overlays.contains_key(&row.commit) {
                 continue;
@@ -821,6 +850,15 @@ impl RemoteQueryIo {
                     commit.change_id == row.change,
                     "native canonical row ChangeId mismatch"
                 );
+                ensure!(
+                    seen.insert(descriptor.key),
+                    "duplicate native query page object"
+                );
+                ensure!(
+                    canonical.canonical_bytes().len() as u64 == descriptor.size_bytes,
+                    "native canonical row byte length mismatch"
+                );
+                canonical_bytes.push(canonical.canonical_bytes());
                 nodes.push((descriptor, object));
             }
         }
@@ -843,17 +881,47 @@ impl RemoteQueryIo {
         .await?;
         // This private fetched-data path installs canonical objects, not authored
         // operation/index roots. Only the following explicit witness grants fetches.
-        for (expected, object) in &nodes {
-            let actual = self
-                .inner
-                .local
-                .write_metadata_with_owner(object.clone(), owner.clone())
-                .await
-                .map_err(backend)?;
-            ensure!(
-                actual == *expected,
-                "native fetched metadata installation changed identity"
-            );
+        let limits = self.inner.local.commit_batch_limits();
+        let mut chunk = Vec::with_capacity(limits.max_objects);
+        let mut chunk_bytes = 0u64;
+        for ((expected, object), bytes) in nodes.iter().zip(canonical_bytes) {
+            // The SDK already verified these exact canonical bytes. Copy only
+            // one bounded physical chunk; no page-wide encoded clone or cap.
+            if expected.size_bytes > limits.max_bytes {
+                if !chunk.is_empty() {
+                    self.install_commit_chunk(std::mem::take(&mut chunk), owner.clone())
+                        .await?;
+                    chunk_bytes = 0;
+                }
+                io::check_deadline()?;
+                let actual = self
+                    .inner
+                    .local
+                    .write_metadata_with_owner(object.clone(), owner.clone())
+                    .await
+                    .map_err(backend)?;
+                ensure!(
+                    actual == *expected,
+                    "native fetched metadata installation changed identity"
+                );
+                continue;
+            }
+            let next = chunk_bytes
+                .checked_add(expected.size_bytes)
+                .context("native canonical chunk bytes overflow")?;
+            if chunk.len() == limits.max_objects || next > limits.max_bytes {
+                self.install_commit_chunk(std::mem::take(&mut chunk), owner.clone())
+                    .await?;
+                chunk_bytes = 0;
+            }
+            chunk_bytes += expected.size_bytes;
+            chunk.push(m::EncodedObject {
+                descriptor: *expected,
+                bytes: bytes.to_vec(),
+            });
+        }
+        if !chunk.is_empty() {
+            self.install_commit_chunk(chunk, owner.clone()).await?;
         }
         let ledger = self.inner.ledger.clone();
         let authority = scope.authority.clone();
@@ -864,6 +932,25 @@ impl RemoteQueryIo {
             ledger.admit_captured_page(&authority, &nodes, digest, epoch)
         })
         .await
+    }
+    async fn install_commit_chunk(
+        &self,
+        chunk: Vec<m::EncodedObject>,
+        owner: QueryOwner,
+    ) -> Result<()> {
+        io::check_deadline()?;
+        let expected: Vec<_> = chunk.iter().map(|object| object.descriptor).collect();
+        let actual = self
+            .inner
+            .local
+            .write_commit_batch_with_owner(chunk, owner)
+            .await
+            .map_err(backend)?;
+        ensure!(
+            actual == expected,
+            "native fetched metadata batch changed identity or order"
+        );
+        Ok(())
     }
 }
 fn scope_fingerprint(roots: &[m::CommitId], overlay: &[Vec<u8>]) -> [u8; 32] {
@@ -946,6 +1033,15 @@ impl RemoteQueryIo {
                         pending.push((c, depth + 1));
                     }
                 }
+                E::ChangedPath(v) => {
+                    ensure!(
+                        v.policy_version == 1 && !v.path.is_empty() && v.path.len() <= 4096,
+                        "unsupported exact path filter"
+                    );
+                    if let Some(c) = v.candidates.as_deref() {
+                        pending.push((c, depth + 1));
+                    }
+                }
                 E::Heads(v) | E::Roots(v) | E::HasConflict(v) => {
                     if let Some(c) = v.input.as_deref() {
                         pending.push((c, depth + 1));
@@ -1020,6 +1116,16 @@ impl RemoteQueryIo {
 }
 #[async_trait]
 impl NativeQueryIo for RemoteQueryIo {
+    async fn blame_capabilities(&self, owner: QueryOwner) -> std::result::Result<QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            let client = operation.client(&this.inner.connector.get_bare().await?);
+            let capability = client.resolved_blame_capability().await?;
+            Ok(QueryReply { value: match capability {
+                None => native_broker::BlameCapabilities::LegacyUnnegotiated,
+                Some(value) => native_broker::BlameCapabilities::Explicit { supported: value.supported, authorized: value.authorized },
+            }, owner: operation })
+        }).await
+    }
     async fn preflight_creation(
         &self,
         root: m::CommitId,
@@ -1095,6 +1201,42 @@ impl NativeQueryIo for RemoteQueryIo {
                 .saturating_add(self.inner.config.remote.limits.max_buffered_bytes as u64),
         }
     }
+    async fn prepare_cloud_authorization(
+        &self,
+        source: native_broker::CloudAuthorizationSource,
+        owner: QueryOwner,
+    ) -> std::result::Result<Option<QueryReply<Arc<dyn NativeQueryIo>>>, tonic::Status> {
+        self.run(owner, move |mut this, operation| async move {
+            ensure!(
+                source.provider_identity != [0; 32]
+                    && source.generation > 0
+                    && source.manifest_size_bytes > 0
+                    && source.manifest_size_bytes
+                        <= this.inner.config.remote.cloud.max_manifest_bytes as u64,
+                tonic::Status::invalid_argument("invalid cloud authorization selection")
+            );
+            let memory = this.charge(4096)?;
+            let client = this.inner.connector.get_bare().await?;
+            let rpc = operation.client(&client);
+            let proof = Arc::new(rpc.cloud_retained_version_selected(
+                tinytree_client::RetainedVersionSelector {
+                    workspace_id: source.workspace_id,
+                    generation: source.generation,
+                    manifest_id: tinytree_client::CloudManifestId(source.manifest_id),
+                },
+                tinytree_client::CloudRawDigest {
+                    blake3: source.manifest_blake3,
+                    size_bytes: source.manifest_size_bytes,
+                },
+            ).await?);
+            let pass = Arc::new(CloudAuthorization { source, _client: client, proof, _memory: memory });
+            this.cloud_authorization = Some(pass.clone());
+            Ok(Some(QueryReply {
+                value: Arc::new(this) as Arc<dyn NativeQueryIo>,
+                owner: pass as QueryOwner,
+            }))
+        }).await
+    }
     async fn open_cloud_scope(
         &self,
         input: OpenCloudQueryScope,
@@ -1123,6 +1265,12 @@ impl NativeQueryIo for RemoteQueryIo {
                         <= this.inner.config.remote.cloud.max_manifest_bytes as u64,
                 tonic::Status::invalid_argument("invalid selected snapshot query source")
             );
+            if let Some(pass) = &this.cloud_authorization {
+                ensure!(
+                    pass.source == input.source.authorization_source(),
+                    tonic::Status::failed_precondition("cloud authorization selection changed")
+                );
+            }
             let source_digest = input.source.digest();
             let overlay_digest = scope_fingerprint(&[], &input.overlay);
             let fingerprint = hash(&[
@@ -1180,22 +1328,28 @@ impl NativeQueryIo for RemoteQueryIo {
                                 .saturating_mul(1024),
                         ),
                 )?;
+                // Recheck configured online/credential provenance for every
+                // new scope, even when this pass already owns a retained proof.
+                // The SDK still checks that proof against this exact client.
                 let client = this.inner.connector.get_bare().await?;
                 let rpc = operation.client(&client);
-                let proof = Arc::new(
-                    rpc.cloud_retained_version_selected(
-                        tinytree_client::RetainedVersionSelector {
-                            workspace_id: input.source.workspace_id,
-                            generation: input.source.generation,
-                            manifest_id: tinytree_client::CloudManifestId(input.source.manifest_id),
-                        },
-                        tinytree_client::CloudRawDigest {
-                            blake3: input.source.manifest_blake3,
-                            size_bytes: input.source.manifest_size_bytes,
-                        },
-                    )
-                    .await?,
-                );
+                let proof = match &this.cloud_authorization {
+                    Some(pass) => pass.proof.clone(),
+                    None => Arc::new(
+                        rpc.cloud_retained_version_selected(
+                            tinytree_client::RetainedVersionSelector {
+                                workspace_id: input.source.workspace_id,
+                                generation: input.source.generation,
+                                manifest_id: tinytree_client::CloudManifestId(input.source.manifest_id),
+                            },
+                            tinytree_client::CloudRawDigest {
+                                blake3: input.source.manifest_blake3,
+                                size_bytes: input.source.manifest_size_bytes,
+                            },
+                        )
+                        .await?,
+                    ),
+                };
                 let (overlay, overlays) = this.overlay(&rpc, input.overlay).await?;
                 let checked = rpc
                     .open_cloud_query_scope(
@@ -1216,6 +1370,7 @@ impl NativeQueryIo for RemoteQueryIo {
                 })
                 .await?;
                 Ok(Arc::new(CapturedScope {
+                    annotation: Mutex::new(AnnotationRecord::default()),
                     client,
                     checked,
                     authority: Authority::CloudQuery(authority),
@@ -1341,6 +1496,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     tonic::Status::unimplemented("native query identity negotiation failed")
                 );
                 Ok(Arc::new(CapturedScope {
+                    annotation: Mutex::new(AnnotationRecord::default()),
                     client,
                     checked,
                     authority: Authority::Query(authority),
@@ -1479,6 +1635,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     "native private query overlay object limit exceeded"
                 );
                 Ok(Arc::new(CapturedScope {
+                    annotation: Mutex::new(AnnotationRecord::default()),
                     client: parent.client.clone(),
                     checked,
                     authority: parent.authority.clone(),
@@ -2249,6 +2406,179 @@ impl NativeQueryIo for RemoteQueryIo {
         })
         .await
     }
+    async fn annotation_capabilities(
+        &self,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            let client = operation.client(&this.inner.connector.get_bare().await?);
+            let capability = client.annotation_frontier_capability().await?;
+            Ok(QueryReply {
+                value: match capability {
+                    None => native_broker::BlameCapabilities::LegacyUnnegotiated,
+                    Some(value) => native_broker::BlameCapabilities::Explicit {
+                        supported: value.supported,
+                        authorized: value.authorized,
+                    },
+                },
+                owner: operation,
+            })
+        })
+        .await
+    }
+    async fn open_limited_annotation_frontier(&self,input:OpenAnnotationFrontier,owner:QueryOwner)->std::result::Result<QueryReply<q::AnnotationFrontier>,tonic::Status>{
+        if input.limits.is_none(){return Err(tonic::Status::invalid_argument("limited frontier requires caps"));}
+        self.open_annotation_frontier(input,owner).await
+    }
+    async fn open_annotation_frontier(
+        &self,
+        input: OpenAnnotationFrontier,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::AnnotationFrontier>, tonic::Status> {
+        if input
+            .path
+            .len()
+            .saturating_add(input.anchors.len().saturating_mul(40))
+            .saturating_add(128)
+            > self.inner.config.remote.limits.max_request_bytes
+        {
+            return Err(tonic::Status::resource_exhausted(
+                "native annotation request limit exceeded",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            ensure!(
+                !input
+                    .anchors
+                    .iter()
+                    .any(|id| scope.overlays.contains_key(id)),
+                tonic::Status::invalid_argument(
+                    "annotation anchors must not be private overlay commits"
+                )
+            );
+            let mut slot = scope.annotation.try_lock().map_err(|_| {
+                tonic::Status::resource_exhausted("native annotation context is busy")
+            })?;
+            ensure!(
+                !slot.closed,
+                tonic::Status::failed_precondition("native annotation context is closed")
+            );
+            let checked = operation
+                .client(&scope.client)
+                .open_annotation_frontier_with_limits(
+                    &scope.checked,
+                    &input.anchors,
+                    &input.path,
+                    input.max_commits,
+                    input.limits.clone(),
+                )
+                .await?;
+            if let Some(previous) = &slot.checked {
+                ensure!(
+                    previous.result() == checked.result(),
+                    tonic::Status::data_loss("annotation replay changed captured frontier")
+                );
+            } else {
+                slot.checked = Some(checked);
+            }
+            let checked = slot.checked.as_ref().unwrap().clone();
+            let bytes = checked
+                .result()
+                .encoded_len()
+                .checked_mul(128)
+                .and_then(|n| n.checked_add(4096))
+                .context("native annotation reply allocation overflow")?;
+            let retained = this.charge(bytes)?;
+            let mut value = checked.result().clone();
+            value.context = input.scope.to_vec();
+            drop(slot);
+            Ok(QueryReply {
+                value,
+                owner: Arc::new((scope, checked, retained)),
+            })
+        })
+        .await
+    }
+    async fn read_annotation_input(
+        &self,
+        input: ReadAnnotationInput,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::AnnotationInput>, tonic::Status> {
+        if input.context != input.scope {
+            return Err(tonic::Status::invalid_argument(
+                "native annotation context belongs to another scope",
+            ));
+        }
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(input.scope).await?;
+            this.online(&scope).await?;
+            let slot = scope.annotation.try_lock().map_err(|_| {
+                tonic::Status::resource_exhausted("native annotation context is busy")
+            })?;
+            ensure!(
+                !slot.closed,
+                tonic::Status::failed_precondition("native annotation context is closed")
+            );
+            let frontier = slot
+                .checked
+                .clone()
+                .context("native annotation context is unavailable")?;
+            drop(slot);
+            let checked = operation
+                .client(&scope.client)
+                .read_annotation_input(&frontier, input.revision, &input.expected)
+                .await?;
+            // The checked input has one flat FILE buffer and fixed-width
+            // metadata. Reserve that copy, not a graph-shaped multiplier.
+            let bytes = checked
+                .result()
+                .data
+                .capacity()
+                .checked_add(4096)
+                .context("native annotation input allocation overflow")?;
+            let retained = this.charge(bytes)?;
+            let mut value = checked.result().clone();
+            value.context = input.context.to_vec();
+            Ok(QueryReply {
+                value,
+                owner: Arc::new((scope, checked, retained)),
+            })
+        })
+        .await
+    }
+    async fn close_annotation_frontier(
+        &self,
+        handle: [u8; 32],
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<()>, tonic::Status> {
+        self.run(owner, move |this, operation| async move {
+            let scope = this.captured(handle).await?;
+            this.online(&scope).await?;
+            let mut slot = scope.annotation.try_lock().map_err(|_| {
+                tonic::Status::resource_exhausted("native annotation context is busy")
+            })?;
+            if !slot.closed {
+                let frontier = slot
+                    .checked
+                    .as_ref()
+                    .context("native annotation context is unavailable")?;
+                operation
+                    .client(&scope.client)
+                    .close_annotation_frontier(frontier)
+                    .await?;
+                slot.closed = true;
+                slot.checked = None;
+            }
+            drop(slot);
+            Ok(QueryReply {
+                value: (),
+                owner: scope,
+            })
+        })
+        .await
+    }
     async fn path_history(
         &self,
         input: ScopedPathQuery,
@@ -2264,15 +2594,45 @@ impl NativeQueryIo for RemoteQueryIo {
             let scope = this.captured(input.scope).await?;
             this.online(&scope).await?;
             let client = operation.client(&scope.client);
-            let checked = client
-                .path_history(
-                    &scope.checked,
-                    input.revision,
-                    &input.path,
-                    input.policy,
-                    input.max_commits,
+            // The ordinary default remains one RPC, even if this host has a
+            // lower scan cap. Only an explicit larger total opts into collection.
+            enum HistoryReply {
+                One(tinytree_client::CheckedPathHistory),
+                Collected(tinytree_client::CheckedPathHistoryCollection),
+            }
+            impl HistoryReply {
+                fn result(&self) -> &q::PathHistoryResult {
+                    match self {
+                        Self::One(reply) => reply.result(),
+                        Self::Collected(reply) => reply.result(),
+                    }
+                }
+            }
+            let checked = if input.max_commits > 256 {
+                HistoryReply::Collected(
+                    client
+                        .collect_path_history(
+                            &scope.checked,
+                            input.revision,
+                            &input.path,
+                            input.policy,
+                            input.max_commits,
+                        )
+                        .await?,
                 )
-                .await?;
+            } else {
+                HistoryReply::One(
+                    client
+                        .path_history(
+                            &scope.checked,
+                            input.revision,
+                            &input.path,
+                            input.policy,
+                            input.max_commits,
+                        )
+                        .await?,
+                )
+            };
             // The SDK's checked result retains its independent output budget.
             // Reserve the broker wire copy before cloning, and retain both
             // owners without keeping the physical RPC/inflight permit alive.

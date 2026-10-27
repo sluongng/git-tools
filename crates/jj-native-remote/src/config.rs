@@ -40,7 +40,8 @@ impl Default for QueryLimits {
         Self {
             max_scopes: 32,
             max_queries: 64,
-            max_replays: 256,
+            // Completed command scopes remain replayable until their expiry.
+            max_replays: 4096,
             max_registry_bytes: 64 * 1024 * 1024,
             max_authorities: 256,
             max_grants: 50_000,

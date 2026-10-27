@@ -25,6 +25,9 @@ service RepositoryQuery {
   rpc PathHistory(PathHistoryRequest) returns (PathHistoryResult);
   rpc Blame(BlameRequest) returns (BlameResult);
   rpc Search(SearchRequest) returns (SearchResult);
+  rpc OpenAnnotationFrontier(OpenAnnotationFrontierRequest) returns (AnnotationFrontier);
+  rpc ReadAnnotationInput(ReadAnnotationInputRequest) returns (AnnotationInput);
+  rpc CloseAnnotationFrontier(CloseAnnotationFrontierRequest) returns (CloseAnnotationFrontierResponse);
 }
 
 message CommitId { bytes value = 1; } // Exactly 32 bytes; zero is intrinsic root.
@@ -247,6 +250,7 @@ message GraphExpr {
     // Canonical root-tree merge has multiple terms. This is metadata-only,
     // not a file-content conflict scan and not the commit parent count.
     UnaryExpr has_conflict = 12;
+    ChangedPathExpr changed_path = 13;
   }
 }
 // Half-open intervals. Absent end_exclusive means unbounded; present zero is
@@ -270,6 +274,18 @@ message DagRangeExpr {
   GenerationRange generations_from_roots = 3;
 }
 message UnaryExpr { GraphExpr input = 1; }
+// Versioned fixed-path entry comparison against the single canonical parent.
+// No FILE body reads or rename following. Tree entries compare subtree IDs;
+// exact_file rejects a directory at this path rather than treating it as a file.
+// Merge/conflict/private-overlay boundaries are errors, never empty selections.
+// Clients may compose explicit selected local-draft IDs before graph projection.
+message ChangedPathExpr {
+  uint32 policy_version = 1; // Exactly 1; requires EXACT_PATH_GRAPH_V1 capability.
+  GraphExpr candidates = 2;
+  string path = 3; // Nonempty normalized repository-relative path.
+  bool exact_file = 4;
+}
+
 // Empty union is empty. Empty intersection is invalid, not an implicit request
 // to enumerate the entire scoped graph.
 message SetExpr { repeated GraphExpr inputs = 1; }
@@ -364,6 +380,11 @@ message CloudSnapshotSource {
 enum HistoryPolicy {
   HISTORY_POLICY_UNSPECIFIED = 0;
   LINEAR_FIXED_PATH_V1 = 1;
+  // Stock jj's fixed-path filtered DAG attribution with line/accept parent
+  // merges. Canonical resolved trees only; conflicts/private sources remain
+  // explicit incomplete boundaries. max_commits bounds the ancestor graph,
+  // including commits omitted by the path filter. Blame only, not PathHistory.
+  JJ_RESOLVED_FIXED_PATH_V1 = 2;
 }
 enum HistoryCoverage {
   HISTORY_COVERAGE_UNSPECIFIED = 0;
@@ -508,3 +529,71 @@ message SearchResult {
   uint64 file_bytes_read = 13; // Cumulative actual candidate payloads opened.
   uint32 page_size = 14; // Effective fixed result cap, echoed for validation.
 }
+
+// One immutable annotation context per captured scope. Opening another path or
+// anchor union on that scope is refused. Close leaves a tombstone until scope
+// expiry; reopen never resets cumulative work/read limits or the original data
+// deadline. A new logical command creates its own scope. No private graph or
+// private body is sent by this protocol. Opaque context bytes are not credentials.
+// Optional command-owned reservation. Every value is positive and only lowers
+// operator limits; accepted values are echoed and never reset by context replay.
+message AnnotationLimits {
+  uint64 work_nodes = 1;
+  uint64 work_edges = 2;
+  uint64 work_bytes = 3;
+  uint64 frontier = 4;
+  uint64 read_bytes = 5;
+  uint64 diff_input_bytes = 6;
+  uint64 diff_lines = 7;
+  uint64 diff_work = 8;
+  uint64 diff_allocation_bytes = 9;
+  uint64 diff_depth = 10;
+}
+message OpenAnnotationFrontierRequest {
+  ScopeKey scope = 1;
+  uint32 version = 2; // 1 legacy caps; 2 requires explicit lowering limits. Line/Accept semantics.
+  repeated CommitId anchors = 3; // Nonempty sorted unique authorized canonical heads.
+  string path = 4;
+  uint32 max_commits = 5; // May lower, never increase server limits.
+  AnnotationLimits limits = 6;
+}
+message AnnotationPathValue {
+  HistoryPathState state = 1;
+  bytes copy_id = 2; // Empty/32; FILE only. Exact metadata, not read authority.
+}
+message AnnotationNode {
+  CommitId revision = 1;
+  repeated CommitId parents = 2; // Raw ordered parents, including intrinsic root.
+  uint32 source_layer = 3; // 0 public index, 1 exact retained-frozen layer.
+  uint64 topological_key = 4; // (source_layer,key) strictly increases parent-before-child.
+  AnnotationPathValue value = 5;
+  optional bool affects_path = 6; // Mandatory, NONFORCED intrinsic files(path).
+}
+message AnnotationFrontier {
+  bytes context = 1; // Opaque32, valid only with this captured scope/principal.
+  bytes scope_digest = 2;
+  bytes index_epoch = 3;
+  uint32 version = 4;
+  repeated CommitId anchors = 5;
+  string path = 6;
+  int64 expires_at_unix_seconds = 7; // Absolute original open deadline/scope cap.
+  HistoryCoverage coverage = 8;
+  uint32 scanned_commits = 9;
+  repeated AnnotationNode nodes = 10; // Complete parent-first union or EMPTY when incomplete.
+  AnnotationLimits limits = 11; // Effective cumulative caps, when requested.
+}
+message ReadAnnotationInputRequest {
+  ScopeKey scope = 1;
+  bytes context = 2;
+  CommitId revision = 3;
+  AnnotationPathValue expected = 4; // Exact snapshot value, never an arbitrary FILE grant.
+}
+message AnnotationInput {
+  bytes context = 1;
+  CommitId revision = 2;
+  AnnotationPathValue value = 3;
+  tinytree.v1.ObjectDescriptor descriptor = 4;
+  bytes data = 5; // One demanded, verified FILE only; no eager history hydration.
+}
+message CloseAnnotationFrontierRequest { ScopeKey scope = 1; bytes context = 2; }
+message CloseAnnotationFrontierResponse {}

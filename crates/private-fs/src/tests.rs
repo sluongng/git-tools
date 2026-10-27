@@ -34,6 +34,40 @@ fn creation_publication_and_bounded_reads() {
         b"second"
     );
 }
+#[cfg(unix)]
+#[test]
+fn durable_nested_creation_uses_trusted_existing_anchor_without_repair() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = root();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.path().join("actor/daemon/native");
+    let private = PrivateDir::create_all_durable(&path).unwrap();
+    for name in ["actor", "actor/daemon", "actor/daemon/native"] {
+        assert_eq!(
+            std::fs::metadata(root.path().join(name)).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().mode() & 0o777,
+        0o755
+    );
+    private.replace("identity", b"durable").unwrap();
+    drop(private);
+    let reopened = PrivateDir::create_all_durable(&path).unwrap();
+    assert_eq!(reopened.read("identity", 7).unwrap(), b"durable");
+    assert!(PrivateDir::create_all_durable(path.join("identity/child")).is_err());
+    assert!(PrivateDir::create_all_durable(root.path()).is_err());
+    assert!(PrivateDir::create_all_durable("relative/state").is_err());
+    assert!(PrivateDir::create_all_durable(root.path().join("../escape")).is_err());
+    assert!(
+        PrivateDir::create_all_durable(format!("{}/actor//alias", root.path().display())).is_err()
+    );
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(PrivateDir::create_all_durable(root.path().join("must-not-exist/child")).is_err());
+    assert!(!root.path().join("must-not-exist").exists());
+}
+
 #[test]
 fn nonabsolute_and_non_normalized_paths_are_rejected() {
     assert!(PrivateDir::create("relative/state").is_err());
@@ -54,6 +88,7 @@ fn permissive_existing_directories_are_not_repaired() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(PrivateDir::open_existing(&path).is_err());
     assert!(PrivateDir::create(&path).is_err());
+    assert!(PrivateDir::create_all_durable(&path).is_err());
     assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o755);
     let private = PrivateDir::create(root.path().join("private")).unwrap();
     let child = private.path().join("jj-store");
@@ -131,11 +166,165 @@ fn symlink_ancestors_and_files_are_rejected() {
     symlink(real.path(), &alias).unwrap();
     assert!(PrivateDir::open_existing(&alias).is_err());
     assert!(PrivateDir::create(alias.join("child")).is_err());
+    assert!(PrivateDir::create_all_durable(alias.join("nested/child")).is_err());
     assert!(!real.path().join("child").exists());
     let outside = root.path().join("outside");
     std::fs::write(&outside, b"do not read").unwrap();
     symlink(&outside, real.path().join("link")).unwrap();
     assert!(real.read("link", 100).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires native Linux Landlock"]
+fn private_directory_operations_under_landlock() {
+    const CHILD_ROOT: &str = "PRIVATE_FS_LANDLOCK_CHILD_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        confined_private_directory_operations(Path::new(&root));
+        return;
+    }
+
+    let parent = root();
+    let allowed = PrivateDir::create(parent.path().join("allowed")).unwrap();
+    let real = PrivateDir::create(allowed.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(real.path(), allowed.path().join("alias")).unwrap();
+    std::fs::write(parent.path().join("outside"), b"preserve").unwrap();
+    // Restriction is irreversible: isolate it from the parent test harness and
+    // leave fixture cleanup to that unrestricted parent after the child waits.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::private_directory_operations_under_landlock",
+        ])
+        .env_clear()
+        .env(CHILD_ROOT, parent.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "confined private-directory workflow failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(parent.path().join("outside")).unwrap(),
+        b"preserve"
+    );
+    assert!(!real.path().join("child").exists());
+}
+
+#[cfg(target_os = "linux")]
+fn confined_private_directory_operations(root: &Path) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+    }
+    #[repr(C, packed)]
+    struct PathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+    // Stable Linux Landlock ABI v1 filesystem rights. No host-policy or resource
+    // limit is changed; unsupported kernels fail this native acceptance test.
+    let access = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8);
+    let attr = RulesetAttr {
+        handled_access_fs: access,
+    };
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr as *const RulesetAttr,
+            std::mem::size_of_val(&attr),
+            0,
+        )
+    };
+    assert!(raw >= 0, "Landlock ruleset: {}", io::Error::last_os_error());
+    let ruleset = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let allowed = root.join("allowed");
+    let directory = File::open(&allowed).unwrap();
+    let beneath = PathBeneathAttr {
+        allowed_access: access,
+        parent_fd: directory.as_raw_fd(),
+    };
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset.as_raw_fd(),
+                1,
+                &beneath as *const PathBeneathAttr,
+                0,
+            )
+        },
+        0,
+        "Landlock path rule: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) },
+        0,
+        "Landlock restriction: {}",
+        io::Error::last_os_error()
+    );
+    drop(directory);
+    drop(ruleset);
+
+    assert_eq!(
+        std::fs::read_dir("/").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        std::fs::read_dir(root).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        std::fs::read(root.join("outside")).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let private = PrivateDir::create(allowed.join("state")).unwrap();
+    private.open_lock("owner.lock").unwrap();
+    private.replace("record", b"first").unwrap();
+    assert_eq!(private.read("record", 5).unwrap(), b"first");
+    let child = PrivateDir::create(private.path().join("child")).unwrap();
+    child.replace("data", b"bounded").unwrap();
+    drop(child);
+    private.check_child_tree("child", 4, 2).unwrap();
+    private.remove_child_tree("child", 4, 2).unwrap();
+    drop(private);
+    let reopened = PrivateDir::open_existing(allowed.join("state")).unwrap();
+    assert_eq!(reopened.read("record", 5).unwrap(), b"first");
+    let nested = allowed.join("actor/daemon/native");
+    let durable = PrivateDir::create_all_durable(&nested).unwrap();
+    durable
+        .replace("sourceidentity.json", b"public-registry-identity")
+        .unwrap();
+    drop(durable);
+    let reopened = PrivateDir::create_all_durable(&nested).unwrap();
+    assert_eq!(
+        reopened.read("sourceidentity.json", 24).unwrap(),
+        b"public-registry-identity"
+    );
+    assert!(PrivateDir::create_all_durable(allowed.join("alias/nested/child")).is_err());
+    assert_eq!(
+        std::fs::read_dir("/").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        std::fs::read_dir(root).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        std::fs::read(root.join("outside")).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(PrivateDir::create(allowed.join("alias/child")).is_err());
+    assert!(!allowed.join("real/child").exists());
 }
 #[cfg(windows)]
 #[test]

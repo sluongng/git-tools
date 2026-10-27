@@ -17,7 +17,7 @@
 //! The selected stream is consumed once. External summaries, canonical parent
 //! order, selective dedup and conditional transitive reduction follow that port;
 //! no second revset/membership evaluation or complete selected-set index is used.
-use crate::query_eval::{EvalError, EvalStep, Evaluator};
+use crate::query_eval::{EvalError, EvalStep, Evaluator, NoPathPredicate, PathPredicate};
 use crate::query_overlay::{GraphKey, GraphNode, OverlayGraph};
 use std::{
     collections::BTreeMap,
@@ -444,6 +444,13 @@ impl GraphEvaluator {
         })
     }
     pub fn step(&mut self, budget: &mut WorkBudget) -> Result<GraphStep> {
+        self.step_with_path(budget, &mut NoPathPredicate)
+    }
+    pub fn step_with_path(
+        &mut self,
+        budget: &mut WorkBudget,
+        path: &mut dyn PathPredicate,
+    ) -> Result<GraphStep> {
         if self.failed {
             return Err(Error::Unavailable.into());
         }
@@ -455,20 +462,24 @@ impl GraphEvaluator {
         let result = budget
             .frontier(retained)
             .map_err(EvalError::from)
-            .and_then(|()| self.quantum(budget));
+            .and_then(|()| self.quantum(budget, path));
         if result.is_err() {
             self.failed = true;
         }
         result
     }
-    fn quantum(&mut self, budget: &mut WorkBudget) -> Result<GraphStep> {
+    fn quantum(
+        &mut self,
+        budget: &mut WorkBudget,
+        path: &mut dyn PathPredicate,
+    ) -> Result<GraphStep> {
         for _ in 0..self.limits.max_step_work {
             self.steps = self.steps.checked_add(1).ok_or_else(limit)?;
             if self.steps > self.limits.max_steps {
                 return Err(limit());
             }
             if let Some(task) = self.tasks.pop() {
-                if let Some(row) = self.advance(task, budget)? {
+                if let Some(row) = self.advance(task, budget, path)? {
                     return Ok(GraphStep::Row(row));
                 }
                 if self.input_progress {
@@ -481,7 +492,7 @@ impl GraphEvaluator {
                 self.tasks.push(Task::Start(owner))?;
             } else if self.input_done {
                 return Ok(GraphStep::Done);
-            } else if !self.pump(budget)? {
+            } else if !self.pump(budget, path)? {
                 return Ok(GraphStep::Progress);
             }
         }
@@ -489,7 +500,7 @@ impl GraphEvaluator {
     }
     // One inner quantum at a time; max_step_work=1 still makes progress because
     // every input row and every graph continuation is persisted before yielding.
-    fn pump(&mut self, budget: &mut WorkBudget) -> Result<bool> {
+    fn pump(&mut self, budget: &mut WorkBudget, path: &mut dyn PathPredicate) -> Result<bool> {
         if self.input_done {
             return Ok(true);
         }
@@ -501,7 +512,7 @@ impl GraphEvaluator {
                 ..Default::default()
             },
         )?;
-        match self.evaluator.step(budget)? {
+        match self.evaluator.step_with_path(budget, path)? {
             EvalStep::Progress => Ok(false),
             EvalStep::Done => {
                 self.input_done = true;
@@ -621,7 +632,12 @@ impl GraphEvaluator {
         }
         Ok(())
     }
-    fn advance(&mut self, task: Task, budget: &mut WorkBudget) -> Result<Option<SelectedRow>> {
+    fn advance(
+        &mut self,
+        task: Task,
+        budget: &mut WorkBudget,
+        path: &mut dyn PathPredicate,
+    ) -> Result<Option<SelectedRow>> {
         match task {
             Task::Start(owner) => {
                 if let Some((&key, _)) = self.cache.last_key_value() {
@@ -660,7 +676,7 @@ impl GraphEvaluator {
                     }
                     Phase::Consume => {
                         let key = frame.parents.as_ref().unwrap().values[frame.parent].key();
-                        if !self.consumed(key) && !self.pump(budget)? {
+                        if !self.consumed(key) && !self.pump(budget, path)? {
                             self.input_progress = true;
                         }
                         if self.consumed(key) {

@@ -160,6 +160,15 @@ impl NativeObjectIo for GuardedIo {
         })
         .await
     }
+    async fn read_local_file_bounded(&self,expected:m::Descriptor,max_bytes:u64,owner:Owner)->BackendResult<FileRead>{
+        if expected.size_bytes>max_bytes || max_bytes>self.config.max_file_bytes {return Err(wire::other(tonic::Status::invalid_argument("bounded local FILE limit invalid")));}
+        self.read("/ReadLocalFile",owner,move|provider,owner|async move{
+            let read=provider.read_local_file_bounded(expected,max_bytes,owner.clone()).await?;
+            let (actual,reader)=read.into_parts();
+            if actual!=expected {return Err(wire::other(tonic::Status::data_loss("bounded local FILE descriptor changed")));}
+            FileRead::from_preverified_pinned_source(actual,Box::pin(OwnedReader{reader,_owner:owner}))
+        }).await
+    }
     async fn read_file(&self, id: m::FileId) -> BackendResult<FileRead> {
         self.read_file_for_cache(id, Arc::new(())).await
     }

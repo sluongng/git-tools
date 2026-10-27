@@ -29,6 +29,8 @@ tower = { version = "0.5", features = ["util"] }
 libc = "0.2"
 
 [dev-dependencies]
+jj-lib = { version = "=0.46.0", default-features = false }
+tinytree-cloud = { path = "../tinytree-cloud" }
 tinytree-index = { path = "../tinytree-index" }
 futures-util = "0.3"
 tinytree-server = { path = "../tinytree-server" }

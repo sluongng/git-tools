@@ -252,10 +252,7 @@ pub(crate) fn drain_cleanup(deadline: Instant) {
                     handle.wait(left)
                 };
                 if let Err(error) = result {
-                    let code = match error {
-                        jj_native_index::Error::Query(code) => code,
-                        _ => tonic::Code::Internal,
-                    };
+                    let code = error.query_code().unwrap_or(tonic::Code::Internal);
                     first.get_or_insert(handle.first_failure().unwrap_or(("driver", "wait", code)));
                 }
             }

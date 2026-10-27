@@ -33,3 +33,6 @@ mod native_cloud;
 mod native_restore_policy;
 #[cfg(unix)]
 mod native_restore_source;
+
+#[cfg(unix)]
+mod provider_identity;

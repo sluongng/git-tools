@@ -65,6 +65,12 @@ enum Action {
         destination_git: PathBuf,
         #[arg(long)]
         remote: String,
+        /// Explicit pinned helper policy JSON; arguments are public, never tokens.
+        #[arg(long)]
+        credential_helper_config: Option<PathBuf>,
+        /// Initial exact remote SHA-1 head; must be an exported public ancestor.
+        #[arg(long)]
+        bootstrap_remote_head: Option<String>,
         #[arg(long, default_value = "main")]
         source_reference: String,
         #[arg(long, default_value = "refs/heads/main")]
@@ -155,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
             push_state,
             destination_git,
             remote,
+            credential_helper_config,
+            bootstrap_remote_head,
             source_reference,
             destination_reference,
             remote_reference,
@@ -172,6 +180,11 @@ async fn main() -> anyhow::Result<()> {
                 export.destination_reference = destination_reference;
                 let mut options = PushOptions::new(export, push_state, remote);
                 options.remote_reference = remote_reference;
+                options.bootstrap_remote_head = bootstrap_remote_head;
+                options.credential_helper = credential_helper_config
+                    .as_deref()
+                    .map(tinytree_git::push::CredentialHelper::load)
+                    .transpose()?;
                 options.poll_interval = Duration::from_millis(poll_interval_ms);
                 options.operation_timeout = Duration::from_millis(operation_timeout_ms);
                 options.max_backoff = Duration::from_millis(max_backoff_ms);

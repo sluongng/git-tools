@@ -114,6 +114,34 @@ struct Initialization {
     restore_origin: Option<[u8; 32]>,
 }
 
+/// Read-only private enrollment observations. Locks live through the caller's
+/// census only; release before ordinary initialization/retirement operations.
+pub struct EnrollmentCensus {
+    pub bindings: Vec<Binding>,
+    pub read_bytes: usize,
+    pub entries: usize,
+    _locks: Vec<File>,
+}
+impl EnrollmentCensus {
+    pub fn lock_count(&self) -> usize { self._locks.len() }
+}
+fn census_temporary(name: &str) -> bool {
+    let Some(body) = name.strip_prefix(".private-").and_then(|s|s.strip_suffix(".tmp")) else { return false; };
+    let Some((pid,sequence)) = body.split_once('-') else { return false; };
+    !pid.is_empty() && !sequence.is_empty() && pid.bytes().all(|b|b.is_ascii_digit())
+        && sequence.bytes().all(|b|b.is_ascii_digit()) && pid.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
+}
+fn decode_id(value: &str) -> Result<[u8; 32]> {
+    ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid enrollment census identity");
+    let mut result = [0; 32];
+    for (i, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[i*2..i*2+2], 16)
+            .map_err(|_| anyhow::anyhow!("invalid enrollment census identity"))?;
+    }
+    ensure!(result != [0; 32], "invalid enrollment census identity");
+    Ok(result)
+}
 /// Exclusive registry and per-ID initialization fences for disposable check admin.
 pub struct CandidateAdminRetirement {
     binding: Binding,
@@ -211,6 +239,115 @@ impl Registry {
             records,
             admins,
         }))
+    }
+    /// Bounded, read-only enrollment metadata for a stopped host's admission
+    /// census. This does not attest a live mount or create initialization state.
+    pub fn inspect_enrollments(
+        &self,
+        endpoint: &Endpoint,
+        known_pending: &std::collections::BTreeSet<[u8; 32]>,
+        max_entries: usize,
+        max_bytes: usize,
+        max_locks: usize,
+    ) -> Result<EnrollmentCensus> {
+        ensure!(max_entries > 0 && max_entries <= 32768 && max_bytes > 0
+            && max_bytes <= 64 * 1024 * 1024 && max_locks > 0 && max_locks <= 257,
+            "invalid enrollment census bounds");
+        let global = self.root.open_existing_file("registry.lock", 4096)?;
+        global.try_lock_exclusive().context("native registry initialization is active")?;
+        let mut result = EnrollmentCensus {
+            bindings: Vec::new(), read_bytes: 0, entries: 0, _locks: vec![global],
+        };
+        let mut bindings = std::collections::BTreeMap::new();
+        let read = |directory: &PrivateDir, name: &std::ffi::OsStr,
+                        result: &mut EnrollmentCensus| -> Result<Vec<u8>> {
+            result.entries = result.entries.checked_add(1).context("enrollment census count overflow")?;
+            ensure!(result.entries <= max_entries, "enrollment census entry limit");
+            let cap = MAX_RECORD.min(max_bytes.saturating_sub(result.read_bytes));
+            ensure!(cap > 0, "enrollment census byte limit");
+            let bytes = directory.read(name, cap)?;
+            result.read_bytes = result.read_bytes.checked_add(bytes.len()).and_then(|n| n.checked_add(4096))
+                .context("enrollment census byte overflow")?;
+            ensure!(result.read_bytes <= max_bytes, "enrollment census byte limit");
+            Ok(bytes)
+        };
+        for item in fs::read_dir(self.records.path())? {
+            let item = item?;
+            let name = item.file_name();
+            let bytes = read(&self.records, &name, &mut result)?;
+            if name.to_str().is_some_and(census_temporary) { continue; }
+            let binding: Binding = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid enrollment census record"))?;
+            self.validate(&binding)?;
+            ensure!(name == std::ffi::OsStr::new(&record_name(&binding.workspace_id)),
+                "enrollment census filename differs");
+            ensure!(bindings.insert(binding.workspace_id, binding).is_none(),
+                "duplicate enrollment census identity");
+        }
+        for item in fs::read_dir(self.admins.path())? {
+            let item = item?;
+            result.entries = result.entries.checked_add(1).context("enrollment census count overflow")?;
+            ensure!(result.entries <= max_entries && item.file_type()?.is_dir(),
+                "unknown enrollment census administration");
+            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid enrollment census name"))?;
+            if name == "command-leases" {
+                let leases = PrivateDir::open_existing(item.path())?;
+                for lease in fs::read_dir(leases.path())? {
+                    result.entries += 1;
+                    ensure!(result.entries <= max_entries, "enrollment census entry limit");
+                    let name = lease?.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid enrollment lease name"))?;
+                    let mount = name.strip_suffix(".lock").context("unknown enrollment lease entry")?;
+                    ensure!(!mount.is_empty() && mount.len() <= 128
+                        && mount.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
+                        "invalid enrollment lease name");
+                    let _file = leases.open_existing_file(&name, 4096)?;
+                }
+                continue;
+            }
+            let id = decode_id(&name)?;
+            let admin = PrivateDir::open_existing(item.path())?;
+            let journal = match admin.read(JOURNAL, MAX_RECORD.min(max_bytes.saturating_sub(result.read_bytes))) {
+                Ok(bytes) => {
+                    result.read_bytes = result.read_bytes.checked_add(bytes.len()).and_then(|n| n.checked_add(4096))
+                        .context("enrollment census byte overflow")?;
+                    ensure!(result.read_bytes <= max_bytes, "enrollment census byte limit");
+                    let value: Initialization = serde_json::from_slice(&bytes)
+                        .map_err(|_| anyhow::anyhow!("invalid enrollment census initialization"))?;
+                    self.validate(&value.binding)?;
+                    ensure!(value.version == 1 && value.binding.workspace_id == id
+                        && value.initial_commit.len() == 32 && !value.workspace.is_empty(),
+                        "invalid enrollment census initialization");
+                    Some(value)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let Some(journal) = journal else {
+                ensure!(known_pending.contains(&id) && !admin.path().join("repo/index").try_exists()?,
+                    "unknown unbound native administration; preserve state");
+                ensure!(!bindings.contains_key(&id), "ready enrollment has no initialization journal");
+                ensure!(result._locks.len() < max_locks, "enrollment census lock limit");
+                let lock = self.root.open_existing_file(format!("initialize-{}.lock", hex(&id)),4096)?;
+                lock.try_lock_exclusive().context("native workspace initialization is active")?;
+                result._locks.push(lock);
+                continue;
+            };
+            if let Some(record) = bindings.get(&id) {
+                ensure!(record == &journal.binding, "enrollment census binding differs");
+            } else {
+                if &journal.binding.endpoint != endpoint { continue; }
+                ensure!(known_pending.contains(&id), "orphan native initialization; preserve state");
+                bindings.insert(id, journal.binding);
+            }
+        }
+        for binding in bindings.into_values().filter(|binding| &binding.endpoint == endpoint) {
+            ensure!(result._locks.len() < max_locks, "enrollment census lock limit");
+            let lock = self.root.open_existing_file(format!("initialize-{}.lock", binding.id()), 4096)?;
+            lock.try_lock_exclusive().context("native workspace initialization is active")?;
+            result._locks.push(lock);
+            result.bindings.push(binding);
+        }
+        Ok(result)
     }
     pub fn path(&self) -> &Path {
         self.root.path()

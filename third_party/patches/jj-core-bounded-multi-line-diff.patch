@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:40:00 +0000
+Subject: [PATCH] jj-core: Bound literal multi-input line comparisons
+
+Stock merge filtering and conflict resolution compare all remove and add
+terms simultaneously. Calling the unbounded multi-input diff inside a
+request timeout leaves its histogram, LCS and intersection work alive.
+
+Add a separate bounded multi-input API that retains the existing pairwise
+literal choices and intersects their matching base ranges. Charge every
+pair and intersection before allocation, poll cancellation during traversal,
+and retain conservative cumulative allocation accounting across scratch
+lifetimes. Keep the existing two-sided API and its quotas unchanged.
+
+This primitive does not materialize conflicts or confer object authority.
+Callers still own source admission and must bound merge terms/output.
+---
+diff --git a/src/diff/bounded.rs b/src/diff/bounded.rs
+--- a/src/diff/bounded.rs
++++ b/src/diff/bounded.rs
+@@ -14,6 +14,8 @@
+ 
+ use super::*;
+ 
++mod multi;
++
+ /// Limits shared by one or more exact two-sided line comparisons.
+ ///
+ /// Counts are cumulative, including failed calls. Depth is additionally capped at
+diff --git a/src/diff/bounded/multi.rs b/src/diff/bounded/multi.rs
+new file mode 100644
+--- /dev/null
++++ b/src/diff/bounded/multi.rs
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use super::*;
++
++fn append_compact(
++    output: &mut Vec<UnchangedRange>,
++    next: UnchangedRange,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<(), LineDiffError> {
++    budget.work(next.others.len().saturating_add(1), check)?;
++    if let Some(previous) = output.last_mut() {
++        if previous.base.end == next.base.start
++            && iter::zip(&previous.others, &next.others).all(|(a, b)| a.end == b.start)
++        {
++            previous.base.end = next.base.end;
++            for (a, b) in iter::zip(&mut previous.others, next.others) {
++                a.end = b.end;
++            }
++            return Ok(());
++        }
++    }
++    output.push(next);
++    Ok(())
++}
++
++impl<'input> ContentDiff<'input> {
++    /// Exact literal `by_line` choices for one or more inputs, with bounded work.
++    ///
++    /// Like the original multi-input algorithm, compare each other input to the
++    /// base and intersect the matching base positions. Pair comparisons retain
++    /// the existing repeated-line choices. Intersections of compacted literal
++    /// line ranges are equivalent to intersections of individual line positions.
++    ///
++    /// Input and line charges include the base once per pair. Allocation charges
++    /// conservatively accumulate scratch across pairs, including freed buffers.
++    /// The caller retains borrowed input/admission owners. Zero inputs refuse
++    /// rather than panic. Existing two-sided API behavior and quotas are unchanged.
++    pub fn by_line_bounded_many(
++        inputs: &[&'input [u8]],
++        budget: &mut LineDiffBudget,
++        mut check: impl FnMut() -> bool,
++    ) -> Result<Self, LineDiffError> {
++        budget.work(inputs.len().saturating_add(1), &mut check)?;
++        let Some(&base) = inputs.first() else {
++            return Err(LineDiffError::LimitExceeded);
++        };
++        if inputs.len() == 2 {
++            return Self::by_line_bounded([base, inputs[1]], budget, check);
++        }
++        budget.capacity(inputs.len(), 32)?;
++        if inputs.len() == 1 {
++            // Charge scanning and comparison through the same bounded primitive.
++            let _ = Self::by_line_bounded([base, base], budget, &mut check)?;
++            budget.capacity(1, 64)?;
++            return Ok(Self {
++                base_input: BStr::new(base),
++                other_inputs: smallvec![],
++                unchanged_regions: vec![UnchangedRange { base: 0..base.len(), others: smallvec![] }],
++            });
++        }
++
++        let mut current = Self::by_line_bounded([base, inputs[1]], budget, &mut check)?;
++        for &input in &inputs[2..] {
++            budget.work(1, &mut check)?;
++            let pair = Self::by_line_bounded([base, input], budget, &mut check)?;
++            let width = current.other_inputs.len().saturating_add(1);
++            let capacity = current.unchanged_regions.len()
++                .checked_add(pair.unchanged_regions.len())
++                .and_then(|count| count.checked_add(2))
++                .ok_or(LineDiffError::LimitExceeded)?;
++            budget.capacity(capacity, width.checked_mul(64).ok_or(LineDiffError::LimitExceeded)?)?;
++            let mut regions = Vec::with_capacity(capacity);
++            append_compact(&mut regions, UnchangedRange {
++                base: 0..0,
++                others: smallvec![0..0; width],
++            }, budget, &mut check)?;
++            let (mut left, mut right) = (0, 0);
++            while left < current.unchanged_regions.len() && right < pair.unchanged_regions.len() {
++                budget.work(1, &mut check)?;
++                let a = &current.unchanged_regions[left];
++                let b = &pair.unchanged_regions[right];
++                let start = a.base.start.max(b.base.start);
++                let end = a.base.end.min(b.base.end);
++                if start < end {
++                    budget.work(width, &mut check)?;
++                    let mut others = SmallVec::with_capacity(width);
++                    for range in &a.others {
++                        budget.work(1, &mut check)?;
++                        others.push(range.start + start - a.base.start..range.start + end - a.base.start);
++                    }
++                    let range = &b.others[0];
++                    others.push(range.start + start - b.base.start..range.start + end - b.base.start);
++                    append_compact(&mut regions, UnchangedRange { base: start..end, others }, budget, &mut check)?;
++                }
++                match a.base.end.cmp(&b.base.end) {
++                    std::cmp::Ordering::Less => left += 1,
++                    std::cmp::Ordering::Greater => right += 1,
++                    std::cmp::Ordering::Equal => { left += 1; right += 1; }
++                }
++            }
++            budget.work(width, &mut check)?;
++            let mut ends = SmallVec::with_capacity(width);
++            for input in &current.other_inputs {
++                budget.work(1, &mut check)?;
++                ends.push(input.len()..input.len());
++            }
++            ends.push(input.len()..input.len());
++            append_compact(&mut regions, UnchangedRange { base: base.len()..base.len(), others: ends }, budget, &mut check)?;
++            current.other_inputs.push(BStr::new(input));
++            current.unchanged_regions = regions;
++        }
++        Ok(current)
++    }
++}
+-- 
+2.51.0

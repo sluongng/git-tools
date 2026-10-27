@@ -146,6 +146,36 @@ impl Client {
             )
             .await
     }
+    pub(crate) async fn cloud_representation_read(
+        &mut self,
+        request: Request<tinytree_proto::cloud_v1::ReadObjectRepresentationRequest>,
+        limits: &crate::CloudLimits,
+    ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::ObjectChunk>>, Status> {
+        let cap = limits.max_chunk_bytes + 1024;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(4096);
+        self.limits.max_frame_bytes = limits.max_chunk_bytes;
+        self.inner
+            .ready()
+            .await
+            .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
+        self.inner
+            .server_streaming(
+                request,
+                http::uri::PathAndQuery::from_static(
+                    "/tinytree.cloud.v1.WorkspaceCloud/ReadObjectRepresentation",
+                ),
+                BoundedCodec::<
+                    tinytree_proto::cloud_v1::ReadObjectRepresentationRequest,
+                    tinytree_proto::cloud_v1::ObjectChunk,
+                >::new(Shape::CloudChunk, self.limits.clone(), cap)
+                .with_optional_owner(self.owner.clone()),
+            )
+            .await
+    }
     pub(crate) async fn cloud_index_read(
         &mut self,
         request: Request<tinytree_proto::cloud_v1::ReadIndexArtifactRequest>,
@@ -380,6 +410,39 @@ impl Client {
         )
         .await
     }
+    pub async fn open_annotation_frontier(
+        &mut self,
+        request: Request<q::OpenAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontier>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/OpenAnnotationFrontier",
+            Shape::AnnotationFrontier,
+        )
+        .await
+    }
+    pub async fn read_annotation_input(
+        &mut self,
+        request: Request<q::ReadAnnotationInputRequest>,
+    ) -> Result<Response<q::AnnotationInput>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/ReadAnnotationInput",
+            Shape::AnnotationInput,
+        )
+        .await
+    }
+    pub async fn close_annotation_frontier(
+        &mut self,
+        request: Request<q::CloseAnnotationFrontierRequest>,
+    ) -> Result<Response<q::CloseAnnotationFrontierResponse>, Status> {
+        self.unary(
+            request,
+            "/tinytree.query.v1.RepositoryQuery/CloseAnnotationFrontier",
+            Shape::QueryEmpty,
+        )
+        .await
+    }
     pub async fn blame(
         &mut self,
         request: Request<q::BlameRequest>,
@@ -587,6 +650,11 @@ pub(crate) enum Shape {
     Search,
     SearchHit,
     PathHistory,
+    AnnotationFrontier,
+    AnnotationLimits,
+    AnnotationNode,
+    AnnotationPathValue,
+    AnnotationInput,
     PathHistoryEntry,
     HistoryPathState,
     Blame,
@@ -829,7 +897,9 @@ fn scan(
                 return Err(invalid());
             }
         }
-        if matches!(shape, Shape::GraphRow | Shape::CanonicalRow) && number == 3 {
+        if (matches!(shape, Shape::GraphRow | Shape::CanonicalRow) && number == 3)
+            || (matches!(shape, Shape::AnnotationNode) && number == 2)
+        {
             *edges = edges.checked_add(1).ok_or_else(exhausted)?;
             if *edges > limits.max_query_edges {
                 return Err(exhausted());
@@ -838,14 +908,25 @@ fn scan(
         if wire == 0
             && matches!(
                 (shape, number),
-                (Shape::Capabilities, 1 | 4) | (Shape::FeatureCapability, 1)
+                (Shape::Capabilities, 1 | 4)
+                    | (Shape::FeatureCapability, 1)
+                    | (Shape::AnnotationFrontier, 4 | 8 | 9)
+                    | (Shape::AnnotationNode, 3)
+                    | (Shape::AnnotationLimits, 1..=10)
+                    | (Shape::HistoryPathState, 1)
             )
         {
             let mut offset = 0;
             let value = varint(data, &mut offset)?;
-            let valid = match shape {
-                Shape::Capabilities => value == 1,
-                Shape::FeatureCapability => (1..=7).contains(&value),
+            let valid = match (shape, number) {
+                (Shape::Capabilities, _) => value == 1,
+                (Shape::AnnotationFrontier, 4) => matches!(value, 1 | 2),
+                (Shape::FeatureCapability, _) => (1..=13).contains(&value),
+                (Shape::AnnotationFrontier, 8) => (1..=7).contains(&value),
+                (Shape::AnnotationFrontier, 9) => value <= u32::MAX as u64,
+                (Shape::AnnotationLimits, _) => value > 0 && value <= usize::MAX as u64,
+                (Shape::AnnotationNode, 3) => value <= 1,
+                (Shape::HistoryPathState, 1) => (1..=4).contains(&value),
                 _ => false,
             };
             if !valid {
@@ -880,6 +961,7 @@ fn scan(
                         )
                         | (Shape::ShortestPrefix, 3)
                         | (Shape::HistoryPathState, 4)
+                        | (Shape::AnnotationNode, 6)
                         | (Shape::CloudNativeChunk, 4)
                 )
             {
@@ -951,6 +1033,13 @@ fn scan(
             (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
         }
         Shape::PathHistoryEntry => (1 << 1) | (1 << 2) | (1 << 3),
+        Shape::AnnotationFrontier => {
+            (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)
+        }
+        Shape::AnnotationLimits => (1 << 11) - 2,
+        Shape::AnnotationNode => (1 << 1) | (1 << 5) | (1 << 6),
+        Shape::AnnotationPathValue => 1 << 1,
+        Shape::AnnotationInput => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
         Shape::HistoryPathState => 1 << 1,
         Shape::CloudId | Shape::CloudIndexId => (1 << 1) | (1 << 2),
         Shape::CloudDigest => 1 << 1,
@@ -1054,6 +1143,38 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::SearchHit, 2) => text(32),
         (Shape::SearchHit, 3..=8) => scalar(),
         (Shape::SearchHit, 9) => text(1280),
+        (Shape::AnnotationFrontier, 1 | 2) | (Shape::AnnotationInput, 1) => text(32),
+        (Shape::AnnotationFrontier, 3) => text(16),
+        (Shape::AnnotationFrontier, 4 | 7 | 8 | 9) => scalar(),
+        (Shape::AnnotationFrontier, 5) => repeated(
+            Shape::CommitId,
+            l.max_graph_objects,
+            4 * std::mem::size_of::<q::CommitId>(),
+        ),
+        (Shape::AnnotationFrontier, 6) => text(4096),
+        (Shape::AnnotationFrontier, 10) => repeated(
+            Shape::AnnotationNode,
+            l.max_graph_objects.saturating_add(1),
+            4 * std::mem::size_of::<q::AnnotationNode>(),
+        ),
+        (Shape::AnnotationFrontier, 11) => nested(Shape::AnnotationLimits),
+        (Shape::AnnotationLimits, 1..=10) => scalar(),
+        (Shape::AnnotationNode, 1) | (Shape::AnnotationInput, 2) => nested(Shape::CommitId),
+        (Shape::AnnotationNode, 2) => repeated(
+            Shape::CommitId,
+            l.max_query_edges,
+            4 * std::mem::size_of::<q::CommitId>(),
+        ),
+        (Shape::AnnotationNode, 3 | 4 | 6) => scalar(),
+        (Shape::AnnotationNode, 5) | (Shape::AnnotationInput, 3) => {
+            nested(Shape::AnnotationPathValue)
+        }
+        (Shape::AnnotationPathValue, 1) => nested(Shape::HistoryPathState),
+        (Shape::AnnotationPathValue, 2) => text(32),
+        (Shape::AnnotationInput, 4) => nested(Shape::Descriptor),
+        (Shape::AnnotationInput, 5) => {
+            text(l.max_file_bytes.min(l.max_batch_bytes as u64) as usize)
+        }
         (Shape::PathHistory | Shape::Blame, 1) => text(32),
         (Shape::PathHistory | Shape::Blame, 2) => text(16),
         (Shape::PathHistory | Shape::Blame, 3) => nested(Shape::CommitId),
@@ -1103,7 +1224,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Capabilities, 2) => text(128),
         (Shape::Capabilities, 3) => repeated(
             Shape::FeatureCapability,
-            7,
+            13,
             4 * std::mem::size_of::<p::FeatureCapability>(),
         ),
         (Shape::CloudWorkspacePage, 1) => repeated(
@@ -1331,7 +1452,7 @@ mod tests {
         // produce, including a u32-truncating scalar before Prost decoding.
         for (name, nested) in [
             ("nonboolean support", vec![8, 1, 16, 2]),
-            ("next unknown feature", vec![8, 8]),
+            ("next unknown feature", vec![8, 14]),
             ("unknown feature", vec![8, 99]),
             (
                 "u32 truncating feature",
@@ -1352,13 +1473,113 @@ mod tests {
                     supported: false,
                     authorized: false
                 };
-                8
+                14
             ],
             root_readiness: 1,
         }
         .encode_to_vec();
         assert!(check(&too_many).is_err());
     }
+    #[test]
+    fn annotation_wire_rejects_scalar_aliases_before_prost_narrowing() {
+        fn scalar(number: u8, mut value: u64) -> Vec<u8> {
+            let mut bytes = vec![number << 3];
+            while value >= 128 {
+                bytes.push((value as u8 & 127) | 128);
+                value >>= 7;
+            }
+            bytes.push(value as u8);
+            bytes
+        }
+        let root = q::AnnotationNode {
+            revision: Some(q::CommitId { value: vec![0; 32] }),
+            parents: Vec::new(),
+            source_layer: 0,
+            topological_key: 0,
+            value: Some(q::AnnotationPathValue {
+                state: Some(q::HistoryPathState {
+                    kind: 1,
+                    native_id: Vec::new(),
+                    size_bytes: 0,
+                    executable: false,
+                }),
+                copy_id: Vec::new(),
+            }),
+            affects_path: Some(false),
+        };
+        let frontier = q::AnnotationFrontier {
+            limits: None,
+            context: vec![1; 32],
+            scope_digest: vec![2; 32],
+            index_epoch: vec![3; 16],
+            version: 1,
+            anchors: vec![q::CommitId { value: vec![0; 32] }],
+            path: "file".into(),
+            expires_at_unix_seconds: 1,
+            coverage: 1,
+            scanned_commits: 0,
+            nodes: vec![root.clone()],
+        };
+        let check =
+            |bytes: &[u8], shape| scan(bytes, shape, &Limits::default(), &mut 65536, &mut 0, 0);
+        check(&frontier.encode_to_vec(), Shape::AnnotationFrontier).unwrap();
+        for (name, field, value) in [
+            ("version alias", 4, (1u64 << 32) + 1),
+            ("coverage alias", 8, (1u64 << 32) + 1),
+            ("scan-count alias", 9, 1u64 << 32),
+        ] {
+            let mut base = frontier.clone();
+            match field {
+                4 => base.version = 0,
+                8 => base.coverage = 0,
+                9 => base.scanned_commits = 0,
+                _ => unreachable!(),
+            }
+            let mut bytes = base.encode_to_vec();
+            bytes.extend(scalar(field, value));
+            // These normalize into otherwise valid values under generated Prost.
+            let decoded = q::AnnotationFrontier::decode(bytes.as_slice()).unwrap();
+            assert_eq!(
+                (decoded.version, decoded.coverage, decoded.scanned_commits),
+                (1, 1, 0),
+                "{name}"
+            );
+            assert_eq!(
+                check(&bytes, Shape::AnnotationFrontier).unwrap_err().code(),
+                tonic::Code::DataLoss,
+                "{name}"
+            );
+        }
+        let mut bytes = root.encode_to_vec();
+        bytes.extend(scalar(3, 1u64 << 32));
+        assert_eq!(
+            q::AnnotationNode::decode(bytes.as_slice())
+                .unwrap()
+                .source_layer,
+            0
+        );
+        assert_eq!(
+            check(&bytes, Shape::AnnotationNode).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        let mut bytes = q::HistoryPathState {
+            kind: 0,
+            native_id: vec![4; 32],
+            size_bytes: 0,
+            executable: false,
+        }
+        .encode_to_vec();
+        bytes.extend(scalar(1, (1u64 << 32) + 2));
+        assert_eq!(
+            q::HistoryPathState::decode(bytes.as_slice()).unwrap().kind,
+            2
+        );
+        assert_eq!(
+            check(&bytes, Shape::HistoryPathState).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+    }
+
     #[tokio::test]
     async fn physical_encoded_body_owns_admission_after_fused_source_eof() {
         let drops = Arc::new(AtomicUsize::new(0));

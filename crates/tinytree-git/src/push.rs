@@ -13,10 +13,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::JoinHandle, time::Instant};
+#[path = "push_auth.rs"]
+mod auth;
 #[path = "push_state.rs"]
 mod disk;
 #[path = "push_git.rs"]
 mod git;
+pub use auth::CredentialHelper;
 const TRANSPORT_POLICY: &str = "https-file-no-ambient-auth-session-pipe-v1";
 #[derive(Clone)]
 pub struct PushOptions {
@@ -27,6 +30,12 @@ pub struct PushOptions {
     pub poll_interval: Duration,
     pub operation_timeout: Duration,
     pub max_backoff: Duration,
+    pub credential_helper: Option<CredentialHelper>,
+    /// Optional initial remote observation, not an acknowledged push position.
+    /// Keep this policy unchanged for the complete lifetime of its outbox.
+    pub bootstrap_remote_head: Option<String>,
+    #[cfg(test)]
+    pub(crate) before_git_admission: Option<Arc<crate::watch::TestPause>>,
     #[cfg(test)]
     pub(crate) after_push: bool,
     #[cfg(test)]
@@ -44,6 +53,10 @@ impl PushOptions {
             poll_interval: Duration::from_secs(5),
             operation_timeout: Duration::from_secs(60),
             max_backoff: Duration::from_secs(300),
+            credential_helper: None,
+            bootstrap_remote_head: None,
+            #[cfg(test)]
+            before_git_admission: None,
             #[cfg(test)]
             after_push: false,
             #[cfg(test)]
@@ -62,6 +75,15 @@ impl PushOptions {
             "push state and verification memory budgets do not fit"
         );
         validate_remote(&self.remote)?;
+        if let Some(oid) = &self.bootstrap_remote_head {
+            ensure!(
+                valid_hex(oid, 40) && oid.bytes().any(|b| b != b'0'),
+                "bootstrap remote head must be a full nonzero lowercase SHA-1 Git OID"
+            );
+        }
+        if let Some(helper) = &self.credential_helper {
+            helper.validate()?;
+        }
         ensure!(
             valid_reference(&self.remote_reference)
                 && valid_reference(&self.export.destination_reference),
@@ -388,7 +410,7 @@ fn program(path: &Path) -> Result<PathBuf> {
     ensure!(p.is_file(), "push Git executable must be regular");
     Ok(p)
 }
-fn identity(scope: [u8; 32], o: &PushOptions, program: &Path) -> Result<[u8; 32]> {
+pub(super) fn identity(scope: [u8; 32], o: &PushOptions, program: &Path) -> Result<[u8; 32]> {
     let mut h = blake3::Hasher::new();
     h.update(TRANSPORT_POLICY.as_bytes());
     h.update(&scope);
@@ -405,6 +427,17 @@ fn identity(scope: [u8; 32], o: &PushOptions, program: &Path) -> Result<[u8; 32]
     for s in [&o.remote, &o.remote_reference] {
         h.update(&(s.len() as u64).to_le_bytes());
         h.update(s.as_bytes());
+    }
+    if let Some(helper) = &o.credential_helper {
+        h.update(b"explicit-pinned-credential-helper-v1");
+        let policy = helper.policy_bytes()?;
+        h.update(&(policy.len() as u64).to_le_bytes());
+        h.update(&policy);
+    }
+    if let Some(oid) = &o.bootstrap_remote_head {
+        h.update(b"explicit-initial-public-ancestor-v1");
+        h.update(&(oid.len() as u64).to_le_bytes());
+        h.update(oid.as_bytes());
     }
     Ok(*h.finalize().as_bytes())
 }
@@ -625,9 +658,17 @@ async fn verify(
         &p.native_head,
         &p.git_head,
     )?;
+    verify_mapping(owner, &p.git_head, &mapping, deadline).await
+}
+async fn verify_mapping(
+    owner: &Arc<git::Owner>,
+    oid: &str,
+    mapping: &state::Mapping,
+    deadline: Instant,
+) -> Result<()> {
     let bytes = owner
         .run(
-            vec!["cat-file".into(), "commit".into(), p.git_head.clone()],
+            vec!["cat-file".into(), "commit".into(), oid.into()],
             usize::try_from(mapping.payload_size)?,
             deadline,
         )
@@ -644,13 +685,58 @@ async fn verify(
                 "--strict".into(),
                 "--no-reflogs".into(),
                 "--no-dangling".into(),
-                p.git_head.clone(),
+                oid.into(),
             ],
             65536,
             deadline,
         )
         .await?;
     Ok(())
+}
+async fn verify_bootstrap(
+    owner: &Arc<git::Owner>,
+    o: &PushOptions,
+    scope: [u8; 32],
+    pending: &PushPosition,
+    bootstrap: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let mapping = state::mapped_public_ancestor(
+        &o.export.state_dir,
+        scope,
+        &o.export.limits,
+        &pending.native_head,
+        &pending.git_head,
+        bootstrap,
+        || {
+            ensure!(
+                !*owner.cancel.borrow(),
+                "push cancelled before bootstrap verification"
+            );
+            ensure!(
+                Instant::now() < deadline,
+                "bootstrap verification deadline exceeded"
+            );
+            Ok(())
+        },
+    )?;
+    let Some(mapping) = mapping else {
+        return Ok(false);
+    };
+    verify_mapping(owner, bootstrap, &mapping, deadline).await?;
+    owner
+        .run(
+            vec![
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                bootstrap.into(),
+                pending.git_head.clone(),
+            ],
+            1024,
+            deadline,
+        )
+        .await?;
+    Ok(true)
 }
 async fn run(
     config: tinytree_client::Config,
@@ -667,6 +753,13 @@ async fn run(
         local,
         program,
         cancel: stop.clone(),
+        #[cfg(test)]
+        before_git_admission: o.before_git_admission.clone(),
+        credential_helper: o
+            .credential_helper
+            .as_ref()
+            .map(CredentialHelper::capture)
+            .transpose()?,
     });
     let result = run_inner(&config, &o, scope, id, &disk, &owner, &mut stop).await;
     drain(&owner).await;
@@ -812,7 +905,21 @@ async fn run_inner(
                 .map_err(|_| PushError::RemoteUnavailable)?;
             s.last_remote_check_unix_ms = Some(now_ms().map_err(|_| PushError::RemoteUnavailable)?);
             if observed.as_deref() != Some(p.git_head.as_str()) {
-                if observed.as_deref() != s.delivered.as_ref().map(|p| p.git_head.as_str()) {
+                if let Some(delivered) = &s.delivered {
+                    if observed.as_deref() != Some(delivered.git_head.as_str()) {
+                        return Err(PushError::RemoteDiverged);
+                    }
+                } else if let Some(bootstrap) = &o.bootstrap_remote_head {
+                    if observed.as_deref() != Some(bootstrap.as_str()) {
+                        return Err(PushError::RemoteDiverged);
+                    }
+                    if !verify_bootstrap(owner, o, scope, &p, bootstrap, deadline)
+                        .await
+                        .map_err(|_| PushError::CheckpointUnavailable)?
+                    {
+                        return Err(PushError::RemoteDiverged);
+                    }
+                } else if observed.is_some() {
                     return Err(PushError::RemoteDiverged);
                 }
                 s.phase = PushPhase::Pushing;

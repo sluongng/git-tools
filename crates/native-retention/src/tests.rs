@@ -861,6 +861,70 @@ fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoint
                 Err(Error::DirtyWorkspace)
             ));
         }
+        // A fresh exact full-bundle attestation may close a later command's
+        // Dirty checkpoint without rotating any historical pending ticket.
+        let old = expected[0].clone();
+        let read = registry.read_capture(old.id).await.unwrap();
+        let owner = registry.begin_command(registration).await.unwrap();
+        let epoch = owner.epoch();
+        let before = registry.storage_stats().transactions;
+        let saved = old.clone();
+        let outcome = registry
+            .capture_dirty_or_reuse_pending_owned(owner.token(), move || async move {
+                Ok(OwnedCaptureBundle::new(
+                    CaptureBundle {
+                        checkpoint: saved.checkpoint,
+                        bundle: saved.bundle,
+                    },
+                    Arc::new(()),
+                )
+                .with_verified_existing_bundle())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, DirtyCaptureDisposition::ReusedPending(pending) if pending == &old)
+        );
+        assert_eq!(
+            registry.storage_stats().transactions,
+            before + 1,
+            "reuse still commits the current Dirty checkpoint with SyncAll"
+        );
+        let info = registry.workspace(registration).await.unwrap();
+        assert_eq!(info.state, WorkspaceState::Dirty);
+        assert_eq!(info.command_epoch, epoch);
+        assert!(info.fingerprint.is_some() && info.fingerprint != Some(old.fingerprint));
+        assert!(matches!(
+            registry.resolve(owner.token()),
+            Err(Error::ClosedCommand)
+        ));
+        assert_eq!(
+            read.pending(),
+            &old,
+            "existing read owners retain the exact historical ticket"
+        );
+        drop(owner);
+        drop(read);
+        let mut pending = registry.pending_captures().await.unwrap();
+        pending.sort_by_key(|ticket| ticket.id);
+        let mut sorted = expected.clone();
+        sorted.sort_by_key(|ticket| ticket.id);
+        assert_eq!(pending, sorted);
+        drop(registry);
+        let registry =
+            Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            registry.workspace(registration).await.unwrap(),
+            info,
+            "Dirty checkpoint reuse survives restart"
+        );
+        assert_eq!(
+            registry.pending_captures().await.unwrap(),
+            sorted,
+            "restart preserves all original ticket epochs and roots"
+        );
         let owner = registry.begin_command(registration).await.unwrap();
         registry
             .checkpoint(owner.token(), checkpoint(9))
@@ -881,6 +945,48 @@ fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoint
         drop(collector);
         expected.sort_by_key(|ticket| ticket.id);
         assert_eq!(registry.pending_captures().await.unwrap(), expected);
+        let snapshot = registry
+            .pending_capture_registrations(
+                expected.len(),
+                expected.len() * CaptureRegistrations::BYTES_PER_ENTRY,
+            )
+            .await
+            .unwrap();
+        let mut registrations = snapshot.as_slice().to_vec();
+        registrations.sort_by_key(|registration| {
+            (
+                registration.workspace.0,
+                registration.op_store.0,
+                registration.generation,
+            )
+        });
+        let mut expected_registrations = expected
+            .iter()
+            .map(|ticket| ticket.registration)
+            .collect::<Vec<_>>();
+        expected_registrations.sort_by_key(|registration| {
+            (
+                registration.workspace.0,
+                registration.op_store.0,
+                registration.generation,
+            )
+        });
+        assert_eq!(registrations, expected_registrations);
+        assert!(matches!(
+            registry
+                .pending_capture_registrations(expected.len() - 1, usize::MAX)
+                .await,
+            Err(Error::Limit(_))
+        ));
+        assert!(matches!(
+            registry
+                .pending_capture_registrations(
+                    expected.len(),
+                    expected.len() * CaptureRegistrations::BYTES_PER_ENTRY - 1
+                )
+                .await,
+            Err(Error::Limit(_))
+        ));
         let before = registry.storage_stats();
         assert!(matches!(
             registry.read_capture(CaptureId([0; 32])).await,
@@ -1080,6 +1186,137 @@ async fn dirty_capture_drains_physical_jobs_and_commits_after_the_caller_is_canc
     assert_eq!(reopened.pending_captures().await.unwrap(), tickets);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_pending_reuse_keeps_physical_command_and_ticket_until_dirty_checkpoint_is_durable()
+ {
+    struct PhysicalOwner {
+        registry: Registry,
+        dropped: Option<tokio::sync::oneshot::Sender<u64>>,
+    }
+    impl Drop for PhysicalOwner {
+        fn drop(&mut self) {
+            let _ = self
+                .dropped
+                .take()
+                .unwrap()
+                .send(self.registry.storage_stats().transactions);
+        }
+    }
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let first = registry.begin_command(registration).await.unwrap();
+    let path = directory.path().to_owned();
+    let original = registry
+        .capture_dirty(first.token(), move || async move {
+            Ok(staged_capture(&path, 7))
+        })
+        .await
+        .unwrap();
+    drop(first);
+    let historical = registry.read_capture(original.id).await.unwrap();
+    let reuse = registry.begin_command(registration).await.unwrap();
+    let epoch = reuse.epoch();
+    let before = registry.storage_stats().transactions;
+    let (entered, arrival) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (dropped, mut owner_dropped) = tokio::sync::oneshot::channel();
+    let physical = Arc::new(PhysicalOwner {
+        registry: registry.clone(),
+        dropped: Some(dropped),
+    });
+    let saved = original.clone();
+    let capturing = registry.clone();
+    let token = reuse.token();
+    let waiter = tokio::spawn(async move {
+        capturing
+            .capture_dirty_or_reuse_pending_owned(token, move || async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(OwnedCaptureBundle::new(
+                    CaptureBundle {
+                        checkpoint: saved.checkpoint,
+                        bundle: saved.bundle,
+                    },
+                    physical,
+                )
+                .with_verified_existing_bundle())
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), arrival)
+        .await
+        .unwrap()
+        .unwrap();
+    waiter.abort();
+    let _ = waiter.await;
+    drop(reuse);
+    assert_eq!(
+        historical.pending(),
+        &original,
+        "the original read owner is not replaced by command closure"
+    );
+    drop(historical);
+    assert!(
+        matches!(registry.try_capture_cleanup().await, Err(Error::Busy)),
+        "after caller and historical reader drop, accepted reuse still owns the physical read fence"
+    );
+    assert!(
+        matches!(registry.begin_command(registration).await, Err(Error::Busy)),
+        "a new command cannot overlap the accepted physical reuse callback"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut owner_dropped)
+            .await
+            .is_err(),
+        "physical owner is not released before its actual checkpoint transaction"
+    );
+    assert_eq!(
+        registry.pending_captures().await.unwrap(),
+        vec![original.clone()]
+    );
+    let read = registry.read_capture(original.id).await.unwrap();
+    assert_eq!(read.pending(), &original);
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), owner_dropped)
+            .await
+            .unwrap()
+            .unwrap(),
+        before + 1,
+        "reuse callback owner survives caller cancellation through SyncAll"
+    );
+    assert_eq!(read.pending(), &original);
+    drop(read);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match registry.try_capture_cleanup().await {
+                Ok(None) => break,
+                Err(Error::Busy) => tokio::task::yield_now().await,
+                _ => panic!("unexpected capture maintenance state"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let info = registry.workspace(registration).await.unwrap();
+    assert_eq!(info.command_epoch, epoch);
+    assert_eq!(info.state, WorkspaceState::Dirty);
+    assert_eq!(
+        registry.pending_captures().await.unwrap(),
+        vec![original.clone()]
+    );
+    drop(registry);
+    let reopened =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert_eq!(reopened.workspace(registration).await.unwrap(), info);
+    assert_eq!(reopened.pending_captures().await.unwrap(), vec![original]);
+}
+
 #[test]
 fn redundant_capture_retirement_advances_beyond_capacity_and_replays_durable_cleanup_after_reopen()
 {
@@ -1130,6 +1367,17 @@ fn redundant_capture_retirement_advances_beyond_capacity_and_replays_durable_cle
                 );
                 assert!(cleanup.remove_bundle);
                 assert!(registry.capture_cleanup_pending().unwrap());
+                let mut legacy = serde_json::to_value(&cleanup).unwrap();
+                assert!(legacy.get("basis").is_none());
+                assert!(legacy["upload"]["published"].is_object());
+                legacy["id"] = serde_json::json!([0; 32].to_vec());
+                // Serialize through the original field order, not Value's map order.
+                let mut normalized = cleanup.clone();
+                normalized.id = [0; 32];
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"native-retention-capture-cleanup-v1\0");
+                hash.update(&serde_json::to_vec(&normalized).unwrap());
+                assert_eq!(cleanup.id, *hash.finalize().as_bytes());
                 assert_eq!(cleanup.retired_binding, old.binding());
                 assert_eq!(cleanup.successor_binding, current.binding());
                 assert_eq!(
@@ -1212,10 +1460,10 @@ fn cleanup_upload(seed: u8) -> CaptureUploadCleanup {
             blake3: [seed; 32],
             size_bytes: 64,
         }),
-        published: BundleDescriptor {
+        published: Some(BundleDescriptor {
             blake3: [seed.wrapping_add(1); 32],
             size_bytes: 64,
-        },
+        }),
     }
 }
 
@@ -1507,14 +1755,23 @@ async fn capture_retirement_rejects_stale_uncovered_and_foreign_rows_and_preserv
     let command = registry.begin_command(other).await.unwrap();
     let shared_bundle = old.bundle;
     let shared = registry
-        .capture_dirty(command.token(), move || async move {
-            Ok(CaptureBundle {
-                checkpoint: checkpoint(4),
-                bundle: shared_bundle,
-            })
+        .capture_dirty_or_reuse_pending_owned(command.token(), move || async move {
+            Ok(OwnedCaptureBundle::new(
+                CaptureBundle {
+                    checkpoint: checkpoint(4),
+                    bundle: shared_bundle,
+                },
+                Arc::new(()),
+            )
+            .with_verified_existing_bundle())
         })
         .await
         .unwrap();
+    assert!(
+        matches!(&shared, DirtyCaptureDisposition::Queued(_)),
+        "foreign registration cannot reuse an identical pack"
+    );
+    let shared = shared.into_pending();
     drop(command);
     assert!(matches!(
         registry
@@ -1539,11 +1796,61 @@ async fn capture_retirement_rejects_stale_uncovered_and_foreign_rows_and_preserv
         ),
         "fixed cleanup slot cannot accumulate obligations"
     );
+    let command = registry.begin_command(registration).await.unwrap();
+    let saved = tickets[2].clone();
+    let outcome = registry
+        .capture_dirty_or_reuse_pending_owned(command.token(), move || async move {
+            Ok(OwnedCaptureBundle::new(
+                CaptureBundle {
+                    checkpoint: saved.checkpoint,
+                    bundle: saved.bundle,
+                },
+                Arc::new(()),
+            )
+            .with_verified_existing_bundle())
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, DirtyCaptureDisposition::Queued(_)),
+        "a pending cleanup obligation disables coalescing"
+    );
+    drop(command);
     assert!(registry.read_capture(shared.id).await.is_ok());
     let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
     assert_eq!(guard.obligation(), &cleanup);
     drop(guard);
     assert_eq!(registry.capture_cleanup().await.unwrap(), Some(cleanup));
+    registry
+        .try_capture_cleanup()
+        .await
+        .unwrap()
+        .unwrap()
+        .acknowledge_capture_cleanup()
+        .await
+        .unwrap();
+    // The retired pack still exists through a foreign registration's shared
+    // capsule, but retired membership cannot authorize an old-registration skip.
+    let command = registry.begin_command(registration).await.unwrap();
+    let saved = old.clone();
+    let outcome = registry
+        .capture_dirty_or_reuse_pending_owned(command.token(), move || async move {
+            Ok(OwnedCaptureBundle::new(
+                CaptureBundle {
+                    checkpoint: saved.checkpoint,
+                    bundle: saved.bundle,
+                },
+                Arc::new(()),
+            )
+            .with_verified_existing_bundle())
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&outcome, DirtyCaptureDisposition::Queued(pending) if pending.id != old.id),
+        "a physically shared orphan pack is not a still-pending same-registration capsule"
+    );
+    drop(command);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1716,6 +2023,8 @@ fn retired_capture_reopen_rejects_missing_or_rebound_cleanup_state() {
         ReboundUpload,
         MissingSuccessor,
         Downgrade,
+        UnknownMode,
+        ProtectedWitness,
     }
     block_on(async {
         for corruption in [
@@ -1724,6 +2033,8 @@ fn retired_capture_reopen_rejects_missing_or_rebound_cleanup_state() {
             Corruption::ReboundUpload,
             Corruption::MissingSuccessor,
             Corruption::Downgrade,
+            Corruption::UnknownMode,
+            Corruption::ProtectedWitness,
         ] {
             let (directory, registry) = registry().await;
             let registration = registry
@@ -1746,10 +2057,34 @@ fn retired_capture_reopen_rejects_missing_or_rebound_cleanup_state() {
                 );
                 drop(command);
             }
-            registry
-                .retire_redundant_capture(tickets[0].clone(), tickets[1].clone(), cleanup_upload(1))
-                .await
-                .unwrap();
+            let covered = matches!(
+                corruption,
+                Corruption::UnknownMode | Corruption::ProtectedWitness
+            );
+            if covered {
+                let mut upload = cleanup_upload(1);
+                upload.published = None;
+                registry
+                    .retire_capture_covered_by_retained_successor(
+                        tickets[0].clone(),
+                        tickets[1].clone(),
+                        upload,
+                        retained_successor_proof(&tickets[1]),
+                        OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+                        || Ok(()),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                registry
+                    .retire_redundant_capture(
+                        tickets[0].clone(),
+                        tickets[1].clone(),
+                        cleanup_upload(1),
+                    )
+                    .await
+                    .unwrap();
+            }
             drop(registry);
             {
                 let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("metadata"))
@@ -1765,11 +2100,19 @@ fn retired_capture_reopen_rejects_missing_or_rebound_cleanup_state() {
                 let raw = db.read_tx().get(&meta, b"manifest").unwrap().unwrap();
                 let mut manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
                 assert_eq!(
-                    manifest["version"], 3,
+                    manifest["version"],
+                    if covered { 4 } else { 3 },
                     "pre-retirement readers explicitly reject this version"
                 );
                 let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
                 match corruption {
+                    Corruption::UnknownMode => {
+                        manifest["cleanup"]["basis"] = serde_json::json!({"UnknownV2": {}});
+                    }
+                    Corruption::ProtectedWitness => {
+                        manifest["cleanup"]["basis"]["CoveredByRetainedSuccessorV1"]["witness"]["job"]
+                            ["size_bytes"] = 65.into();
+                    }
                     Corruption::MissingCleanup => {
                         manifest.as_object_mut().unwrap().remove("cleanup");
                     }
@@ -1850,6 +2193,30 @@ fn dirty_capture_errors_and_aggregate_limits_never_clean_or_erase_queued_tickets
                 .await
                 .unwrap();
             drop(first);
+            let reuse = registry.begin_command(registration).await.unwrap();
+            let saved = ticket.clone();
+            let outcome = registry
+                .capture_dirty_or_reuse_pending_owned(reuse.token(), move || async move {
+                    Ok(OwnedCaptureBundle::new(
+                        CaptureBundle {
+                            checkpoint: saved.checkpoint,
+                            bundle: saved.bundle,
+                        },
+                        Arc::new(()),
+                    )
+                    .with_verified_existing_bundle())
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, DirtyCaptureDisposition::ReusedPending(_)),
+                "an exact pending capsule uses no new inventory capacity"
+            );
+            drop(reuse);
+            assert_eq!(
+                registry.pending_captures().await.unwrap(),
+                vec![ticket.clone()]
+            );
             let second = registry.begin_command(registration).await.unwrap();
             let path = directory.path().to_owned();
             assert!(matches!(
@@ -2315,4 +2682,634 @@ async fn cancelled_host_registration_retains_its_fence_until_the_durable_dirty_w
             .unwrap(),
         Err(Error::DirtyWorkspace)
     ));
+}
+
+fn retained_successor_proof(successor: &PendingCapture) -> CoveredByRetainedSuccessorV1 {
+    CoveredByRetainedSuccessorV1 {
+        successor_binding: successor.binding(),
+        provider: [7; 32],
+        cloud_workspace: [8; 32],
+        generation: 1,
+        manifest_id: [9; 32],
+        manifest: BundleDescriptor {
+            blake3: [10; 32],
+            size_bytes: 128,
+        },
+        capture: BundleDescriptor {
+            blake3: [11; 32],
+            size_bytes: 256,
+        },
+        witness: RetainedSuccessorWitness {
+            job: cleanup_upload(12).job.unwrap(),
+            published: cleanup_upload(12).published.unwrap(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn retained_successor_mode_binds_tickets_provenance_and_protects_witnesses() {
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5, 6] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut bundle = staged_capture(&path, seed);
+                    if seed == 6 {
+                        bundle.checkpoint.roots.push(checkpoint(4).roots[0]);
+                    }
+                    Ok(bundle)
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    let old = tickets[0].clone();
+    let successor = tickets[2].clone();
+    let mut upload = cleanup_upload(1);
+    upload.published = None;
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(old.clone(), successor.clone(), upload.clone())
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let proof = retained_successor_proof(&successor);
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidProof {
+        Binding,
+        Provider,
+        Workspace,
+        Generation,
+        ManifestId,
+        ManifestSize,
+        CaptureSize,
+        JobSize,
+        PublishedSize,
+        OldJob,
+        OldPublished,
+        ChangedTicket,
+        Uncovered,
+        Reverse,
+        ForeignScope,
+    }
+    for case in [
+        InvalidProof::Binding,
+        InvalidProof::Provider,
+        InvalidProof::Workspace,
+        InvalidProof::Generation,
+        InvalidProof::ManifestId,
+        InvalidProof::ManifestSize,
+        InvalidProof::CaptureSize,
+        InvalidProof::JobSize,
+        InvalidProof::PublishedSize,
+        InvalidProof::OldJob,
+        InvalidProof::OldPublished,
+        InvalidProof::ChangedTicket,
+        InvalidProof::Uncovered,
+        InvalidProof::Reverse,
+        InvalidProof::ForeignScope,
+    ] {
+        let mut attestation = proof.clone();
+        let mut journals = upload.clone();
+        let mut from = old.clone();
+        let mut to = successor.clone();
+        match case {
+            InvalidProof::Binding => attestation.successor_binding[0] ^= 1,
+            InvalidProof::Provider => attestation.provider = [0; 32],
+            InvalidProof::Workspace => attestation.cloud_workspace = [0; 32],
+            InvalidProof::Generation => attestation.generation = 0,
+            InvalidProof::ManifestId => attestation.manifest_id = [0; 32],
+            InvalidProof::ManifestSize => attestation.manifest.size_bytes = 0,
+            InvalidProof::CaptureSize => {
+                attestation.capture.size_bytes = MAX_RETAINED_SUCCESSOR_CAPTURE_BYTES + 1
+            }
+            InvalidProof::JobSize => attestation.witness.job.size_bytes = 32 * 1024 * 1024 + 1,
+            InvalidProof::PublishedSize => attestation.witness.published.size_bytes = 4097,
+            InvalidProof::OldJob => journals.job = None,
+            InvalidProof::OldPublished => journals.published = cleanup_upload(1).published,
+            InvalidProof::ChangedTicket => {
+                to.bundle.size_bytes += 1;
+                attestation.successor_binding = to.binding();
+            }
+            InvalidProof::Uncovered => {
+                to = tickets[1].clone();
+                attestation.successor_binding = to.binding();
+            }
+            InvalidProof::Reverse => {
+                from = successor.clone();
+                to = old.clone();
+                attestation.successor_binding = to.binding();
+            }
+            InvalidProof::ForeignScope => {
+                to.registration.generation += 1;
+                attestation.successor_binding = to.binding();
+            }
+        }
+        assert!(
+            registry
+                .retire_capture_covered_by_retained_successor(
+                    from,
+                    to,
+                    journals,
+                    attestation,
+                    OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+                    || Ok(()),
+                )
+                .await
+                .is_err(),
+            "{case:?}"
+        );
+        assert!(registry.capture_cleanup().await.unwrap().is_none());
+    }
+    let before_refusal = registry.pending_captures().await.unwrap();
+    let transactions = registry.storage_stats().transactions;
+    assert_eq!(
+        registry
+            .retire_capture_covered_by_retained_successor(
+                old.clone(),
+                successor.clone(),
+                upload.clone(),
+                proof.clone(),
+                OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+                || Err(Error::Invalid("host journal recheck refused")),
+            )
+            .await
+            .unwrap_err(),
+        Error::Invalid("host journal recheck refused")
+    );
+    assert_eq!(registry.storage_stats().transactions, transactions);
+    assert_eq!(registry.pending_captures().await.unwrap(), before_refusal);
+    assert!(registry.capture_cleanup().await.unwrap().is_none());
+    drop(registry);
+    assert_retention_manifest_version(directory.path(), 2);
+    let registry =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    // A different capture still owns the same immutable pack.
+    let command = registry.begin_command(registration).await.unwrap();
+    let shared_bundle = old.bundle;
+    registry
+        .capture_dirty(command.token(), move || async move {
+            Ok(CaptureBundle {
+                bundle: shared_bundle,
+                checkpoint: checkpoint(4),
+            })
+        })
+        .await
+        .unwrap();
+    drop(command);
+    let cleanup = registry
+        .retire_capture_covered_by_retained_successor(
+            old.clone(),
+            successor.clone(),
+            upload.clone(),
+            proof.clone(),
+            OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+    assert!(!cleanup.remove_bundle);
+    assert_eq!(cleanup.upload.published, None);
+    assert_eq!(
+        cleanup.basis,
+        Some(CaptureCleanupBasis::CoveredByRetainedSuccessorV1(
+            proof.clone()
+        ))
+    );
+    assert_eq!(
+        registry
+            .retire_capture_covered_by_retained_successor(
+                old,
+                successor.clone(),
+                upload,
+                proof.clone(),
+                OwnedCaptureCoverage::new(Vec::new(), Arc::new(())),
+                || Ok(()),
+            )
+            .await
+            .unwrap(),
+        cleanup
+    );
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(successor.clone(), tickets[1].clone(), cleanup_upload(1))
+            .await,
+        Err(Error::Busy)
+    ));
+    let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
+    assert!(matches!(
+        guard.acknowledge_capture_cleanup().await,
+        Err(Error::Invalid(_))
+    ));
+    let mut wrong = proof.witness.clone();
+    wrong.published.blake3[0] ^= 1;
+    let guard = registry.try_capture_cleanup().await.unwrap().unwrap();
+    assert!(matches!(
+        guard
+            .acknowledge_capture_cleanup_with_successor_witness(wrong)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        registry.capture_cleanup().await.unwrap(),
+        Some(cleanup.clone())
+    );
+    drop(registry);
+    // Durable v4 is visible before the host unlinks anything; reopen must retain
+    // both the obligation and the protected witness contract.
+    assert_retention_manifest_version(directory.path(), 4);
+    let registry =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert_eq!(registry.capture_cleanup().await.unwrap(), Some(cleanup));
+    registry
+        .try_capture_cleanup()
+        .await
+        .unwrap()
+        .unwrap()
+        .acknowledge_capture_cleanup_with_successor_witness(proof.witness)
+        .await
+        .unwrap();
+    drop(registry);
+    assert_retention_manifest_version(directory.path(), 4);
+    let registry =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert!(registry.capture_cleanup().await.unwrap().is_none());
+}
+
+fn assert_retention_manifest_version(directory: &Path, expected: u32) {
+    use fjall::Readable;
+    let db = fjall::SingleWriterTxDatabase::builder(directory.join("metadata"))
+        .manual_journal_persist(true)
+        .open()
+        .unwrap();
+    let meta = db
+        .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    let raw = db.read_tx().get(&meta, b"manifest").unwrap().unwrap();
+    assert!(raw.len() <= 4096);
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(value["version"], expected);
+}
+
+#[tokio::test]
+async fn retained_successor_coverage_requires_typed_witnesses_anchored_in_exact_successor() {
+    use tinytree_model as m;
+    let file = m::describe_file(b"retained file");
+    let tree = m::encode(
+        &m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "file".into(),
+                value: m::TreeValue::File {
+                    id: m::FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        }),
+        m::Limits::default(),
+    )
+    .unwrap();
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for (seed, root) in [
+        (4, file.key),
+        (5, m::empty_tree().descriptor.key),
+        (6, tree.descriptor.key),
+    ] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut bundle = staged_capture(&path, seed);
+                    bundle.checkpoint.roots = vec![root];
+                    Ok(bundle)
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    let before = registry.pending_captures().await.unwrap();
+    let mut upload = cleanup_upload(1);
+    upload.published = None;
+    assert!(
+        matches!(
+            registry
+                .retire_capture_covered_by_retained_successor(
+                    tickets[0].clone(),
+                    tickets[1].clone(),
+                    upload.clone(),
+                    retained_successor_proof(&tickets[1]),
+                    OwnedCaptureCoverage::new(vec![tree.clone()], Arc::new(())),
+                    || Ok(()),
+                )
+                .await,
+            Err(Error::Invalid(_))
+        ),
+        "a witness containing the old FILE is insufficient when not anchored in the exact successor roots"
+    );
+    assert_eq!(registry.pending_captures().await.unwrap(), before);
+    assert!(!registry.capture_cleanup_pending().unwrap());
+    registry
+        .retire_capture_covered_by_retained_successor(
+            tickets[0].clone(),
+            tickets[2].clone(),
+            upload,
+            retained_successor_proof(&tickets[2]),
+            OwnedCaptureCoverage::new(vec![tree], Arc::new(())),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+    let after = registry.pending_captures().await.unwrap();
+    assert_eq!(after.len(), before.len() - 1);
+    assert!(!after.iter().any(|ticket| ticket.id == tickets[0].id));
+    assert!(after.contains(&tickets[1]));
+    assert!(after.contains(&tickets[2]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_successor_precommit_retains_physical_owner_and_exclusive_fence() {
+    struct ProofOwner {
+        registry: Registry,
+        dropped: Option<tokio::sync::oneshot::Sender<(u64, bool)>>,
+    }
+    impl Drop for ProofOwner {
+        fn drop(&mut self) {
+            let exclusive = self.registry.inner.fence.try_read().is_err();
+            let _ = self
+                .dropped
+                .take()
+                .unwrap()
+                .send((self.registry.storage_stats().transactions, exclusive));
+        }
+    }
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    let mut bundle = staged_capture(&path, seed);
+                    bundle.checkpoint.roots.push(checkpoint(4).roots[0]);
+                    Ok(bundle)
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    let before = registry.storage_stats().transactions;
+    let pending_before = registry.pending_captures().await.unwrap();
+    let (entered, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (owner_dropped, mut dropped) = tokio::sync::oneshot::channel();
+    let coverage = OwnedCaptureCoverage::new(
+        Vec::new(),
+        Arc::new(ProofOwner {
+            registry: registry.clone(),
+            dropped: Some(owner_dropped),
+        }),
+    );
+    let retiring = registry.clone();
+    let old = tickets[0].clone();
+    let successor = tickets[1].clone();
+    let proof = retained_successor_proof(&successor);
+    let mut upload = cleanup_upload(1);
+    upload.published = None;
+    let waiter = tokio::spawn(async move {
+        retiring
+            .retire_capture_covered_by_retained_successor(
+                old,
+                successor,
+                upload,
+                proof,
+                coverage,
+                move || {
+                    let _ = entered.send(());
+                    released.recv().map_err(|_| Error::Storage)?;
+                    Ok(())
+                },
+            )
+            .await
+    });
+    // This notification comes from actual callback execution, never an inferred
+    // lock-readiness probe. The blocking worker is physically paused here.
+    tokio::time::timeout(Duration::from_secs(3), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        dropped.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
+    assert_eq!(registry.storage_stats().transactions, before);
+    assert_eq!(registry.pending_captures().await.unwrap(), pending_before);
+    assert!(matches!(
+        registry.try_capture_cleanup().await,
+        Err(Error::Busy)
+    ));
+    assert!(matches!(registry.try_host_access(), Err(Error::Busy)));
+    release.send(()).unwrap();
+    let (after, exclusive_at_drop) = tokio::time::timeout(Duration::from_secs(3), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "owner survives the actual durable retirement"
+    );
+    assert!(
+        exclusive_at_drop,
+        "proof owner drops before exclusive fence release"
+    );
+    let cleanup = registry.capture_cleanup().await.unwrap().unwrap();
+    assert_eq!(cleanup.retired.id, tickets[0].id);
+    assert_eq!(cleanup.successor.id, tickets[1].id);
+}
+
+#[tokio::test]
+async fn retained_old_capture_has_a_distinct_pinned_source_basis_and_survives_reopen() {
+    let (directory, registry) = registry().await;
+    let registration = registry
+        .register(WorkspaceId([2; 16]), OpStoreId([3; 16]))
+        .await
+        .unwrap();
+    let mut tickets = Vec::new();
+    for seed in [4, 5] {
+        let command = registry.begin_command(registration).await.unwrap();
+        let path = directory.path().to_owned();
+        tickets.push(
+            registry
+                .capture_dirty(command.token(), move || async move {
+                    Ok(staged_capture(&path, seed))
+                })
+                .await
+                .unwrap(),
+        );
+        drop(command);
+    }
+    let old = tickets[0].clone();
+    let newer = tickets[1].clone();
+    let upload = cleanup_upload(1);
+    assert!(matches!(
+        registry
+            .retire_redundant_capture(old.clone(), newer.clone(), upload.clone())
+            .await,
+        Err(Error::Invalid("successor omits retained typed roots"))
+    ));
+    let proof = RetainedOldCaptureV1 {
+        retired_binding: old.binding(),
+        provider: [7; 32],
+        cloud_workspace: [8; 32],
+        generation: 1,
+        manifest_id: [9; 32],
+        manifest: BundleDescriptor {
+            blake3: [10; 32],
+            size_bytes: 128,
+        },
+        capture: BundleDescriptor {
+            blake3: [11; 32],
+            size_bytes: 256,
+        },
+        source: RetainedSourceWitness {
+            authority: [12; 32],
+            pin: [13; 32],
+            binding: [14; 32],
+            roots: retained_root_set_digest(&old.checkpoint.roots),
+        },
+    };
+    let before_inventory = registry.pending_captures().await.unwrap();
+    let invalid: [(&str, fn(&mut RetainedOldCaptureV1)); 6] = [
+        ("different old binding", |p| p.retired_binding[0] ^= 1),
+        ("different root obligation", |p| p.source.roots[0] ^= 1),
+        ("missing source identity", |p| p.source.authority = [0; 32]),
+        ("missing protected pin", |p| p.source.pin = [0; 32]),
+        ("missing current provider", |p| p.provider = [0; 32]),
+        ("missing retained generation", |p| p.generation = 0),
+    ];
+    for (name, mutate) in invalid {
+        let mut wrong = proof.clone();
+        mutate(&mut wrong);
+        assert!(
+            registry
+                .retire_capture_backed_by_retained_version(
+                    old.clone(),
+                    newer.clone(),
+                    upload.clone(),
+                    wrong,
+                    Arc::new(()),
+                    || Ok(())
+                )
+                .await
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(registry.pending_captures().await.unwrap(), before_inventory);
+    }
+    let before = registry.storage_stats().transactions;
+    assert_eq!(
+        registry
+            .retire_capture_backed_by_retained_version(
+                old.clone(),
+                newer.clone(),
+                upload.clone(),
+                proof.clone(),
+                Arc::new(()),
+                || Err(Error::Busy)
+            )
+            .await
+            .unwrap_err(),
+        Error::Busy
+    );
+    assert_eq!(registry.storage_stats().transactions, before);
+    let obligation = registry
+        .retire_capture_backed_by_retained_version(
+            old.clone(),
+            newer.clone(),
+            upload,
+            proof.clone(),
+            Arc::new(()),
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        obligation.basis,
+        Some(CaptureCleanupBasis::RetainedOldCaptureV1(proof.clone()))
+    );
+    assert_eq!(registry.pending_captures().await.unwrap(), vec![newer]);
+    assert!(
+        registry
+            .try_capture_cleanup()
+            .await
+            .unwrap()
+            .unwrap()
+            .acknowledge_capture_cleanup()
+            .await
+            .is_err()
+    );
+    drop(registry);
+    assert_retention_manifest_version(directory.path(), 5);
+    let registry =
+        Registry::open_existing(directory.path(), RegistryId([1; 16]), Limits::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        registry.capture_cleanup().await.unwrap(),
+        Some(obligation.clone())
+    );
+    let mut wrong = proof.source.clone();
+    wrong.pin[0] ^= 1;
+    assert!(
+        registry
+            .try_capture_cleanup()
+            .await
+            .unwrap()
+            .unwrap()
+            .acknowledge_capture_cleanup_with_retained_source(wrong, Arc::new(()))
+            .await
+            .is_err()
+    );
+    assert_eq!(registry.capture_cleanup().await.unwrap(), Some(obligation));
+    registry
+        .try_capture_cleanup()
+        .await
+        .unwrap()
+        .unwrap()
+        .acknowledge_capture_cleanup_with_retained_source(proof.source, Arc::new(()))
+        .await
+        .unwrap();
+    assert!(registry.capture_cleanup().await.unwrap().is_none());
+    drop(registry);
+    assert_retention_manifest_version(directory.path(), 5);
 }

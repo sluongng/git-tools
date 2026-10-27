@@ -24,6 +24,10 @@ pub struct CloudConfig {
     pub enabled: bool,
     pub indexed_versions: bool,
     pub captured_versions: bool,
+    /// Advertise full Store-owned retained backing only when the effective
+    /// backing implements it. Disabling this policy prevents new offloads;
+    /// it never removes previously published dependencies or alters GC roots.
+    pub durable_retained_offload: bool,
     pub max_capture_bytes: usize,
     pub max_native_proof_steps: usize,
     pub max_native_proof_bytes: u64,
@@ -44,6 +48,7 @@ impl Default for CloudConfig {
             enabled: false,
             indexed_versions: false,
             captured_versions: false,
+            durable_retained_offload: true,
             max_capture_bytes: 8 * 1024 * 1024,
             max_native_proof_steps: 256,
             max_native_proof_bytes: 64 * 1024 * 1024,
@@ -100,6 +105,7 @@ impl CloudConfig {
         let maximum = [
             ("PublishVersion", store_work),
             ("GetVersion", store_work),
+            ("GetLatestCapturedVersion", store_work),
             (
                 "ReadCapture",
                 if self.captured_versions {
@@ -109,6 +115,8 @@ impl CloudConfig {
                 },
             ),
             ("PutObject", ordinary_work),
+            ("PutObjectRepresentation", ordinary_work),
+            ("ReadObjectRepresentation", ordinary_work),
             ("LookupObjects", ordinary_work),
             (
                 "ReadNativeClosure",
@@ -153,7 +161,9 @@ impl CloudConfig {
     }
     pub(crate) fn wire_limit(&self, method: &str) -> usize {
         match method {
-            "PutObject" | "PutIndexArtifact" => self.max_object_bytes.saturating_add(4096),
+            "PutObject" | "PutObjectRepresentation" | "PutIndexArtifact" => {
+                self.max_object_bytes.saturating_add(4096)
+            }
             "PublishVersion" => self
                 .max_manifest_bytes
                 .saturating_add(if self.captured_versions {
@@ -279,7 +289,7 @@ impl CloudHost {
             ));
         }
         let store = match method {
-            "PublishVersion" | "GetVersion" => self.store_work,
+            "PublishVersion" | "GetVersion" | "GetLatestCapturedVersion" => self.store_work,
             "PutIndexArtifact" | "ReadIndexArtifact" => self.profile.index_artifact_bytes,
             "ReadNativeClosure" => self.profile.native_read_bytes,
             "ReadCapture" => self.profile.capture_read_bytes,
@@ -639,6 +649,59 @@ fn native_authority(
 fn status(error: s::Error) -> Status {
     if matches!(error, s::Error::Limit("cloud native read deadline")) {
         Status::deadline_exceeded("retained native read deadline exceeded")
+    } else if let s::Error::Limit(limit) = error {
+        use tinytree_proto::PublicationFailureReason as Reason;
+        let reason = match limit {
+            "cloud publication request" => Reason::StorePublicationRequest,
+            "cloud capture attachment bytes" => Reason::StoreCaptureAttachmentBytes,
+            "cloud validation catalog budget" => Reason::StoreValidationCatalogBudget,
+            "cloud owner quota" => Reason::StoreOwnerQuota,
+            "repository quota" => Reason::StoreRepositoryQuota,
+            "cloud version decoded object budget" => Reason::StoreVersionDecodedObjectBudget,
+            "cloud capture input memory" => Reason::StoreCaptureInputMemory,
+            "cloud capture validation budget" => Reason::StoreCaptureValidationBudget,
+            "cloud capture validation metadata" => Reason::StoreCaptureValidationMetadata,
+            "cloud index validation budget" => Reason::StoreIndexValidationBudget,
+            "cloud index native proof memory" => Reason::StoreIndexNativeProofMemory,
+            "cloud index native proof steps" => Reason::StoreIndexNativeProofSteps,
+            "cloud index proof work" => Reason::StoreIndexProofWork,
+            "cloud validation catalog budget exceeded: records" => Reason::StoreValidationCatalogRecords,
+            "cloud validation catalog budget exceeded: metadata" => Reason::StoreValidationCatalogMetadata,
+            "cloud validation catalog budget exceeded: records_metadata" => Reason::StoreValidationCatalogRecordsMetadata,
+            "cloud validation catalog budget exceeded: payload" => Reason::StoreValidationCatalogPayload,
+            "cloud validation catalog budget exceeded: records_payload" => Reason::StoreValidationCatalogRecordsPayload,
+            "cloud validation catalog budget exceeded: metadata_payload" => Reason::StoreValidationCatalogMetadataPayload,
+            "cloud validation catalog budget exceeded: records_metadata_payload" => Reason::StoreValidationCatalogRecordsMetadataPayload,
+            "cloud index proof work exceeded: records" => Reason::StoreIndexProofRecords,
+            "cloud index proof work exceeded: metadata" => Reason::StoreIndexProofMetadata,
+            "cloud index proof work exceeded: records_metadata" => Reason::StoreIndexProofRecordsMetadata,
+            "cloud index proof work exceeded: payload" => Reason::StoreIndexProofPayload,
+            "cloud index proof work exceeded: records_payload" => Reason::StoreIndexProofRecordsPayload,
+            "cloud index proof work exceeded: metadata_payload" => Reason::StoreIndexProofMetadataPayload,
+            "cloud index proof work exceeded: records_metadata_payload" => Reason::StoreIndexProofRecordsMetadataPayload,
+            "cloud index artifact allocation" => Reason::StoreIndexArtifactAllocation,
+            "cloud index artifact count" => Reason::StoreIndexArtifactCount,
+            "cloud index loader memory" => Reason::StoreIndexLoaderMemory,
+            "cloud index decoded allocation" => Reason::StoreIndexDecodedAllocation,
+            "cloud index graph memory" => Reason::StoreIndexGraphMemory,
+            "cloud frozen index memory" => Reason::StoreFrozenIndexMemory,
+            "cloud frozen snapshot reconstruction memory" => Reason::StoreFrozenSnapshotMemory,
+            "cloud capture graph memory" => Reason::StoreCaptureGraphMemory,
+            "cloud capture binding memory" => Reason::StoreCaptureBindingMemory,
+            "cloud selected anchors memory" => Reason::StoreSelectedAnchorsMemory,
+            "cloud version member allocation" => Reason::StoreVersionMemberAllocation,
+            "cloud version raw bytes" => Reason::StoreVersionRawBytes,
+            "cloud catalog scan" => Reason::StoreCatalogScan,
+            "cloud payload validation" => Reason::StorePayloadValidation,
+            "cloud staging closure" => Reason::StoreStagingClosure,
+            "cloud catalog references" => Reason::StoreCatalogReferences,
+            "cloud retained version quota" => Reason::StoreRetainedVersionQuota,
+            "cloud version validation metadata" => Reason::StoreVersionValidationMetadata,
+            "cloud version validation bytes" => Reason::StoreVersionValidationBytes,
+            "cloud workspace generation" => Reason::StoreWorkspaceGeneration,
+            _ => Reason::UnknownStoreLimit,
+        };
+        Status::resource_exhausted(reason.message())
     } else {
         crate::service::store_status(error)
     }
@@ -685,6 +748,56 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         let receipt = execute(work.clone(), move || {
             store
                 .put_cloud_object(
+                    &input.repository_id,
+                    owner,
+                    id,
+                    digest,
+                    &input.payload,
+                    now()?,
+                    tinytree_cloud::Limits::default(),
+                )
+                .map_err(status)
+        })
+        .await?;
+        Ok(response(
+            p::WriteReceipt {
+                descriptor: Some(descriptor(receipt.descriptor)),
+                staging_lease: receipt.staging_lease,
+                expires_at_unix_seconds: receipt.expires_at,
+            },
+            work,
+            (),
+        ))
+    }
+    async fn put_object_representation(
+        &self,
+        request: Request<p::PutObjectRequest>,
+    ) -> Result<Response<p::WriteReceipt>, Status> {
+        let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
+        let input = request.into_inner();
+        if input.payload.len() > host.config.max_object_bytes {
+            return Err(Status::resource_exhausted(
+                "private object exceeds payload budget",
+            ));
+        }
+        let d = input
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing private object descriptor"))?;
+        let id = id(d.id)?;
+        let digest = d
+            .selected
+            .ok_or_else(|| Status::invalid_argument("missing private object digest"))?;
+        let digest = tinytree_cloud::BlobDigest {
+            blake3: array(&digest.blake3)?,
+            size_bytes: digest.size_bytes,
+        };
+        if digest.size_bytes != input.payload.len() as u64 {
+            return Err(Status::invalid_argument("private object size mismatch"));
+        }
+        let store = host.store.clone();
+        let receipt = execute(work.clone(), move || {
+            store
+                .put_cloud_object_representation(
                     &input.repository_id,
                     owner,
                     id,
@@ -784,6 +897,64 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         };
         Ok(response(
             Box::pin(stream) as Self::ReadObjectStream,
+            work,
+            held,
+        ))
+    }
+    type ReadObjectRepresentationStream = RpcStream<p::ObjectChunk>;
+    async fn read_object_representation(
+        &self,
+        request: Request<p::ReadObjectRepresentationRequest>,
+    ) -> Result<Response<Self::ReadObjectRepresentationStream>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        let input = request.into_inner();
+        let d = input
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing private representation descriptor"))?;
+        let id = id(d.id)?;
+        let raw = d
+            .selected
+            .ok_or_else(|| Status::invalid_argument("missing private representation digest"))?;
+        let exact = s::CloudObjectDescriptor {
+            id,
+            selected: tinytree_cloud::BlobDigest {
+                blake3: array(&raw.blake3)?,
+                size_bytes: raw.size_bytes,
+            },
+        };
+        let store = host.store.clone();
+        let mut limits = tinytree_cloud::Limits::default();
+        limits.max_payload_bytes = host.config.max_object_bytes;
+        let lease = execute(work.clone(), move || {
+            store
+                .read_cloud_object_representation(&input.repository_id, owner, exact, limits)
+                .map_err(status)
+        })
+        .await?;
+        let descriptor = descriptor(lease.descriptor());
+        let lease = Arc::new(Mutex::new(lease));
+        let held = lease.clone();
+        let stream_work = work.clone();
+        let frame = host.config.max_frame_bytes;
+        let stream = async_stream::try_stream! {
+            let mut offset=0u64;
+            loop {
+                let lease=lease.clone();
+                let bytes=execute(stream_work.clone(),move||{
+                    let mut bytes=vec![0;frame];
+                    let n=lease.lock().map_err(|_|Status::internal("private object read failed"))?.read(&mut bytes).map_err(|_|Status::data_loss("private object payload unavailable"))?;
+                    bytes.truncate(n);Ok(bytes)
+                }).await?;
+                let n=bytes.len();let eof=offset+n as u64==descriptor.selected.as_ref().unwrap().size_bytes;
+                if n==0 && !eof {Err(Status::data_loss("private object payload truncated"))?;}
+                yield p::ObjectChunk{descriptor:Some(descriptor.clone()),offset,data:bytes,eof};
+                offset+=n as u64;
+                if eof{break;}
+            }
+        };
+        Ok(response(
+            Box::pin(stream) as Self::ReadObjectRepresentationStream,
             work,
             held,
         ))
@@ -1024,13 +1195,15 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
     ) -> Result<Response<p::Publication>, Status> {
         let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
         let input = request.into_inner();
-        if input.manifest.len() > host.config.max_manifest_bytes
-            || input.capture_data.len() > host.config.max_capture_bytes
-            || input.staging_leases.len() > host.config.max_staging_leases
-        {
-            return Err(Status::resource_exhausted(
-                "private workspace publication exceeds budget",
-            ));
+        use tinytree_proto::PublicationFailureReason as Reason;
+        if input.manifest.len() > host.config.max_manifest_bytes {
+            return Err(Status::resource_exhausted(Reason::ManifestBytes.message()));
+        }
+        if input.capture_data.len() > host.config.max_capture_bytes {
+            return Err(Status::resource_exhausted(Reason::CaptureBytes.message()));
+        }
+        if input.staging_leases.len() > host.config.max_staging_leases {
+            return Err(Status::resource_exhausted(Reason::StagingLeaseCount.message()));
         }
         // The opt-in reserves the complete indexed Store profile before decode.
         let indexed_format = input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
@@ -1226,6 +1399,65 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
                     value.manifest_bytes(),
                 )
             }),
+        };
+        Ok(response(output, work, value))
+    }
+    async fn get_latest_captured_version(
+        &self,
+        request: Request<p::GetLatestCapturedVersionRequest>,
+    ) -> Result<Response<p::Version>, Status> {
+        let (host, work, owner) =
+            self.context(&request, &request.get_ref().repository_id, false)?;
+        if !host.config.indexed_versions || !host.config.captured_versions {
+            return Err(Status::unimplemented(
+                "captured cloud versions are not enabled",
+            ));
+        }
+        let input = request.into_inner();
+        let workspace_id = array(&input.workspace_id)?;
+        let store = host.store.clone();
+        let mut limits = tinytree_cloud::ManifestLimits::default();
+        limits.max_manifest_bytes = host.config.max_manifest_bytes;
+        let authority_repo = input.repository_id.clone();
+        let deadline = work.deadline.into_std();
+        let value = execute(work.clone(), move || {
+            store
+                .read_latest_captured_cloud_version(
+                    &input.repository_id,
+                    owner,
+                    workspace_id,
+                    limits,
+                    deadline,
+                )
+                .map_err(|error| match error {
+                    s::Error::Invalid(
+                        "ambiguous latest capture exporter" | "ambiguous latest capture sequence",
+                    ) => Status::failed_precondition(
+                        "latest capture is ambiguous; select an explicit generation",
+                    ),
+                    s::Error::Limit("latest capture deadline") => {
+                        Status::deadline_exceeded("latest capture deadline")
+                    }
+                    error => status(error),
+                })
+        })
+        .await?
+        .ok_or_else(|| Status::not_found("no captured cloud version"))?;
+        let version = value.version();
+        let output = p::Version {
+            workspace_id: version.workspace.to_vec(),
+            generation: version.generation,
+            manifest_id: version.manifest.0.to_vec(),
+            previous_manifest_id: version.previous.map(|id| id.0.to_vec()),
+            manifest: value.manifest_bytes().to_vec(),
+            native_authority: Some(native_authority(
+                owner,
+                &authority_repo,
+                version.workspace,
+                version.generation,
+                version.manifest.0,
+                value.manifest_bytes(),
+            )),
         };
         Ok(response(output, work, value))
     }
@@ -1483,6 +1715,34 @@ mod indexed_adapter_tests {
         assert_eq!(permanent.code(), tonic::Code::ResourceExhausted);
         assert!(permanent.details().is_empty());
         assert!(!reapi::policy::retryable(&permanent));
+        use tinytree_proto::PublicationFailureReason as Reason;
+        for (limit, expected) in [
+            ("cloud validation catalog budget", Reason::StoreValidationCatalogBudget),
+            ("cloud version decoded object budget", Reason::StoreVersionDecodedObjectBudget),
+            ("cloud validation catalog budget exceeded: records", Reason::StoreValidationCatalogRecords),
+            ("cloud validation catalog budget exceeded: metadata", Reason::StoreValidationCatalogMetadata),
+            ("cloud validation catalog budget exceeded: records_metadata", Reason::StoreValidationCatalogRecordsMetadata),
+            ("cloud validation catalog budget exceeded: payload", Reason::StoreValidationCatalogPayload),
+            ("cloud validation catalog budget exceeded: records_payload", Reason::StoreValidationCatalogRecordsPayload),
+            ("cloud validation catalog budget exceeded: metadata_payload", Reason::StoreValidationCatalogMetadataPayload),
+            ("cloud validation catalog budget exceeded: records_metadata_payload", Reason::StoreValidationCatalogRecordsMetadataPayload),
+            ("cloud index proof work exceeded: records", Reason::StoreIndexProofRecords),
+            ("cloud index proof work exceeded: metadata", Reason::StoreIndexProofMetadata),
+            ("cloud index proof work exceeded: records_metadata", Reason::StoreIndexProofRecordsMetadata),
+            ("cloud index proof work exceeded: payload", Reason::StoreIndexProofPayload),
+            ("cloud index proof work exceeded: records_payload", Reason::StoreIndexProofRecordsPayload),
+            ("cloud index proof work exceeded: metadata_payload", Reason::StoreIndexProofMetadataPayload),
+            ("cloud index proof work exceeded: records_metadata_payload", Reason::StoreIndexProofRecordsMetadataPayload),
+            ("synthetic-sensitive-marker /private/fixture token=not-real", Reason::UnknownStoreLimit),
+        ] {
+            let failure = status(s::Error::Limit(limit));
+            assert_eq!(failure.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(Reason::from_message(failure.message()), Some(expected));
+            assert!(failure.details().is_empty());
+            assert!(!reapi::policy::retryable(&failure));
+            assert!(!format!("{failure:?}").contains("synthetic-sensitive-marker"));
+            assert!(!failure.message().contains("/private/"));
+        }
     }
     #[tokio::test]
     async fn legacy_rpc_rejects_indexed_publish_and_read_before_artifact_work() {

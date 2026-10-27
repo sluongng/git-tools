@@ -23,6 +23,7 @@ private-fs = { path = "../private-fs" }
 reapi = { path = "../reapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tinytree-annotate = { path = "../tinytree-annotate" }
 tinytree-cloud = { path = "../tinytree-cloud" }
 tinytree-check-runner = { path = "../tinytree-check-runner" }
 tinytree-search = { path = "../tinytree-search" }

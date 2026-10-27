@@ -16,6 +16,9 @@ pub(super) struct Owner {
     pub local: PrivateDir,
     pub program: PathBuf,
     pub cancel: watch::Receiver<bool>,
+    pub credential_helper: Option<super::auth::CapturedHelper>,
+    #[cfg(test)]
+    pub before_git_admission: Option<Arc<crate::watch::TestPause>>,
 }
 impl Owner {
     pub async fn raw(
@@ -31,6 +34,17 @@ impl Owner {
         let owner = self.clone();
         let job = tokio::spawn(async move {
             ensure!(!*owner.cancel.borrow(), "push cancelled before admission");
+            let helper_command = if let Some(helper) = &owner.credential_helper {
+                let policy = helper.policy.clone();
+                let cancel = owner.cancel.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || policy.command_until(deadline, &cancel))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("helper verification worker failed"))??,
+                )
+            } else {
+                None
+            };
             let mut command = Command::new(&owner.program);
             command.env_clear();
             for key in [
@@ -42,6 +56,11 @@ impl Owner {
             ] {
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);
+                }
+            }
+            if let Some(helper) = &owner.credential_helper {
+                for (name, value) in &helper.environment {
+                    command.env(name, value);
                 }
             }
             command
@@ -79,7 +98,11 @@ impl Owner {
                     "core.fsync=all",
                     "-c",
                     "core.fsyncMethod=fsync",
-                ])
+                ]);
+            if let Some(helper) = helper_command {
+                command.args(["-c", &format!("credential.helper={helper}")]);
+            }
+            command
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -104,6 +127,18 @@ impl Owner {
                     Ok(())
                 });
             }
+            #[cfg(test)]
+            if let Some(pause) = &owner.before_git_admission {
+                let pause = pause.clone();
+                tokio::task::spawn_blocking(move || pause.block(None)).await?;
+            }
+            // Verification may take time; no process may be admitted after a
+            // stop or expired budget, including while hashing a helper binary.
+            ensure!(!*owner.cancel.borrow(), "push cancelled before admission");
+            ensure!(
+                Instant::now() < deadline,
+                "push operation deadline exceeded"
+            );
             let mut child = command
                 .spawn()
                 .map_err(|_| anyhow::anyhow!("cannot start push Git worker"))?;
