@@ -227,6 +227,8 @@ fn configuration_cannot_override_remote_or_source_policy() {
     );
     for flag in [
         "--remote_executor=grpc://example.invalid",
+        "--remote_cache=grpc://example.invalid",
+        "--remote_proxy=unix:/tmp/other.sock",
         "--spawn_strategy=local",
         "--build_event_json_file=/tmp/other",
         "--config=hidden",

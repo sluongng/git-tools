@@ -656,8 +656,9 @@ fn profile_flags(attempt: &Attempt, flags: &[String]) -> Result<Vec<String>> {
 fn build_flags(config: &Config, attempt: &Attempt, profile: &crate::Profile) -> Vec<String> {
     let socket = format!("unix:{}", config.rbe_socket.display());
     let mut flags = vec![
-        format!("--remote_executor={socket}"),
-        format!("--remote_cache={socket}"),
+        "--remote_executor=grpc://localhost".into(),
+        "--remote_cache=grpc://localhost".into(),
+        format!("--remote_proxy={socket}"),
         "--nogoogle_default_credentials".into(),
         format!("--remote_instance_name={}", config.remote_instance_name),
         "--bes_backend=".into(),
