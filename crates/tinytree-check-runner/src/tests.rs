@@ -217,6 +217,15 @@ fn configuration_cannot_override_remote_or_source_policy() {
     let bytes = include_str!("../example.toml");
     let config: Config = toml::from_str(bytes).unwrap();
     config.validate().unwrap();
+    for mode in ["opt", "dbg", "fastbuild"] {
+        let mut candidate = config.clone();
+        candidate.profiles[0].flags.extend([
+            "--@curl//:ssl_lib=openssl".into(),
+            "--//build:feature=true".into(),
+            format!("--compilation_mode={mode}"),
+        ]);
+        candidate.validate().unwrap();
+    }
     let mut oversized = config.clone();
     oversized.profiles[0].targets = (0..10)
         .map(|n| format!("//app:{}{n}", "x".repeat(900)))
@@ -233,11 +242,26 @@ fn configuration_cannot_override_remote_or_source_policy() {
         "--build_event_json_file=/tmp/other",
         "--config=hidden",
         "--remote_header=secret",
+        "--compilation_mode=other",
+        "--@curl//:ssl_lib",
+        "--@curl//:ssl_lib=",
+        "--@@curl//:ssl_lib=openssl",
+        "--@//:ssl_lib=openssl",
+        "--@bad/repo//:ssl_lib=openssl",
+        "--//build:=true",
+        "--//build:feature:other=true",
+        "--//build//nested:feature=true",
+        "--//build:feature=true\n--config=hidden",
     ] {
         let mut candidate = config.clone();
         candidate.profiles[0].flags.push(flag.into());
         assert!(candidate.validate().is_err());
     }
+    let mut oversized_repository = config.clone();
+    oversized_repository.profiles[0]
+        .flags
+        .push(format!("--@{}//:feature=true", "r".repeat(129)));
+    assert!(oversized_repository.validate().is_err());
 }
 
 #[tokio::test]

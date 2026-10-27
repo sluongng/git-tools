@@ -319,5 +319,48 @@ fn allowed_flag(value: &str) -> bool {
     ];
     value.len() <= 4096
         && !value.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r')
-        && PREFIXES.iter().any(|p| value.starts_with(p))
+        && (PREFIXES.iter().any(|p| value.starts_with(p))
+            || matches!(
+                value,
+                "--compilation_mode=opt"
+                    | "--compilation_mode=dbg"
+                    | "--compilation_mode=fastbuild"
+            )
+            || setting_assignment(value))
+}
+fn setting_assignment(value: &str) -> bool {
+    let Some((label, assigned)) = value.strip_prefix("--").and_then(|v| v.split_once('=')) else {
+        return false;
+    };
+    if assigned.is_empty() {
+        return false;
+    }
+    let label = if let Some(external) = label.strip_prefix('@') {
+        let Some(end) = external.find("//") else {
+            return false;
+        };
+        let repository = &external[..end];
+        if repository.is_empty()
+            || repository.len() > 128
+            || !repository
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+        {
+            return false;
+        }
+        &external[end..]
+    } else {
+        label
+    };
+    if !target(label) {
+        return false;
+    }
+    let Some((package, setting)) = label[2..].split_once(':') else {
+        return false;
+    };
+    let components = |path: &str| path.split('/').all(|part| !part.is_empty() && part != ".");
+    (package.is_empty() || components(package))
+        && !setting.is_empty()
+        && !setting.contains(':')
+        && components(setting)
 }
