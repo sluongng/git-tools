@@ -167,7 +167,7 @@ impl Closure {
         let mut expectations = HashMap::<m::ObjectKey, u64>::new();
         let mut tree_roots = HashSet::new();
         let mut bytes = 0usize;
-        let mut edges = 0usize;
+        let mut graph_edges = 0usize;
         while let Some((key, exit)) = pending.pop() {
             crate::io::check_deadline()?;
             if key.kind == m::Kind::Commit && key.id.0 == [0; 32] {
@@ -312,11 +312,11 @@ impl Closure {
             visiting.insert(key);
             pending.push((key, true));
             let refs = node.object.references();
-            edges = edges
+            graph_edges = graph_edges
                 .checked_add(refs.len())
                 .context(ClosureFailure::EdgeOverflow)?;
             ensure!(
-                edges <= inner.config.closure.max_edges,
+                graph_edges <= inner.config.closure.max_edges,
                 ClosureFailure::EdgeBudget
             );
             for child in refs.into_iter().rev() {
@@ -343,7 +343,7 @@ impl Closure {
                 ClosureFailure::SymlinkLength
             );
         }
-        validate_contexts(&nodes, tree_roots, &inner.config, &mut edges)?;
+        validate_contexts(&nodes, tree_roots, &inner.config)?;
         let files = files
             .into_iter()
             .map(|(id, (size, tree))| (id, size, tree))
@@ -436,8 +436,9 @@ pub(crate) fn validate_contexts(
     nodes: &HashMap<m::ObjectKey, Node>,
     roots: HashSet<m::TreeId>,
     config: &Config,
-    edges: &mut usize,
 ) -> Result<()> {
+    // One path-work allowance spans all roots and all distinct (tree, prefix) contexts.
+    let mut path_edges = 0usize;
     let mut pending = Vec::new();
     let mut seen = HashSet::new();
     let mut context_bytes = 0usize;
@@ -465,11 +466,11 @@ pub(crate) fn validate_contexts(
         };
         for entry in &tree.entries {
             crate::io::check_deadline()?;
-            *edges = edges
+            path_edges = path_edges
                 .checked_add(1)
                 .context(ClosureFailure::PathEdgeOverflow)?;
             ensure!(
-                *edges <= config.closure.max_edges,
+                path_edges <= config.closure.max_edges,
                 ClosureFailure::PathEdgeBudget
             );
             let length = prefix
@@ -501,11 +502,11 @@ pub(crate) fn validate_contexts(
                     copy_id: Some(copy),
                     ..
                 } => {
-                    *edges = edges
+                    path_edges = path_edges
                         .checked_add(1)
                         .context(ClosureFailure::PathEdgeOverflow)?;
                     ensure!(
-                        *edges <= config.closure.max_edges,
+                        path_edges <= config.closure.max_edges,
                         ClosureFailure::PathEdgeBudget
                     );
                     let path = if prefix.is_empty() {

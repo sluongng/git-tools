@@ -5,6 +5,8 @@ use std::{io::Read, path::Path};
 #[serde(default, deny_unknown_fields)]
 pub struct ClosureLimits {
     pub max_objects: usize,
+    /// Per-phase edge-work bound: canonical graph discovery and the entire
+    /// path-context validation pass each get this allowance (at most twice total).
     pub max_edges: usize,
     pub max_metadata_bytes: usize,
     pub max_path_contexts: usize,

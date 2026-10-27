@@ -1396,6 +1396,144 @@ async fn admission_respects_tight_request_and_closure_budgets() {
         }
         server.stop().await;
     }
+
+    // Canonical graph edges and expanded path edges are distinct bounded work.
+    // Two roots each have three names for a shared three-entry leaf: 12 graph
+    // references, but 24 path edges (12 per root). Neither phase gets a reset
+    // for an additional root, and their sum does not consume one shared budget.
+    for (name, max_edges, failure) in [
+        ("independent phase allowances", 25, None),
+        (
+            "graph phase overrun",
+            11,
+            Some("metadata closure edge budget exceeded"),
+        ),
+        (
+            "all roots share path allowance",
+            23,
+            Some("path edge budget exceeded"),
+        ),
+    ] {
+        let (_serverdir, store, fixture, old) = seed();
+        let counts = Counters::new();
+        let server = Server::start(store, counts.clone()).await;
+        let directory = private_dir();
+        let mut configuration = config(&server);
+        configuration.closure.max_edges = max_edges;
+        let (_direct, repo) = local(
+            directory.path(),
+            cache(directory.path()),
+            configuration,
+            true,
+        );
+        let file = first_file(&fixture).descriptor;
+        let leaf = repo
+            .io
+            .write_metadata(m::Object::Tree(m::Tree {
+                entries: (0..3)
+                    .map(|n| m::TreeEntry {
+                        name: format!("file-{n}"),
+                        value: m::TreeValue::File {
+                            id: m::FileId(file.key.id.0),
+                            executable: false,
+                            size_bytes: file.size_bytes,
+                            copy_id: None,
+                        },
+                    })
+                    .collect(),
+            }))
+            .await
+            .unwrap();
+        let mut roots = Vec::new();
+        for prefix in ["left", "right"] {
+            let tree = repo
+                .io
+                .write_metadata(m::Object::Tree(m::Tree {
+                    entries: (0..3)
+                        .map(|n| m::TreeEntry {
+                            name: format!("{prefix}-{n}"),
+                            value: m::TreeValue::Tree(m::TreeId(leaf.key.id.0)),
+                        })
+                        .collect(),
+                }))
+                .await
+                .unwrap();
+            roots.push(m::TreeId(tree.key.id.0));
+        }
+        let original = fixture
+            .objects()
+            .iter()
+            .find(|object| object.descriptor.key.id.0 == old.0)
+            .unwrap();
+        let m::Object::Commit(mut commit) =
+            m::decode(&original.bytes, m::Limits::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        commit.parents = vec![m::CommitId::ROOT];
+        commit.predecessors.clear();
+        commit.root_tree = m::TreeMerge {
+            terms: vec![roots[0], roots[1], roots[0]],
+            labels: vec!["left".into(), "base".into(), "right".into()],
+        };
+        commit.description = "independent closure work phases".into();
+        let head = repo
+            .io
+            .write_metadata(m::Object::Commit(commit))
+            .await
+            .unwrap();
+        let published = repo
+            .control
+            .publish(PublishRequest {
+                head: m::CommitId(head.key.id.0),
+                reference_name: "phase-budget".into(),
+                expected_generation: 0,
+                idempotency_key: "phase-budget-publication".into(),
+            })
+            .await;
+        assert_eq!(
+            published.is_ok(),
+            failure.is_none(),
+            "{name}: {published:?}"
+        );
+        if let Some(expected) = failure {
+            assert!(
+                format!("{:#}", published.unwrap_err()).contains(expected),
+                "{name}"
+            );
+        }
+        let source = Arc::new(TransferSource {
+            inner: repo.io.clone(),
+            files: AtomicUsize::new(0),
+            metadata_reads: AtomicUsize::new(0),
+            hook: None,
+        });
+        let mut limits = jj_native_remote::NativeTransferLimits::default();
+        limits.closure.max_edges = max_edges;
+        let transferred = repo
+            .control
+            .transfer_native_closure(
+                source,
+                vec![head.key],
+                Arc::new(()),
+                limits,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(
+            transferred.is_ok(),
+            failure.is_none(),
+            "{name}: {transferred:?}"
+        );
+        if max_edges == 23 {
+            assert!(
+                format!("{:#}", transferred.unwrap_err()).contains("path edge budget exceeded"),
+                "{name}"
+            );
+        }
+        assert_eq!(counts.files.load(Ordering::SeqCst), 0, "{name}");
+        server.stop().await;
+    }
 }
 
 /// Matched parent-run baseline/candidate benchmark: real compressed repository
@@ -4450,8 +4588,10 @@ async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_his
         tonic::Code::ResourceExhausted,
         "retained facts must consume independent registry bytes, not an inflight slot"
     );
-    assert_eq!(native_broker::QueryFailureReason::from_status(&exhausted),
-        Some(native_broker::QueryFailureReason::LocalRegistryBytesExhausted));
+    assert_eq!(
+        native_broker::QueryFailureReason::from_status(&exhausted),
+        Some(native_broker::QueryFailureReason::LocalRegistryBytesExhausted)
+    );
     drop(first_facts);
     let recovered = repo.query.facts(scope, facts, Arc::new(())).await.unwrap();
     assert_eq!(recovered.value.answers.len(), 64);
@@ -4576,17 +4716,24 @@ async fn captured_multi_root_queries_admit_deep_metadata_without_intervening_his
         )
         .await
         .unwrap();
-    let capacity = repo.query.open_scope(
-        OpenQueryScope {
-            query_identity_version: 1,
-            roots: vec![head, independent_head],
-            overlay: Vec::new(),
-            replay_key: [35; 32],
-        }, Arc::new(()),
-    ).await.unwrap_err();
+    let capacity = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                query_identity_version: 1,
+                roots: vec![head, independent_head],
+                overlay: Vec::new(),
+                replay_key: [35; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap_err();
     assert_eq!(capacity.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(native_broker::QueryFailureReason::from_status(&capacity),
-        Some(native_broker::QueryFailureReason::LocalScopeCountExceeded));
+    assert_eq!(
+        native_broker::QueryFailureReason::from_status(&capacity),
+        Some(native_broker::QueryFailureReason::LocalScopeCountExceeded)
+    );
     let private = repo
         .query
         .read_commit(
@@ -5026,8 +5173,11 @@ async fn canonical_query_install_chunks_operator_limits_and_preserves_lazy_prove
         );
         repo.wait_for_idle().await;
         cache.wait_for_idle().await;
-        assert_eq!(counts.files.load(Ordering::SeqCst), files_before + 1,
-            "each fresh case fetches only its explicitly demanded FILE");
+        assert_eq!(
+            counts.files.load(Ordering::SeqCst),
+            files_before + 1,
+            "each fresh case fetches only its explicitly demanded FILE"
+        );
     }
     server.stop().await;
 }
@@ -5182,9 +5332,21 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
         path: "historical-0000.txt".into(),
         max_commits: 1,
     };
-    assert_eq!(query.annotation_capabilities(Arc::new(())).await.unwrap().value,
-        native_broker::BlameCapabilities::Explicit { supported: true, authorized: true });
-    let frontier = query.open_annotation_frontier(annotation.clone(), Arc::new(())).await.unwrap();
+    assert_eq!(
+        query
+            .annotation_capabilities(Arc::new(()))
+            .await
+            .unwrap()
+            .value,
+        native_broker::BlameCapabilities::Explicit {
+            supported: true,
+            authorized: true
+        }
+    );
+    let frontier = query
+        .open_annotation_frontier(annotation.clone(), Arc::new(()))
+        .await
+        .unwrap();
     assert_eq!(frontier.value.context, scope);
     assert_eq!(frontier.value.version, 3);
     let before_replay = counts.query_rpcs.load(Ordering::SeqCst);
@@ -5211,16 +5373,40 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
     );
     assert_eq!(frontier.value.scanned_commits, 1);
     assert_eq!(frontier.value.nodes.len(), 2);
-    let target = frontier.value.nodes.iter().find(|node|node.revision.as_ref().unwrap().value == selected.0).unwrap();
-    let demanded = query.read_annotation_input(native_broker::ReadAnnotationInput {
-        scope, context: scope, revision: selected, expected: target.value.clone().unwrap(),
-    }, Arc::new(())).await.unwrap();
+    let target = frontier
+        .value
+        .nodes
+        .iter()
+        .find(|node| node.revision.as_ref().unwrap().value == selected.0)
+        .unwrap();
+    let demanded = query
+        .read_annotation_input(
+            native_broker::ReadAnnotationInput {
+                scope,
+                context: scope,
+                revision: selected,
+                expected: target.value.clone().unwrap(),
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
     assert_eq!(demanded.value.context, scope);
     assert_eq!(demanded.value.data, first_file(&fixture).bytes);
-    assert_eq!(counts.files.load(Ordering::SeqCst), 0, "comparison input must not fall back to generic FILE RPCs");
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        0,
+        "comparison input must not fall back to generic FILE RPCs"
+    );
     assert_eq!(counts.metadata_rpcs.load(Ordering::SeqCst), before);
-    assert!(direct.descriptor(historical[0].descriptor.key).await.unwrap().is_none(),
-        "frontier metadata must not become eager generic TREE hydration");
+    assert!(
+        direct
+            .descriptor(historical[0].descriptor.key)
+            .await
+            .unwrap()
+            .is_none(),
+        "frontier metadata must not become eager generic TREE hydration"
+    );
     // Retained frontier/input results cannot retain the only RPC slot, and a
     // closed annotation context does not disable other queries on the scope.
     query
@@ -5346,18 +5532,59 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
 
     // A private COMMIT-only overlay is intentionally admitted for graph queries,
     // but its ID is rejected locally before a new frontier RPC can send it.
-    let original = fixture.objects().iter().find(|o|o.descriptor.key.kind == m::Kind::Commit).unwrap();
-    let m::Object::Commit(mut draft) = m::decode(&original.bytes, m::Limits::default()).unwrap() else { unreachable!() };
-    draft.parents = vec![head]; draft.change_id = m::ChangeId([239;16]); draft.description = "private annotation anchor".into();
+    let original = fixture
+        .objects()
+        .iter()
+        .find(|o| o.descriptor.key.kind == m::Kind::Commit)
+        .unwrap();
+    let m::Object::Commit(mut draft) = m::decode(&original.bytes, m::Limits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    draft.parents = vec![head];
+    draft.change_id = m::ChangeId([239; 16]);
+    draft.description = "private annotation anchor".into();
     let draft = m::encode(&m::Object::Commit(draft), m::Limits::default()).unwrap();
-    let private = query.fork_scope(native_broker::ForkQueryScope { parent: scope, expected_cloud_source_digest: None,
-        overlay: vec![draft.bytes], replay_key: [42;32] }, Arc::new(())).await.unwrap();
+    let private = query
+        .fork_scope(
+            native_broker::ForkQueryScope {
+                parent: scope,
+                expected_cloud_source_digest: None,
+                overlay: vec![draft.bytes],
+                replay_key: [42; 32],
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
     let before_private = counts.query_rpcs.load(Ordering::SeqCst);
-    assert_eq!(query.open_annotation_frontier(native_broker::OpenAnnotationFrontier { limits: None, scope: private.value.handle,
-        anchors: vec![m::CommitId(draft.descriptor.key.id.0)], path: "historical-0000.txt".into(), max_commits: 1,
-    }, Arc::new(())).await.unwrap_err().code(), tonic::Code::InvalidArgument);
-    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before_private, "known private anchor must not be sent by frontier RPC");
-    query.close_scope(private.value.handle, Arc::new(())).await.unwrap(); drop(private);
+    assert_eq!(
+        query
+            .open_annotation_frontier(
+                native_broker::OpenAnnotationFrontier {
+                    limits: None,
+                    scope: private.value.handle,
+                    anchors: vec![m::CommitId(draft.descriptor.key.id.0)],
+                    path: "historical-0000.txt".into(),
+                    max_commits: 1,
+                },
+                Arc::new(())
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before_private,
+        "known private anchor must not be sent by frontier RPC"
+    );
+    query
+        .close_scope(private.value.handle, Arc::new(()))
+        .await
+        .unwrap();
+    drop(private);
 
     let tree = objects
         .read_metadata(historical[0].descriptor.key)
@@ -7087,7 +7314,10 @@ fn prepared_cloud_authorization_rechecks_credentials_in_owned_child() {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "isolated credential-boundary fixture failed");
+            assert!(
+                status.success(),
+                "isolated credential-boundary fixture failed"
+            );
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -8568,8 +8798,14 @@ async fn exercise_retained_query_facade(
         native_broker::BrokerQueryClient::connect(&socket, "example", broker_config.clone())
             .await
             .unwrap();
-    assert!(query.prepare_cloud_authorization(source.authorization_source(), Arc::new(()))
-        .await.unwrap().is_none(), "wire providers retain the original per-root path");
+    assert!(
+        query
+            .prepare_cloud_authorization(source.authorization_source(), Arc::new(()))
+            .await
+            .unwrap()
+            .is_none(),
+        "wire providers retain the original per-root path"
+    );
     let input = native_broker::OpenCloudQueryScope {
         source: source.clone(),
         overlay: vec![],
@@ -8613,91 +8849,230 @@ async fn exercise_retained_query_facade(
     // obtains its own authenticated server scope. A second pass must refetch.
     let common = source.authorization_source();
     let cloud_before = counts.cloud_rpcs.load(Ordering::SeqCst);
-    let prepared = remote.query.prepare_cloud_authorization(common.clone(), Arc::new(()))
-        .await.unwrap().expect("remote provider prepares a bounded authorization pass");
+    let prepared = remote
+        .query
+        .prepare_cloud_authorization(common.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .expect("remote provider prepares a bounded authorization pass");
     assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), cloud_before + 1);
     let queries_before = counts.query_rpcs.load(Ordering::SeqCst);
     for (key, root, anchor, member) in [
-        (91, selected_index.root.id.0, m::CommitId(base.descriptor.key.id.0), m::CommitId(frozen.descriptor.key.id.0)),
-        (92, intrinsic.root.id.0, m::CommitId::ROOT, m::CommitId::ROOT),
+        (
+            91,
+            selected_index.root.id.0,
+            m::CommitId(base.descriptor.key.id.0),
+            m::CommitId(frozen.descriptor.key.id.0),
+        ),
+        (
+            92,
+            intrinsic.root.id.0,
+            m::CommitId::ROOT,
+            m::CommitId::ROOT,
+        ),
     ] {
         let mut selected_source = source.clone();
         selected_source.index_root_ids = vec![root];
         selected_source.expected_anchors = vec![anchor];
-        let scope = prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-            source: selected_source.clone(), overlay: vec![], replay_key: [key; 32],
-        }, prepared.owner.clone()).await.unwrap();
-        assert_eq!(scope.value.cloud_source_digest, Some(selected_source.digest()));
-        let facts = prepared.value.facts(scope.value.handle, vec![q::GraphFact {
-            fact: Some(q::graph_fact::Fact::HasId(q::HasId {
-                commit: Some(q::CommitId { value: member.0.to_vec() }),
-            })),
-        }], prepared.owner.clone()).await.unwrap();
-        assert!(matches!(facts.value.answers.as_slice(), [q::GraphFactAnswer {
-            answer: Some(q::graph_fact_answer::Answer::HasId(true)),
-        }]));
-        prepared.value.close_scope(scope.value.handle, prepared.owner.clone()).await.unwrap();
+        let scope = prepared
+            .value
+            .open_cloud_scope(
+                native_broker::OpenCloudQueryScope {
+                    source: selected_source.clone(),
+                    overlay: vec![],
+                    replay_key: [key; 32],
+                },
+                prepared.owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scope.value.cloud_source_digest,
+            Some(selected_source.digest())
+        );
+        let facts = prepared
+            .value
+            .facts(
+                scope.value.handle,
+                vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(q::CommitId {
+                            value: member.0.to_vec(),
+                        }),
+                    })),
+                }],
+                prepared.owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            facts.value.answers.as_slice(),
+            [q::GraphFactAnswer {
+                answer: Some(q::graph_fact_answer::Answer::HasId(true)),
+            }]
+        ));
+        prepared
+            .value
+            .close_scope(scope.value.handle, prepared.owner.clone())
+            .await
+            .unwrap();
     }
     assert!(counts.query_rpcs.load(Ordering::SeqCst) > queries_before);
-    assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), cloud_before + 1,
-        "per-root scope/facts/ACK closes must not refetch the common proof");
-    let next = prepared.value.prepare_cloud_authorization(common.clone(), Arc::new(()))
-        .await.unwrap().unwrap();
-    assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), cloud_before + 2,
-        "even preparing from a pass view must freshly authenticate the next pass");
+    assert_eq!(
+        counts.cloud_rpcs.load(Ordering::SeqCst),
+        cloud_before + 1,
+        "per-root scope/facts/ACK closes must not refetch the common proof"
+    );
+    let next = prepared
+        .value
+        .prepare_cloud_authorization(common.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        counts.cloud_rpcs.load(Ordering::SeqCst),
+        cloud_before + 2,
+        "even preparing from a pass view must freshly authenticate the next pass"
+    );
     drop(next);
     // Every common field is exact, and mismatch must fail before even replaying
     // a previously closed matching scope or issuing upstream work.
     let mut changed_sources = Vec::new();
-    let mut changed = source.clone(); changed.provider_identity[0] ^= 1; changed_sources.push(changed);
-    let mut changed = source.clone(); changed.workspace_id[0] ^= 1; changed_sources.push(changed);
-    let mut changed = source.clone(); changed.generation += 1; changed_sources.push(changed);
-    let mut changed = source.clone(); changed.manifest_id[0] ^= 1; changed_sources.push(changed);
-    let mut changed = source.clone(); changed.manifest_blake3[0] ^= 1; changed_sources.push(changed);
-    let mut changed = source.clone(); changed.manifest_size_bytes += 1; changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.provider_identity[0] ^= 1;
+    changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.workspace_id[0] ^= 1;
+    changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.generation += 1;
+    changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.manifest_id[0] ^= 1;
+    changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.manifest_blake3[0] ^= 1;
+    changed_sources.push(changed);
+    let mut changed = source.clone();
+    changed.manifest_size_bytes += 1;
+    changed_sources.push(changed);
     let before_mismatch = counts.query_rpcs.load(Ordering::SeqCst);
     for changed in changed_sources {
-        assert_eq!(prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-            source: changed, overlay: vec![], replay_key: [91; 32],
-        }, prepared.owner.clone()).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            prepared
+                .value
+                .open_cloud_scope(
+                    native_broker::OpenCloudQueryScope {
+                        source: changed,
+                        overlay: vec![],
+                        replay_key: [91; 32],
+                    },
+                    prepared.owner.clone()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
     assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before_mismatch);
     let mut wrong_anchor = source.clone();
     wrong_anchor.expected_anchors = vec![m::CommitId::ROOT];
-    assert!(prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-        source: wrong_anchor, overlay: vec![], replay_key: [93; 32],
-    }, prepared.owner.clone()).await.is_err(), "pass cannot skip per-root anchor verification");
+    assert!(
+        prepared
+            .value
+            .open_cloud_scope(
+                native_broker::OpenCloudQueryScope {
+                    source: wrong_anchor,
+                    overlay: vec![],
+                    replay_key: [93; 32],
+                },
+                prepared.owner.clone()
+            )
+            .await
+            .is_err(),
+        "pass cannot skip per-root anchor verification"
+    );
     let mut wrong_root = source.clone();
     wrong_root.index_root_ids = vec![[0x99; 32]];
-    assert!(prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-        source: wrong_root, overlay: vec![], replay_key: [94; 32],
-    }, prepared.owner.clone()).await.is_err(), "pass cannot grant an unselected root");
+    assert!(
+        prepared
+            .value
+            .open_cloud_scope(
+                native_broker::OpenCloudQueryScope {
+                    source: wrong_root,
+                    overlay: vec![],
+                    replay_key: [94; 32],
+                },
+                prepared.owner.clone()
+            )
+            .await
+            .is_err(),
+        "pass cannot grant an unselected root"
+    );
     let mut wrong_common = common;
     wrong_common.manifest_blake3[0] ^= 1;
-    assert!(remote.query.prepare_cloud_authorization(wrong_common, Arc::new(())).await.is_err(),
-        "failed proof preparation must not return an unprepared fallback view");
+    assert!(
+        remote
+            .query
+            .prepare_cloud_authorization(wrong_common, Arc::new(()))
+            .await
+            .is_err(),
+        "failed proof preparation must not return an unprepared fallback view"
+    );
     if std::env::var_os("TINYTREE_AUTHORIZATION_CREDENTIAL_CHILD").is_some() {
         // This mutation is confined to the self-spawned, single-test child;
         // no other fixture reads this dedicated variable concurrently.
         for (key, token) in [(95, Some("changed-loopback-fixture-token")), (96, None)] {
             match token {
-                Some(value) => unsafe { std::env::set_var("TINYTREE_AUTHORIZATION_CHILD_TOKEN", value) },
+                Some(value) => unsafe {
+                    std::env::set_var("TINYTREE_AUTHORIZATION_CHILD_TOKEN", value)
+                },
                 None => unsafe { std::env::remove_var("TINYTREE_AUTHORIZATION_CHILD_TOKEN") },
             }
             let queries = counts.query_rpcs.load(Ordering::SeqCst);
             let versions = counts.cloud_rpcs.load(Ordering::SeqCst);
-            assert_eq!(prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-                source: source.clone(), overlay: vec![], replay_key: [key; 32],
-            }, prepared.owner.clone()).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
-            assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), queries,
-                "changed or missing current credentials must refuse before using the cached token");
+            assert_eq!(
+                prepared
+                    .value
+                    .open_cloud_scope(
+                        native_broker::OpenCloudQueryScope {
+                            source: source.clone(),
+                            overlay: vec![],
+                            replay_key: [key; 32],
+                        },
+                        prepared.owner.clone()
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                counts.query_rpcs.load(Ordering::SeqCst),
+                queries,
+                "changed or missing current credentials must refuse before using the cached token"
+            );
             assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), versions);
         }
         unsafe { std::env::set_var("TINYTREE_AUTHORIZATION_CHILD_TOKEN", TOKEN) };
-        let scope = prepared.value.open_cloud_scope(native_broker::OpenCloudQueryScope {
-            source: source.clone(), overlay: vec![], replay_key: [97; 32],
-        }, prepared.owner.clone()).await.unwrap();
-        prepared.value.close_scope(scope.value.handle, prepared.owner.clone()).await.unwrap();
+        let scope = prepared
+            .value
+            .open_cloud_scope(
+                native_broker::OpenCloudQueryScope {
+                    source: source.clone(),
+                    overlay: vec![],
+                    replay_key: [97; 32],
+                },
+                prepared.owner.clone(),
+            )
+            .await
+            .unwrap();
+        prepared
+            .value
+            .close_scope(scope.value.handle, prepared.owner.clone())
+            .await
+            .unwrap();
     }
     drop(prepared);
     let opened = query
@@ -8741,20 +9116,59 @@ async fn exercise_retained_query_facade(
     // publishing drafts or hydrating them into generic object authority. This
     // fixture deliberately has a one-nonroot history cap, so its complete union
     // cannot fit and no partial nodes may escape as a usable snapshot.
-    let annotation = query.open_annotation_frontier(native_broker::OpenAnnotationFrontier { limits: None,
-        scope: opened.value.handle, anchors: vec![frozen_id], path: "never-present.txt".into(), max_commits: 0,
-    }, Arc::new(())).await.unwrap();
+    let annotation = query
+        .open_annotation_frontier(
+            native_broker::OpenAnnotationFrontier {
+                limits: None,
+                scope: opened.value.handle,
+                anchors: vec![frozen_id],
+                path: "never-present.txt".into(),
+                max_commits: 0,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
     assert_eq!(annotation.value.context, opened.value.handle);
-    assert_eq!(annotation.value.coverage, q::HistoryCoverage::HistoryScanLimit as i32);
+    assert_eq!(
+        annotation.value.coverage,
+        q::HistoryCoverage::HistoryScanLimit as i32
+    );
     assert!(annotation.value.nodes.is_empty());
     let before_input = counts.query_rpcs.load(Ordering::SeqCst);
-    assert_eq!(query.read_annotation_input(native_broker::ReadAnnotationInput {
-        scope: opened.value.handle, context: opened.value.handle, revision: frozen_id,
-        expected: q::AnnotationPathValue { state: Some(q::HistoryPathState { kind: 2,
-            native_id: vec![1;32], size_bytes: 1, executable: false }), copy_id: Vec::new() },
-    }, Arc::new(())).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
-    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before_input, "incomplete frontier cannot issue input RPCs");
-    query.close_annotation_frontier(opened.value.handle, Arc::new(())).await.unwrap();
+    assert_eq!(
+        query
+            .read_annotation_input(
+                native_broker::ReadAnnotationInput {
+                    scope: opened.value.handle,
+                    context: opened.value.handle,
+                    revision: frozen_id,
+                    expected: q::AnnotationPathValue {
+                        state: Some(q::HistoryPathState {
+                            kind: 2,
+                            native_id: vec![1; 32],
+                            size_bytes: 1,
+                            executable: false
+                        }),
+                        copy_id: Vec::new()
+                    },
+                },
+                Arc::new(())
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before_input,
+        "incomplete frontier cannot issue input RPCs"
+    );
+    query
+        .close_annotation_frontier(opened.value.handle, Arc::new(()))
+        .await
+        .unwrap();
     drop(annotation);
 
     for (maximum, expected_scanned) in [(0, 1), (256, 1), (257, 2)] {

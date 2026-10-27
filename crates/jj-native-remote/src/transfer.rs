@@ -860,7 +860,7 @@ async fn collect(
     }
     let mut configured = config.clone();
     configured.closure = limits.closure.clone();
-    closure::validate_contexts(&nodes, tree_roots, &configured, &mut edges)?;
+    closure::validate_contexts(&nodes, tree_roots, &configured)?;
     Ok(closure::Closure {
         nodes,
         order,
