@@ -1817,6 +1817,7 @@ impl Projection for FuseMount {
         expected: output_core::SourceVersion,
         request_id: String,
         limits: output_core::SourceLimits,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<output_core::SourceReceipt> {
         let cached_metadata = !self.adapter.metadata_ttl.is_zero();
         self.complete(move |tree, notifier| {
@@ -1842,8 +1843,9 @@ impl Projection for FuseMount {
                 // Retain the same source fence through replacement: dropping it
                 // and reacquiring lets a kernel metadata job race publication.
                 // The explicit original version also preserves exact replay.
-                let receipt =
-                    snapshot.install_with_expected(root, expected, &request_id, &limits)?;
+                let receipt = snapshot
+                    .install_checkout_with_expected(root, expected, &request_id, &limits, owner)
+                    .await?;
                 // complete() retains the generation/control guard through every
                 // notification, even if its initiating RPC was cancelled.
                 for node in old {

@@ -500,6 +500,7 @@ async fn persisted_source_ack_recovers_controller_wal_gap_and_missing_receipts_s
         .unwrap();
     let controller = fixture.open(None).await;
     let before = controller.inspect().unwrap();
+    let retained = fixture.local("before-publication", b"retained").await;
     let capture = fixture
         .tree
         .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
@@ -529,6 +530,19 @@ async fn persisted_source_ack_recovers_controller_wal_gap_and_missing_receipts_s
         .await
         .unwrap();
     assert_eq!(source.version.generation, expected.generation + 1);
+    assert_eq!(
+        fixture
+            .tree
+            .resolve_source("before-publication")
+            .await
+            .unwrap()
+            .id,
+        retained
+    );
+    assert_eq!(
+        fixture.tree.read(retained, 0, 100).await.unwrap(),
+        b"retained"
+    );
     let local = fixture.local("after-publication", b"preserved").await;
     drop(controller);
     let controller = fixture.open(None).await;
@@ -996,6 +1010,173 @@ async fn lazy_policy_keeps_ignored_local_entries_and_verified_symlink_targets() 
         1,
         "excluded content remains a dirty overlay"
     );
+    drop(capture);
+    let target = fixture
+        .provider
+        .write_metadata(m::Object::Tree(m::Tree::default()))
+        .await
+        .unwrap();
+    let native = NativeTree {
+        terms: vec![target.key.id.0],
+        labels: Vec::new(),
+    };
+    let (checkout, _) = mutation
+        .check_out("lazy-policy-checkout", &native)
+        .await
+        .unwrap();
+    assert_eq!(checkout.after.tree, native);
+    assert_eq!(
+        fixture.tree.resolve_source("ignored").await.unwrap().id,
+        ignored
+    );
+    assert_eq!(
+        fixture.tree.read(ignored, 0, 100).await.unwrap(),
+        b"not uploaded"
+    );
+    assert!(fixture.tree.resolve_source("new").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_snapshot_exclusion_proof_survives_retirement_but_not_writes_or_checkout() {
+    let fixture = Fixture::lazy(true).await;
+    let controller = fixture.open(None).await;
+    let ignored = fixture.local("ignored", b"excluded bytes").await;
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (receipt, _) = mutation
+        .snapshot("exclude-for-capture", &options())
+        .await
+        .unwrap();
+    mutation
+        .finish(&receipt.after, &operation(), Some(&receipt))
+        .await
+        .unwrap();
+    drop(mutation);
+    let assert_ready = |controller: &Controller, expected| {
+        let snapshot = fixture
+            .tree
+            .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+            .unwrap();
+        let ledger = controller.inner.ledger.lock().unwrap();
+        let ack = ledger.acknowledgement.as_ref().unwrap();
+        assert!(
+            ack.retire.is_empty(),
+            "receipt retirement retains exclusion provenance"
+        );
+        assert_eq!(
+            canonical_capture_ready(&snapshot, ack.snapshot_source_version.as_ref()),
+            expected
+        );
+    };
+    assert_ready(&controller, true);
+    {
+        let snapshot = fixture
+            .tree
+            .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+            .unwrap();
+        let ledger = controller.inner.ledger.lock().unwrap();
+        let mut old_record =
+            serde_json::to_value(ledger.acknowledgement.as_ref().unwrap()).unwrap();
+        old_record
+            .as_object_mut()
+            .unwrap()
+            .remove("snapshot_source_version");
+        let old: Acknowledgement = serde_json::from_value(old_record).unwrap();
+        assert!(
+            !canonical_capture_ready(&snapshot, old.snapshot_source_version.as_ref()),
+            "old acknowledgements do not authorize excluded data"
+        );
+    }
+    drop(controller);
+    let controller = fixture.open(None).await;
+    assert_ready(&controller, true);
+    controller
+        .acknowledge(&receipt.after, &operation(), None)
+        .await
+        .unwrap();
+    assert_ready(&controller, true);
+    fixture
+        .tree
+        .write(ignored, 0, b"new ignored bytes")
+        .await
+        .unwrap();
+    assert_ready(&controller, false);
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (refreshed, _) = mutation
+        .snapshot("refresh-exclusion", &options())
+        .await
+        .unwrap();
+    mutation
+        .finish(&refreshed.after, &operation(), Some(&refreshed))
+        .await
+        .unwrap();
+    drop(mutation);
+    assert_ready(&controller, true);
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (checkout, _) = mutation
+        .check_out("checkout-excluded", &refreshed.after.tree)
+        .await
+        .unwrap();
+    mutation
+        .finish(&checkout.after, &operation(), Some(&checkout))
+        .await
+        .unwrap();
+    drop(mutation);
+    assert_ready(&controller, false);
+    assert_eq!(
+        fixture.tree.read(ignored, 0, 100).await.unwrap(),
+        b"new ignored bytes"
+    );
+
+    // Reset also produces Acknowledge receipts, but is not a policy snapshot.
+    let fixture = Fixture::lazy(false).await;
+    let controller = fixture.open(None).await;
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let (snapshot, _) = mutation
+        .snapshot("clean-snapshot", &options())
+        .await
+        .unwrap();
+    mutation
+        .finish(&snapshot.after, &operation(), Some(&snapshot))
+        .await
+        .unwrap();
+    drop(mutation);
+    let mut mutation = controller
+        .begin(&controller.inspect().unwrap())
+        .await
+        .unwrap();
+    let reset = mutation
+        .reset("clean-reset", &snapshot.after.tree, false)
+        .await
+        .unwrap();
+    mutation
+        .finish(&reset.after, &operation(), Some(&reset))
+        .await
+        .unwrap();
+    drop(mutation);
+    assert!(
+        controller
+            .inner
+            .ledger
+            .lock()
+            .unwrap()
+            .acknowledgement
+            .as_ref()
+            .unwrap()
+            .snapshot_source_version
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1121,12 +1302,107 @@ async fn lazy_checkout_counts_changed_leaves_and_reset_rejects_unsafe_rebaseline
         controller.receipt("unsafe-reset").await.unwrap(),
         ProjectionOutcome::Unknown
     ));
+    let local = fixture.local("untracked", b"keep local").await;
+    let parent = fixture.tree.resolve_source("unvisited").await.unwrap();
+    let nested = fixture
+        .tree
+        .create(parent.id, "local", 0o644)
+        .await
+        .unwrap();
+    fixture
+        .tree
+        .write(nested.id, 0, b"nested local")
+        .await
+        .unwrap();
     let (receipt, stats) = mutation.check_out("lazy-checkout", &native).await.unwrap();
+    assert_eq!(
+        fixture.tree.resolve_source("untracked").await.unwrap().id,
+        local
+    );
+    assert_eq!(
+        fixture.tree.read(local, 0, 100).await.unwrap(),
+        b"keep local"
+    );
+    assert_eq!(
+        fixture
+            .tree
+            .resolve_source("unvisited/local")
+            .await
+            .unwrap()
+            .id,
+        nested.id
+    );
+    assert_eq!(
+        fixture.tree.read(nested.id, 0, 100).await.unwrap(),
+        b"nested local"
+    );
+    assert!(fixture.tree.resolve_source("unvisited/deep").await.is_ok());
     assert_eq!(stats.updated_files, 1);
     assert_eq!(stats.added_files, 0);
     assert_eq!(stats.removed_files, 0);
     assert_eq!(receipt.after.tree, native);
     assert_eq!(fixture.provider.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_checkout_rejects_local_path_and_ancestor_collisions_without_loss() {
+    for local_directory in [false, true] {
+        let fixture = Fixture::lazy(false).await;
+        let controller = fixture.open(None).await;
+        let local = if local_directory {
+            let directory = fixture
+                .tree
+                .mkdir(fixture.tree.root_id(), "collision", 0o755)
+                .await
+                .unwrap();
+            let node = fixture
+                .tree
+                .create(directory.id, "note", 0o644)
+                .await
+                .unwrap();
+            fixture.tree.write(node.id, 0, b"keep local").await.unwrap();
+            node.id
+        } else {
+            fixture.local("collision", b"keep local").await
+        };
+        let value = files(fixture.provider.as_ref(), fixture.base).await["tracked"].clone();
+        let target = fixture
+            .provider
+            .write_metadata(m::Object::Tree(m::Tree {
+                entries: vec![m::TreeEntry {
+                    name: "collision".into(),
+                    value,
+                }],
+            }))
+            .await
+            .unwrap();
+        let native = NativeTree {
+            terms: vec![target.key.id.0],
+            labels: Vec::new(),
+        };
+        let before = controller.inspect().unwrap();
+        let mut mutation = controller.begin(&before).await.unwrap();
+        let error = mutation
+            .check_out("local-collision", &native)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProjectionFailure::Rejected(_)));
+        assert_eq!(controller.inspect().unwrap(), before);
+        assert!(matches!(
+            controller.receipt("local-collision").await.unwrap(),
+            ProjectionOutcome::Unknown
+        ));
+        let path = if local_directory {
+            "collision/note"
+        } else {
+            "collision"
+        };
+        assert_eq!(fixture.tree.resolve_source(path).await.unwrap().id, local);
+        assert_eq!(
+            fixture.tree.read(local, 0, 100).await.unwrap(),
+            b"keep local"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1544,9 +1820,32 @@ async fn controller_backup_capture_owns_the_actual_frontend_pause_and_resumes_on
         expected,
         "backup capture does not ACK or rebaseline dirty state"
     );
+    let mut policy = options();
+    policy.max_new_file_size = 0;
+    let mut mutation = controller.begin(&expected).await.unwrap();
+    let (receipt, _) = mutation
+        .snapshot("excluded-native-capture", &policy)
+        .await
+        .unwrap();
+    mutation
+        .finish(&receipt.after, &operation(), Some(&receipt))
+        .await
+        .unwrap();
+    drop(mutation);
+    let capture = controller.capture_for_backup(&receipt.after).await.unwrap();
+    assert!(capture.canonical_capture_ready());
+    assert!(!capture.snapshot().entries().is_empty());
+    drop(capture);
+    fs::write(config.root.join("local"), b"new unsnapshotted bytes").unwrap();
+    let capture = controller.capture_for_backup(&receipt.after).await.unwrap();
+    assert!(
+        !capture.canonical_capture_ready(),
+        "writes invalidate the exact snapshot ACK"
+    );
+    drop(capture);
     mount.shutdown().await.unwrap();
     assert!(
-        controller.capture_for_backup(&expected).await.is_err(),
+        controller.capture_for_backup(&receipt.after).await.is_err(),
         "an actual stopped mount cannot produce another sealed capture"
     );
 }

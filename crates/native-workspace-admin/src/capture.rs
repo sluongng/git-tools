@@ -182,7 +182,7 @@ impl TreeFreezePermit {
         owner: Owner,
     ) -> Result<Self> {
         ensure!(
-            capture.snapshot().entries().is_empty() && capture.snapshot().changes().is_empty(),
+            capture.canonical_capture_ready(),
             "dirty source cannot seal quiescent capture"
         );
         Ok(Self {
@@ -190,10 +190,12 @@ impl TreeFreezePermit {
             _owner: owner,
         })
     }
-    fn snapshot(&self) -> &output_core::SourceDeltaSnapshot {
+    fn canonical_capture_ready(&self) -> bool {
         match &self.source {
-            CaptureFreeze::Tree { snapshot, .. } => snapshot,
-            CaptureFreeze::Host(host) => host.snapshot(),
+            CaptureFreeze::Tree { snapshot, .. } => {
+                snapshot.entries().is_empty() && snapshot.changes().is_empty()
+            }
+            CaptureFreeze::Host(host) => host.canonical_capture_ready(),
         }
     }
     fn projection(&self) -> &jj_vfs::native::ProjectionState {
@@ -746,7 +748,7 @@ async fn read_inventory(
         "capture projection repository mismatch"
     );
     ensure!(
-        permit.snapshot().entries().is_empty() && permit.snapshot().changes().is_empty(),
+        permit.canonical_capture_ready(),
         "source changed before capture"
     );
     let quota = Arc::new(Quota {

@@ -39,6 +39,7 @@ struct TransferGate {
 #[derive(Debug)]
 struct Counting {
     gate: std::sync::Mutex<Option<Arc<TransferGate>>>,
+    metadata_gate: std::sync::Mutex<Option<Arc<TransferGate>>>,
     direct: Arc<DirectObjectIo>,
     reads: AtomicUsize,
     writes: AtomicUsize,
@@ -103,7 +104,21 @@ impl NativeObjectIo for Counting {
         key: m::ObjectKey,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> jj_lib::backend::BackendResult<VerifiedMetadata> {
-        self.direct.read_metadata_with_owner(key, owner).await
+        let gate = self.metadata_gate.lock().unwrap().clone();
+        let Some(gate) = gate else {
+            return self.direct.read_metadata_with_owner(key, owner).await;
+        };
+        let direct = self.direct.clone();
+        tokio::spawn(async move {
+            let _owner = owner.clone();
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+            direct.read_metadata_with_owner(key, owner).await.unwrap();
+            gate.completed.add_permits(1);
+        });
+        Err(jj_lib::backend::BackendError::Other(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture metadata timeout").into(),
+        ))
     }
     async fn read_file_with_owner(
         &self,
@@ -194,6 +209,14 @@ impl Fixture {
         Self::with_delays(limits, Duration::ZERO, Duration::ZERO).await
     }
     async fn with_delays(limits: Limits, header_delay: Duration, body_delay: Duration) -> Self {
+        Self::with_source(limits, header_delay, body_delay, false).await
+    }
+    async fn with_source(
+        limits: Limits,
+        header_delay: Duration,
+        body_delay: Duration,
+        lazy: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let private = directory.path().join("private");
         drop(PrivateDir::create(&private).unwrap());
@@ -207,6 +230,7 @@ impl Fixture {
         drop(PrivateDir::create(&objects).unwrap());
         let provider = Arc::new(Counting {
             gate: std::sync::Mutex::new(None),
+            metadata_gate: std::sync::Mutex::new(None),
             direct: Arc::new(
                 DirectObjectIo::init(&objects, jj_native_backend::Config::default()).unwrap(),
             ),
@@ -262,14 +286,27 @@ impl Fixture {
         let tree =
             Tree::open_with_cache_and_source(namespace, scope.backend(), cache, compiler.source())
                 .unwrap();
-        let compiled = compiler.compile_tree(base).await.unwrap();
-        tree.install_source(
-            compiled.manifest(tree.identity()),
-            None,
-            "bootstrap",
-            &SourceLimits::default(),
-        )
-        .unwrap();
+        if lazy {
+            let source = compiler
+                .lazy_tree_for_source(base, 1, SourceLimits::default())
+                .unwrap();
+            tree.install_lazy_source(
+                source.source_root(tree.identity()),
+                None,
+                "bootstrap",
+                &SourceLimits::default(),
+            )
+            .unwrap();
+        } else {
+            let compiled = compiler.compile_tree(base).await.unwrap();
+            tree.install_source(
+                compiled.manifest(tree.identity()),
+                None,
+                "bootstrap",
+                &SourceLimits::default(),
+            )
+            .unwrap();
+        }
         let controller = Arc::new(
             Controller::open_protocol_fixture(
                 ProtocolFixture {
@@ -981,96 +1018,138 @@ impl CommandHost for CommandFixture {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_command_wire_and_guard_survive_provider_timeout_until_physical_write_finishes() {
-    let fixture = Fixture::new().await;
-    let active = Arc::new(AtomicUsize::new(0));
-    fixture
-        .service
-        .set_command_host(Arc::new(CommandFixture {
-            active: active.clone(),
-        }))
+    for lazy_checkout in [false, true] {
+        let fixture = Fixture::with_source(
+            Limits::default(),
+            Duration::ZERO,
+            Duration::ZERO,
+            lazy_checkout,
+        )
+        .await;
+        let active = Arc::new(AtomicUsize::new(0));
+        fixture
+            .service
+            .set_command_host(Arc::new(CommandFixture {
+                active: active.clone(),
+            }))
+            .unwrap();
+        let command =
+            CommandClient::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
+        let channel = native_broker::connect_local_channel(
+            fixture.endpoint.clone(),
+            &Limits::default().transport,
+        )
+        .await
         .unwrap();
-    let command =
-        CommandClient::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
-    let channel = native_broker::connect_local_channel(
-        fixture.endpoint.clone(),
-        &Limits::default().transport,
-    )
-    .await
-    .unwrap();
-    let mut raw = client::client(channel, &Limits::default());
-    let oversized =
-        serde_json::json!({"Prepare":{"version":1,"mount":"workspace","replay":vec![5u8;33]}});
-    assert_eq!(
-        raw.command(tonic::Request::new(proto::Envelope {
-            payload: serde_json::to_vec(&oversized).unwrap()
-        }))
-        .await
-        .unwrap_err()
-        .code(),
-        tonic::Code::InvalidArgument
-    );
-    let preparation = command.prepare([5; 32]).await.unwrap();
-    let started = command.begin([5; 32], preparation).await.unwrap();
-    assert_eq!(started.epoch, 1);
-    let missing =
-        ClientConnector::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
-    assert!(missing.connect(&fixture.binding).is_err());
-    let wrong = missing.clone().with_command_token([6; 32]);
-    assert!(wrong.connect(&fixture.binding).is_err());
-    let connector = missing.with_command_token(started.token);
-    let binding = fixture.binding.clone();
-    let remote = tokio::task::spawn_blocking(move || connector.connect(&binding))
-        .await
-        .unwrap()
-        .unwrap();
-    fixture.local("new", b"owned bytes").await;
-    let expected = remote.inspect().unwrap();
-    let gate = Arc::new(TransferGate {
-        entered: tokio::sync::Semaphore::new(0),
-        release: tokio::sync::Semaphore::new(0),
-        completed: tokio::sync::Semaphore::new(0),
-    });
-    *fixture.provider.gate.lock().unwrap() = Some(gate.clone());
-    let operation = tokio::spawn(async move {
-        let mut session = remote.begin(&expected).await.unwrap();
-        let options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
-            progress: None,
-            start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &NothingMatcher,
-            max_new_file_size: 1024,
-        };
-        session.snapshot(SNAPSHOT, &options).await
-    });
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), operation)
+        let mut raw = client::client(channel, &Limits::default());
+        let oversized =
+            serde_json::json!({"Prepare":{"version":1,"mount":"workspace","replay":vec![5u8;33]}});
+        assert_eq!(
+            raw.command(tonic::Request::new(proto::Envelope {
+                payload: serde_json::to_vec(&oversized).unwrap()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        let preparation = command.prepare([5; 32]).await.unwrap();
+        let started = command.begin([5; 32], preparation).await.unwrap();
+        assert_eq!(started.epoch, 1);
+        let missing =
+            ClientConnector::new(fixture.endpoint.clone(), "workspace", Limits::default()).unwrap();
+        assert!(missing.connect(&fixture.binding).is_err());
+        let wrong = missing.clone().with_command_token([6; 32]);
+        assert!(wrong.connect(&fixture.binding).is_err());
+        let connector = missing.with_command_token(started.token);
+        let binding = fixture.binding.clone();
+        let remote = tokio::task::spawn_blocking(move || connector.connect(&binding))
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.local("new", b"owned bytes").await;
+        let expected = remote.inspect().unwrap();
+        let gate = Arc::new(TransferGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            completed: tokio::sync::Semaphore::new(0),
+        });
+        if lazy_checkout {
+            *fixture.provider.metadata_gate.lock().unwrap() = Some(gate.clone());
+        } else {
+            *fixture.provider.gate.lock().unwrap() = Some(gate.clone());
+        }
+        let operation = tokio::spawn(async move {
+            let mut session = remote.begin(&expected).await.unwrap();
+            let options = SnapshotOptions {
+                base_ignores: GitIgnoreFile::empty(),
+                progress: None,
+                start_tracking_matcher: &EverythingMatcher,
+                force_tracking_matcher: &NothingMatcher,
+                max_new_file_size: 1024,
+            };
+            if lazy_checkout {
+                session
+                    .check_out(CHECKOUT, &expected.tree)
+                    .await
+                    .map(|_| ())
+            } else {
+                session.snapshot(SNAPSHOT, &options).await.map(|_| ())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
             .await
             .unwrap()
             .unwrap()
-            .is_err()
-    );
-    assert!(
-        active.load(Ordering::SeqCst) > 0,
-        "physical provider job must retain its command after returning a timeout"
-    );
-    gate.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), gate.completed.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while active.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
+            .forget();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            active.load(Ordering::SeqCst) > 0,
+            "physical provider job must retain its command after returning a timeout"
+        );
+        if lazy_checkout {
+            assert!(
+                fixture
+                    .tree
+                    .freeze_lazy_source(
+                        output_core::SourceFrontendFence::TreeOnly,
+                        &SourceLimits::default()
+                    )
+                    .is_err(),
+                "detached checkout metadata must retain the captured source fence"
+            );
         }
-    })
-    .await
-    .unwrap();
-    command.finish_dirty(started.token).await.unwrap();
-    fixture.stop().await;
+        gate.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), gate.completed.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if lazy_checkout {
+            let capture = fixture
+                .tree
+                .freeze_lazy_source(
+                    output_core::SourceFrontendFence::TreeOnly,
+                    &SourceLimits::default(),
+                )
+                .unwrap();
+            assert!(capture.entries().iter().any(|entry| entry.path == "new"));
+            drop(capture);
+        }
+        command.finish_dirty(started.token).await.unwrap();
+        fixture.stop().await;
+    }
 }

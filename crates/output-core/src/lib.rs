@@ -151,6 +151,7 @@ pub trait Projection: Send + Sync {
         _expected: SourceVersion,
         _request_id: String,
         _limits: SourceLimits,
+        _owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<SourceReceipt> {
         anyhow::bail!("native lazy source publication is unsupported by this provider")
     }

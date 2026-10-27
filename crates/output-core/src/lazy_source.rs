@@ -727,7 +727,7 @@ impl Tree {
         let access = SourceAccess::ImmutableCandidate {
             root_tree: root.root_tree,
         };
-        self.install_lazy_source_frozen_access(root, None, request_id, limits, access)
+        self.install_lazy_source_frozen_access(root, None, request_id, limits, access, None)
     }
     fn install_lazy_source_frozen(
         &self,
@@ -742,6 +742,7 @@ impl Tree {
             request_id,
             limits,
             SourceAccess::ReadWrite,
+            None,
         )
     }
     fn install_lazy_source_frozen_access(
@@ -751,6 +752,7 @@ impl Tree {
         request_id: &str,
         limits: &SourceLimits,
         access: SourceAccess,
+        overlay: Option<CheckoutOverlay>,
     ) -> Result<SourceReceipt> {
         limits.validate()?;
         root.load_limits.validate()?;
@@ -859,7 +861,11 @@ impl Tree {
                     .collect::<Result<_>>()?;
                 Self::change_locked_mode(&mut ns, true, |state| {
                     for (id, path) in &old {
-                        if !path.split('/').next().is_some_and(source::control_name) {
+                        if !path.split('/').next().is_some_and(source::control_name)
+                            && !overlay
+                                .as_ref()
+                                .is_some_and(|overlay| overlay.paths.contains_key(path))
+                        {
                             state.nodes.get_mut(id).unwrap().node.linked = false;
                         }
                     }
@@ -889,6 +895,9 @@ impl Tree {
                             resident_bytes: 0,
                         }),
                     });
+                    if let Some(overlay) = &overlay {
+                        overlay.apply(state)?;
+                    }
                     let entries = dirty_entries(state, limits)?;
                     let version = source_version(self, state, &entries)?;
                     let result = SourceReceipt {
@@ -1580,6 +1589,79 @@ pub(super) fn account_records(previous: &State, next: &mut State) -> Result<()> 
     Ok(())
 }
 
+// Only overlay ancestry is expanded; untouched target subtrees remain lazy links.
+struct CheckoutOverlay {
+    paths: BTreeMap<String, u64>,
+    directories: BTreeMap<String, VerifiedSourceDirectory>,
+}
+impl CheckoutOverlay {
+    fn apply(&self, state: &mut State) -> Result<()> {
+        for id in self.paths.values() {
+            let record = state
+                .nodes
+                .get_mut(id)
+                .context("checkout overlay inode missing")?;
+            record.source_origin = None;
+            record.source_directory = None;
+            record.source_clean_ctime = None;
+        }
+        let mut ids = self.paths.clone();
+        ids.insert(String::new(), 1);
+        for (path, directory) in &self.directories {
+            let parent = *ids.get(path).context("checkout overlay parent missing")?;
+            state.nodes.get_mut(&parent).unwrap().source_directory = Some(DirectoryBase {
+                tree_id: directory.tree_id,
+                loaded: true,
+            });
+            for entry in &directory.entries {
+                let path = if path.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{path}/{}", entry.name)
+                };
+                let (kind, remote, size) = match &entry.kind {
+                    SourceDirectoryEntryKind::Directory { .. } => (NodeKind::Directory, None, 0),
+                    SourceDirectoryEntryKind::File { artifact, .. } => {
+                        (NodeKind::File, Some(artifact.clone()), artifact.size)
+                    }
+                    SourceDirectoryEntryKind::Symlink { target_size, .. } => {
+                        (NodeKind::Symlink, None, *target_size)
+                    }
+                };
+                let id = if let Some(id) = self.paths.get(&path) {
+                    ensure!(
+                        kind == NodeKind::Directory
+                            && record(state, *id)?.node.kind == NodeKind::Directory,
+                        "native checkout collides with local path: {path}"
+                    );
+                    *id
+                } else {
+                    allocate(state, parent, &entry.name, kind, entry.mode, remote, true)?.id
+                };
+                ids.insert(path.clone(), id);
+                let record = state.nodes.get_mut(&id).unwrap();
+                record.node.size = size;
+                let loaded = self.directories.contains_key(&path);
+                record.source_origin = Some(SourceBaseOrigin {
+                    path,
+                    parent_tree: directory.tree_id,
+                    mode: entry.mode,
+                    kind: entry.kind.clone(),
+                });
+                record.source_clean_ctime = Some(record.node.ctime);
+                record.source_directory = match &entry.kind {
+                    SourceDirectoryEntryKind::Directory { tree_id } => Some(DirectoryBase {
+                        tree_id: *tree_id,
+                        loaded,
+                    }),
+                    _ => None,
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SourceDeltaSnapshot {
     pub fn baseline(&self) -> &SourcePin {
         &self.baseline
@@ -1637,6 +1719,144 @@ impl SourceDeltaSnapshot {
     ) -> Result<SourceReceipt> {
         self.tree
             .install_lazy_source_frozen(root, Some(expected), request_id, limits)
+    }
+    /// Reject tracked work and target collisions without changing the namespace.
+    /// Only target directories along retained local paths are read.
+    pub async fn validate_checkout(
+        self: &Arc<Self>,
+        root: &LazySourceRoot,
+        limits: &SourceLimits,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<()> {
+        self.checkout_overlay(root, limits, owner).await.map(|_| ())
+    }
+    async fn checkout_overlay(
+        self: &Arc<Self>,
+        root: &LazySourceRoot,
+        limits: &SourceLimits,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<CheckoutOverlay> {
+        limits.validate()?;
+        root.load_limits.validate()?;
+        ensure!(
+            self.entries.iter().all(|entry| entry.origin.is_none())
+                && self.changes.iter().all(|change| match change {
+                    SourceNamespaceChange::MakeDirectory { .. } => true,
+                    SourceNamespaceChange::Remove { origin, .. }
+                    | SourceNamespaceChange::Move { origin, .. } => origin.is_none(),
+                }),
+            "native checkout would overwrite tracked changes"
+        );
+        let mut paths = BTreeMap::new();
+        {
+            let ns = self.tree.namespace.lock().unwrap();
+            for entry in &self.entries {
+                let mut id = entry.node.id;
+                while id != 1 {
+                    paths.insert(path_for(&ns.state, id)?, id);
+                    id = record(&ns.state, id)?.node.parent;
+                }
+            }
+        }
+        let aliases: BTreeMap<_, _> = paths
+            .keys()
+            .map(|path| (path.to_lowercase(), path))
+            .collect();
+        let mut directories = BTreeMap::new();
+        let mut pending = vec![(String::new(), root.root_tree)];
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(root.load_limits.timeout_ms);
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        while let Some((path, tree_id)) = pending.pop() {
+            if paths.is_empty() {
+                break;
+            }
+            let directory = tokio::time::timeout_at(
+                deadline,
+                root.provider.read_directory(
+                    root.pin.clone(),
+                    tree_id,
+                    path.clone(),
+                    root.load_limits.clone(),
+                    // Accepted provider work can outlive this future's timeout.
+                    // Keep both the capture fence and physical action alive.
+                    Arc::new((self.clone(), owner.clone())),
+                ),
+            )
+            .await
+            .map_err(|_| CacheTimeoutError)??;
+            checked_directory(
+                &self.tree,
+                &directory,
+                tree_id,
+                &path,
+                limits,
+                &root.load_limits,
+            )?;
+            for entry in &directory.entries {
+                count = count
+                    .checked_add(1)
+                    .context("checkout entry count overflow")?;
+                bytes = bytes
+                    .checked_add(directory_charge(entry, &path)?)
+                    .context("checkout metadata byte overflow")?;
+                ensure!(
+                    count <= limits.max_entries && bytes <= limits.max_metadata_bytes,
+                    "checkout overlay metadata limit exceeded"
+                );
+                let child_path = if path.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{path}/{}", entry.name)
+                };
+                ensure!(
+                    aliases
+                        .get(&child_path.to_lowercase())
+                        .is_none_or(|local_path| **local_path == child_path),
+                    "native checkout case-aliases local path: {child_path}"
+                );
+                if let Some(id) = paths.get(&child_path) {
+                    let kind = self.tree.get(*id)?.kind;
+                    let SourceDirectoryEntryKind::Directory { tree_id } = &entry.kind else {
+                        bail!("native checkout collides with local path: {child_path}");
+                    };
+                    ensure!(
+                        kind == NodeKind::Directory,
+                        "native checkout collides with local path: {child_path}"
+                    );
+                    pending.push((child_path, *tree_id));
+                }
+            }
+            directories.insert(path, directory);
+        }
+        Ok(CheckoutOverlay { paths, directories })
+    }
+    /// Install a checkout while retaining noncolliding local entries and their
+    /// inode IDs under this snapshot's fence and the original version CAS.
+    pub async fn install_checkout_with_expected(
+        self,
+        root: LazySourceRoot,
+        expected: SourceVersion,
+        request_id: &str,
+        limits: &SourceLimits,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<SourceReceipt> {
+        let snapshot = Arc::new(self);
+        // Durable replay must not reinterpret edits made after publication.
+        let overlay = if snapshot.tree.source_receipt(request_id)?.is_some() {
+            None
+        } else {
+            Some(snapshot.checkout_overlay(&root, limits, owner).await?)
+        };
+        snapshot.tree.install_lazy_source_frozen_access(
+            root,
+            Some(expected),
+            request_id,
+            limits,
+            SourceAccess::ReadWrite,
+            overlay,
+        )
     }
     /// Advance a validated baseline without dropping local bytes or changing
     /// inode IDs. The caller supplies rebuilt canonical directories for every

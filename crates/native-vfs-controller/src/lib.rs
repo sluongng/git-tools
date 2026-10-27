@@ -307,7 +307,7 @@ impl Host {
         tree: &NativeTree,
         expected: SourceVersion,
         id: &str,
-        limits: &SourceLimits,
+        _limits: &SourceLimits,
         scope: Option<&ActionScope>,
     ) -> Result<SourceReceipt> {
         let merge = resolved_merge(tree)?;
@@ -327,6 +327,7 @@ impl Host {
             }
             #[cfg(any(test, feature = "protocol-test-support"))]
             Self::Protocol { tree, compiler, .. } => {
+                let limits = _limits;
                 if tree.lazy_source_pin().is_some() {
                     // Request identity must remain stable after core applied a
                     // receipt but controller completion/invalidation was lost.
@@ -342,12 +343,25 @@ impl Host {
                     if let Some(scope) = scope {
                         scope.check()?;
                     }
-                    return tree.install_lazy_source(
-                        lazy.source_root(tree.identity()),
-                        Some(expected),
-                        id,
-                        limits,
-                    );
+                    let snapshot = tree
+                        .freeze_lazy_source_wait(
+                            output_core::SourceFrontendFence::TreeOnly,
+                            limits,
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_millis(
+                                    lazy.source_root(tree.identity()).load_limits.timeout_ms,
+                                ),
+                        )
+                        .await?;
+                    return snapshot
+                        .install_checkout_with_expected(
+                            lazy.source_root(tree.identity()),
+                            expected,
+                            id,
+                            limits,
+                            scope.and_then(ActionScope::owner),
+                        )
+                        .await;
                 }
                 let compiled = if let Some(owner) = scope.and_then(ActionScope::owner) {
                     compiler.compile_merge_with_owner(&merge, owner).await?
@@ -466,6 +480,8 @@ struct Acknowledgement {
     operation: String,
     receipt: Option<ProjectionReceipt>,
     retire: Vec<SourceReceipt>,
+    #[serde(default)]
+    snapshot_source_version: Option<SourceVersion>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -583,6 +599,7 @@ pub struct ControllerCapture {
     native: SealedNativeCapture,
     projection: ProjectionState,
     binding: CaptureBinding,
+    snapshot_source_version: Option<SourceVersion>,
     _controller: Controller,
     _admission: OwnedMutexGuard<()>,
 }
@@ -601,6 +618,23 @@ impl ControllerCapture {
     pub fn binding(&self) -> &CaptureBinding {
         &self.binding
     }
+    /// Only a completed jj snapshot ACK can classify remaining local entries
+    /// as excluded from the canonical tree. Any later write invalidates proof.
+    pub fn canonical_capture_ready(&self) -> bool {
+        canonical_capture_ready(self.snapshot(), self.snapshot_source_version.as_ref())
+    }
+}
+fn canonical_capture_ready(
+    snapshot: &SourceDeltaSnapshot,
+    snapshot_source_version: Option<&SourceVersion>,
+) -> bool {
+    snapshot.changes().is_empty()
+        && (snapshot.entries().is_empty()
+            || (snapshot_source_version == Some(snapshot.version())
+                && snapshot
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.origin.is_none())))
 }
 /// Explicit unmounted fixture configuration. Available only in the test-support
 /// build; it is not native-provider acceptance or a user workspace fallback.
@@ -996,6 +1030,30 @@ impl Controller {
                 "native acknowledgement receipt mismatch"
             );
         }
+        let snapshot_source_version = match receipt {
+            Some(receipt) => ledger.requests.get(&receipt.request_id).and_then(|intent| {
+                if matches!(intent.action, Action::Snapshot { .. }) && receipt.after == *state {
+                    intent
+                        .source_receipt
+                        .as_ref()
+                        .filter(|source| source.operation == SourceOperation::Acknowledge)
+                        .map(|source| source.version.clone())
+                } else {
+                    None
+                }
+            }),
+            None => ledger
+                .acknowledgement
+                .as_ref()
+                .filter(|ack| {
+                    ack.state == *state
+                        && ledger
+                            .requests
+                            .values()
+                            .all(|intent| intent.receipt.is_none())
+                })
+                .and_then(|ack| ack.snapshot_source_version.clone()),
+        };
         let mut next = ledger.clone();
         let mut retire = next
             .acknowledgement
@@ -1017,6 +1075,7 @@ impl Controller {
             operation: operation.hex(),
             receipt: receipt.cloned(),
             retire,
+            snapshot_source_version,
         });
         self.save(&mut ledger, next)?;
         drop(ledger);
@@ -1137,10 +1196,20 @@ impl Controller {
                 && expected.repository == self.inner.config.repository,
             "native capture baseline changed during frontend fencing"
         );
+        let snapshot_source_version = self
+            .inner
+            .ledger
+            .lock()
+            .unwrap()
+            .acknowledgement
+            .as_ref()
+            .filter(|ack| ack.state == *expected)
+            .and_then(|ack| ack.snapshot_source_version.clone());
         Ok(ControllerCapture {
             native,
             projection: expected.clone(),
             binding,
+            snapshot_source_version,
             _controller: self.clone(),
             _admission: admission,
         })

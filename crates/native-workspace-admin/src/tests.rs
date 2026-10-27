@@ -1720,6 +1720,40 @@ async fn native_capture_rejects_another_workspace_before_private_reads() {
         b"capture released on rejection",
     )
     .unwrap();
+    let options = jj_lib::working_copy::SnapshotOptions {
+        base_ignores: jj_lib::gitignore::GitIgnoreFile::empty(),
+        progress: None,
+        start_tracking_matcher: &jj_lib::matchers::EverythingMatcher,
+        force_tracking_matcher: &jj_lib::matchers::NothingMatcher,
+        max_new_file_size: 0,
+    };
+    let mut mutation = controller_a.begin(&projection).await.unwrap();
+    let (receipt, _) = mutation
+        .snapshot("exclude-local-capture", &options)
+        .await
+        .unwrap();
+    mutation
+        .finish(
+            &receipt.after,
+            &OperationId::from_bytes(&[1; 64]),
+            Some(&receipt),
+        )
+        .await
+        .unwrap();
+    drop(mutation);
+    let actual = controller_a
+        .capture_for_backup(&receipt.after)
+        .await
+        .unwrap();
+    assert!(!actual.snapshot().entries().is_empty());
+    let permit = capture::TreeFreezePermit::from_controller(actual, Arc::new(())).unwrap();
+    drop(permit);
+    fs::write(binding_a.root.join("resumed"), b"new unsnapshotted bytes").unwrap();
+    let actual = controller_a
+        .capture_for_backup(&receipt.after)
+        .await
+        .unwrap();
+    assert!(capture::TreeFreezePermit::from_controller(actual, Arc::new(())).is_err());
     drop(controller_a);
     drop(controller_b);
     mount_a.shutdown().await.unwrap();

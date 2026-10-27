@@ -2440,6 +2440,44 @@ async fn lazy_directory_cursor_rejects_mutations_and_root_replacement() {
 }
 
 #[tokio::test]
+async fn lazy_checkout_publication_rejects_a_version_before_local_writes() {
+    let (_dir, source, tree) = setup(CacheConfig::default());
+    let directories = Arc::new(Directories::default());
+    let root = lazy_fixture(&tree, &source, &directories);
+    tree.install_lazy_source(root, None, "initial", &SourceLimits::default())
+        .unwrap();
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let expected = snapshot.version().clone();
+    drop(snapshot);
+    let local = tree.create(1, "local", 0o644).await.unwrap();
+    tree.write(local.id, 0, b"new local bytes").await.unwrap();
+    let snapshot = tree
+        .freeze_lazy_source(SourceFrontendFence::TreeOnly, &SourceLimits::default())
+        .unwrap();
+    let mut target = lazy_fixture(&tree, &source, &directories);
+    target.pin.generation = expected.generation + 1;
+    let error = snapshot
+        .install_checkout_with_expected(
+            target,
+            expected,
+            "stale-checkout",
+            &SourceLimits::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("source snapshot is stale"));
+    assert!(tree.source_receipt("stale-checkout").unwrap().is_none());
+    assert_eq!(tree.resolve_source("local").await.unwrap().id, local.id);
+    assert_eq!(
+        tree.read(local.id, 0, 100).await.unwrap(),
+        b"new local bytes"
+    );
+}
+
+#[tokio::test]
 async fn lazy_symlink_acknowledgement_rejects_same_size_different_target() {
     let (_dir, source, tree) = setup(CacheConfig::default());
     let directories = Arc::new(Directories::default());

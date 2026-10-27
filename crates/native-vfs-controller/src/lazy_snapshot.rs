@@ -1038,8 +1038,33 @@ pub(super) async fn checkout(
             "lazy checkout capture changed type"
         )));
     };
-    ensure_clean(&snapshot).map_err(rejected)?;
+    let target = resolved_merge(tree).map_err(rejected)?.terms[0];
+    let generation = snapshot
+        .version()
+        .generation
+        .checked_add(1)
+        .context("source generation exhausted")
+        .map_err(rejected)?;
+    let lazy = mutation
+        .controller
+        .inner
+        .host
+        .compiler()
+        .lazy_tree_for_source(
+            target,
+            generation,
+            mutation.controller.inner.config.source_limits.clone(),
+        )
+        .map_err(rejected)?;
     let snapshot = Arc::new(snapshot);
+    snapshot
+        .validate_checkout(
+            &lazy.source_root(mutation.controller.inner.host.tree().identity()),
+            &mutation.controller.inner.config.source_limits,
+            scope.owner(),
+        )
+        .await
+        .map_err(rejected)?;
     let stats = checkout_counts(
         &mutation.controller,
         snapshot.clone(),
@@ -1081,13 +1106,6 @@ pub(super) async fn checkout(
     mutation.current = receipt.after.clone();
     scope.check().map_err(ambiguous)?;
     Ok((receipt, stats))
-}
-fn ensure_clean(snapshot: &SourceDeltaSnapshot) -> Result<()> {
-    ensure!(
-        snapshot.changes().is_empty() && snapshot.entries().is_empty(),
-        "native checkout would overwrite dirty or untracked paths"
-    );
-    Ok(())
 }
 
 pub(super) async fn reset(
