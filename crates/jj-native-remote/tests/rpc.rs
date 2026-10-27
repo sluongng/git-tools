@@ -8436,7 +8436,9 @@ async fn exercise_retained_query_facade(
     };
     model.parents = vec![m::CommitId(base.descriptor.key.id.0)];
     model.change_id = m::ChangeId([114; 16]);
-    model.description = "frozen selected baseline".into();
+    // Large but valid selected metadata makes independently held cloud result
+    // owners visible to the default SDK's retained-state admission boundary.
+    model.description = "frozen selected baseline\n".to_owned() + &"x".repeat(160 * 1024);
     let frozen = m::encode(&m::Object::Commit(model.clone()), Default::default()).unwrap();
     store
         .put("example", frozen.descriptor, &frozen.bytes, 0)
@@ -9112,6 +9114,127 @@ async fn exercise_retained_query_facade(
         "opening selected snapshot must not hydrate its frozen draft bodies"
     );
     let frozen_id = m::CommitId(frozen.descriptor.key.id.0);
+    {
+        assert_eq!(
+            configuration.remote.limits.max_buffered_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(configuration.remote.limits.max_batch_bytes, 4 * 1024 * 1024);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let sdk = remote
+            .control
+            .client_for_owned_work(Arc::new(()), deadline)
+            .await
+            .unwrap();
+        let proof = sdk
+            .cloud_retained_version_selected(selector, selected)
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let metadata = sdk
+                .cloud_read_snapshot_metadata(
+                    &proof,
+                    &[selected_index.root.id.0],
+                    frozen_id,
+                    &[],
+                    frozen.descriptor.key,
+                )
+                .await
+                .unwrap();
+            assert_eq!(metadata.descriptor(), frozen.descriptor);
+            assert!(metadata.canonical_bytes().len() >= 160 * 1024);
+            held.push(metadata);
+        }
+        // Four verified native cloud results own >8MiB of decode/state
+        // admission, leaving <8MiB in the UNCHANGED 16MiB state pool. Their
+        // physical calls have completed; the independent RPC window remains.
+        let limits = q::AnnotationLimits {
+            work_nodes: 100_000,
+            work_edges: 1_000_000,
+            work_bytes: 32 * 1024 * 1024,
+            frontier: 8192,
+            read_bytes: 16 * 1024 * 1024,
+            diff_input_bytes: 16 * 1024 * 1024,
+            diff_lines: 100_000,
+            diff_work: 8_000_000,
+            diff_allocation_bytes: 16 * 1024 * 1024,
+            diff_depth: 64,
+        };
+        let mut children = Vec::new();
+        for replay_key in [101, 102] {
+            children.push(
+                query
+                    .fork_scope(
+                        native_broker::ForkQueryScope {
+                            parent: opened.value.handle,
+                            expected_cloud_source_digest: Some(source.digest()),
+                            overlay: vec![],
+                            replay_key: [replay_key; 32],
+                        },
+                        Arc::new(()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let blame = query
+            .blame_with_limits(
+                native_broker::ScopedPathQuery {
+                    scope: children[0].value.handle,
+                    revision: frozen_id,
+                    path: "hello.cc".into(),
+                    policy: q::HistoryPolicy::JjResolvedFixedPathV1,
+                    max_commits: 16,
+                },
+                limits.clone(),
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            blame.value.coverage,
+            q::HistoryCoverage::HistoryComplete as i32
+        );
+        assert!(!blame.value.target_bytes.is_empty());
+        let frontier = query
+            .open_annotation_frontier(
+                native_broker::OpenAnnotationFrontier {
+                    scope: children[1].value.handle,
+                    anchors: vec![frozen_id],
+                    path: "hello.cc".into(),
+                    max_commits: 16,
+                    limits: Some(limits),
+                },
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            frontier.value.coverage,
+            q::HistoryCoverage::HistoryComplete as i32
+        );
+        assert!(
+            frontier
+                .value
+                .nodes
+                .iter()
+                .any(|node| node.revision.as_ref().unwrap().value == frozen_id.0)
+        );
+        for child in &children {
+            query
+                .close_annotation_frontier(child.value.handle, Arc::new(()))
+                .await
+                .unwrap();
+            query
+                .close_scope(child.value.handle, Arc::new(()))
+                .await
+                .unwrap();
+        }
+        drop(frontier);
+        drop(blame);
+        drop(held);
+    }
     // Exact retained-frozen sources use the SAME frontier plumbing, without
     // publishing drafts or hydrating them into generic object authority. This
     // fixture deliberately has a one-nonroot history cap, so its complete union

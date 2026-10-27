@@ -376,12 +376,22 @@ impl Repository for Faults {
                 "capability negotiation is not installed",
             ));
         }
-        if self.mode == Mode::CapabilitiesLegacyFeature && matches!(request.get_ref().features.as_slice(), [11] | [13]) {
-            return Err(Status::invalid_argument("legacy capability vocabulary ends at10"));
+        if self.mode == Mode::CapabilitiesLegacyFeature
+            && matches!(request.get_ref().features.as_slice(), [11] | [13])
+        {
+            return Err(Status::invalid_argument(
+                "legacy capability vocabulary ends at10",
+            ));
         }
-        if self.mode == Mode::CapabilitiesDenied { return Err(Status::permission_denied("capability denied")); }
-        if self.mode == Mode::CapabilitiesLimited { return Err(Status::resource_exhausted("capability busy")); }
-        if self.mode == Mode::CapabilitiesTransport { return Err(Status::unavailable("capability transport unavailable")); }
+        if self.mode == Mode::CapabilitiesDenied {
+            return Err(Status::permission_denied("capability denied"));
+        }
+        if self.mode == Mode::CapabilitiesLimited {
+            return Err(Status::resource_exhausted("capability busy"));
+        }
+        if self.mode == Mode::CapabilitiesTransport {
+            return Err(Status::unavailable("capability transport unavailable"));
+        }
         let mut response = self.service.get_capabilities(request).await?;
         let value = response.get_mut();
         match self.mode {
@@ -1884,7 +1894,10 @@ impl QueryFaults {
 }
 #[tonic::async_trait]
 impl RepositoryQuery for QueryFaults {
-    async fn open_annotation_frontier(&self, request: Request<q::OpenAnnotationFrontierRequest>) -> Result<Response<q::AnnotationFrontier>, Status> {
+    async fn open_annotation_frontier(
+        &self,
+        request: Request<q::OpenAnnotationFrontierRequest>,
+    ) -> Result<Response<q::AnnotationFrontier>, Status> {
         let mut reply = self.service.open_annotation_frontier(request).await?;
         let result = reply.get_mut();
         match self.mode {
@@ -2037,11 +2050,18 @@ impl RepositoryQuery for QueryFaults {
         request: Request<q::ReadAnnotationInputRequest>,
     ) -> Result<Response<q::AnnotationInput>, Status> {
         let mut reply = self.service.read_annotation_input(request).await?;
-        if self.mode == QueryMode::AnnotationInputHash { reply.get_mut().data[0] ^= 1; }
+        if self.mode == QueryMode::AnnotationInputHash {
+            reply.get_mut().data[0] ^= 1;
+        }
         Ok(reply)
     }
 
-    async fn close_annotation_frontier(&self, request: Request<q::CloseAnnotationFrontierRequest>) -> Result<Response<q::CloseAnnotationFrontierResponse>, Status> { self.service.close_annotation_frontier(request).await }
+    async fn close_annotation_frontier(
+        &self,
+        request: Request<q::CloseAnnotationFrontierRequest>,
+    ) -> Result<Response<q::CloseAnnotationFrontierResponse>, Status> {
+        self.service.close_annotation_frontier(request).await
+    }
 
     async fn search(
         &self,
@@ -8837,14 +8857,25 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     let mut capture_config = config.clone();
     capture_config.cloud.max_capture_bytes = 1;
     for (name, config, expected) in [
-        ("manifest-bytes", manifest_config, Reason::ClientManifestBytes),
+        (
+            "manifest-bytes",
+            manifest_config,
+            Reason::ClientManifestBytes,
+        ),
         ("capture-bytes", capture_config, Reason::ClientCaptureBytes),
     ] {
         let small = NativeClient::connect(config).await.unwrap();
         let before = faults.calls.load(Ordering::SeqCst);
-        let failure = small.cloud_publish_captured_version(&intent).await.unwrap_err();
+        let failure = small
+            .cloud_publish_captured_version(&intent)
+            .await
+            .unwrap_err();
         assert_eq!(failure.code(), Code::ResourceExhausted, "{name}");
-        assert_eq!(Reason::from_message(failure.message()), Some(expected), "{name}");
+        assert_eq!(
+            Reason::from_message(failure.message()),
+            Some(expected),
+            "{name}"
+        );
         assert_eq!(faults.calls.load(Ordering::SeqCst), before);
     }
     server.abort();
@@ -9091,6 +9122,11 @@ async fn checked_annotation_refuses_actual_graph_capacity_before_aggregate_appen
     let mut config = running.config.clone();
     config.limits.max_batch_bytes = 8192;
     config.limits.max_metadata_bytes = 8192;
+    config.limits.max_graph_bytes = 8192;
+    config.limits.max_request_bytes = 1024;
+    config.limits.max_batch_items = 16;
+    config.limits.max_frame_bytes = 1024;
+    config.limits.max_buffered_bytes = 65536;
     let client = NativeClient::connect(config).await.unwrap();
     let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
     let error = client
@@ -9115,6 +9151,55 @@ async fn checked_annotation_refuses_actual_graph_capacity_before_aggregate_appen
         "valid small pages fit physically before aggregate retention is refused"
     );
     client.close_query_scope(&scope).await.unwrap();
+    drop(scope);
+    // Completed public results legitimately retain their own state admission.
+    // Two small checked ROOT frontiers leave less than the 16KiB aggregate
+    // request, while preserving the independent physical-page window.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+        let frontier = client
+            .collect_annotation_frontier_with_paging(
+                &scope,
+                &[tinytree_model::CommitId::ROOT],
+                "BUILD.bazel",
+                1,
+                annotation_reservation(),
+                4,
+                128,
+            )
+            .await
+            .unwrap();
+        assert_eq!(frontier.result().nodes.len(), 1);
+        client.close_annotation_frontier(&frontier).await.unwrap();
+        client.close_query_scope(&scope).await.unwrap();
+        held.push(frontier);
+    }
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let before = running.counts.annotation_nodes.load(Ordering::SeqCst);
+    let error = client
+        .collect_annotation_frontier_with_paging(
+            &scope,
+            &[fixture.root],
+            "BUILD.bazel",
+            13,
+            annotation_reservation(),
+            4,
+            128,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(
+        error.message(),
+        "annotation aggregate allocation exceeded reservation"
+    );
+    assert!(
+        running.counts.annotation_nodes.load(Ordering::SeqCst) > before,
+        "reduced remaining capacity admits real pages but never unadmitted aggregation"
+    );
+    client.close_query_scope(&scope).await.unwrap();
+    drop(scope);
     let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
     // Untrusted opaque anchor inputs need admission even when an honest peer
     // would reject their cardinality before emitting its copied header.
@@ -9145,6 +9230,7 @@ async fn checked_annotation_refuses_actual_graph_capacity_before_aggregate_appen
         "refuse all retained anchor-header copies before issuing frontier work"
     );
     client.close_query_scope(&scope).await.unwrap();
+    drop(held);
     running.stop().await;
 }
 
@@ -9427,7 +9513,11 @@ async fn checked_annotation_frontier_and_inputs_keep_source_and_detach_rpc_owner
         frontier.result().coverage,
         q::HistoryCoverage::HistoryComplete as i32
     );
-    assert_eq!(frontier.result().nodes.len(), 2, "one bounded non-root commit PLUS intrinsic root");
+    assert_eq!(
+        frontier.result().nodes.len(),
+        2,
+        "one bounded non-root commit PLUS intrinsic root"
+    );
     let selected = frontier
         .result()
         .nodes
@@ -9586,12 +9676,25 @@ async fn checked_path_history_and_blame_bind_revision_and_retain_only_result_own
             .all(|range| range.origin.as_ref().unwrap().value == fixture.root.0)
     );
     let dag_blame = operation
-        .blame(&scope, fixture.root, "BUILD.bazel", q::HistoryPolicy::JjResolvedFixedPathV1, 0)
-        .await.unwrap();
-    assert_eq!(dag_blame.result().policy, q::HistoryPolicy::JjResolvedFixedPathV1 as i32);
+        .blame(
+            &scope,
+            fixture.root,
+            "BUILD.bazel",
+            q::HistoryPolicy::JjResolvedFixedPathV1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dag_blame.result().policy,
+        q::HistoryPolicy::JjResolvedFixedPathV1 as i32
+    );
     assert_eq!(dag_blame.result().target_bytes, blame.result().target_bytes);
     assert_eq!(dag_blame.result().ranges, blame.result().ranges);
-    assert_eq!(dag_blame.result().coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(
+        dag_blame.result().coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
     drop(dag_blame);
     let collection = operation
         .collect_path_history(

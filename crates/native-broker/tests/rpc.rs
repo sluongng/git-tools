@@ -349,21 +349,51 @@ async fn small_metadata_limits_do_not_reject_valid_larger_file_frames() {
         .unwrap();
     assert_eq!(actual, bytes);
     drop(reader);
-    let tiny=client.write_file(&mut Cursor::new(b"x\n"),2).await.unwrap();
+    let tiny = client
+        .write_file(&mut Cursor::new(b"x\n"), 2)
+        .await
+        .unwrap();
     drop(client);
     host.stop().await;
     // A small operator ceiling is valid even though the annotation caller's
     // own limit is512KiB. The exact expected2byte transfer must still work.
-    let mut narrow=config();narrow.max_file_bytes=64*1024;narrow.max_frame_bytes=16*1024;
-    let socket=root.join("small.sock");let spool=root.join("small-spool");private(&spool);
-    let host=Running::start(&socket,provider,narrow.clone()).await;
-    let client=BrokerObjectIo::connect(&socket,"example",&spool,narrow).await.unwrap();
-    let backend=jj_native_backend::NativeBackend::from_io(Arc::new(client),Default::default()).await.unwrap();
-    let value=|size_bytes|tinytree_model::TreeValue::File{id:tiny,executable:false,size_bytes,copy_id:None};
-    assert!(backend.local_annotation_file(&value(1),512*1024,Arc::new(())).await.is_err());
-    let mut reader=backend.local_annotation_file(&value(2),512*1024,Arc::new(())).await.unwrap();
-    let mut body=Vec::new();futures::AsyncReadExt::read_to_end(&mut reader,&mut body).await.unwrap();assert_eq!(body,b"x\n");
-    drop(reader);drop(backend);host.stop().await;
+    let mut narrow = config();
+    narrow.max_file_bytes = 64 * 1024;
+    narrow.max_frame_bytes = 16 * 1024;
+    let socket = root.join("small.sock");
+    let spool = root.join("small-spool");
+    private(&spool);
+    let host = Running::start(&socket, provider, narrow.clone()).await;
+    let client = BrokerObjectIo::connect(&socket, "example", &spool, narrow)
+        .await
+        .unwrap();
+    let backend = jj_native_backend::NativeBackend::from_io(Arc::new(client), Default::default())
+        .await
+        .unwrap();
+    let value = |size_bytes| tinytree_model::TreeValue::File {
+        id: tiny,
+        executable: false,
+        size_bytes,
+        copy_id: None,
+    };
+    assert!(
+        backend
+            .local_annotation_file(&value(1), 512 * 1024, Arc::new(()))
+            .await
+            .is_err()
+    );
+    let mut reader = backend
+        .local_annotation_file(&value(2), 512 * 1024, Arc::new(()))
+        .await
+        .unwrap();
+    let mut body = Vec::new();
+    futures::AsyncReadExt::read_to_end(&mut reader, &mut body)
+        .await
+        .unwrap();
+    assert_eq!(body, b"x\n");
+    drop(reader);
+    drop(backend);
+    host.stop().await;
 }
 struct Probe(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl futures::AsyncRead for Probe {
@@ -1010,8 +1040,16 @@ async fn cancelled_metadata_waiter_keeps_owners_until_local_and_provider_jobs_fi
 struct EarlyAck;
 #[tonic::async_trait]
 impl native_broker::proto::object_io_server::ObjectIo for EarlyAck {
-    type ReadLocalFileStream = futures::stream::Empty<Result<native_broker::proto::ReadFrame,tonic::Status>>;
-    async fn read_local_file(&self,_:tonic::Request<native_broker::proto::LocalFileRequest>)->Result<tonic::Response<Self::ReadLocalFileStream>,tonic::Status>{Err(tonic::Status::unimplemented("legacy fixture has no bounded local delivery"))}
+    type ReadLocalFileStream =
+        futures::stream::Empty<Result<native_broker::proto::ReadFrame, tonic::Status>>;
+    async fn read_local_file(
+        &self,
+        _: tonic::Request<native_broker::proto::LocalFileRequest>,
+    ) -> Result<tonic::Response<Self::ReadLocalFileStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "legacy fixture has no bounded local delivery",
+        ))
+    }
     async fn descriptor(
         &self,
         _: tonic::Request<native_broker::proto::ObjectRequest>,
@@ -1888,8 +1926,14 @@ impl FakeQuery {
 }
 #[async_trait::async_trait]
 impl native_broker::NativeQueryIo for FakeQuery {
-    async fn annotation_capabilities(&self, _: native_broker::QueryOwner) -> Result<native_broker::QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
-        Ok(self.reply(native_broker::BlameCapabilities::Explicit { supported: true, authorized: true }))
+    async fn annotation_capabilities(
+        &self,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
+        Ok(self.reply(native_broker::BlameCapabilities::Explicit {
+            supported: true,
+            authorized: true,
+        }))
     }
     async fn open_annotation_frontier(
         &self,
@@ -1900,21 +1944,78 @@ impl native_broker::NativeQueryIo for FakeQuery {
         tonic::Status,
     > {
         use native_broker::query_protocol as q;
-        self.annotation_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        self.annotation_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.scope(input.scope)?;
-        if input.anchors.len() != 1 { return Err(tonic::Status::unimplemented("fixture takes one annotation anchor")); }
-        let body = [self.marker,b'\n']; let descriptor = tinytree_model::describe_file(&body);
-        let value = q::AnnotationPathValue { state: Some(q::HistoryPathState { kind: 2, native_id: descriptor.key.id.0.to_vec(), size_bytes: 2, executable: false }), copy_id: Vec::new() };
-        let mut context = input.scope.to_vec(); if self.malformed_history_echo.load(std::sync::atomic::Ordering::SeqCst) { context[0] ^= 1; }
+        if input.anchors.len() != 1 {
+            return Err(tonic::Status::unimplemented(
+                "fixture takes one annotation anchor",
+            ));
+        }
+        let body = [self.marker, b'\n'];
+        let descriptor = tinytree_model::describe_file(&body);
+        let value = q::AnnotationPathValue {
+            state: Some(q::HistoryPathState {
+                kind: 2,
+                native_id: descriptor.key.id.0.to_vec(),
+                size_bytes: 2,
+                executable: false,
+            }),
+            copy_id: Vec::new(),
+        };
+        let mut context = input.scope.to_vec();
+        if self
+            .malformed_history_echo
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            context[0] ^= 1;
+        }
         Ok(self.reply(q::AnnotationFrontier {
-            limits: None, context, scope_digest: vec![self.marker;32], index_epoch: vec![self.marker;16], version: 1,
-            anchors: input.anchors.iter().map(|id|q::CommitId { value: id.0.to_vec() }).collect(), path: input.path, expires_at_unix_seconds: i64::MAX/2,
-            coverage: 1, scanned_commits: 1, nodes: vec![
-                q::AnnotationNode { revision: Some(q::CommitId { value: vec![0;32] }), parents: Vec::new(), source_layer: 0, topological_key: 0,
-                    value: Some(q::AnnotationPathValue { state: Some(q::HistoryPathState { kind: 1, native_id: Vec::new(), size_bytes: 0, executable: false }), copy_id: Vec::new() }), affects_path: Some(false) },
-                q::AnnotationNode { revision: Some(q::CommitId { value: input.anchors[0].0.to_vec() }), parents: vec![q::CommitId { value: vec![0;32] }], source_layer: 0, topological_key: 1,
-                    value: Some(value), affects_path: Some(true) },
-            ] }))
+            limits: None,
+            context,
+            scope_digest: vec![self.marker; 32],
+            index_epoch: vec![self.marker; 16],
+            version: 1,
+            anchors: input
+                .anchors
+                .iter()
+                .map(|id| q::CommitId {
+                    value: id.0.to_vec(),
+                })
+                .collect(),
+            path: input.path,
+            expires_at_unix_seconds: i64::MAX / 2,
+            coverage: 1,
+            scanned_commits: 1,
+            nodes: vec![
+                q::AnnotationNode {
+                    revision: Some(q::CommitId { value: vec![0; 32] }),
+                    parents: Vec::new(),
+                    source_layer: 0,
+                    topological_key: 0,
+                    value: Some(q::AnnotationPathValue {
+                        state: Some(q::HistoryPathState {
+                            kind: 1,
+                            native_id: Vec::new(),
+                            size_bytes: 0,
+                            executable: false,
+                        }),
+                        copy_id: Vec::new(),
+                    }),
+                    affects_path: Some(false),
+                },
+                q::AnnotationNode {
+                    revision: Some(q::CommitId {
+                        value: input.anchors[0].0.to_vec(),
+                    }),
+                    parents: vec![q::CommitId { value: vec![0; 32] }],
+                    source_layer: 0,
+                    topological_key: 1,
+                    value: Some(value),
+                    affects_path: Some(true),
+                },
+            ],
+        }))
     }
     async fn read_annotation_input(
         &self,
@@ -1926,19 +2027,53 @@ impl native_broker::NativeQueryIo for FakeQuery {
     > {
         use native_broker::query_protocol as q;
         self.scope(input.scope)?;
-        let mut data = vec![self.marker,b'\n']; let descriptor = tinytree_model::describe_file(&data);
-        if self.corrupt_blame_bytes.load(std::sync::atomic::Ordering::SeqCst) { data[0] ^= 1; }
-        Ok(self.reply(q::AnnotationInput { context: input.context.to_vec(), revision: Some(q::CommitId { value: input.revision.0.to_vec() }), value: Some(input.expected),
-            descriptor: Some(tinytree_proto::v1::ObjectDescriptor { key: Some(tinytree_proto::v1::ObjectKey { kind: 1, native_id: descriptor.key.id.0.to_vec() }),
-                content_blake3: descriptor.key.id.0.to_vec(), size_bytes: descriptor.size_bytes, object_format_version: descriptor.format_version as u32 }), data }))
+        let mut data = vec![self.marker, b'\n'];
+        let descriptor = tinytree_model::describe_file(&data);
+        if self
+            .corrupt_blame_bytes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            data[0] ^= 1;
+        }
+        Ok(self.reply(q::AnnotationInput {
+            context: input.context.to_vec(),
+            revision: Some(q::CommitId {
+                value: input.revision.0.to_vec(),
+            }),
+            value: Some(input.expected),
+            descriptor: Some(tinytree_proto::v1::ObjectDescriptor {
+                key: Some(tinytree_proto::v1::ObjectKey {
+                    kind: 1,
+                    native_id: descriptor.key.id.0.to_vec(),
+                }),
+                content_blake3: descriptor.key.id.0.to_vec(),
+                size_bytes: descriptor.size_bytes,
+                object_format_version: descriptor.format_version as u32,
+            }),
+            data,
+        }))
     }
-    async fn close_annotation_frontier(&self, scope: [u8;32], _: native_broker::QueryOwner) -> Result<native_broker::QueryReply<()>, tonic::Status> { self.scope(scope)?; Ok(self.reply(())) }
+    async fn close_annotation_frontier(
+        &self,
+        scope: [u8; 32],
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<()>, tonic::Status> {
+        self.scope(scope)?;
+        Ok(self.reply(()))
+    }
 
-    async fn blame_capabilities(&self, _: native_broker::QueryOwner)
-        -> Result<native_broker::QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
+    async fn blame_capabilities(
+        &self,
+        _: native_broker::QueryOwner,
+    ) -> Result<native_broker::QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
         Ok(self.reply(if self.marker == 1 {
-            native_broker::BlameCapabilities::Explicit { supported: true, authorized: true }
-        } else { native_broker::BlameCapabilities::LegacyUnnegotiated }))
+            native_broker::BlameCapabilities::Explicit {
+                supported: true,
+                authorized: true,
+            }
+        } else {
+            native_broker::BlameCapabilities::LegacyUnnegotiated
+        }))
     }
     fn resources(&self) -> native_broker::QueryResources {
         native_broker::QueryResources {
@@ -2450,10 +2585,17 @@ async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
         policy: q::HistoryPolicy::LinearFixedPathV1,
         max_commits: 4,
     };
-    assert_eq!(first.blame_capabilities(Arc::new(())).await.unwrap().value,
-        native_broker::BlameCapabilities::Explicit { supported: true, authorized: true });
-    assert_eq!(second.blame_capabilities(Arc::new(())).await.unwrap().value,
-        native_broker::BlameCapabilities::LegacyUnnegotiated);
+    assert_eq!(
+        first.blame_capabilities(Arc::new(())).await.unwrap().value,
+        native_broker::BlameCapabilities::Explicit {
+            supported: true,
+            authorized: true
+        }
+    );
+    assert_eq!(
+        second.blame_capabilities(Arc::new(())).await.unwrap().value,
+        native_broker::BlameCapabilities::LegacyUnnegotiated
+    );
     let history = first
         .path_history(input.clone(), Arc::new(()))
         .await
@@ -2462,11 +2604,20 @@ async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
     // Retaining history and blame replies cannot retain the one transport slot.
     let blame = first.blame(input.clone(), Arc::new(())).await.unwrap();
     assert_eq!(blame.value.target_bytes, b"selected line\n");
-    let dag_blame = first.blame(ScopedPathQuery {
-        policy: q::HistoryPolicy::JjResolvedFixedPathV1,
-        ..input.clone()
-    }, Arc::new(())).await.unwrap();
-    assert_eq!(dag_blame.value.policy, q::HistoryPolicy::JjResolvedFixedPathV1 as i32);
+    let dag_blame = first
+        .blame(
+            ScopedPathQuery {
+                policy: q::HistoryPolicy::JjResolvedFixedPathV1,
+                ..input.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dag_blame.value.policy,
+        q::HistoryPolicy::JjResolvedFixedPathV1 as i32
+    );
     assert_eq!(dag_blame.value.target_bytes, blame.value.target_bytes);
     let second_history = second
         .path_history(
@@ -2488,26 +2639,107 @@ async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
         tonic::Code::PermissionDenied
     );
 
-    let annotation = native_broker::OpenAnnotationFrontier { limits: None, scope: [1;32], anchors: vec![input.revision], path: input.path.clone(), max_commits: 1 };
-    assert_eq!(first.annotation_capabilities(Arc::new(())).await.unwrap().value,
-        native_broker::BlameCapabilities::Explicit { supported: true, authorized: true });
-    let first_frontier = first.open_annotation_frontier(annotation.clone(), Arc::new(())).await.unwrap();
-    assert_eq!(first_frontier.value.nodes.len(), 2, "one non-root commit plus intrinsic root");
-    let second_frontier = second.open_annotation_frontier(native_broker::OpenAnnotationFrontier { scope: [2;32], ..annotation.clone() }, Arc::new(())).await.unwrap();
-    assert_eq!(first_frontier.value.scope_digest, vec![1;32]);
-    assert_eq!(second_frontier.value.scope_digest, vec![2;32], "resolver must select the distinct provider, not fallback");
-    let read = native_broker::ReadAnnotationInput { scope: [1;32], context: [1;32], revision: input.revision,
-        expected: first_frontier.value.nodes.last().unwrap().value.clone().unwrap() };
-    let body = first.read_annotation_input(read.clone(), Arc::new(())).await.unwrap();
-    assert_eq!(body.value.data, vec![1,b'\n']);
-    assert_eq!(second.read_annotation_input(read.clone(), Arc::new(())).await.unwrap_err().code(), tonic::Code::PermissionDenied);
-    first_provider.malformed_history_echo.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(first.open_annotation_frontier(annotation, Arc::new(())).await.unwrap_err().code(), tonic::Code::DataLoss);
-    first_provider.malformed_history_echo.store(false, std::sync::atomic::Ordering::SeqCst);
-    first_provider.corrupt_blame_bytes.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(first.read_annotation_input(read, Arc::new(())).await.unwrap_err().code(), tonic::Code::DataLoss);
-    first_provider.corrupt_blame_bytes.store(false, std::sync::atomic::Ordering::SeqCst);
-    first.close_annotation_frontier([1;32], Arc::new(())).await.unwrap();
+    let annotation = native_broker::OpenAnnotationFrontier {
+        limits: None,
+        scope: [1; 32],
+        anchors: vec![input.revision],
+        path: input.path.clone(),
+        max_commits: 1,
+    };
+    assert_eq!(
+        first
+            .annotation_capabilities(Arc::new(()))
+            .await
+            .unwrap()
+            .value,
+        native_broker::BlameCapabilities::Explicit {
+            supported: true,
+            authorized: true
+        }
+    );
+    let first_frontier = first
+        .open_annotation_frontier(annotation.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_frontier.value.nodes.len(),
+        2,
+        "one non-root commit plus intrinsic root"
+    );
+    let second_frontier = second
+        .open_annotation_frontier(
+            native_broker::OpenAnnotationFrontier {
+                scope: [2; 32],
+                ..annotation.clone()
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_frontier.value.scope_digest, vec![1; 32]);
+    assert_eq!(
+        second_frontier.value.scope_digest,
+        vec![2; 32],
+        "resolver must select the distinct provider, not fallback"
+    );
+    let read = native_broker::ReadAnnotationInput {
+        scope: [1; 32],
+        context: [1; 32],
+        revision: input.revision,
+        expected: first_frontier
+            .value
+            .nodes
+            .last()
+            .unwrap()
+            .value
+            .clone()
+            .unwrap(),
+    };
+    let body = first
+        .read_annotation_input(read.clone(), Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(body.value.data, vec![1, b'\n']);
+    assert_eq!(
+        second
+            .read_annotation_input(read.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    first_provider
+        .malformed_history_echo
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        first
+            .open_annotation_frontier(annotation, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    first_provider
+        .malformed_history_echo
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    first_provider
+        .corrupt_blame_bytes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        first
+            .read_annotation_input(read, Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::DataLoss
+    );
+    first_provider
+        .corrupt_blame_bytes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    first
+        .close_annotation_frontier([1; 32], Arc::new(()))
+        .await
+        .unwrap();
 
     let calls = first_provider
         .history_calls
@@ -2840,18 +3072,84 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
     let resource = native_broker::QueryFailureReason::ServerScopeReplayHistoryQuota;
     for (code, message, expected) in [
         (reason.code(), reason.diagnostic().to_owned(), Some(reason)),
-        (resource.code(), resource.diagnostic().to_owned(), Some(resource)),
-        (resource.code(), "query scope replay history quota exceeded".to_owned(), Some(resource)),
-        (tonic::Code::FailedPrecondition, resource.diagnostic().to_owned(), None),
-        (tonic::Code::ResourceExhausted, reason.diagnostic().to_owned(), None),
-        (resource.code(), format!("{}; private fixture detail", resource.diagnostic()), None),
-        (reason.code(), "fixture private scope detail".to_owned(), None),
-        (resource.code(), "fixture private resource detail".to_owned(), None),
+        (
+            resource.code(),
+            resource.diagnostic().to_owned(),
+            Some(resource),
+        ),
+        (
+            resource.code(),
+            "query scope replay history quota exceeded".to_owned(),
+            Some(resource),
+        ),
+        (
+            resource.code(),
+            "annotation aggregate exhausts query headroom".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientAnnotationStateHeadroom),
+        ),
+        (
+            resource.code(),
+            "annotation aggregate exhausts byte headroom".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientAnnotationByteHeadroom),
+        ),
+        (
+            resource.code(),
+            "annotation aggregate header exceeds reservation".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientAnnotationHeaderReservation),
+        ),
+        (
+            resource.code(),
+            "annotation aggregate allocation exceeded reservation".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientAnnotationActualReservation),
+        ),
+        (
+            resource.code(),
+            "workspace-cloud resource limit exceeded".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientCloudResourceLimit),
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            "annotation aggregate exhausts query headroom".to_owned(),
+            None,
+        ),
+        (
+            resource.code(),
+            "annotation aggregate exhausts query headroom; private fixture detail".to_owned(),
+            None,
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            resource.diagnostic().to_owned(),
+            None,
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            reason.diagnostic().to_owned(),
+            None,
+        ),
+        (
+            resource.code(),
+            format!("{}; private fixture detail", resource.diagnostic()),
+            None,
+        ),
+        (
+            reason.code(),
+            "fixture private scope detail".to_owned(),
+            None,
+        ),
+        (
+            resource.code(),
+            "fixture private resource detail".to_owned(),
+            None,
+        ),
     ] {
         *a.scope_failure.lock().unwrap() = Some(tonic::Status::new(code, message));
         let failure = first.open_scope(open(), Arc::new(())).await.unwrap_err();
         assert_eq!(failure.code(), code);
-        assert_eq!(native_broker::QueryFailureReason::from_status(&failure), expected);
+        assert_eq!(
+            native_broker::QueryFailureReason::from_status(&failure),
+            expected
+        );
         assert!(!format!("{failure:?}").contains("private"));
     }
     *a.scope_failure.lock().unwrap() = None;
@@ -4709,11 +5007,13 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
     );
 }
 
-#[tokio::test(flavor="multi_thread",worker_threads=2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn limited_annotation_refuses_old_broker_and_old_provider_before_frontier_work() {
     #[derive(Clone)]
     struct OldBroker(native_broker::QueryRpcService);
-    impl tonic::server::NamedService for OldBroker {const NAME:&'static str="native.broker.v1.QueryIo";}
+    impl tonic::server::NamedService for OldBroker {
+        const NAME: &'static str = "native.broker.v1.QueryIo";
+    }
     impl tower::Service<http::Request<tonic::body::Body>> for OldBroker {
         type Response = http::Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
@@ -4732,7 +5032,14 @@ async fn limited_annotation_refuses_old_broker_and_old_provider_before_frontier_
             {
                 // The previous broker vocabulary does not dispatch this method.
                 // It must not route a lowering request through old Open.
-                return Box::pin(async{Ok(http::Response::builder().status(200).header("content-type","application/grpc").header("grpc-status","12").body(tonic::body::Body::empty()).unwrap())});
+                return Box::pin(async {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "12")
+                        .body(tonic::body::Body::empty())
+                        .unwrap())
+                });
             }
             tower::Service::call(&mut self.0, r)
         }

@@ -14,27 +14,56 @@ pub enum BlameCapabilities {
     Explicit { supported: bool, authorized: bool },
 }
 impl BlameCapabilities {
-    pub(crate) fn wire(self) -> crate::proto::BlameCapabilitiesReply { self.wire_feature(11) }
-    pub(crate) fn annotation_wire(self) -> crate::proto::BlameCapabilitiesReply { self.wire_feature(12) }
+    pub(crate) fn wire(self) -> crate::proto::BlameCapabilitiesReply {
+        self.wire_feature(11)
+    }
+    pub(crate) fn annotation_wire(self) -> crate::proto::BlameCapabilitiesReply {
+        self.wire_feature(12)
+    }
     fn wire_feature(self, feature: u32) -> crate::proto::BlameCapabilitiesReply {
         let (legacy_unnegotiated, supported, authorized) = match self {
             Self::LegacyUnnegotiated => (true, false, false),
-            Self::Explicit { supported, authorized } => (false, supported, authorized),
+            Self::Explicit {
+                supported,
+                authorized,
+            } => (false, supported, authorized),
         };
-        crate::proto::BlameCapabilitiesReply { schema_version: 1, feature,
-            legacy_unnegotiated, supported, authorized,
-            root_readiness: tinytree_proto::v1::RootReadiness::NotChecked as u32 }
+        crate::proto::BlameCapabilitiesReply {
+            schema_version: 1,
+            feature,
+            legacy_unnegotiated,
+            supported,
+            authorized,
+            root_readiness: tinytree_proto::v1::RootReadiness::NotChecked as u32,
+        }
     }
-    pub(crate) fn checked(value: crate::proto::BlameCapabilitiesReply) -> Result<Self, Status> { Self::checked_feature(value, 11) }
-    pub(crate) fn annotation_checked(value: crate::proto::BlameCapabilitiesReply) -> Result<Self, Status> { Self::checked_feature(value, 12) }
-    fn checked_feature(value: crate::proto::BlameCapabilitiesReply, feature: u32) -> Result<Self, Status> {
-        if value.schema_version != 1 || value.feature != feature
+    pub(crate) fn checked(value: crate::proto::BlameCapabilitiesReply) -> Result<Self, Status> {
+        Self::checked_feature(value, 11)
+    }
+    pub(crate) fn annotation_checked(
+        value: crate::proto::BlameCapabilitiesReply,
+    ) -> Result<Self, Status> {
+        Self::checked_feature(value, 12)
+    }
+    fn checked_feature(
+        value: crate::proto::BlameCapabilitiesReply,
+        feature: u32,
+    ) -> Result<Self, Status> {
+        if value.schema_version != 1
+            || value.feature != feature
             || value.root_readiness != tinytree_proto::v1::RootReadiness::NotChecked as u32
-            || (value.legacy_unnegotiated && (value.supported || value.authorized)) {
+            || (value.legacy_unnegotiated && (value.supported || value.authorized))
+        {
             return Err(Status::data_loss("invalid native blame capability reply"));
         }
-        Ok(if value.legacy_unnegotiated { Self::LegacyUnnegotiated }
-            else { Self::Explicit { supported: value.supported, authorized: value.authorized } })
+        Ok(if value.legacy_unnegotiated {
+            Self::LegacyUnnegotiated
+        } else {
+            Self::Explicit {
+                supported: value.supported,
+                authorized: value.authorized,
+            }
+        })
     }
 }
 
@@ -372,7 +401,10 @@ pub struct ScopedPathQuery {
 impl ScopedPathQuery {
     pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
         crate::query_service::bounded_input(self.path.len().saturating_add(128), cap)?;
-        if !matches!(self.policy, q::HistoryPolicy::LinearFixedPathV1 | q::HistoryPolicy::JjResolvedFixedPathV1) {
+        if !matches!(
+            self.policy,
+            q::HistoryPolicy::LinearFixedPathV1 | q::HistoryPolicy::JjResolvedFixedPathV1
+        ) {
             return Err(Status::unimplemented("native history policy unsupported"));
         }
         if self.path.is_empty()
@@ -537,18 +569,53 @@ pub struct OpenAnnotationFrontier {
     pub limits: Option<q::AnnotationLimits>,
 }
 pub fn annotation_limits_valid(value: &q::AnnotationLimits) -> bool {
-    [value.work_nodes, value.work_edges, value.work_bytes, value.frontier,
-     value.read_bytes, value.diff_input_bytes, value.diff_lines, value.diff_work,
-     value.diff_allocation_bytes, value.diff_depth].into_iter().all(|n| n > 0 && n <= usize::MAX as u64)
+    [
+        value.work_nodes,
+        value.work_edges,
+        value.work_bytes,
+        value.frontier,
+        value.read_bytes,
+        value.diff_input_bytes,
+        value.diff_lines,
+        value.diff_work,
+        value.diff_allocation_bytes,
+        value.diff_depth,
+    ]
+    .into_iter()
+    .all(|n| n > 0 && n <= usize::MAX as u64)
 }
-fn annotation_limits_lowered(effective: &q::AnnotationLimits, requested: &q::AnnotationLimits) -> bool {
-    annotation_limits_valid(effective) && annotation_limits_valid(requested) &&
-    [effective.work_nodes, effective.work_edges, effective.work_bytes, effective.frontier,
-     effective.read_bytes, effective.diff_input_bytes, effective.diff_lines, effective.diff_work,
-     effective.diff_allocation_bytes, effective.diff_depth].into_iter().zip([
-     requested.work_nodes, requested.work_edges, requested.work_bytes, requested.frontier,
-     requested.read_bytes, requested.diff_input_bytes, requested.diff_lines, requested.diff_work,
-     requested.diff_allocation_bytes, requested.diff_depth]).all(|(a,b)| a<=b)
+fn annotation_limits_lowered(
+    effective: &q::AnnotationLimits,
+    requested: &q::AnnotationLimits,
+) -> bool {
+    annotation_limits_valid(effective)
+        && annotation_limits_valid(requested)
+        && [
+            effective.work_nodes,
+            effective.work_edges,
+            effective.work_bytes,
+            effective.frontier,
+            effective.read_bytes,
+            effective.diff_input_bytes,
+            effective.diff_lines,
+            effective.diff_work,
+            effective.diff_allocation_bytes,
+            effective.diff_depth,
+        ]
+        .into_iter()
+        .zip([
+            requested.work_nodes,
+            requested.work_edges,
+            requested.work_bytes,
+            requested.frontier,
+            requested.read_bytes,
+            requested.diff_input_bytes,
+            requested.diff_lines,
+            requested.diff_work,
+            requested.diff_allocation_bytes,
+            requested.diff_depth,
+        ])
+        .all(|(a, b)| a <= b)
 }
 fn annotation_value(value: Option<&q::AnnotationPathValue>) -> Result<(), Status> {
     let value = value.ok_or_else(history_integrity)?;
@@ -563,8 +630,14 @@ fn annotation_value(value: Option<&q::AnnotationPathValue>) -> Result<(), Status
 }
 impl OpenAnnotationFrontier {
     pub(crate) fn validate(&self, cap: usize) -> Result<(), Status> {
-        if self.limits.as_ref().is_some_and(|limits| !annotation_limits_valid(limits)) {
-            return Err(Status::invalid_argument("positive annotation limits required"));
+        if self
+            .limits
+            .as_ref()
+            .is_some_and(|limits| !annotation_limits_valid(limits))
+        {
+            return Err(Status::invalid_argument(
+                "positive annotation limits required",
+            ));
         }
         if self.anchors.is_empty()
             || self.anchors.len() > 4096
@@ -592,8 +665,9 @@ impl OpenAnnotationFrontier {
     }
     pub(crate) fn check(&self, value: &q::AnnotationFrontier, cap: usize) -> Result<(), Status> {
         match (&self.limits, &value.limits) {
-            (None, None) => {},
-            (Some(requested), Some(effective)) if annotation_limits_lowered(effective, requested) => {},
+            (None, None) => {}
+            (Some(requested), Some(effective))
+                if annotation_limits_lowered(effective, requested) => {}
             _ => return Err(history_integrity()),
         }
         if value.context != self.scope
@@ -921,13 +995,40 @@ pub trait NativeQueryIo: Send + Sync + std::fmt::Debug {
     }
     /// Explicit opt-in: old providers must refuse BEFORE admitting unbounded
     /// frontier work, rather than erase lowering fields and fail on the echo.
-    async fn open_limited_annotation_frontier(&self, _input: OpenAnnotationFrontier, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationFrontier>, Status> { Err(Status::unimplemented("limited annotation frontier unavailable")) }
-    async fn read_annotation_input(&self, _input: ReadAnnotationInput, _owner: QueryOwner) -> Result<QueryReply<q::AnnotationInput>, Status> { Err(Status::unimplemented("annotation input unavailable")) }
-    async fn close_annotation_frontier(&self, _scope: [u8;32], _owner: QueryOwner) -> Result<QueryReply<()>, Status> { Err(Status::unimplemented("annotation context cleanup unavailable")) }
+    async fn open_limited_annotation_frontier(
+        &self,
+        _input: OpenAnnotationFrontier,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationFrontier>, Status> {
+        Err(Status::unimplemented(
+            "limited annotation frontier unavailable",
+        ))
+    }
+    async fn read_annotation_input(
+        &self,
+        _input: ReadAnnotationInput,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<q::AnnotationInput>, Status> {
+        Err(Status::unimplemented("annotation input unavailable"))
+    }
+    async fn close_annotation_frontier(
+        &self,
+        _scope: [u8; 32],
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<()>, Status> {
+        Err(Status::unimplemented(
+            "annotation context cleanup unavailable",
+        ))
+    }
 
     fn resources(&self) -> QueryResources;
-    async fn blame_capabilities(&self, _owner: QueryOwner) -> Result<QueryReply<BlameCapabilities>, Status> {
-        Err(Status::unimplemented("native blame capability negotiation unavailable"))
+    async fn blame_capabilities(
+        &self,
+        _owner: QueryOwner,
+    ) -> Result<QueryReply<BlameCapabilities>, Status> {
+        Err(Status::unimplemented(
+            "native blame capability negotiation unavailable",
+        ))
     }
     /// Read-only upstream checks, without retaining a broker scope or granting
     /// an anchor. The configured host chooses requirements, never the caller.
@@ -1121,6 +1222,11 @@ pub enum QueryFailureReason {
     ClientOverlayBytes,
     ClientOverlayMemory,
     ClientScopeSourceMemory,
+    ClientAnnotationStateHeadroom,
+    ClientAnnotationByteHeadroom,
+    ClientAnnotationHeaderReservation,
+    ClientAnnotationActualReservation,
+    ClientCloudResourceLimit,
     BrokerRetainedReplyMemory,
     BrokerReplyBytes,
     ServerRequestMemoryBudget,
@@ -1140,7 +1246,9 @@ impl QueryFailureReason {
             "native query scope closed or expired" => Some(Self::LocalScopeClosedOrExpired),
             "native query scope count exceeded" => Some(Self::LocalScopeCountExceeded),
             "native query replay count exceeded" => Some(Self::LocalReplayCountExceeded),
-            "native query creation outcome unavailable; preserve the original intent" => Some(Self::CachedCreationOutcomeUnavailable),
+            "native query creation outcome unavailable; preserve the original intent" => {
+                Some(Self::CachedCreationOutcomeUnavailable)
+            }
             "cloud scope replay source changed" => Some(Self::CloudReplaySourceChanged),
             "native query scope expired" => Some(Self::ClientScopeExpired),
             "query scope unavailable or expired" => Some(Self::ServerScopeUnavailable),
@@ -1153,7 +1261,9 @@ impl QueryFailureReason {
             "query is closed" => Some(Self::ServerQueryClosed),
             "cloud source replay no longer available" => Some(Self::CloudSourceReplayUnavailable),
             "active query scope quota exceeded" => Some(Self::ServerActiveScopeQuota),
-            "query scope replay history quota exceeded" => Some(Self::ServerScopeReplayHistoryQuota),
+            "query scope replay history quota exceeded" => {
+                Some(Self::ServerScopeReplayHistoryQuota)
+            }
             "active query quota exceeded" => Some(Self::ServerActiveQueryQuota),
             "query replay history quota exceeded" => Some(Self::ServerQueryReplayHistoryQuota),
             "native query registry bytes exceeded" => Some(Self::LocalRegistryBytesExceeded),
@@ -1174,6 +1284,25 @@ impl QueryFailureReason {
             "query overlay bytes exceed budget" => Some(Self::ClientOverlayBytes),
             "query overlay memory exceeds budget" => Some(Self::ClientOverlayMemory),
             "query scope source memory exceeds budget" => Some(Self::ClientScopeSourceMemory),
+            "annotation aggregate exhausts query headroom" => {
+                Some(Self::ClientAnnotationStateHeadroom)
+            }
+            "annotation aggregate exhausts byte headroom" => {
+                Some(Self::ClientAnnotationByteHeadroom)
+            }
+            "annotation aggregate header exceeds reservation" => {
+                Some(Self::ClientAnnotationHeaderReservation)
+            }
+            "annotation aggregate allocation exceeded reservation"
+            | "annotation aggregate result exceeds reservation"
+            | "annotation attribution allocation exceeded reservation"
+            | "annotation retained result exceeds reservation"
+            | "annotation cursor allocation exceeds aggregate reservation"
+            | "annotation page count exceeds client reservation"
+            | "annotation aggregate edge limit exceeded" => {
+                Some(Self::ClientAnnotationActualReservation)
+            }
+            "workspace-cloud resource limit exceeded" => Some(Self::ClientCloudResourceLimit),
             "native query retained reply budget exhausted" => Some(Self::BrokerRetainedReplyMemory),
             "query client reply exceeds limit" => Some(Self::BrokerReplyBytes),
             "overlay layer overflow" => Some(Self::ServerOverlayLayerOverflow),
@@ -1183,7 +1312,9 @@ impl QueryFailureReason {
             "query membership memory budget exceeded" => Some(Self::ServerMembershipMemoryBudget),
             "query cursor memory exceeds budget" => Some(Self::ServerQueryCursorMemoryBudget),
             "selected prefix memory exceeds budget" => Some(Self::ServerSelectedPrefixMemoryBudget),
-            "requested query memory exceeds configured pool" => Some(Self::ServerRequestMemoryBudget),
+            "requested query memory exceeds configured pool" => {
+                Some(Self::ServerRequestMemoryBudget)
+            }
             _ => None,
         }
     }
@@ -1227,6 +1358,11 @@ impl QueryFailureReason {
             Self::ClientOverlayBytes => tonic::Code::ResourceExhausted,
             Self::ClientOverlayMemory => tonic::Code::ResourceExhausted,
             Self::ClientScopeSourceMemory => tonic::Code::ResourceExhausted,
+            Self::ClientAnnotationStateHeadroom => tonic::Code::ResourceExhausted,
+            Self::ClientAnnotationByteHeadroom => tonic::Code::ResourceExhausted,
+            Self::ClientAnnotationHeaderReservation => tonic::Code::ResourceExhausted,
+            Self::ClientAnnotationActualReservation => tonic::Code::ResourceExhausted,
+            Self::ClientCloudResourceLimit => tonic::Code::ResourceExhausted,
             Self::BrokerRetainedReplyMemory => tonic::Code::ResourceExhausted,
             Self::BrokerReplyBytes => tonic::Code::ResourceExhausted,
             Self::ServerRequestMemoryBudget => tonic::Code::ResourceExhausted,
@@ -1242,10 +1378,14 @@ impl QueryFailureReason {
     pub fn diagnostic(self) -> &'static str {
         match self {
             Self::LocalScopeUnavailable => "native query precondition: LocalScopeUnavailable",
-            Self::LocalScopeClosedOrExpired => "native query precondition: LocalScopeClosedOrExpired",
+            Self::LocalScopeClosedOrExpired => {
+                "native query precondition: LocalScopeClosedOrExpired"
+            }
             Self::LocalScopeCountExceeded => "native query precondition: LocalScopeCountExceeded",
             Self::LocalReplayCountExceeded => "native query precondition: LocalReplayCountExceeded",
-            Self::CachedCreationOutcomeUnavailable => "native query precondition: CachedCreationOutcomeUnavailable",
+            Self::CachedCreationOutcomeUnavailable => {
+                "native query precondition: CachedCreationOutcomeUnavailable"
+            }
             Self::CloudReplaySourceChanged => "native query precondition: CloudReplaySourceChanged",
             Self::ClientScopeExpired => "native query precondition: ClientScopeExpired",
             Self::ServerScopeUnavailable => "native query precondition: ServerScopeUnavailable",
@@ -1256,21 +1396,33 @@ impl QueryFailureReason {
             Self::ServerCursorExpired => "native query precondition: ServerCursorExpired",
             Self::ServerCursorUnavailable => "native query precondition: ServerCursorUnavailable",
             Self::ServerQueryClosed => "native query precondition: ServerQueryClosed",
-            Self::CloudSourceReplayUnavailable => "native query precondition: CloudSourceReplayUnavailable",
+            Self::CloudSourceReplayUnavailable => {
+                "native query precondition: CloudSourceReplayUnavailable"
+            }
             Self::ServerActiveScopeQuota => "native query resource: ServerActiveScopeQuota",
-            Self::ServerScopeReplayHistoryQuota => "native query resource: ServerScopeReplayHistoryQuota",
+            Self::ServerScopeReplayHistoryQuota => {
+                "native query resource: ServerScopeReplayHistoryQuota"
+            }
             Self::ServerActiveQueryQuota => "native query resource: ServerActiveQueryQuota",
-            Self::ServerQueryReplayHistoryQuota => "native query resource: ServerQueryReplayHistoryQuota",
+            Self::ServerQueryReplayHistoryQuota => {
+                "native query resource: ServerQueryReplayHistoryQuota"
+            }
             Self::LocalRegistryBytesExceeded => "native query resource: LocalRegistryBytesExceeded",
-            Self::LocalRegistryBytesExhausted => "native query resource: LocalRegistryBytesExhausted",
+            Self::LocalRegistryBytesExhausted => {
+                "native query resource: LocalRegistryBytesExhausted"
+            }
             Self::ServerExactGraphWorkBudget => "native query resource: ServerExactGraphWorkBudget",
-            Self::ServerDerivedIndexModelLimit => "native query resource: ServerDerivedIndexModelLimit",
+            Self::ServerDerivedIndexModelLimit => {
+                "native query resource: ServerDerivedIndexModelLimit"
+            }
             Self::ServerScopeMemory => "native query resource: ServerScopeMemory",
             Self::ServerScopeHandleMemory => "native query resource: ServerScopeHandleMemory",
             Self::ServerCloudScopeMemory => "native query resource: ServerCloudScopeMemory",
             Self::ServerFrozenGraphMemory => "native query resource: ServerFrozenGraphMemory",
             Self::ServerOverlayMemory => "native query resource: ServerOverlayMemory",
-            Self::ServerOverlayMemoryOverflow => "native query resource: ServerOverlayMemoryOverflow",
+            Self::ServerOverlayMemoryOverflow => {
+                "native query resource: ServerOverlayMemoryOverflow"
+            }
             Self::ServerLogicalOverlayLimit => "native query resource: ServerLogicalOverlayLimit",
             Self::ServerQueryHistoryMemory => "native query resource: ServerQueryHistoryMemory",
             Self::ServerQueryCursorMemory => "native query resource: ServerQueryCursorMemory",
@@ -1279,15 +1431,38 @@ impl QueryFailureReason {
             Self::ClientOverlayBytes => "native query resource: ClientOverlayBytes",
             Self::ClientOverlayMemory => "native query resource: ClientOverlayMemory",
             Self::ClientScopeSourceMemory => "native query resource: ClientScopeSourceMemory",
+            Self::ClientAnnotationStateHeadroom => {
+                "native query resource: ClientAnnotationStateHeadroom"
+            }
+            Self::ClientAnnotationByteHeadroom => {
+                "native query resource: ClientAnnotationByteHeadroom"
+            }
+            Self::ClientAnnotationHeaderReservation => {
+                "native query resource: ClientAnnotationHeaderReservation"
+            }
+            Self::ClientAnnotationActualReservation => {
+                "native query resource: ClientAnnotationActualReservation"
+            }
+            Self::ClientCloudResourceLimit => "native query resource: ClientCloudResourceLimit",
             Self::BrokerRetainedReplyMemory => "native query resource: BrokerRetainedReplyMemory",
             Self::BrokerReplyBytes => "native query resource: BrokerReplyBytes",
             Self::ServerRequestMemoryBudget => "native query resource: ServerRequestMemoryBudget",
-            Self::ServerSelectedPrefixMemoryBudget => "native query resource: ServerSelectedPrefixMemoryBudget",
-            Self::ServerQueryCursorMemoryBudget => "native query resource: ServerQueryCursorMemoryBudget",
-            Self::ServerMembershipMemoryBudget => "native query resource: ServerMembershipMemoryBudget",
+            Self::ServerSelectedPrefixMemoryBudget => {
+                "native query resource: ServerSelectedPrefixMemoryBudget"
+            }
+            Self::ServerQueryCursorMemoryBudget => {
+                "native query resource: ServerQueryCursorMemoryBudget"
+            }
+            Self::ServerMembershipMemoryBudget => {
+                "native query resource: ServerMembershipMemoryBudget"
+            }
             Self::ServerMembershipStepBudget => "native query resource: ServerMembershipStepBudget",
-            Self::ServerClosedQueryMetadataMemory => "native query resource: ServerClosedQueryMetadataMemory",
-            Self::ServerQueryHistoryMemoryBudget => "native query resource: ServerQueryHistoryMemoryBudget",
+            Self::ServerClosedQueryMetadataMemory => {
+                "native query resource: ServerClosedQueryMetadataMemory"
+            }
+            Self::ServerQueryHistoryMemoryBudget => {
+                "native query resource: ServerQueryHistoryMemoryBudget"
+            }
             Self::ServerOverlayLayerOverflow => "native query resource: ServerOverlayLayerOverflow",
         }
     }
@@ -1295,10 +1470,14 @@ impl QueryFailureReason {
     pub fn from_status(error: &Status) -> Option<Self> {
         let reason = match error.message() {
             "native query precondition: LocalScopeUnavailable" => Self::LocalScopeUnavailable,
-            "native query precondition: LocalScopeClosedOrExpired" => Self::LocalScopeClosedOrExpired,
+            "native query precondition: LocalScopeClosedOrExpired" => {
+                Self::LocalScopeClosedOrExpired
+            }
             "native query precondition: LocalScopeCountExceeded" => Self::LocalScopeCountExceeded,
             "native query precondition: LocalReplayCountExceeded" => Self::LocalReplayCountExceeded,
-            "native query precondition: CachedCreationOutcomeUnavailable" => Self::CachedCreationOutcomeUnavailable,
+            "native query precondition: CachedCreationOutcomeUnavailable" => {
+                Self::CachedCreationOutcomeUnavailable
+            }
             "native query precondition: CloudReplaySourceChanged" => Self::CloudReplaySourceChanged,
             "native query precondition: ClientScopeExpired" => Self::ClientScopeExpired,
             "native query precondition: ServerScopeUnavailable" => Self::ServerScopeUnavailable,
@@ -1309,21 +1488,33 @@ impl QueryFailureReason {
             "native query precondition: ServerCursorExpired" => Self::ServerCursorExpired,
             "native query precondition: ServerCursorUnavailable" => Self::ServerCursorUnavailable,
             "native query precondition: ServerQueryClosed" => Self::ServerQueryClosed,
-            "native query precondition: CloudSourceReplayUnavailable" => Self::CloudSourceReplayUnavailable,
+            "native query precondition: CloudSourceReplayUnavailable" => {
+                Self::CloudSourceReplayUnavailable
+            }
             "native query resource: ServerActiveScopeQuota" => Self::ServerActiveScopeQuota,
-            "native query resource: ServerScopeReplayHistoryQuota" => Self::ServerScopeReplayHistoryQuota,
+            "native query resource: ServerScopeReplayHistoryQuota" => {
+                Self::ServerScopeReplayHistoryQuota
+            }
             "native query resource: ServerActiveQueryQuota" => Self::ServerActiveQueryQuota,
-            "native query resource: ServerQueryReplayHistoryQuota" => Self::ServerQueryReplayHistoryQuota,
+            "native query resource: ServerQueryReplayHistoryQuota" => {
+                Self::ServerQueryReplayHistoryQuota
+            }
             "native query resource: LocalRegistryBytesExceeded" => Self::LocalRegistryBytesExceeded,
-            "native query resource: LocalRegistryBytesExhausted" => Self::LocalRegistryBytesExhausted,
+            "native query resource: LocalRegistryBytesExhausted" => {
+                Self::LocalRegistryBytesExhausted
+            }
             "native query resource: ServerExactGraphWorkBudget" => Self::ServerExactGraphWorkBudget,
-            "native query resource: ServerDerivedIndexModelLimit" => Self::ServerDerivedIndexModelLimit,
+            "native query resource: ServerDerivedIndexModelLimit" => {
+                Self::ServerDerivedIndexModelLimit
+            }
             "native query resource: ServerScopeMemory" => Self::ServerScopeMemory,
             "native query resource: ServerScopeHandleMemory" => Self::ServerScopeHandleMemory,
             "native query resource: ServerCloudScopeMemory" => Self::ServerCloudScopeMemory,
             "native query resource: ServerFrozenGraphMemory" => Self::ServerFrozenGraphMemory,
             "native query resource: ServerOverlayMemory" => Self::ServerOverlayMemory,
-            "native query resource: ServerOverlayMemoryOverflow" => Self::ServerOverlayMemoryOverflow,
+            "native query resource: ServerOverlayMemoryOverflow" => {
+                Self::ServerOverlayMemoryOverflow
+            }
             "native query resource: ServerLogicalOverlayLimit" => Self::ServerLogicalOverlayLimit,
             "native query resource: ServerQueryHistoryMemory" => Self::ServerQueryHistoryMemory,
             "native query resource: ServerQueryCursorMemory" => Self::ServerQueryCursorMemory,
@@ -1332,15 +1523,38 @@ impl QueryFailureReason {
             "native query resource: ClientOverlayBytes" => Self::ClientOverlayBytes,
             "native query resource: ClientOverlayMemory" => Self::ClientOverlayMemory,
             "native query resource: ClientScopeSourceMemory" => Self::ClientScopeSourceMemory,
+            "native query resource: ClientAnnotationStateHeadroom" => {
+                Self::ClientAnnotationStateHeadroom
+            }
+            "native query resource: ClientAnnotationByteHeadroom" => {
+                Self::ClientAnnotationByteHeadroom
+            }
+            "native query resource: ClientAnnotationHeaderReservation" => {
+                Self::ClientAnnotationHeaderReservation
+            }
+            "native query resource: ClientAnnotationActualReservation" => {
+                Self::ClientAnnotationActualReservation
+            }
+            "native query resource: ClientCloudResourceLimit" => Self::ClientCloudResourceLimit,
             "native query resource: BrokerRetainedReplyMemory" => Self::BrokerRetainedReplyMemory,
             "native query resource: BrokerReplyBytes" => Self::BrokerReplyBytes,
             "native query resource: ServerRequestMemoryBudget" => Self::ServerRequestMemoryBudget,
-            "native query resource: ServerSelectedPrefixMemoryBudget" => Self::ServerSelectedPrefixMemoryBudget,
-            "native query resource: ServerQueryCursorMemoryBudget" => Self::ServerQueryCursorMemoryBudget,
-            "native query resource: ServerMembershipMemoryBudget" => Self::ServerMembershipMemoryBudget,
+            "native query resource: ServerSelectedPrefixMemoryBudget" => {
+                Self::ServerSelectedPrefixMemoryBudget
+            }
+            "native query resource: ServerQueryCursorMemoryBudget" => {
+                Self::ServerQueryCursorMemoryBudget
+            }
+            "native query resource: ServerMembershipMemoryBudget" => {
+                Self::ServerMembershipMemoryBudget
+            }
             "native query resource: ServerMembershipStepBudget" => Self::ServerMembershipStepBudget,
-            "native query resource: ServerClosedQueryMetadataMemory" => Self::ServerClosedQueryMetadataMemory,
-            "native query resource: ServerQueryHistoryMemoryBudget" => Self::ServerQueryHistoryMemoryBudget,
+            "native query resource: ServerClosedQueryMetadataMemory" => {
+                Self::ServerClosedQueryMetadataMemory
+            }
+            "native query resource: ServerQueryHistoryMemoryBudget" => {
+                Self::ServerQueryHistoryMemoryBudget
+            }
             "native query resource: ServerOverlayLayerOverflow" => Self::ServerOverlayLayerOverflow,
             _ => return None,
         };

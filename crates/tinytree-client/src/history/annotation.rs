@@ -608,11 +608,16 @@ impl NativeClient {
         path: &str,
         max_commits: u32,
     ) -> Result<CheckedAnnotationFrontier, Status> {
-        self.open_annotation_frontier_with_limits(scope, anchors, path, max_commits, None).await
+        self.open_annotation_frontier_with_limits(scope, anchors, path, max_commits, None)
+            .await
     }
     pub async fn open_annotation_frontier_with_limits(
-        &self, scope: &CheckedScopeHandle, anchors: &[CommitId], path: &str,
-        max_commits: u32, requested_limits: Option<q::AnnotationLimits>,
+        &self,
+        scope: &CheckedScopeHandle,
+        anchors: &[CommitId],
+        path: &str,
+        max_commits: u32,
+        requested_limits: Option<q::AnnotationLimits>,
     ) -> Result<CheckedAnnotationFrontier, Status> {
         self.history_input(
             scope,
@@ -673,19 +678,45 @@ impl NativeClient {
                 }
             })
             .await?;
-        if reply.version != if requested_limits.is_some() { 2 } else { 1 } { return Err(integrity()); }
+        if reply.version != if requested_limits.is_some() { 2 } else { 1 } {
+            return Err(integrity());
+        }
         if let Some(requested) = requested_limits {
             let effective = reply.limits.as_ref().ok_or_else(integrity)?;
-            let effective = [effective.work_nodes, effective.work_edges, effective.work_bytes,
-                effective.frontier, effective.read_bytes, effective.diff_input_bytes,
-                effective.diff_lines, effective.diff_work, effective.diff_allocation_bytes, effective.diff_depth];
-            let requested = [requested.work_nodes, requested.work_edges, requested.work_bytes,
-                requested.frontier, requested.read_bytes, requested.diff_input_bytes,
-                requested.diff_lines, requested.diff_work, requested.diff_allocation_bytes, requested.diff_depth];
-            if effective.into_iter().zip(requested).any(|(a,b)| a == 0 || a > b || a > usize::MAX as u64) {
+            let effective = [
+                effective.work_nodes,
+                effective.work_edges,
+                effective.work_bytes,
+                effective.frontier,
+                effective.read_bytes,
+                effective.diff_input_bytes,
+                effective.diff_lines,
+                effective.diff_work,
+                effective.diff_allocation_bytes,
+                effective.diff_depth,
+            ];
+            let requested = [
+                requested.work_nodes,
+                requested.work_edges,
+                requested.work_bytes,
+                requested.frontier,
+                requested.read_bytes,
+                requested.diff_input_bytes,
+                requested.diff_lines,
+                requested.diff_work,
+                requested.diff_allocation_bytes,
+                requested.diff_depth,
+            ];
+            if effective
+                .into_iter()
+                .zip(requested)
+                .any(|(a, b)| a == 0 || a > b || a > usize::MAX as u64)
+            {
                 return Err(integrity());
             }
-        } else if reply.limits.is_some() { return Err(integrity()); }
+        } else if reply.limits.is_some() {
+            return Err(integrity());
+        }
         let captured = scope.clone();
         let expected_anchors = anchors.to_vec();
         let path = path.to_owned();
@@ -899,7 +930,12 @@ impl NativeClient {
             aggregate_cap
         } else {
             frontier_reserved.min(aggregate_cap)
-        };
+        }
+        .min(self.inner.query_state.available_permits());
+        // Other checked results may legitimately retain part of the state
+        // pool. Bound this collection by the remaining admitted capacity, not
+        // its worst-case request alone. Both pool acquisitions stay nonblocking;
+        // a concurrent winner can still make either one fail closed.
         let initial_retained = (if server_attribution {
             0
         } else {
