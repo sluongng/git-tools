@@ -13,21 +13,24 @@ JJ="$PWD/bazel-bin/crates/jj-native-cli/tinytree-jj"
   --reference main --bookmark main
 cd project
 "$JJ" status
-"$JJ" tinytree history path/to/file.rs
-"$JJ" tinytree blame path/to/file.rs --json
+"$JJ" log -n 10
+"$JJ" log path/to/file.rs
+"$JJ" file annotate path/to/file.rs
 "$JJ" tinytree search 'fn (open|close)_[a-z_]+' --path-prefix src --json
-"$JJ" tinytree fetch --reference main --bookmark main
-# Make changes, then select the bookmark to publish.
-"$JJ" bookmark set main -r @
-"$JJ" tinytree push --reference main --bookmark main
+"$JJ" tinytree fetch --reference sluongng/topic --bookmark sluongng/topic
+# Make changes, then select the topic bookmark to publish.
+"$JJ" bookmark set sluongng/topic -r @
+"$JJ" tinytree push --reference sluongng/topic --bookmark sluongng/topic
 ```
 
 User workspaces always use a daemon-owned lazy jj-vfs mount. Both `init` and
 `clone` require `--broker SOCKET --store ALIAS`; there is no materialized or
 debug fallback. The mount contains an opaque `.jj/native-workspace` marker;
 operation, index and working-copy state live in private external administration.
-Fetch an absent reference explicitly before its first push. Native publication
-is not Git push.
+Ordinary `log`, exact-path `log` and `file annotate` use lazy native queries by
+default. Fetch an absent reference explicitly before its first push. Native
+publication is not Git push. Use the [checked landing workflow](#checked-landing)
+below for protected main.
 
 For new remote `init`, `clone` and convenience `cloud restore` destinations on
 Linux, the default
@@ -49,11 +52,14 @@ Legacy preference. Older pending restore requests and the lower-level exact
 capture/upload policies to back them up. Missing native state always fails closed. A pending new initialization retains its selected mode
 and backup eligibility across retries rather than adopting later config defaults.
 
-With a federated workspace and an operator-configured landing profile:
+## Checked landing
+
+With a federated workspace and an operator-configured landing profile, set
+`PROFILE_VERSION` to the frozen version supplied by the operator:
 
 ```sh
 "$JJ" tinytree land --base main@tinytree --reference main --bookmark main \
-  --profile checks --profile-version v1
+  --profile checks --profile-version "$PROFILE_VERSION"
 "$JJ" tinytree land --status
 "$JJ" tinytree land --resume
 ```
