@@ -1227,6 +1227,15 @@ pub enum QueryFailureReason {
     ClientAnnotationHeaderReservation,
     ClientAnnotationActualReservation,
     ClientCloudResourceLimit,
+    ServerAnnotationCumulativeBudget,
+    ServerAnnotationMemoryBusy,
+    ServerAnnotationMemoryRange,
+    ServerAnnotationBusy,
+    ServerAnnotationResponseLimit,
+    ServerAnnotationSequenceLimit,
+    ServerAnnotationOutputOverflow,
+    ClientQueryDecodeAllocation,
+    ClientQueryRpcMemory,
     BrokerRetainedReplyMemory,
     BrokerReplyBytes,
     ServerRequestMemoryBudget,
@@ -1303,6 +1312,21 @@ impl QueryFailureReason {
                 Some(Self::ClientAnnotationActualReservation)
             }
             "workspace-cloud resource limit exceeded" => Some(Self::ClientCloudResourceLimit),
+            "annotation cumulative history budget exhausted" => {
+                Some(Self::ServerAnnotationCumulativeBudget)
+            }
+            "annotation context memory is busy" => Some(Self::ServerAnnotationMemoryBusy),
+            "annotation context memory exceeds permit range" => {
+                Some(Self::ServerAnnotationMemoryRange)
+            }
+            "annotation context is busy" => Some(Self::ServerAnnotationBusy),
+            "annotation page exceeds response limit" => Some(Self::ServerAnnotationResponseLimit),
+            "annotation sequence exhausted" => Some(Self::ServerAnnotationSequenceLimit),
+            "annotation output overflow" => Some(Self::ServerAnnotationOutputOverflow),
+            "native protobuf response exceeds collection allocation budget" => {
+                Some(Self::ClientQueryDecodeAllocation)
+            }
+            "native client memory budget exceeded" => Some(Self::ClientQueryRpcMemory),
             "native query retained reply budget exhausted" => Some(Self::BrokerRetainedReplyMemory),
             "query client reply exceeds limit" => Some(Self::BrokerReplyBytes),
             "overlay layer overflow" => Some(Self::ServerOverlayLayerOverflow),
@@ -1363,6 +1387,15 @@ impl QueryFailureReason {
             Self::ClientAnnotationHeaderReservation => tonic::Code::ResourceExhausted,
             Self::ClientAnnotationActualReservation => tonic::Code::ResourceExhausted,
             Self::ClientCloudResourceLimit => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationCumulativeBudget => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationMemoryBusy => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationMemoryRange => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationBusy => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationResponseLimit => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationSequenceLimit => tonic::Code::ResourceExhausted,
+            Self::ServerAnnotationOutputOverflow => tonic::Code::ResourceExhausted,
+            Self::ClientQueryDecodeAllocation => tonic::Code::ResourceExhausted,
+            Self::ClientQueryRpcMemory => tonic::Code::ResourceExhausted,
             Self::BrokerRetainedReplyMemory => tonic::Code::ResourceExhausted,
             Self::BrokerReplyBytes => tonic::Code::ResourceExhausted,
             Self::ServerRequestMemoryBudget => tonic::Code::ResourceExhausted,
@@ -1444,6 +1477,27 @@ impl QueryFailureReason {
                 "native query resource: ClientAnnotationActualReservation"
             }
             Self::ClientCloudResourceLimit => "native query resource: ClientCloudResourceLimit",
+            Self::ServerAnnotationCumulativeBudget => {
+                "native query resource: ServerAnnotationCumulativeBudget"
+            }
+            Self::ServerAnnotationMemoryBusy => "native query resource: ServerAnnotationMemoryBusy",
+            Self::ServerAnnotationMemoryRange => {
+                "native query resource: ServerAnnotationMemoryRange"
+            }
+            Self::ServerAnnotationBusy => "native query resource: ServerAnnotationBusy",
+            Self::ServerAnnotationResponseLimit => {
+                "native query resource: ServerAnnotationResponseLimit"
+            }
+            Self::ServerAnnotationSequenceLimit => {
+                "native query resource: ServerAnnotationSequenceLimit"
+            }
+            Self::ServerAnnotationOutputOverflow => {
+                "native query resource: ServerAnnotationOutputOverflow"
+            }
+            Self::ClientQueryDecodeAllocation => {
+                "native query resource: ClientQueryDecodeAllocation"
+            }
+            Self::ClientQueryRpcMemory => "native query resource: ClientQueryRpcMemory",
             Self::BrokerRetainedReplyMemory => "native query resource: BrokerRetainedReplyMemory",
             Self::BrokerReplyBytes => "native query resource: BrokerReplyBytes",
             Self::ServerRequestMemoryBudget => "native query resource: ServerRequestMemoryBudget",
@@ -1536,6 +1590,27 @@ impl QueryFailureReason {
                 Self::ClientAnnotationActualReservation
             }
             "native query resource: ClientCloudResourceLimit" => Self::ClientCloudResourceLimit,
+            "native query resource: ServerAnnotationCumulativeBudget" => {
+                Self::ServerAnnotationCumulativeBudget
+            }
+            "native query resource: ServerAnnotationMemoryBusy" => Self::ServerAnnotationMemoryBusy,
+            "native query resource: ServerAnnotationMemoryRange" => {
+                Self::ServerAnnotationMemoryRange
+            }
+            "native query resource: ServerAnnotationBusy" => Self::ServerAnnotationBusy,
+            "native query resource: ServerAnnotationResponseLimit" => {
+                Self::ServerAnnotationResponseLimit
+            }
+            "native query resource: ServerAnnotationSequenceLimit" => {
+                Self::ServerAnnotationSequenceLimit
+            }
+            "native query resource: ServerAnnotationOutputOverflow" => {
+                Self::ServerAnnotationOutputOverflow
+            }
+            "native query resource: ClientQueryDecodeAllocation" => {
+                Self::ClientQueryDecodeAllocation
+            }
+            "native query resource: ClientQueryRpcMemory" => Self::ClientQueryRpcMemory,
             "native query resource: BrokerRetainedReplyMemory" => Self::BrokerRetainedReplyMemory,
             "native query resource: BrokerReplyBytes" => Self::BrokerReplyBytes,
             "native query resource: ServerRequestMemoryBudget" => Self::ServerRequestMemoryBudget,

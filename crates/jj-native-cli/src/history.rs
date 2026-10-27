@@ -1007,7 +1007,7 @@ async fn run_query(
     };
     let cleanup = query.clone();
     let query = query.with_operation_deadline(deadline);
-    let scope = query_source.open(&query, random()).await.map_err(failure)?;
+    let scope = query_source.open(&query, random(), deadline).await.map_err(failure)?;
     let result = tokio::time::timeout_at(deadline, async {
         if annotate {
             let index = helper.repo().readonly_index().downcast_ref::<jj_native_index::NativeReadonlyIndex>()

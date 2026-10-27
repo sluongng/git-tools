@@ -2185,7 +2185,9 @@ impl Store {
             return Err(Error::Corrupt("cloud version artifact proof"));
         }
         {
-            let mut gate = self.inner.lock()?;
+            // The validation guard still owns this read's catalog arena. Only
+            // reacquire exclusion for descriptor rechecks and artifact pins.
+            let mut gate = self.inner.lock_read()?;
             guard.pin_artifacts(&verified.artifacts, &mut gate)?;
         }
         Ok(Some(CloudVersionReadGuard {

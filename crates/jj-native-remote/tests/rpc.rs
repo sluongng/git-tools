@@ -56,6 +56,7 @@ struct Counters {
     capture_timeouts: Arc<AtomicBool>,
     metadata_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
     query_timeouts: Arc<std::sync::Mutex<Vec<String>>>,
+    query_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     graph_rpcs: Arc<AtomicUsize>,
     query_rpcs: Arc<AtomicUsize>,
     cloud_rpcs: Arc<AtomicUsize>,
@@ -88,6 +89,7 @@ impl Counters {
             capture_timeouts: Arc::new(AtomicBool::new(false)),
             metadata_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
             query_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            query_failure: Arc::new(std::sync::Mutex::new(None)),
             graph_rpcs: Arc::new(AtomicUsize::new(0)),
             query_rpcs: Arc::new(AtomicUsize::new(0)),
             cloud_rpcs: Arc::new(AtomicUsize::new(0)),
@@ -381,6 +383,7 @@ impl Server {
         let query_requests = counts.query_rpcs.clone();
         let capture_timeouts = counts.capture_timeouts.clone();
         let query_timeouts = counts.query_timeouts.clone();
+        let query_failure = counts.query_failure.clone();
         let query = tonic::service::interceptor::InterceptedService::new(
             PreflightCloseFault {
                 inner: service.query_grpc_service(),
@@ -397,6 +400,9 @@ impl Server {
                             .unwrap_or("missing")
                             .to_owned(),
                     );
+                }
+                if let Some(error) = query_failure.lock().unwrap().clone() {
+                    return Err(error);
                 }
                 Ok(request)
             },
@@ -5312,6 +5318,50 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
             .unwrap()
             .is_none()
     );
+    // A preclassified upstream category must survive BOTH adapter and broker
+    // sanitization; arbitrary peer suffixes and wrong codes still never escape.
+    let reason = native_broker::QueryFailureReason::ServerAnnotationMemoryBusy;
+    for (code, message, expected) in [
+        (reason.code(), reason.diagnostic().to_owned(), Some(reason)),
+        (
+            reason.code(),
+            "annotation context memory is busy".to_owned(),
+            Some(reason),
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            reason.diagnostic().to_owned(),
+            None,
+        ),
+        (
+            reason.code(),
+            format!("{}; private fixture detail", reason.diagnostic()),
+            None,
+        ),
+    ] {
+        *counts.query_failure.lock().unwrap() = Some(tonic::Status::new(code, message));
+        let failure = query
+            .facts(
+                scope,
+                vec![q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::HasId(q::HasId {
+                        commit: Some(q::CommitId {
+                            value: selected.0.to_vec(),
+                        }),
+                    })),
+                }],
+                Arc::new(()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), code);
+        assert_eq!(
+            native_broker::QueryFailureReason::from_status(&failure),
+            expected
+        );
+        assert!(!format!("{failure:?}").contains("private"));
+    }
+    *counts.query_failure.lock().unwrap() = None;
     // Annotation runs through this same real broker -> RemoteQueryIo -> checked
     // SDK -> authenticated server chain. Returned context bytes remain local.
     let annotation = native_broker::OpenAnnotationFrontier {
@@ -5491,44 +5541,62 @@ async fn real_broker_query_then_lazy_object_reads_share_the_captured_remote_adap
     drop(blame);
     drop(replayed);
     drop(attributed_scope);
-    let bounded_scope = query
-        .fork_scope(
-            native_broker::ForkQueryScope {
-                parent: scope,
-                expected_cloud_source_digest: None,
-                overlay: vec![],
-                replay_key: [44; 32],
-            },
-            Arc::new(()),
-        )
-        .await
-        .unwrap();
-    let mut tiny = annotation.limits.clone().unwrap();
-    tiny.work_nodes = 1;
-    assert_eq!(
-        query
+    let mut node_bounded = annotation.limits.clone().unwrap();
+    node_bounded.work_nodes = 1;
+    let mut read_bounded = annotation.limits.clone().unwrap();
+    read_bounded.read_bytes = 1;
+    for (key, limits, reason) in [
+        (
+            44,
+            node_bounded,
+            native_broker::QueryFailureReason::ServerExactGraphWorkBudget,
+        ),
+        (
+            45,
+            read_bounded,
+            native_broker::QueryFailureReason::ServerAnnotationCumulativeBudget,
+        ),
+    ] {
+        let bounded_scope = query
+            .fork_scope(
+                native_broker::ForkQueryScope {
+                    parent: scope,
+                    expected_cloud_source_digest: None,
+                    overlay: vec![],
+                    replay_key: [key; 32],
+                },
+                Arc::new(()),
+            )
+            .await
+            .unwrap();
+        let failure = query
             .blame_with_limits(
                 native_broker::ScopedPathQuery {
                     scope: bounded_scope.value.handle,
                     revision: selected,
                     path: "historical-0000.txt".into(),
                     policy: q::HistoryPolicy::JjResolvedFixedPathV1,
-                    max_commits: 1
+                    max_commits: 1,
                 },
-                tiny,
-                Arc::new(())
+                limits,
+                Arc::new(()),
             )
             .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::ResourceExhausted,
-        "the broker must not drop an explicit command reservation"
-    );
-    query
-        .close_scope(bounded_scope.value.handle, Arc::new(()))
-        .await
-        .unwrap();
-    drop(bounded_scope);
+            .unwrap_err();
+        assert_eq!(
+            failure.code(),
+            tonic::Code::ResourceExhausted,
+            "the broker must not drop an explicit command reservation"
+        );
+        assert_eq!(
+            native_broker::QueryFailureReason::from_status(&failure),
+            Some(reason)
+        );
+        query
+            .close_scope(bounded_scope.value.handle, Arc::new(()))
+            .await
+            .unwrap();
+    }
 
     // A private COMMIT-only overlay is intentionally admitted for graph queries,
     // but its ID is rejected locally before a new frontier RPC can send it.

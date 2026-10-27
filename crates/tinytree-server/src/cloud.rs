@@ -699,6 +699,10 @@ fn status(error: s::Error) -> Status {
             "cloud version validation metadata" => Reason::StoreVersionValidationMetadata,
             "cloud version validation bytes" => Reason::StoreVersionValidationBytes,
             "cloud workspace generation" => Reason::StoreWorkspaceGeneration,
+            "cloud resident memory" => Reason::StoreResidentMemory,
+            "cloud index graph work" => Reason::StoreIndexGraphWork,
+            "cloud index aggregate payload" => Reason::StoreIndexAggregatePayload,
+            "cloud index anchor proof" => Reason::StoreIndexAnchorProof,
             _ => Reason::UnknownStoreLimit,
         };
         Status::resource_exhausted(reason.message())
@@ -1733,6 +1737,14 @@ mod indexed_adapter_tests {
             ("cloud index proof work exceeded: records_payload", Reason::StoreIndexProofRecordsPayload),
             ("cloud index proof work exceeded: metadata_payload", Reason::StoreIndexProofMetadataPayload),
             ("cloud index proof work exceeded: records_metadata_payload", Reason::StoreIndexProofRecordsMetadataPayload),
+            ("cloud resident memory", Reason::StoreResidentMemory),
+            ("cloud index graph work", Reason::StoreIndexGraphWork),
+            ("cloud index aggregate payload", Reason::StoreIndexAggregatePayload),
+            ("cloud index anchor proof", Reason::StoreIndexAnchorProof),
+            ("cloud resident memory /private/fixture", Reason::UnknownStoreLimit),
+            ("cloud index graph work /private/fixture", Reason::UnknownStoreLimit),
+            ("cloud index aggregate payload /private/fixture", Reason::UnknownStoreLimit),
+            ("cloud index anchor proof /private/fixture", Reason::UnknownStoreLimit),
             ("synthetic-sensitive-marker /private/fixture token=not-real", Reason::UnknownStoreLimit),
         ] {
             let failure = status(s::Error::Limit(limit));
@@ -1742,6 +1754,11 @@ mod indexed_adapter_tests {
             assert!(!reapi::policy::retryable(&failure));
             assert!(!format!("{failure:?}").contains("synthetic-sensitive-marker"));
             assert!(!failure.message().contains("/private/"));
+            assert_eq!(Reason::from_message(expected.message()), Some(expected));
+            assert_eq!(expected.message(), format!("workspace-cloud limit: {}", expected.as_str()));
+            let wrong_code = status(s::Error::Invalid(limit));
+            assert_eq!(wrong_code.code(), tonic::Code::InvalidArgument);
+            assert_eq!(Reason::from_message(wrong_code.message()), None);
         }
     }
     #[tokio::test]

@@ -188,12 +188,21 @@ fn status(error: anyhow::Error) -> tonic::Status {
     let code = error
         .downcast_ref::<tonic::Status>()
         .map_or(tonic::Code::FailedPrecondition, tonic::Status::code);
-    let message = if matches!(code, tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted) {
-        let source = error.downcast_ref::<tonic::Status>()
+    let message = if matches!(
+        code,
+        tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted
+    ) {
+        let source = error
+            .downcast_ref::<tonic::Status>()
             .map(|status| status.message().to_owned())
             .unwrap_or_else(|| error.root_cause().to_string());
-        native_broker::QueryFailureReason::from_source_message(&source)
-            .filter(|reason| reason.code() == code)
+        error
+            .downcast_ref::<tonic::Status>()
+            .and_then(native_broker::QueryFailureReason::from_status)
+            .or_else(|| {
+                native_broker::QueryFailureReason::from_source_message(&source)
+                    .filter(|reason| reason.code() == code)
+            })
             .map(native_broker::QueryFailureReason::diagnostic)
             .unwrap_or("native repository query operation failed")
     } else {
@@ -1119,15 +1128,25 @@ impl RemoteQueryIo {
 }
 #[async_trait]
 impl NativeQueryIo for RemoteQueryIo {
-    async fn blame_capabilities(&self, owner: QueryOwner) -> std::result::Result<QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
+    async fn blame_capabilities(
+        &self,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<native_broker::BlameCapabilities>, tonic::Status> {
         self.run(owner, move |this, operation| async move {
             let client = operation.client(&this.inner.connector.get_bare().await?);
             let capability = client.resolved_blame_capability().await?;
-            Ok(QueryReply { value: match capability {
-                None => native_broker::BlameCapabilities::LegacyUnnegotiated,
-                Some(value) => native_broker::BlameCapabilities::Explicit { supported: value.supported, authorized: value.authorized },
-            }, owner: operation })
-        }).await
+            Ok(QueryReply {
+                value: match capability {
+                    None => native_broker::BlameCapabilities::LegacyUnnegotiated,
+                    Some(value) => native_broker::BlameCapabilities::Explicit {
+                        supported: value.supported,
+                        authorized: value.authorized,
+                    },
+                },
+                owner: operation,
+            })
+        })
+        .await
     }
     async fn preflight_creation(
         &self,
@@ -1221,24 +1240,33 @@ impl NativeQueryIo for RemoteQueryIo {
             let memory = this.charge(4096)?;
             let client = this.inner.connector.get_bare().await?;
             let rpc = operation.client(&client);
-            let proof = Arc::new(rpc.cloud_retained_version_selected(
-                tinytree_client::RetainedVersionSelector {
-                    workspace_id: source.workspace_id,
-                    generation: source.generation,
-                    manifest_id: tinytree_client::CloudManifestId(source.manifest_id),
-                },
-                tinytree_client::CloudRawDigest {
-                    blake3: source.manifest_blake3,
-                    size_bytes: source.manifest_size_bytes,
-                },
-            ).await?);
-            let pass = Arc::new(CloudAuthorization { source, _client: client, proof, _memory: memory });
+            let proof = Arc::new(
+                rpc.cloud_retained_version_selected(
+                    tinytree_client::RetainedVersionSelector {
+                        workspace_id: source.workspace_id,
+                        generation: source.generation,
+                        manifest_id: tinytree_client::CloudManifestId(source.manifest_id),
+                    },
+                    tinytree_client::CloudRawDigest {
+                        blake3: source.manifest_blake3,
+                        size_bytes: source.manifest_size_bytes,
+                    },
+                )
+                .await?,
+            );
+            let pass = Arc::new(CloudAuthorization {
+                source,
+                _client: client,
+                proof,
+                _memory: memory,
+            });
             this.cloud_authorization = Some(pass.clone());
             Ok(Some(QueryReply {
                 value: Arc::new(this) as Arc<dyn NativeQueryIo>,
                 owner: pass as QueryOwner,
             }))
-        }).await
+        })
+        .await
     }
     async fn open_cloud_scope(
         &self,
@@ -1343,7 +1371,9 @@ impl NativeQueryIo for RemoteQueryIo {
                             tinytree_client::RetainedVersionSelector {
                                 workspace_id: input.source.workspace_id,
                                 generation: input.source.generation,
-                                manifest_id: tinytree_client::CloudManifestId(input.source.manifest_id),
+                                manifest_id: tinytree_client::CloudManifestId(
+                                    input.source.manifest_id,
+                                ),
                             },
                             tinytree_client::CloudRawDigest {
                                 blake3: input.source.manifest_blake3,
@@ -2429,9 +2459,17 @@ impl NativeQueryIo for RemoteQueryIo {
         })
         .await
     }
-    async fn open_limited_annotation_frontier(&self,input:OpenAnnotationFrontier,owner:QueryOwner)->std::result::Result<QueryReply<q::AnnotationFrontier>,tonic::Status>{
-        if input.limits.is_none(){return Err(tonic::Status::invalid_argument("limited frontier requires caps"));}
-        self.open_annotation_frontier(input,owner).await
+    async fn open_limited_annotation_frontier(
+        &self,
+        input: OpenAnnotationFrontier,
+        owner: QueryOwner,
+    ) -> std::result::Result<QueryReply<q::AnnotationFrontier>, tonic::Status> {
+        if input.limits.is_none() {
+            return Err(tonic::Status::invalid_argument(
+                "limited frontier requires caps",
+            ));
+        }
+        self.open_annotation_frontier(input, owner).await
     }
     async fn open_annotation_frontier(
         &self,

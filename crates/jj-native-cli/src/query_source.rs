@@ -9,7 +9,10 @@ use std::{io, path::Path, sync::Arc};
 use tinytree_model::CommitId;
 
 pub(crate) enum Source {
-    Cloud(CloudQuerySource),
+    Cloud {
+        source: CloudQuerySource,
+        index: jj_native_index::NativeReadonlyIndex,
+    },
     Live {
         roots: Vec<CommitId>,
         // Preserve the live observation's command lock through the query.
@@ -20,7 +23,10 @@ impl Source {
     /// Exact roots of this captured observation/retained source. These are only
     /// boundary candidates; the opened scope/frontier still validates authority.
     pub(crate) fn anchors(&self) -> &[CommitId] {
-        match self { Self::Cloud(source) => &source.expected_anchors, Self::Live { roots, .. } => roots }
+        match self {
+            Self::Cloud { source, .. } => &source.expected_anchors,
+            Self::Live { roots, .. } => roots,
+        }
     }
 
     pub(crate) fn resolve(
@@ -28,13 +34,15 @@ impl Source {
         working_copy: &Path,
         locator: &Locator,
     ) -> io::Result<Self> {
-        if let Some(source) = index
-            .downcast_ref::<jj_native_index::NativeReadonlyIndex>()
-            .and_then(|index| index.cloud_query_source())
+        if let Some(index) = index.downcast_ref::<jj_native_index::NativeReadonlyIndex>()
+            && let Some(source) = index.cloud_query_source()
         {
             // The loaded checkpoint is operation-specific. Do not substitute
             // restore-journal roots, moving refs or a scope with local drafts.
-            return Ok(Self::Cloud(source));
+            return Ok(Self::Cloud {
+                source,
+                index: index.clone(),
+            });
         }
         let state = LockedState::open(working_copy, locator)?;
         let mut roots = state
@@ -69,9 +77,28 @@ impl Source {
         &self,
         query: &BrokerQueryClient,
         replay_key: [u8; 32],
+        deadline: tokio::time::Instant,
     ) -> Result<QueryReply<QueryScope>, tonic::Status> {
+        let query = query.clone().with_operation_deadline(deadline);
         match self {
-            Self::Cloud(source) => {
+            Self::Cloud { source, index } => {
+                if let Some(root) = index.cached_cloud_root_scope(deadline).await? {
+                    let reply = query
+                        .fork_scope(
+                            native_broker::ForkQueryScope {
+                                parent: root.value.handle,
+                                expected_cloud_source_digest: Some(source.digest()),
+                                overlay: Vec::new(),
+                                replay_key,
+                            },
+                            root.owner.clone(),
+                        )
+                        .await?;
+                    return Ok(QueryReply {
+                        value: reply.value,
+                        owner: Arc::new((reply.owner, root.owner)),
+                    });
+                }
                 query
                     .open_cloud_scope(
                         OpenCloudQueryScope {

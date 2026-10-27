@@ -3073,6 +3073,51 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
     for (code, message, expected) in [
         (reason.code(), reason.diagnostic().to_owned(), Some(reason)),
         (
+            tonic::Code::ResourceExhausted,
+            "annotation cumulative history budget exhausted".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationCumulativeBudget),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation context memory is busy".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationMemoryBusy),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation context memory exceeds permit range".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationMemoryRange),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation context is busy".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationBusy),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation page exceeds response limit".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationResponseLimit),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation sequence exhausted".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationSequenceLimit),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation output overflow".to_owned(),
+            Some(native_broker::QueryFailureReason::ServerAnnotationOutputOverflow),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "native protobuf response exceeds collection allocation budget".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientQueryDecodeAllocation),
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "native client memory budget exceeded".to_owned(),
+            Some(native_broker::QueryFailureReason::ClientQueryRpcMemory),
+        ),
+        (
             resource.code(),
             resource.diagnostic().to_owned(),
             Some(resource),
@@ -3140,6 +3185,16 @@ async fn query_aliases_preserve_scopes_replay_pages_and_cancellation_without_hol
         (
             resource.code(),
             "fixture private resource detail".to_owned(),
+            None,
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            "annotation cumulative history budget exhausted".to_owned(),
+            None,
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            "annotation context memory is busy; private fixture detail".to_owned(),
             None,
         ),
     ] {

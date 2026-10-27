@@ -4989,12 +4989,12 @@ fn retained_version_arenas_follow_leases_and_refuse_gc_without_deleting() {
         max_bytes: 2 * 1024 * 1024 * 1024,
         max_entries: 512,
     });
-    let store = Store::open(directory.path(), policy).unwrap();
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
     store.create_repository("demo").unwrap();
     let owner = CloudOwner {
         principal: [54; 32],
     };
-    let (_, root, head) = fixture(&store, "leased resident arena");
+    let (file, root, head) = fixture(&store, "leased resident arena");
     let (manifest, leases) = cloud_capture(&store, owner, head, root);
     let mut missing = manifest.clone();
     // Classify missing metadata before admission even when precharging all
@@ -5019,6 +5019,63 @@ fn retained_version_arenas_follow_leases_and_refuse_gc_without_deleting() {
     store
         .publish_cloud_version("demo", owner, &request, 1, &Default::default())
         .unwrap();
+    drop(store);
+    // Size only the fixture from its closed catalog. Public reads below must
+    // fit one complete arena plus pin growth, but never two operation arenas.
+    let arena = cloud::resident::preflight(directory.path(), &policy)
+        .unwrap()
+        .charge()
+        .unwrap();
+    assert!(arena.bytes > 65536);
+    let mut single_reader_policy = policy.clone();
+    single_reader_policy.cloud.resident = Some(CloudResidentLimits {
+        max_bytes: arena.bytes + 65536,
+        max_entries: 65_536,
+    });
+    let store = Store::open_existing(directory.path(), single_reader_policy).unwrap();
+    let first = store
+        .read_cloud_version("demo", owner, manifest.workspace, 1, Default::default())
+        .unwrap();
+    assert_eq!(first.manifest_bytes(), request.manifest_bytes);
+    // Native operations need only bounded reader/pin admission, not another
+    // complete cloud catalog arena while this immutable version is retained.
+    assert!(store.references("demo", &[]).unwrap().is_empty());
+    assert_eq!(store.descriptor("demo", head.key).unwrap(), Some(head));
+    let pin = store.pin_root("demo", head.key).unwrap();
+    assert_eq!(pin.descriptor(), head);
+    let (actual, metadata) = store.read_metadata("demo", head.key).unwrap();
+    assert_eq!(actual, head);
+    tinytree_model::verify(&head, &metadata, Limits::default()).unwrap();
+    drop(metadata);
+    let mut reader = store.read("demo", file.key).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"native source\n");
+    drop(reader);
+    drop(pin);
+    let mut native_readers = Vec::new();
+    for _ in 0..32 {
+        match store.read("demo", file.key) {
+            Ok(reader) => native_readers.push(reader),
+            Err(Error::Limit("cloud resident memory")) => break,
+            _ => panic!("unexpected native reader outcome"),
+        }
+    }
+    assert!(!native_readers.is_empty() && native_readers.len() < 32);
+    drop(native_readers);
+    drop(store.read("demo", file.key).unwrap());
+    assert!(matches!(
+        store.read_cloud_version("demo", owner, manifest.workspace, 1, Default::default()),
+        Err(Error::Limit("cloud resident memory"))
+    ));
+    drop(first);
+    let retry = store
+        .read_cloud_version("demo", owner, manifest.workspace, 1, Default::default())
+        .unwrap();
+    assert_eq!(retry.manifest_bytes(), request.manifest_bytes);
+    drop(retry);
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy).unwrap();
     let mut readers = Vec::new();
     for _ in 0..8 {
         match store.read_cloud_version("demo", owner, manifest.workspace, 1, Default::default()) {
@@ -5032,6 +5089,9 @@ fn retained_version_arenas_follow_leases_and_refuse_gc_without_deleting() {
         readers.len() < 8,
         "returned version owners must retain their arena charges"
     );
+    // Release one admitted reader so the detached physical read can take its
+    // place. It must retain that arena until completion, not charge it twice.
+    drop(readers.pop().unwrap());
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let release = Arc::new(std::sync::Barrier::new(2));
     *store.inner.cloud_version_read_pause.lock().unwrap() = Some((entered_tx, release.clone()));
@@ -5040,9 +5100,9 @@ fn retained_version_arenas_follow_leases_and_refuse_gc_without_deleting() {
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let caller = std::thread::spawn(move || {
         let result = physical.read_cloud_version("demo", owner, workspace, 1, Default::default());
-        let refused = matches!(result, Err(Error::Limit("cloud resident memory")));
+        let completed = result.is_ok();
         drop(result);
-        done_tx.send(refused).unwrap();
+        done_tx.send(completed).unwrap();
     });
     entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     // Losing the caller's join handle does not cancel the physical read or its
@@ -7052,6 +7112,18 @@ fn indexed_version_read_and_gc_fail_closed_on_missing_artifact_but_v1_gate_does_
     store
         .put("demo", spare, b"must survive invalid mark", 0)
         .unwrap();
+    drop(store);
+    let mut policy = config();
+    policy.cloud.resident = Some(CloudResidentLimits {
+        max_bytes: 2 * 1024 * 1024 * 1024,
+        max_entries: 65_536,
+    });
+    let arena = cloud::resident::preflight(directory.path(), &policy)
+        .unwrap()
+        .charge()
+        .unwrap();
+    policy.cloud.resident.as_mut().unwrap().max_bytes = arena.bytes + 65536;
+    let store = Store::open_existing(directory.path(), policy).unwrap();
     let artifact = artifacts
         .iter()
         .find(|d| matches!(d.id, tinytree_cloud::IndexArtifactId::Node(_)))

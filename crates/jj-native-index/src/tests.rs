@@ -3325,7 +3325,7 @@ async fn cancelled_portable_export_keeps_accepted_sink_artifact_owned_until_phys
 
 #[test]
 fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_or_live_fallback() {
-    block_on(async {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         use tinytree_cloud as cloud;
         let (directory, _objects_directory, _unused, io, objects, config) = fixture();
         let backend =
@@ -3606,6 +3606,10 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
         )
         .unwrap();
         let historical = reopened.index_at_operation(&[1; 64]).unwrap();
+        let opens_before_lookup = io.cloud_opens.load(Ordering::SeqCst);
+        assert!(historical.cached_cloud_root_scope(tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap().is_none());
+        assert_eq!(io.cloud_opens.load(Ordering::SeqCst), opens_before_lookup,
+            "uncached lookup must not create RPC work");
         assert_eq!(historical.checkpoint.drafts.len(), 2);
         assert!(
             historical
@@ -3666,6 +3670,50 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
                 .iter()
                 .all(|key| key.id.0 == model_id(delta.id()).unwrap().0)
         );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let canonical = updated.cached_cloud_root_scope(deadline).await.unwrap().unwrap();
+        let private_handle = updated.checkpoint.scope.lock().await.cached.as_ref().unwrap().value.handle;
+        assert_ne!(canonical.value.handle, private_handle, "never lend the private-overlay scope");
+        let source = updated.cloud_query_source().unwrap();
+        assert_eq!(canonical.value.cloud_source_digest, Some(source.digest()));
+        let child = io.fork_scope(ForkQueryScope {
+            parent: canonical.value.handle,
+            expected_cloud_source_digest: Some(source.digest()),
+            overlay: Vec::new(),
+            replay_key: [97; 32],
+        }, canonical.owner.clone()).await.unwrap();
+        let membership = |handle, owner| io.facts(handle, vec![q::GraphFact {
+            fact: Some(q::graph_fact::Fact::HasId(q::HasId { commit: Some(q::CommitId { value: model_id(delta.id()).unwrap().0.to_vec() }) })),
+        }], owner);
+        assert!(matches!(membership(child.value.handle, canonical.owner.clone()).await.unwrap().value.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::HasId(false))), "empty child excludes local draft FILE authority");
+        io.close_scope(child.value.handle, child.owner).await.unwrap();
+        assert!(matches!(membership(canonical.value.handle, canonical.owner.clone()).await.unwrap().value.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::HasId(false))), "child close does not close cached root");
+        assert!(matches!(membership(private_handle, canonical.owner.clone()).await.unwrap().value.answers[0].answer,
+            Some(q::graph_fact_answer::Answer::HasId(true))), "private index scope remains independent");
+        drop(canonical);
+        let before = io.cloud_opens.load(Ordering::SeqCst);
+        assert_eq!(updated.cached_cloud_root_scope(tokio::time::Instant::now()).await.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        {
+            let mut state = updated.checkpoint.scope.lock().await;
+            state.root_only = Some(Arc::new(CachedScope {
+                value: QueryScope {
+                    handle: [96; 32],
+                    expires_at_unix_seconds: 0,
+                    query_identity_version: 2,
+                    cloud_source_digest: Some(source.digest()),
+                },
+                _owner: Arc::new(()),
+                cleanup: updated.core.cleanup.clone(),
+                close_once: Default::default(),
+                parent: None,
+                timeout: Duration::from_millis(updated.core.limits.cleanup_timeout_ms),
+            }));
+        }
+        assert!(updated.cached_cloud_root_scope(deadline).await.unwrap().is_none());
+        updated.checkpoint.scope.lock().await.root_only = None;
+        assert_eq!(io.cloud_opens.load(Ordering::SeqCst), before, "expired lookup never reopens a scope");
         // Match jj's actual plural-operation reconciliation order: merge the
         // common operation index, then the other operation head. Each source is
         // an exact selection from the SAME retained version, never live roots.

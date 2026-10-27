@@ -739,7 +739,7 @@ async fn run_query(
     let cleanup = query.clone();
     let query = query.with_operation_deadline(deadline);
     let io = io.with_operation_deadline(deadline);
-    let scope = query_source.open(&query, random()).await.map_err(failure)?;
+    let scope = query_source.open(&query, random(), deadline).await.map_err(failure)?;
     let owner = Arc::new(PhysicalBudget {
         usage: Mutex::new(Usage::default()),
         _scope: scope.owner.clone(),

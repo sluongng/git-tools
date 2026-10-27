@@ -95,6 +95,10 @@ pub enum PublicationFailureReason {
     StoreIndexProofRecordsPayload,
     StoreIndexProofMetadataPayload,
     StoreIndexProofRecordsMetadataPayload,
+    StoreResidentMemory,
+    StoreIndexGraphWork,
+    StoreIndexAggregatePayload,
+    StoreIndexAnchorProof,
     UnknownStoreLimit,
 }
 impl PublicationFailureReason {
@@ -160,6 +164,10 @@ impl PublicationFailureReason {
             Self::StoreIndexProofRecordsPayload => "store_index_proof_records_payload",
             Self::StoreIndexProofMetadataPayload => "store_index_proof_metadata_payload",
             Self::StoreIndexProofRecordsMetadataPayload => "store_index_proof_records_metadata_payload",
+            Self::StoreResidentMemory => "store_resident_memory",
+            Self::StoreIndexGraphWork => "store_index_graph_work",
+            Self::StoreIndexAggregatePayload => "store_index_aggregate_payload",
+            Self::StoreIndexAnchorProof => "store_index_anchor_proof",
             Self::UnknownStoreLimit => "unknown_store_limit",
         }
     }
@@ -225,6 +233,10 @@ impl PublicationFailureReason {
             Self::StoreIndexProofRecordsPayload => "workspace-cloud limit: store_index_proof_records_payload",
             Self::StoreIndexProofMetadataPayload => "workspace-cloud limit: store_index_proof_metadata_payload",
             Self::StoreIndexProofRecordsMetadataPayload => "workspace-cloud limit: store_index_proof_records_metadata_payload",
+            Self::StoreResidentMemory => "workspace-cloud limit: store_resident_memory",
+            Self::StoreIndexGraphWork => "workspace-cloud limit: store_index_graph_work",
+            Self::StoreIndexAggregatePayload => "workspace-cloud limit: store_index_aggregate_payload",
+            Self::StoreIndexAnchorProof => "workspace-cloud limit: store_index_anchor_proof",
             Self::UnknownStoreLimit => "workspace-cloud limit: unknown_store_limit",
         }
     }
@@ -291,6 +303,10 @@ impl PublicationFailureReason {
             "workspace-cloud limit: store_index_proof_records_payload" => Some(Self::StoreIndexProofRecordsPayload),
             "workspace-cloud limit: store_index_proof_metadata_payload" => Some(Self::StoreIndexProofMetadataPayload),
             "workspace-cloud limit: store_index_proof_records_metadata_payload" => Some(Self::StoreIndexProofRecordsMetadataPayload),
+            "workspace-cloud limit: store_resident_memory" => Some(Self::StoreResidentMemory),
+            "workspace-cloud limit: store_index_graph_work" => Some(Self::StoreIndexGraphWork),
+            "workspace-cloud limit: store_index_aggregate_payload" => Some(Self::StoreIndexAggregatePayload),
+            "workspace-cloud limit: store_index_anchor_proof" => Some(Self::StoreIndexAnchorProof),
             "workspace-cloud limit: unknown_store_limit" => Some(Self::UnknownStoreLimit),
             "private workspace call budget exhausted" => Some(Self::ServerAdmissionCall),
             "private workspace memory budget exhausted" => Some(Self::ServerAdmissionMemory),

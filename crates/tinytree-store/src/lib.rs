@@ -888,7 +888,7 @@ impl Store {
     }
 
     pub fn references(&self, repo: &str, names: &[String]) -> Result<Vec<Reference>> {
-        let _guard = self.inner.lock()?;
+        let _guard = self.inner.lock_read()?;
         self.inner.repository(repo)?;
         if names.len() > 1024 {
             return Err(Error::Limit("reference batch"));
@@ -909,7 +909,7 @@ impl Store {
     }
 
     pub fn descriptor(&self, repo: &str, object: ObjectKey) -> Result<Option<Descriptor>> {
-        let _guard = self.inner.lock()?;
+        let _guard = self.inner.lock_read()?;
         self.inner.repository(repo)?;
         self.inner.descriptor(repo, object)
     }
@@ -959,7 +959,7 @@ impl Store {
     /// byte verification or proof that every dependency is resident. Callers
     /// still verify the objects they read. The guard is process-local only.
     pub fn pin_root(&self, repo: &str, object: ObjectKey) -> Result<RootReadGuard> {
-        let mut gate = self.inner.lock()?;
+        let mut gate = self.inner.lock_read()?;
         self.inner.repository(repo)?;
         let descriptor = self
             .inner
@@ -979,7 +979,7 @@ impl Store {
 
     pub fn read(&self, repo: &str, object: ObjectKey) -> Result<ReadLease> {
         // Acquire the lease under the same gate as GC before opening the file.
-        let mut gate = self.inner.lock()?;
+        let mut gate = self.inner.lock_read()?;
         self.inner.repository(repo)?;
         let descriptor = self
             .inner
@@ -1805,6 +1805,15 @@ impl Store {
 }
 
 impl Inner {
+    // Bounded native reads do not construct catalog-wide models. Payload,
+    // reader leases and pin-table growth have their own admission below.
+    fn lock_read(&self) -> Result<MutexGuard<'_, Runtime>> {
+        let guard = self.gate.lock().map_err(|_| Error::Poisoned)?;
+        if self.uncertain_commit.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        Ok(guard)
+    }
     fn lock(&self) -> Result<RuntimeGuard<'_>> {
         let mut guard = self.gate.lock().map_err(|_| Error::Poisoned)?;
         if self.uncertain_commit.load(Ordering::Acquire) {

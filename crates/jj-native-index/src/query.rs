@@ -56,6 +56,49 @@ impl NativeReadonlyIndex {
             CheckpointSource::CloudSnapshot { pins, .. } => Some(pins.clone()),
         }
     }
+    /// Borrow an already-open canonical cloud root without creating work or
+    /// admitting local COMMIT overlays. The caller must fork an empty-overlay
+    /// child and close only that child, never this cached root. Its reply owner
+    /// keeps the checkpoint and cached chain alive until the child is released.
+    pub async fn cached_cloud_root_scope(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<native_broker::QueryReply<native_broker::QueryScope>>, tonic::Status> {
+        let CheckpointSource::CloudSnapshot { pins, .. } = &self.checkpoint.source else {
+            return Ok(None);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(tonic::Status::deadline_exceeded("cached cloud scope deadline exceeded"));
+        }
+        let state = tokio::time::timeout_at(deadline, self.checkpoint.scope.lock())
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("cached cloud scope deadline exceeded"))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(tonic::Status::deadline_exceeded("cached cloud scope deadline exceeded"));
+        }
+        let Some(cached) = state.root_only.as_ref().or(state.cached.as_ref()) else {
+            return Ok(None);
+        };
+        let mut root = cached;
+        while let Some(parent) = &root.parent {
+            root = parent;
+        }
+        let threshold = now().map_err(|_| tonic::Status::internal("cloud scope clock unavailable"))?
+            .checked_add(1)
+            .ok_or_else(|| tonic::Status::internal("cloud scope clock overflow"))?;
+        if root.value.expires_at_unix_seconds <= threshold {
+            return Ok(None);
+        }
+        if root.value.query_identity_version != 2
+            || root.value.cloud_source_digest != Some(pins.digest())
+        {
+            return Err(tonic::Status::failed_precondition("cached cloud source binding mismatch"));
+        }
+        Ok(Some(native_broker::QueryReply {
+            value: root.value.clone(),
+            owner: Arc::new((self.clone(), cached.clone())),
+        }))
+    }
     pub(super) fn verify_draft(
         &self,
         descriptor: m::Descriptor,

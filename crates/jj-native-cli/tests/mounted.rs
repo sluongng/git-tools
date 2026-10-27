@@ -7454,6 +7454,7 @@ fn restore_captured_workspace_with_watchdog(
     );
     // Default prefix/author/timestamp rendering must use captured-only COMMIT
     // metadata, not IDs returned by blame as an ambient read capability.
+    let retained_before_default = upstream.metadata.retained_scope_opens.load(Ordering::SeqCst);
     let default_annotation = fixture.success(
         &root,
         &[
@@ -7464,6 +7465,8 @@ fn restore_captured_workspace_with_watchdog(
             &captured_revision,
         ],
     );
+    assert_eq!(upstream.metadata.retained_scope_opens.load(Ordering::SeqCst) - retained_before_default, 1,
+        "ordinary retained annotation shares its canonical index root instead of reopening the frozen source");
     assert!(!default_annotation.contains("<Error"));
     assert!(default_annotation.contains(std::str::from_utf8(authored_bytes).unwrap().trim_end()));
     let inherited_annotation = fixture.success(
