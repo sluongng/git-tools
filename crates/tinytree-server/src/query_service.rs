@@ -286,7 +286,9 @@ impl QueryService {
         host: Arc<QueryHost>,
         admission: Option<Arc<Work>>,
         key: q::ScopeKey,
-        f: impl FnOnce(&Scoped, &mut WorkBudget, &QueryConfig) -> Result<T, Status> + Send + 'static,
+        f: impl FnOnce(&Arc<Scoped>, &mut WorkBudget, &QueryConfig) -> Result<T, Status>
+        + Send
+        + 'static,
     ) -> Result<Response<T>, Status> {
         identity.authorize(&key.repository_id, false)?;
         let work = admitted(&host, deadline, admission).await?;
@@ -308,6 +310,21 @@ impl QueryService {
             self.repository.service_config().query.max_response_bytes,
         )
     }
+}
+fn merged_admission(
+    admission: &Option<Arc<Work>>,
+    expression: Option<&q::GraphExpr>,
+) -> Result<(), Status> {
+    if expression.is_some_and(crate::query_eval::has_merged_path)
+        && admission
+            .as_ref()
+            .is_none_or(|work| !work.has_merged_path_memory())
+    {
+        return Err(Status::failed_precondition(
+            "merged path requires predecode admission",
+        ));
+    }
+    Ok(())
 }
 async fn admitted(
     host: &Arc<QueryHost>,
@@ -347,7 +364,7 @@ async fn execute<T: Send + 'static>(
     host: Arc<QueryHost>,
     work: Arc<Work>,
     deadline: Instant,
-    f: impl FnOnce(&QueryHost, &Arc<Work>) -> Result<T, Status> + Send + 'static,
+    f: impl FnOnce(&Arc<QueryHost>, &Arc<Work>) -> Result<T, Status> + Send + 'static,
 ) -> Result<(T, Arc<Work>), Status> {
     // The result also retains the owner: timeout/cancellation cannot release
     // physical work or a completed-but-not-yet-collected allocation early.
@@ -591,6 +608,11 @@ impl RepositoryQuery for QueryService {
         let admission = request.extensions().get::<Arc<Work>>().cloned();
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
+        for fact in &input.facts {
+            if let Some(q::graph_fact::Fact::Membership(value)) = &fact.fact {
+                merged_admission(&admission, value.expression.as_ref())?;
+            }
+        }
         let key = scope_key(input.scope)?;
         if input.facts.len() > host.config.max_facts {
             return Err(Status::resource_exhausted("query fact count exceeded"));
@@ -603,6 +625,9 @@ impl RepositoryQuery for QueryService {
             admission,
             key,
             move |scope, budget, config| {
+                let path_state = Arc::new(std::sync::Mutex::new(
+                    crate::query_history::path::PathState::new(config),
+                ));
                 let mut answers = Vec::new();
                 let mut inputs = 0usize;
                 let mut outputs = 0usize;
@@ -630,6 +655,7 @@ impl RepositoryQuery for QueryService {
                                     deadline,
                                     &mut remaining_steps,
                                     &mut inputs,
+                                    &path_state,
                                 )?,
                             )
                         }
@@ -718,6 +744,7 @@ impl RepositoryQuery for QueryService {
         let admission = request.extensions().get::<Arc<Work>>().cloned();
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
+        merged_admission(&admission, input.selection.as_ref())?;
         let key = scope_key(input.scope)?;
         prefix(&input.hex_prefix, 64)?;
         let prefix_host = host.clone();
@@ -780,6 +807,7 @@ impl RepositoryQuery for QueryService {
         let admission = request.extensions().get::<Arc<Work>>().cloned();
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
+        merged_admission(&admission, input.selection.as_ref())?;
         let key = scope_key(input.scope)?;
         prefix(&input.hex_prefix, 32)?;
         let prefix_host = host.clone();
@@ -870,6 +898,7 @@ impl RepositoryQuery for QueryService {
         let admission = request.extensions().get::<Arc<Work>>().cloned();
         self.bounded(request.get_ref())?;
         let input = request.into_inner();
+        merged_admission(&admission, input.selection.as_ref())?;
         let key = scope_key(input.scope)?;
         let prefix_host = host.clone();
         self.scoped(
@@ -1245,7 +1274,13 @@ impl RepositoryQuery for QueryService {
             if host.requires_cloud(&identity.id, &key.repository_id, &key.handle)? {
                 identity.cloud_capability()?;
             }
-            let result = host.cursors.evaluate(host, &identity.id, input, deadline)?;
+            let result = host.cursors.evaluate_admitted(
+                host,
+                &identity.id,
+                input,
+                deadline,
+                work.has_merged_path_memory(),
+            )?;
             work.query_owners.lock().unwrap().push(result.owner);
             Ok(result.page)
         })

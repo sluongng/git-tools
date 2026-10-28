@@ -17,13 +17,17 @@ struct FixtureIo {
     cloud_scope_sources: Mutex<BTreeMap<[u8; 32], [u8; 32]>>,
     cloud_opens: AtomicUsize,
     scope_closes: AtomicUsize,
-    queries: Mutex<BTreeMap<[u8; 32], (Vec<q::GraphRow>, usize, u64)>>,
+    queries: Mutex<BTreeMap<[u8; 32], (Vec<q::GraphRow>, usize, u64, usize, bool)>>,
     opens: AtomicUsize,
     live_opens: AtomicUsize,
     facts_count: AtomicUsize,
     prefix_count: AtomicUsize,
     fail_fact: AtomicBool,
     begins: AtomicUsize,
+    requested_page_sizes: Mutex<Vec<(bool, u32)>>,
+    fill_requested_pages: AtomicBool,
+    overfill_merged_page: AtomicBool,
+    merged_page_rows: AtomicUsize,
     next: AtomicUsize,
     closes: AtomicUsize,
     remote: Mutex<Vec<m::Commit>>,
@@ -779,7 +783,15 @@ impl NativeQueryIo for FixtureIo {
             });
         }
         let handle = random();
-        self.queries.lock().unwrap().insert(handle, (rows, 0, 0));
+        let merged_path = path_filter::has_merged_path(&i.expression);
+        self.requested_page_sizes
+            .lock()
+            .unwrap()
+            .push((merged_path, i.page_size));
+        self.queries
+            .lock()
+            .unwrap()
+            .insert(handle, (rows, 0, 0, i.page_size as usize, merged_path));
         Ok(reply(
             QueryHandle {
                 handle,
@@ -800,7 +812,7 @@ impl NativeQueryIo for FixtureIo {
             let _ = recv.await;
         }
         let mut queries = self.queries.lock().unwrap();
-        let (rows, offset, expected) = queries.get_mut(&h).unwrap();
+        let (rows, offset, expected, requested, merged_path) = queries.get_mut(&h).unwrap();
         assert_eq!(seq, *expected);
         *expected += 1;
         if seq == 0 {
@@ -813,8 +825,23 @@ impl NativeQueryIo for FixtureIo {
                 o,
             ));
         }
-        let page = rows.get(*offset).cloned().into_iter().collect();
-        *offset += 1;
+        let count = if self.fill_requested_pages.load(Ordering::SeqCst) {
+            *requested
+                + usize::from(*merged_path && self.overfill_merged_page.load(Ordering::SeqCst))
+        } else {
+            1
+        };
+        let page = rows
+            .iter()
+            .skip(*offset)
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>();
+        *offset += page.len();
+        if *merged_path {
+            self.merged_page_rows
+                .fetch_add(page.len(), Ordering::SeqCst);
+        }
         Ok(reply(
             QueryPage {
                 sequence: seq,
@@ -911,21 +938,49 @@ fn query_failures_report_static_scope_stage_without_reflecting_provider_details(
     let resource = native_broker::QueryFailureReason::ServerScopeReplayHistoryQuota;
     for (code, message, expected) in [
         (reason.code(), reason.diagnostic().to_owned(), Some(reason)),
-        (resource.code(), resource.diagnostic().to_owned(), Some(resource)),
-        (tonic::Code::FailedPrecondition, resource.diagnostic().to_owned(), None),
-        (tonic::Code::ResourceExhausted, reason.diagnostic().to_owned(), None),
-        (resource.code(), format!("{}; private fixture detail", resource.diagnostic()), None),
-        (reason.code(), "fixture private connection detail".to_owned(), None),
-        (resource.code(), "fixture private resource detail".to_owned(), None),
+        (
+            resource.code(),
+            resource.diagnostic().to_owned(),
+            Some(resource),
+        ),
+        (
+            tonic::Code::FailedPrecondition,
+            resource.diagnostic().to_owned(),
+            None,
+        ),
+        (
+            tonic::Code::ResourceExhausted,
+            reason.diagnostic().to_owned(),
+            None,
+        ),
+        (
+            resource.code(),
+            format!("{}; private fixture detail", resource.diagnostic()),
+            None,
+        ),
+        (
+            reason.code(),
+            "fixture private connection detail".to_owned(),
+            None,
+        ),
+        (
+            resource.code(),
+            "fixture private resource detail".to_owned(),
+            None,
+        ),
     ] {
         *io.scope_failure.lock().unwrap() = Some(tonic::Status::new(code, message));
         let index = store.seed_index().unwrap();
         let error = block_on(index.has_id(&CommitId::from_bytes(&[42; 32]))).unwrap_err();
-        let IndexError::Other(source) = error else { panic!("unexpected error category") };
+        let IndexError::Other(source) = error else {
+            panic!("unexpected error category")
+        };
         let failure = source.downcast_ref::<Error>().unwrap();
         assert_eq!(failure.query_code(), Some(code));
-        assert!(matches!(failure, Error::QueryFailure { code: actual, stage: QueryStage::ScopeOpen, reason }
-            if *actual == code && *reason == expected));
+        assert!(
+            matches!(failure, Error::QueryFailure { code: actual, stage: QueryStage::ScopeOpen, reason }
+            if *actual == code && *reason == expected)
+        );
         assert!(!format!("{failure:?} {failure}").contains("private"));
     }
     *io.scope_failure.lock().unwrap() = None;
@@ -938,13 +993,28 @@ fn immutable_operation_associations_reopen_and_reject_missing_transplanted_or_fo
     let (directory, _objects_directory, store, io, objects, config) = fixture();
     let manifest = directory.path().join("index/manifest");
     let before = std::fs::read(&manifest).unwrap();
-    assert_eq!(NativeIndexStore::inspect_config(&directory.path().join("index")).unwrap(), config);
-    assert_eq!(std::fs::read(&manifest).unwrap(), before, "inspection is read-only");
-    let corrupt = private_fs::PrivateDir::create(directory.path().join("corrupt-manifest")).unwrap();
-    let mut damaged = before.clone(); damaged[13] ^= 1;
+    assert_eq!(
+        NativeIndexStore::inspect_config(&directory.path().join("index")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read(&manifest).unwrap(),
+        before,
+        "inspection is read-only"
+    );
+    let corrupt =
+        private_fs::PrivateDir::create(directory.path().join("corrupt-manifest")).unwrap();
+    let mut damaged = before.clone();
+    damaged[13] ^= 1;
     corrupt.replace("manifest", &damaged).unwrap();
-    assert!(matches!(NativeIndexStore::inspect_config(corrupt.path()), Err(Error::Corrupt)));
-    assert_eq!(std::fs::read(corrupt.path().join("manifest")).unwrap(), damaged);
+    assert!(matches!(
+        NativeIndexStore::inspect_config(corrupt.path()),
+        Err(Error::Corrupt)
+    ));
+    assert_eq!(
+        std::fs::read(corrupt.path().join("manifest")).unwrap(),
+        damaged
+    );
     let foreign_dir =
         private_fs::PrivateDir::create(directory.path().join("foreign-index")).unwrap();
     std::fs::write(foreign_dir.path().join("sentinel"), b"untouched").unwrap();
@@ -1101,11 +1171,9 @@ fn public_mutable_traits_keep_local_drafts_hidden_siblings_and_lazy_streams_acro
             panic!("wrong compiler limit category")
         };
         assert!(matches!(source.downcast_ref::<Error>(), Some(Error::Limit)));
-        use jj_lib::{
-            fileset::FilesetExpression,
-            revset::RevsetFilterPredicate as F,
-        };
-        let exact = FilesetExpression::file_path(RepoPathBuf::from_internal_string("file").unwrap());
+        use jj_lib::{fileset::FilesetExpression, revset::RevsetFilterPredicate as F};
+        let exact =
+            FilesetExpression::file_path(RepoPathBuf::from_internal_string("file").unwrap());
         let prefix =
             FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("directory").unwrap());
         let union = FilesetExpression::UnionAll(vec![exact.clone(), prefix.clone()]);
@@ -1484,11 +1552,18 @@ struct CountingObjects {
     file_writes: AtomicUsize,
     reply_owner_probe: Option<Arc<FixtureIo>>,
     pause_metadata: AtomicBool,
+    pause_non_intrinsic_trees: AtomicBool,
     metadata_waiters: Mutex<Vec<futures::channel::oneshot::Sender<()>>>,
 }
 impl CountingObjects {
-    async fn metadata_gate(&self) {
-        if self.pause_metadata.load(Ordering::SeqCst) {
+    async fn metadata_gate(&self, key: m::ObjectKey) {
+        // Generic permit tests may stop backend initialization. The ordinary
+        // path owner test instead stops a source TREE, after selected/parent
+        // COMMIT replies exist; the fixed intrinsic empty TREE has no such owner.
+        let source_tree = key.kind == m::Kind::Tree && key != m::empty_tree().descriptor.key;
+        if self.pause_metadata.load(Ordering::SeqCst)
+            && (!self.pause_non_intrinsic_trees.load(Ordering::SeqCst) || source_tree)
+        {
             let (send, recv) = futures::channel::oneshot::channel();
             self.metadata_waiters.lock().unwrap().push(send);
             let _ = recv.await;
@@ -1543,7 +1618,7 @@ impl NativeObjectIo for CountingObjects {
         key: m::ObjectKey,
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
         self.reads.lock().unwrap().push(key);
-        self.metadata_gate().await;
+        self.metadata_gate(key).await;
         self.inner.read_metadata(key).await
     }
     async fn read_metadata_with_owner(
@@ -1552,7 +1627,7 @@ impl NativeObjectIo for CountingObjects {
         owner: QueryOwner,
     ) -> jj_lib::backend::BackendResult<jj_native_backend::VerifiedMetadata> {
         self.reads.lock().unwrap().push(key);
-        self.metadata_gate().await;
+        self.metadata_gate(key).await;
         self.inner.read_metadata_with_owner(key, owner).await
     }
     async fn write_metadata(
@@ -1595,6 +1670,7 @@ fn admitted_root_advance_promotes_overlay_without_losing_hidden_drafts_or_old_op
             file_writes: AtomicUsize::new(0),
             reply_owner_probe: None,
             pause_metadata: AtomicBool::new(false),
+            pause_non_intrinsic_trees: AtomicBool::new(false),
             metadata_waiters: Mutex::new(Vec::new()),
         });
         let store = NativeIndexStore::open(
@@ -1994,6 +2070,7 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
         // be exactly that resolved parent result, so HasConflict alone is not
         // enough and the resolver's synthesized file must not be published.
         let mut file_trees = Vec::new();
+        let mut file_values = Vec::new();
         for contents in [
             "one\nmiddle\nthree\n",
             "ONE\nmiddle\nthree\n",
@@ -2008,6 +2085,11 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
                 )
                 .await
                 .unwrap();
+            file_values.push(TreeValue::File {
+                id: file.clone(),
+                executable: false,
+                copy_id: jj_lib::backend::CopyId::placeholder(),
+            });
             file_trees.push(
                 backend
                     .write_tree(
@@ -2088,6 +2170,201 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             mutable.add_commit(&commit).await.unwrap();
             file_commits.push(commit);
         }
+        // The shared predicate also handles ordinary resolved merges, without
+        // the selected-conflict optimization or an all-path-only assumption.
+        struct Parents {
+            base: CommitId,
+            remaining: u64,
+            active: bool,
+        }
+        impl tinytree_annotate::Budget for Parents {
+            type Error = &'static str;
+            fn check(&self) -> Result<(), Self::Error> {
+                if self.active {
+                    Ok(())
+                } else {
+                    Err("cancelled")
+                }
+            }
+            fn charge(&mut self, items: u64, _: u64) -> Result<(), Self::Error> {
+                self.remaining = self.remaining.checked_sub(items).ok_or("limit")?;
+                Ok(())
+            }
+            fn frontier(&mut self, entries: usize) -> Result<(), Self::Error> {
+                if entries <= 128 {
+                    Ok(())
+                } else {
+                    Err("frontier")
+                }
+            }
+            fn diff_active(&self) -> bool {
+                self.active
+            }
+        }
+        impl tinytree_annotate::path::ParentGraph for Parents {
+            fn prepare_diff(&mut self, terms: usize) -> Result<(), Self::Error> {
+                tinytree_annotate::Budget::frontier(self, terms)
+            }
+            async fn common_ancestors(
+                &mut self,
+                _: &[CommitId],
+                _: &[CommitId],
+            ) -> Result<Vec<CommitId>, Self::Error> {
+                Ok(vec![self.base.clone()])
+            }
+        }
+        let limits = jj_lib::diff::LineDiffLimits {
+            max_input_bytes: 1_000_000,
+            max_lines: 100_000,
+            max_work: 1_000_000,
+            max_allocation_bytes: 10_000_000,
+            max_recursion_depth: 128,
+        };
+        let mut ledger = jj_lib::diff::LineDiffBudget::new(limits);
+        let mut graph = Parents {
+            base: file_commits[0].id().clone(),
+            remaining: 1_000_000,
+            active: true,
+        };
+        let missing = jj_lib::matchers::FilesMatcher::new([
+            jj_lib::repo_path::RepoPathBuf::from_internal_string("unrelated").unwrap(),
+        ]);
+        let exact = jj_lib::matchers::FilesMatcher::new([
+            jj_lib::repo_path::RepoPathBuf::from_internal_string("file").unwrap(),
+        ]);
+        let mut ordinary_merges = Vec::new();
+        for (tree, expected) in [(3, false), (4, true)] {
+            let mut value = file_commits[3].store_commit().as_ref().clone();
+            value.root_tree = Merge::resolved(file_trees[tree].clone());
+            value.description = "ordinary resolved merge".into();
+            let clean = jj_store.write_commit(value, None).await.unwrap();
+            assert!(!clean.has_conflict());
+            mutable.add_commit(&clean).await.unwrap();
+            ordinary_merges.push(clean.clone());
+            let before = ledger.usage().input_bytes;
+            assert!(
+                !tinytree_annotate::path::changed_with_matcher(
+                    &jj_store,
+                    &clean,
+                    &missing,
+                    &mut graph,
+                    &mut ledger,
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(
+                ledger.usage().input_bytes,
+                before,
+                "unmatched files never enter the resolver"
+            );
+            let actual = tinytree_annotate::path::changed_with_matcher(
+                &jj_store,
+                &clean,
+                &exact,
+                &mut graph,
+                &mut ledger,
+            )
+            .await
+            .unwrap();
+            assert_eq!(actual, expected);
+            // Independent stock before-side oracle, preserving parent order
+            // and labels instead of comparing to either parent individually.
+            let stock = jj_lib::merged_tree::MergedTree::merge_no_resolve(Merge::from_vec(vec![
+                (file_commits[1].tree(), file_commits[1].conflict_label()),
+                (file_commits[0].tree(), file_commits[0].conflict_label()),
+                (file_commits[2].tree(), file_commits[2].conflict_label()),
+            ]));
+            let to = clean.tree();
+            let mut diff = stock.diff_stream(&to, &exact);
+            let mut stock_changed = false;
+            while let Some(entry) = diff.next().await {
+                let mut values = entry.values.unwrap();
+                values.before =
+                    jj_lib::tree_merge::resolve_file_values(&jj_store, &entry.path, values.before)
+                        .await
+                        .unwrap();
+                stock_changed |= values.is_changed();
+            }
+            assert_eq!(actual, stock_changed);
+        }
+        assert!(ledger.usage().input_bytes > 0);
+        graph.remaining = 0;
+        assert!(
+            tinytree_annotate::path::changed_with_matcher(
+                &jj_store,
+                &file_commits[3],
+                &missing,
+                &mut graph,
+                &mut ledger,
+            )
+            .await
+            .is_err(),
+            "matcher pruning cannot turn pre-diff budget failure into false"
+        );
+        graph.remaining = 1_000_000;
+        graph.active = false;
+        assert!(
+            tinytree_annotate::path::changed_with_matcher(
+                &jj_store,
+                &file_commits[3],
+                &missing,
+                &mut graph,
+                &mut ledger,
+            )
+            .await
+            .is_err()
+        );
+        let mut directory_commits: Vec<Commit> = Vec::new();
+        // Realistic directory widths exercise decoded-entry accounting under
+        // the literal default 16 MiB/100k-work limits, across TWO merge candidates.
+        // Charging every encoded byte as a maximum-length path or diff entry
+        // refuses this small four-directory graph before useful work can run.
+        for tree in 0..5 {
+            let mut nested = None;
+            for (depth, width) in [(3, 50), (2, 50), (1, 50), (0, 30)] {
+                let child_name = match depth {
+                    0 => "directory",
+                    3 => "file",
+                    _ => "n",
+                };
+                let child = if let Some(id) = nested {
+                    TreeValue::Tree(id)
+                } else {
+                    file_values[tree].clone()
+                };
+                let mut entries = vec![(RepoPathComponentBuf::new(child_name).unwrap(), child)];
+                for number in 1..width {
+                    entries.push((
+                        RepoPathComponentBuf::new(format!("e{number:02}")).unwrap(),
+                        file_values[0].clone(),
+                    ));
+                }
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                nested = Some(
+                    backend
+                        .write_tree(RepoPath::root(), &Tree::from_sorted_entries(entries))
+                        .await
+                        .unwrap(),
+                );
+            }
+            let directory_tree = nested.unwrap();
+            let mut value = root.store_commit().as_ref().clone();
+            value.parents = match tree {
+                0 => vec![root.id().clone()],
+                1 | 2 => vec![directory_commits[0].id().clone()],
+                _ => vec![
+                    directory_commits[1].id().clone(),
+                    directory_commits[2].id().clone(),
+                ],
+            };
+            value.change_id = ChangeId::from_bytes(&[80 + tree as u8; 16]);
+            value.root_tree = Merge::resolved(directory_tree);
+            value.description = "nested ordinary path change".into();
+            let commit = jj_store.write_commit(value, None).await.unwrap();
+            mutable.add_commit(&commit).await.unwrap();
+            directory_commits.push(commit);
+        }
         let readonly = index_store.persist_index(mutable).unwrap();
         index_store
             .associate_operation(&[71; 64], &readonly)
@@ -2146,6 +2423,7 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             file_writes: AtomicUsize::new(0),
             reply_owner_probe: Some(io.clone()),
             pause_metadata: AtomicBool::new(false),
+            pause_non_intrinsic_trees: AtomicBool::new(false),
             metadata_waiters: Mutex::new(Vec::new()),
         });
         let observed_store = NativeIndexStore::open(
@@ -2157,6 +2435,248 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
         )
         .unwrap();
         let observed_index = observed_store.index_at_operation(&[71; 64]).unwrap();
+        let ordinary_path =
+            |commits: Vec<CommitId>, path: &str, exact: bool| ResolvedExpression::FilterWithin {
+                candidates: Box::new(ResolvedExpression::Commits(commits)),
+                predicate: P::Filter(F::File(if exact {
+                    FilesetExpression::file_path(RepoPathBuf::from_internal_string(path).unwrap())
+                } else {
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string(path).unwrap())
+                })),
+            };
+        // Drain earlier short-circuit queries on the original Core before
+        // attributing Close observations from this shared transport fixture.
+        index_store
+            .cleanup_handle()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        // A CLI -n limit consumes only the stream prefix. Its first V2 page
+        // must not fetch a configured 128-row batch ahead of that demand.
+        io.fill_requested_pages.store(true, Ordering::SeqCst);
+        let first_three = file_commits[..3]
+            .iter()
+            .map(|c| c.id().clone())
+            .collect::<Vec<_>>();
+        let demand_expression = ordinary_path(first_three.clone(), "file", true);
+        let demand = observed_index
+            .evaluate_revset(&demand_expression, &jj_store)
+            .unwrap();
+        let before_rows = io.merged_page_rows.load(Ordering::SeqCst);
+        let mut stream = demand.stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), *file_commits[2].id());
+        assert_eq!(
+            io.requested_page_sizes.lock().unwrap().last(),
+            Some(&(true, 1))
+        );
+        assert_eq!(
+            io.merged_page_rows.load(Ordering::SeqCst) - before_rows,
+            1,
+            "one requested result must not fetch a large ahead page"
+        );
+        let before_close = io.closes.load(Ordering::SeqCst);
+        drop(stream);
+        drop(demand);
+        observed_store
+            .cleanup_handle()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            io.closes.load(Ordering::SeqCst) - before_close,
+            1,
+            "dropping after the first non-exhausted row closes the query"
+        );
+        assert!(io.queries.lock().unwrap().is_empty());
+        let plain = observed_index
+            .evaluate_revset(&ResolvedExpression::Commits(first_three), &jj_store)
+            .unwrap();
+        let mut plain_stream = plain.stream();
+        assert!(plain_stream.next().await.unwrap().is_ok());
+        assert_eq!(
+            io.requested_page_sizes.lock().unwrap().last(),
+            Some(&(false, Limits::default().page_size)),
+            "ordinary non-V2 queries retain their configured page size"
+        );
+        drop(plain_stream);
+        drop(plain);
+        observed_store
+            .cleanup_handle()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        io.overfill_merged_page.store(true, Ordering::SeqCst);
+        let oversized = observed_index
+            .evaluate_revset(&demand_expression, &jj_store)
+            .unwrap();
+        let mut oversized_stream = oversized.stream();
+        let error = oversized_stream.next().await.unwrap().unwrap_err();
+        let RevsetEvaluationError::Other(error) = error else {
+            panic!("oversized path page category")
+        };
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::Corrupt)),
+            "two rows exceed the actual V2 request even though below configured 128"
+        );
+        drop(oversized_stream);
+        drop(oversized);
+        observed_store
+            .cleanup_handle()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        assert!(io.queries.lock().unwrap().is_empty());
+        io.overfill_merged_page.store(false, Ordering::SeqCst);
+        io.fill_requested_pages.store(false, Ordering::SeqCst);
+        for (hunk_level, same_change) in [
+            (
+                jj_lib::files::FileMergeHunkLevel::Word,
+                jj_lib::merge::SameChange::Accept,
+            ),
+            (
+                jj_lib::files::FileMergeHunkLevel::Line,
+                jj_lib::merge::SameChange::Keep,
+            ),
+        ] {
+            let backend =
+                jj_native_backend::NativeBackend::from_io(observed.clone(), Default::default())
+                    .await
+                    .unwrap();
+            let nonfixed = Store::new(
+                Box::new(backend),
+                jj_lib::signing::Signer::new(None, vec![]),
+                jj_lib::tree_merge::MergeOptions {
+                    hunk_level,
+                    same_change,
+                },
+            );
+            let begins = io.begins.load(Ordering::SeqCst);
+            let reads = observed.reads.lock().unwrap().len();
+            let error = observed_index
+                .evaluate_revset(
+                    &ordinary_path(vec![ordinary_merges[0].id().clone()], "file", true),
+                    &nonfixed,
+                )
+                .unwrap_err();
+            let RevsetEvaluationError::Other(error) = error else {
+                panic!("merge option refusal category")
+            };
+            assert!(matches!(
+                error.downcast_ref::<Error>(),
+                Some(Error::UnsupportedExpression("path_merge_options"))
+            ));
+            assert_eq!(io.begins.load(Ordering::SeqCst), begins);
+            assert_eq!(
+                observed.reads.lock().unwrap().len(),
+                reads,
+                "nonfixed merge options fail before query/provider work"
+            );
+        }
+        let before_unrelated = observed.files.load(Ordering::SeqCst);
+        let unrelated = ordinary_path(vec![conflict.id().clone()], "file", true);
+        assert!(
+            observed_index
+                .evaluate_revset(&unrelated, &jj_store)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            observed.files.load(Ordering::SeqCst),
+            before_unrelated,
+            "an unrelated unresolved path must not hydrate FILE bodies"
+        );
+        for (behavior, candidates, path, exact, expected) in [
+            (
+                "exact clean merge exclusion",
+                ordinary_merges.iter().map(|c| c.id().clone()).collect(),
+                "file",
+                true,
+                ordinary_merges[1].id().clone(),
+            ),
+            (
+                "exact descends into realistic-width directories",
+                directory_commits[3..]
+                    .iter()
+                    .map(|c| c.id().clone())
+                    .collect(),
+                "directory/n/n/file",
+                true,
+                directory_commits[4].id().clone(),
+            ),
+            (
+                "prefix descends into directory",
+                directory_commits[3..]
+                    .iter()
+                    .map(|c| c.id().clone())
+                    .collect(),
+                "directory",
+                false,
+                directory_commits[4].id().clone(),
+            ),
+        ] {
+            let expression = ordinary_path(candidates, path, exact);
+            let revset = observed_index
+                .evaluate_revset(&expression, &jj_store)
+                .unwrap();
+            assert!(!revset.is_empty().unwrap(), "{behavior}");
+            assert_eq!(
+                revset.stream().try_collect::<Vec<_>>().await.unwrap(),
+                vec![expected.clone()],
+                "{behavior}"
+            );
+            assert!(
+                revset.containing_fn()(&expected).await.unwrap(),
+                "{behavior}"
+            );
+        }
+        let directory_exact =
+            ordinary_path(vec![directory_commits[4].id().clone()], "directory", true);
+        let error = observed_index
+            .evaluate_revset(&directory_exact, &jj_store)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        let RevsetEvaluationError::Other(error) = error else {
+            panic!("directory refusal category")
+        };
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::UnsupportedExpression("path_exact_file_directory"))
+        ));
+        // Explicit policy1 retains its old merge boundary; compiler output is
+        // policy2 and the cache discriminator includes that semantic version.
+        let compiled = revsets::compile(
+            &ordinary_path(vec![ordinary_merges[0].id().clone()], "file", true),
+            &Limits::default(),
+            false,
+        )
+        .unwrap();
+        let mut legacy = compiled.clone();
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) = legacy.expression.as_mut()
+        else {
+            panic!("path compiler output")
+        };
+        assert_eq!(filter.policy_version, 2);
+        filter.policy_version = 1;
+        let fact = |expression| {
+            q::graph_fact::Fact::Membership(q::Membership {
+                expression: Some(expression),
+                candidate: Some(q::CommitId {
+                    value: model_id(ordinary_merges[0].id()).unwrap().0.to_vec(),
+                }),
+            })
+        };
+        assert_ne!(
+            memo::fact_key([0; 32], &fact(compiled), &Limits::default()).unwrap(),
+            memo::fact_key([0; 32], &fact(legacy.clone()), &Limits::default()).unwrap()
+        );
+        let scope = observed_index.scope().await.unwrap();
+        assert!(matches!(
+            path_filter::prepare(&observed_index, &scope, legacy, Some(jj_store.clone())).await,
+            Err(Error::UnsupportedExpression("path_merge_boundary"))
+        ));
         let regular = ResolvedExpression::FilterWithin {
             candidates: Box::new(ResolvedExpression::Commits(vec![
                 file_commits[3].id().clone(),
@@ -2217,6 +2737,7 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             file_writes: AtomicUsize::new(0),
             reply_owner_probe: None,
             pause_metadata: AtomicBool::new(false),
+            pause_non_intrinsic_trees: AtomicBool::new(false),
             metadata_waiters: Mutex::new(Vec::new()),
         });
         let mut concurrent_limits = Limits::default();
@@ -2390,6 +2911,9 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
         }
         let tree_reads = paused.reads.lock().unwrap().len();
         let file_reads = paused.files.load(Ordering::SeqCst);
+        paused
+            .pause_non_intrinsic_trees
+            .store(true, Ordering::SeqCst);
         paused.pause_metadata.store(true, Ordering::SeqCst);
         let mut canceled = exact_long.stream();
         let waiting = canceled.next();
@@ -2439,20 +2963,26 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             "cancelled/timed-out exact-path physical jobs must retain all four permits"
         );
         assert_eq!(paused.metadata_waiters.lock().unwrap().len(), 4);
-        assert_eq!(
+        assert!(
             io.reply_owners
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|owner| owner.upgrade().is_some())
-                .count(),
-            4,
-            "each paused TREE read must retain its private canonical COMMIT reply owner"
+                .count()
+                >= 8,
+            "each of four paused source TREE jobs retains its selected AND parent COMMIT owners"
         );
         assert!(
             paused.reads.lock().unwrap()[tree_reads..]
                 .iter()
                 .all(|key| key.kind == m::Kind::Tree)
+        );
+        assert!(
+            paused.reads.lock().unwrap()[tree_reads..]
+                .iter()
+                .any(|key| *key != m::empty_tree().descriptor.key),
+            "owner retention must pause a source TREE, not intrinsic backend initialization"
         );
         assert_eq!(paused.files.load(Ordering::SeqCst), file_reads);
         paused.resume_metadata();
@@ -2567,6 +3097,7 @@ fn changed_checkpoints_flatten_preserving_old_branches_and_bounded_shards() {
                 file_writes: AtomicUsize::new(0),
                 reply_owner_probe: None,
                 pause_metadata: AtomicBool::new(false),
+                pause_non_intrinsic_trees: AtomicBool::new(false),
                 metadata_waiters: Mutex::new(Vec::new()),
             });
             let path = directory.path().join("index");
@@ -3545,6 +4076,7 @@ fn portable_import_preserves_exact_cloud_baselines_without_canonical_hydration_o
             file_writes: AtomicUsize::new(0),
             reply_owner_probe: None,
             pause_metadata: AtomicBool::new(false),
+            pause_non_intrinsic_trees: AtomicBool::new(false),
             metadata_waiters: Mutex::new(Vec::new()),
         });
         let opens = io.opens.load(Ordering::SeqCst);

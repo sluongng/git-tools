@@ -167,6 +167,14 @@ fn request<T>(value: T, token: &str) -> Request<T> {
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
+fn merged_request<T>(value: T, token: &str) -> Request<T> {
+    let mut request = request(value, token);
+    request.metadata_mut().insert(
+        tinytree_proto::QUERY_WORK_CLASS_HEADER,
+        tinytree_proto::MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+    );
+    request
+}
 fn wire_key(key: ObjectKey) -> p::ObjectKey {
     p::ObjectKey {
         kind: key.kind as i32,
@@ -786,7 +794,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let mut client = server.client().await;
         let input = p::GetCapabilitiesRequest {
             repository_id: "alpha".into(),
-            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14],
+            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15],
         };
         assert_eq!(
             client
@@ -837,12 +845,12 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         .iter()
                         .map(|f| f.feature)
                         .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14]
+                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15]
                 );
                 for feature in &result.features {
                     assert_eq!(
                         feature.supported,
-                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11 | 14) {
+                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11 | 14 | 15) {
                             query
                         } else if feature.feature == 13 {
                             cloud && indexed && captured && offload
@@ -855,7 +863,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                     assert_eq!(
                         feature.authorized,
                         match feature.feature {
-                            1..=3 | 8 | 11 | 14 => true,
+                            1..=3 | 8 | 11 | 14 | 15 => true,
                             4 | 9 | 13 => cloud_read,
                             5 | 10 => cloud_write,
                             _ => unreachable!(),
@@ -6157,25 +6165,24 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             },
         ))),
     });
-    let changed = query
-        .query_facts(request(
-            q::QueryFactsRequest {
+    for policy in [1, 2] {
+        let mut expression = input.expression.clone().unwrap();
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) = expression.expression.as_mut() else { unreachable!() };
+        filter.policy_version = policy;
+        let facts = q::QueryFactsRequest {
                 scope: scope.key.clone(),
                 facts: [frozen[1].descriptor.key, root(&data)]
                     .into_iter()
                     .map(|candidate| q::GraphFact {
                         fact: Some(q::graph_fact::Fact::Membership(q::Membership {
-                            expression: input.expression.clone(),
+                            expression: Some(expression.clone()),
                             candidate: Some(query_id(candidate)),
                         })),
                     })
                     .collect(),
-            },
-            ALPHA,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
+            };
+        let request = if policy == 2 { merged_request(facts, ALPHA) } else { request(facts, ALPHA) };
+        let changed = query.query_facts(request).await.unwrap().into_inner();
     assert_eq!(
         changed
             .answers
@@ -6187,6 +6194,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             Some(q::graph_fact_answer::Answer::Membership(true)),
         ]
     );
+    }
     let selected_prefix = query
         .resolve_commit_prefix(request(
             q::ResolveCommitPrefixRequest {
@@ -7014,15 +7022,18 @@ fn history_commit(
     value: Option<tinytree_model::TreeValue>,
     change: u8,
 ) -> tinytree_model::EncodedObject {
+    history_tree_commit(store, index, parents, value.into_iter().map(|value| tinytree_model::TreeEntry { name: "file".into(), value }).collect(), change)
+}
+fn history_tree_commit(
+    store: &Store,
+    index: &tinytree_index::Index,
+    parents: &[ObjectKey],
+    entries: Vec<tinytree_model::TreeEntry>,
+    change: u8,
+) -> tinytree_model::EncodedObject {
     let tree = tinytree_model::encode(
         &Object::Tree(tinytree_model::Tree {
-            entries: value
-                .into_iter()
-                .map(|value| tinytree_model::TreeEntry {
-                    name: "file".into(),
-                    value,
-                })
-                .collect(),
+            entries,
         }),
         Limits::default(),
     )
@@ -11273,4 +11284,312 @@ async fn browser_http_and_native_grpc_share_the_listener() {
     assert!(response.contains("content-security-policy:"));
     drop(client);
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_and_deadline() {
+    let (temporary, store) = setup();
+    let index = tinytree_index::Index::open(
+        temporary.path().join("merged-path-derived"),
+        &Default::default(),
+    )
+    .unwrap();
+    let base_file = history_file(&store, b"top\nshared\nbottom\n", false);
+    let left_file = history_file(&store, b"LEFT\nshared\nbottom\n", false);
+    let right_file = history_file(&store, b"top\nshared\nRIGHT\n", false);
+    let clean_file = history_file(&store, b"LEFT\nshared\nRIGHT\n", false);
+    let edited_file = history_file(&store, b"LEFT\nextra\nRIGHT\n", false);
+    let noise_base = history_file(&store, &vec![b'a'; 4096], false);
+    let noise_left = history_file(&store, &vec![b'b'; 4096], false);
+    let noise_right = history_file(&store, &vec![b'c'; 4096], false);
+    let unchanged = history_file(&store, b"unchanged\n", false);
+    let entries = |file, noise| {
+        let mut leaves = vec![tinytree_model::TreeEntry { name: "file".into(), value:file }, tinytree_model::TreeEntry { name:"noise".into(), value:noise }];
+        leaves.extend((0..48).map(|n| tinytree_model::TreeEntry { name:format!("unchanged-{n:03}"), value:unchanged.clone() }));
+        let put_tree = |mut entries:Vec<tinytree_model::TreeEntry>| {
+            entries.sort_by(|a,b|a.name.cmp(&b.name));
+            let object=tinytree_model::encode(&Object::Tree(tinytree_model::Tree{entries}),Limits::default()).unwrap();
+            store.put("alpha",object.descriptor,&object.bytes,0).unwrap();
+            tinytree_model::TreeValue::Tree(TreeId(object.descriptor.key.id.0))
+        };
+        let src=put_tree(leaves);
+        let mut project=vec![tinytree_model::TreeEntry{name:"src".into(),value:src}];
+        project.extend((0..49).map(|n|tinytree_model::TreeEntry{name:format!("other-{n:03}"),value:unchanged.clone()}));
+        let project=put_tree(project);
+        let mut crates=vec![tinytree_model::TreeEntry{name:"project".into(),value:project}];
+        crates.extend((0..49).map(|n|tinytree_model::TreeEntry{name:format!("package-{n:03}"),value:unchanged.clone()}));
+        let crates=put_tree(crates);
+        let mut root=vec![tinytree_model::TreeEntry{name:"crates".into(),value:crates}];
+        root.extend((0..29).map(|n|tinytree_model::TreeEntry{name:format!("root-{n:03}"),value:unchanged.clone()}));
+        root.sort_by(|a,b|a.name.cmp(&b.name));
+        root
+    };
+    let base = history_tree_commit(&store, &index, &[], entries(base_file, noise_base), 141)
+        .descriptor
+        .key;
+    let left = history_tree_commit(
+        &store,
+        &index,
+        &[base],
+        entries(left_file, noise_left.clone()),
+        142,
+    )
+    .descriptor
+    .key;
+    let right = history_tree_commit(
+        &store,
+        &index,
+        &[base],
+        entries(right_file, noise_right),
+        143,
+    )
+    .descriptor
+    .key;
+    let clean = history_tree_commit(
+        &store,
+        &index,
+        &[left, right],
+        entries(clean_file, noise_left.clone()),
+        144,
+    )
+    .descriptor
+    .key;
+    let edited = history_tree_commit(
+        &store,
+        &index,
+        &[left, right],
+        entries(edited_file.clone(), noise_left),
+        145,
+    )
+    .descriptor
+    .key;
+    // A normal log limit must scan a broad linear history without paying for
+    // jj merged-entry maps at every unchanged FILE candidate.
+    let mut broad_head = edited;
+    for change in 160..200 {
+        let mut bytes = vec![b'n';4096];
+        bytes[..1].copy_from_slice(&[change]);
+        let noise = history_file(&store, &bytes, false);
+        broad_head = history_tree_commit(&store, &index, &[broad_head], entries(edited_file.clone(), noise), change).descriptor.key;
+    }
+    let mut config = ServiceConfig::default();
+    config.query.max_blame_file_bytes = 128; // Unrelated conflict bodies cannot fit.
+    config.query.max_eval_quantum_steps = 1;
+    let server = Running::start_query(store, config, index).await;
+    let mut client = server.query_client().await;
+    let scope = query_ready(&mut client, &[clean, edited], 221).await;
+    let mut input = ids_evaluation(&scope, 222, &[base, left, right, clean, edited]);
+    input.expression = Some(q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+            q::ChangedPathExpr {
+                policy_version: 2,
+                candidates: input.expression.take().map(Box::new),
+                path: "crates/project/src/file".into(),
+                exact_file: true,
+            },
+        ))),
+    });
+    input.projection = q::Projection::Graph as i32;
+    input.page_size = 1;
+    let selection = input.expression.clone().unwrap();
+    assert_eq!(
+        client
+            .evaluate(request(input.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition,
+        "decoded V2 cannot upgrade ordinary admission"
+    );
+    let mut rows = Vec::new();
+    let mut checked_continuation = false;
+    let mut exhausted = false;
+    for _ in 0..128 {
+        let page = client
+            .evaluate(merged_request(input.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        rows.extend(page.rows);
+        if page.exhausted == Some(true) {
+            exhausted = true;
+            break;
+        }
+        input.cursor = page.cursor;
+        if !checked_continuation {
+            assert_eq!(
+                client
+                    .evaluate(request(input.clone(), ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::FailedPrecondition,
+                "cursor continuation retains heavy admission class"
+            );
+            checked_continuation = true;
+        }
+    }
+    assert!(checked_continuation && exhausted, "bounded paging must reach complete graph output");
+    let actual: std::collections::BTreeSet<_> = rows
+        .iter()
+        .map(|r| r.commit.as_ref().unwrap().value.clone())
+        .collect();
+    let expected: std::collections::BTreeSet<_> = [base, left, right, edited]
+        .iter()
+        .map(|id| id.id.0.to_vec())
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "clean automatic merge is not a path edit; extra edit is"
+    );
+    let mut point_selection = selection.clone();
+    let Some(q::graph_expr::Expression::ChangedPath(filter)) = point_selection.expression.as_mut() else { unreachable!() };
+    filter.candidates = ids_evaluation(&scope, 0, &[clean, edited]).expression.map(Box::new);
+    let facts = q::QueryFactsRequest {
+        scope: scope.key.clone(),
+        facts: [clean, edited]
+            .into_iter()
+            .map(|id| q::GraphFact {
+                fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                    expression: Some(point_selection.clone()),
+                    candidate: Some(query_id(id)),
+                })),
+            })
+            .collect(),
+    };
+    assert_eq!(
+        client
+            .query_facts(request(facts.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let facts = client
+        .query_facts(merged_request(facts, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        facts
+            .answers
+            .iter()
+            .map(|x| x.answer.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(q::graph_fact_answer::Answer::Membership(false)),
+            Some(q::graph_fact_answer::Answer::Membership(true))
+        ]
+    );
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let prefix = q::ResolveCommitPrefixRequest {
+        scope: scope.key.clone(),
+        hex_prefix: hex(&edited.id.0),
+        selection: Some(selection.clone()),
+    };
+    assert_eq!(
+        client
+            .resolve_commit_prefix(request(prefix.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(matches!(
+        client
+            .resolve_commit_prefix(merged_request(prefix, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .result,
+        Some(q::commit_prefix_result::Result::Single(_))
+    ));
+    let clean_prefix = q::ResolveCommitPrefixRequest { scope: scope.key.clone(), hex_prefix: hex(&clean.id.0), selection: Some(selection.clone()) };
+    assert!(matches!(client.resolve_commit_prefix(merged_request(clean_prefix, ALPHA)).await.unwrap().into_inner().result, Some(q::commit_prefix_result::Result::NoMatch(_))));
+    let change = q::ResolveChangePrefixRequest {
+        scope: scope.key.clone(),
+        visible_heads: Vec::new(),
+        hex_prefix: hex(&[145; 16]),
+        selection: Some(selection.clone()),
+    };
+    assert_eq!(
+        client
+            .resolve_change_prefix(request(change.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(matches!(
+        client
+            .resolve_change_prefix(merged_request(change, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .result,
+        Some(q::change_prefix_result::Result::Single(_))
+    ));
+    let shortest = q::ShortestPrefixRequest {
+        scope: scope.key.clone(),
+        target: Some(q::shortest_prefix_request::Target::Commit(query_id(edited))),
+        visible_heads: Vec::new(),
+        selection: Some(selection.clone()),
+    };
+    assert_eq!(
+        client
+            .shortest_prefix(request(shortest.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    client
+        .shortest_prefix(merged_request(shortest, ALPHA))
+        .await
+        .unwrap();
+    let clean_shortest = q::ShortestPrefixRequest { scope: scope.key.clone(), target: Some(q::shortest_prefix_request::Target::Commit(query_id(clean))), visible_heads: Vec::new(), selection: Some(selection.clone()) };
+    let clean_shortest = client.shortest_prefix(merged_request(clean_shortest, ALPHA)).await.unwrap().into_inner();
+    assert_eq!(clean_shortest.in_selection, Some(false));
+    assert_eq!(clean_shortest.hex_length, 0);
+    let broad_scope = query_ready(&mut client, &[broad_head], 224).await;
+    let heads = ids_evaluation(&broad_scope, 0, &[broad_head]).expression.unwrap();
+    let ancestors = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Ancestors(Box::new(q::AncestorsExpr { heads:Some(Box::new(heads)), generations:None, parents:None }))) };
+    let changed = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::ChangedPath(Box::new(q::ChangedPathExpr { policy_version:2, candidates:Some(Box::new(ancestors)), path:"crates/project/src/file".into(), exact_file:true }))) };
+    let mut broad = ids_evaluation(&broad_scope, 225, &[]);
+    broad.expression = Some(q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Latest(Box::new(q::LatestExpr { candidates:Some(Box::new(changed)),count:3 }))) });
+    broad.projection = q::Projection::Graph as i32;
+    broad.page_size = 1;
+    let mut broad_rows=Vec::new();let mut broad_done=false;
+    for _ in 0..1024 {
+        let page=client.evaluate(merged_request(broad.clone(),ALPHA)).await.unwrap().into_inner();
+        broad_rows.extend(page.rows);
+        if page.exhausted==Some(true){broad_done=true;break;}
+        broad.cursor=page.cursor;
+    }
+    assert!(broad_done,"broad default-budget FILE query must finish");
+    assert_eq!(broad_rows.iter().map(|r|r.commit.as_ref().unwrap().value.clone()).collect::<std::collections::BTreeSet<_>>(),[edited,right,left].iter().map(|id|id.id.0.to_vec()).collect());
+    client.close_scope(request(q::CloseScopeRequest{scope:broad_scope.key},ALPHA)).await.unwrap();
+    // A peer cannot refresh the original query deadline using a new RPC budget.
+    let mut expiry = ids_evaluation(&scope, 223, &[]);
+    expiry.expression = Some(selection);
+    expiry.page_size = 1;
+    let mut first = merged_request(expiry.clone(), ALPHA);
+    first.set_timeout(Duration::from_secs(2));
+    let page = client.evaluate(first).await.unwrap().into_inner();
+    assert_eq!(page.exhausted, Some(false));
+    expiry.cursor = page.cursor;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let mut renewed = merged_request(expiry, ALPHA);
+    renewed.set_timeout(Duration::from_secs(20));
+    assert_eq!(
+        client.evaluate(renewed).await.unwrap_err().code(),
+        Code::DeadlineExceeded
+    );
+    client
+        .close_scope(request(q::CloseScopeRequest { scope: scope.key }, ALPHA))
+        .await
+        .unwrap();
+    drop(client);
+    server.stop().await;
 }

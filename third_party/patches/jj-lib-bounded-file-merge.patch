@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH] jj-lib: Bound line file merging and selected value resolution
+
+Path filtering compares selected values against recursively merged parents.
+Calling ordinary file resolution under an async timeout leaves equality,
+simplification, diff and materialization work running without a physical bound.
+
+Add separate line-only merge and selected-value APIs that retain stock term
+ordering, trivial choices and unresolved values. Charge allocation before
+requesting buffers, poll cancellation across comparisons and output copies, and
+share one cumulative line budget across calls. Reject word-level merging rather
+than falling back to its unbounded implementation. Backend admission remains
+caller-owned; read-only queries must supply an ephemeral backend for synthesized
+FILE writes. Existing ordinary APIs are unchanged.
+---
+diff --git a/src/files.rs b/src/files.rs
+--- a/src/files.rs
++++ b/src/files.rs
+@@ -30,6 +30,10 @@
+ use crate::merge::Merge;
+ use crate::merge::SameChange;
+ use crate::tree_merge::MergeOptions;
++
++mod bounded;
++pub use bounded::{FileMergeError, merge_bounded, try_merge_bounded};
++pub(crate) use bounded::{simplify_bounded, trivial_bounded};
+ 
+ /// A diff line which may contain small hunks originating from both sides.
+ #[derive(PartialEq, Eq, Clone, Debug)]
+diff --git a/src/files/bounded.rs b/src/files/bounded.rs
+new file mode 100644
+--- /dev/null
++++ b/src/files/bounded.rs
+@@ -0,0 +1,303 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use super::*;
++use crate::diff::{LineDiffBudget, LineDiffError};
++
++/// A bounded file merge either finishes with stock line semantics or fails
++/// without returning a partial result. Word-level merging is deliberately not
++/// delegated to the unbounded word diff.
++#[derive(Debug, thiserror::Error)]
++pub enum FileMergeError {
++    #[error(transparent)]
++    Budget(#[from] LineDiffError),
++    #[error("bounded file merging requires line hunks")]
++    UnsupportedHunkLevel,
++}
++
++fn capacity<T>(budget: &mut LineDiffBudget, count: usize) -> Result<(), LineDiffError> {
++    budget.charge_merge_allocation(
++        count
++            .checked_mul(std::mem::size_of::<T>())
++            .ok_or(LineDiffError::LimitExceeded)?,
++    )
++}
++fn equal<T: Eq>(
++    left: &T,
++    right: &T,
++    cost: &impl Fn(&T) -> usize,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<bool, LineDiffError> {
++    budget.charge_merge_work(cost(left).max(cost(right)).saturating_add(1), check)?;
++    Ok(left == right)
++}
++
++// Match Merge::resolve_trivial, including its ordered three-term fast path.
++// Linear counted buckets avoid an uncancellable hash/equality operation over
++// arbitrarily large caller values; every comparison is explicitly charged.
++pub(crate) fn trivial_bounded<'a, T: Eq>(
++    values: &'a Merge<T>,
++    same_change: SameChange,
++    cost: &impl Fn(&T) -> usize,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<Option<&'a T>, LineDiffError> {
++    budget.charge_merge_work(1, &mut *check)?;
++    let values = values.as_slice();
++    if let [one] = values {
++        return Ok(Some(one));
++    }
++    if let [left, base, right] = values {
++        return if equal(left, right, cost, budget, check)? && same_change == SameChange::Accept {
++            Ok(Some(left))
++        } else if equal(left, base, cost, budget, check)? {
++            Ok(Some(right))
++        } else if equal(right, base, cost, budget, check)? {
++            Ok(Some(left))
++        } else {
++            Ok(None)
++        };
++    }
++    capacity::<(&T, i64)>(budget, values.len())?;
++    let mut counts: Vec<(&T, i64)> = Vec::with_capacity(values.len());
++    for (position, value) in values.iter().enumerate() {
++        budget.charge_merge_work(1, &mut *check)?;
++        let mut found = None;
++        for (at, (existing, _)) in counts.iter().enumerate() {
++            if equal(value, *existing, cost, budget, check)? {
++                found = Some(at);
++                break;
++            }
++        }
++        let delta = if position % 2 == 0 { 1 } else { -1 };
++        if let Some(at) = found {
++            counts[at].1 = counts[at]
++                .1
++                .checked_add(delta)
++                .ok_or(LineDiffError::LimitExceeded)?;
++        } else {
++            counts.push((value, delta));
++        }
++    }
++    capacity::<(&T, i64)>(budget, 2)?;
++    let mut nonzero = Vec::with_capacity(2);
++    for entry in counts {
++        budget.charge_merge_work(1, &mut *check)?;
++        if entry.1 != 0 {
++            if nonzero.len() == 2 {
++                return Ok(None);
++            }
++            nonzero.push(entry);
++        }
++    }
++    Ok(match nonzero.as_slice() {
++        [(value, _)] => Some(*value),
++        [(left, left_count), (right, _)] if same_change == SameChange::Accept => {
++            Some(if *left_count > 0 { *left } else { *right })
++        }
++        _ => None,
++    })
++}
++
++// Preserve Merge::get_simplified_mapping's pairing and ordering exactly.
++pub(crate) fn simplify_bounded<T: Eq + Clone>(
++    values: &Merge<T>,
++    cost: &impl Fn(&T) -> usize,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<Merge<T>, LineDiffError> {
++    capacity::<usize>(budget, values.as_slice().len())?;
++    let mut mapping: Vec<_> = (0..values.as_slice().len()).collect();
++    let mut add = 0;
++    while add < mapping.len() {
++        budget.charge_merge_work(1, &mut *check)?;
++        let mut found = None;
++        for remove in (1..mapping.len()).step_by(2) {
++            if equal(
++                &values.as_slice()[mapping[remove]],
++                &values.as_slice()[mapping[add]],
++                cost,
++                budget,
++                check,
++            )? {
++                found = Some(remove);
++                break;
++            }
++        }
++        if let Some(remove) = found {
++            budget.charge_merge_work(mapping.len(), &mut *check)?;
++            mapping.swap(remove + 1, add);
++            let next_len = mapping.len() - 2;
++            for at in remove..next_len {
++                budget.charge_merge_work(1, &mut *check)?;
++                mapping[at] = mapping[at + 2];
++            }
++            mapping.truncate(next_len);
++        } else {
++            add += 2;
++        }
++    }
++    capacity::<T>(budget, mapping.len())?;
++    let mut result = Vec::with_capacity(mapping.len());
++    for at in mapping {
++        let value = &values.as_slice()[at];
++        budget.charge_merge_work(cost(value).saturating_add(1), &mut *check)?;
++        budget.charge_merge_allocation(cost(value))?;
++        result.push(value.clone());
++    }
++    Ok(Merge::from_vec(result))
++}
++
++fn append(
++    output: &mut Vec<u8>,
++    bytes: &[u8],
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++) -> Result<(), LineDiffError> {
++    let required = output
++        .len()
++        .checked_add(bytes.len())
++        .ok_or(LineDiffError::LimitExceeded)?;
++    budget.charge_merge_work(1, &mut *check)?;
++    if required > output.capacity() {
++        budget.charge_merge_allocation(required)?;
++        output
++            .try_reserve_exact(required - output.len())
++            .map_err(|_| LineDiffError::LimitExceeded)?;
++    }
++    for chunk in bytes.chunks(16 * 1024) {
++        budget.charge_merge_work(chunk.len(), &mut *check)?;
++        output.extend_from_slice(chunk);
++    }
++    Ok(())
++}
++
++/// Stock-equivalent line merge with a shared cumulative diff/merge budget.
++/// Borrowed input storage and backend transport remain caller-owned. The
++/// budget additionally covers merge terms, equality, hunk and output storage.
++pub fn merge_bounded<T: AsRef<[u8]>>(
++    inputs: &Merge<T>,
++    options: &MergeOptions,
++    budget: &mut LineDiffBudget,
++    mut check: impl FnMut() -> bool,
++) -> Result<Merge<BString>, FileMergeError> {
++    Ok(collect(inputs, options, budget, &mut check, false)?
++        .expect("full merge always returns terms"))
++}
++
++/// Like try_merge, but bounded. An unresolved merge returns None; exhaustion
++/// and cancellation are errors, never an unresolved or partial success.
++pub fn try_merge_bounded<T: AsRef<[u8]>>(
++    inputs: &Merge<T>,
++    options: &MergeOptions,
++    budget: &mut LineDiffBudget,
++    mut check: impl FnMut() -> bool,
++) -> Result<Option<BString>, FileMergeError> {
++    Ok(
++        collect(inputs, options, budget, &mut check, true)?.map(|value| {
++            value
++                .into_resolved()
++                .ok()
++                .expect("resolved-only collection")
++        }),
++    )
++}
++
++fn collect<T: AsRef<[u8]>>(
++    inputs: &Merge<T>,
++    options: &MergeOptions,
++    budget: &mut LineDiffBudget,
++    check: &mut impl FnMut() -> bool,
++    resolved_only: bool,
++) -> Result<Option<Merge<BString>>, FileMergeError> {
++    if options.hunk_level != FileMergeHunkLevel::Line {
++        return Err(FileMergeError::UnsupportedHunkLevel);
++    }
++    let count = inputs.as_slice().len();
++    budget.charge_merge_work(count, &mut *check)?;
++    capacity::<&[u8]>(budget, count)?;
++    // Explicit capacity avoids generic collect's minimum-capacity rounding.
++    let mut ordered = Vec::with_capacity(count);
++    for input in inputs.removes().chain(inputs.adds()) {
++        budget.charge_merge_work(1, &mut *check)?;
++        ordered.push(input.as_ref());
++    }
++    let diff = ContentDiff::by_line_bounded_many(&ordered, budget, &mut *check)?;
++    // The iterator owns position and hunk bookkeeping for each input.
++    budget.charge_merge_allocation(count.checked_mul(256).ok_or(LineDiffError::LimitExceeded)?)?;
++    let mut hunks = diff.hunks();
++    capacity::<Vec<u8>>(budget, 1)?;
++    let mut output = vec![Vec::new()];
++    loop {
++        budget.charge_merge_work(1, &mut *check)?;
++        // DiffHunkContentVec collects into SmallVec, whose heap capacity can
++        // round up to the next power of two. Precharge that before next().
++        capacity::<&BStr>(
++            budget,
++            count.checked_mul(2).ok_or(LineDiffError::LimitExceeded)?,
++        )?;
++        let Some(hunk) = hunks.next() else {
++            break;
++        };
++        let values = if hunk.kind == DiffHunkKind::Matching {
++            Merge::resolved(hunk.contents[0])
++        } else {
++            capacity::<&BStr>(budget, count)?;
++            let removes = inputs.removes().len();
++            let mut values = Vec::with_capacity(count);
++            for at in 0..inputs.num_sides() {
++                budget.charge_merge_work(1, &mut *check)?;
++                values.push(hunk.contents[removes + at]);
++                if at < removes {
++                    values.push(hunk.contents[at]);
++                }
++            }
++            Merge::from_vec(values)
++        };
++        if let Some(&value) = trivial_bounded(
++            &values,
++            options.same_change,
++            &|v: &&BStr| v.len(),
++            budget,
++            check,
++        )? {
++            for buffer in &mut output {
++                append(buffer, value.as_ref(), budget, check)?;
++            }
++        } else {
++            if resolved_only {
++                return Ok(None);
++            }
++            if output.len() == 1 {
++                capacity::<Vec<u8>>(budget, count)?;
++                let prefix = output.pop().unwrap();
++                let mut expanded = Vec::with_capacity(count);
++                for _ in 0..count {
++                    let mut copy = Vec::new();
++                    append(&mut copy, &prefix, budget, check)?;
++                    expanded.push(copy);
++                }
++                output = expanded;
++            }
++            for (buffer, value) in output.iter_mut().zip(values.iter()) {
++                append(buffer, value.as_ref(), budget, check)?;
++            }
++        }
++    }
++    capacity::<BString>(budget, output.len())?;
++    Ok(Some(Merge::from_vec(
++        output.into_iter().map(BString::from).collect::<Vec<_>>(),
++    )))
++}
+diff --git a/src/tree_merge.rs b/src/tree_merge.rs
+--- a/src/tree_merge.rs
++++ b/src/tree_merge.rs
+@@ -384,6 +384,227 @@
+     Ok(maybe_resolved.unwrap_or(values))
+ }
+ 
++/// Failure of bounded selected-value resolution. Backend I/O admission and
++/// source authority remain owned by the caller; budget failure is never a
++/// successful unresolved value.
++#[derive(Debug, thiserror::Error)]
++pub enum BoundedFileResolveError {
++    #[error(transparent)]
++    Backend(#[from] BackendError),
++    #[error(transparent)]
++    Merge(#[from] files::FileMergeError),
++    #[error(transparent)]
++    Budget(#[from] crate::diff::LineDiffError),
++}
++
++fn bounded_value_bytes(value: Option<&TreeValue>) -> usize {
++    match value {
++        None => 1,
++        Some(TreeValue::File { id, copy_id, .. }) => id
++            .as_bytes()
++            .len()
++            .saturating_add(copy_id.as_bytes().len())
++            .saturating_add(64),
++        Some(TreeValue::Tree(id)) => id.as_bytes().len().saturating_add(64),
++        Some(TreeValue::Symlink(id)) => id.as_bytes().len().saturating_add(64),
++        Some(TreeValue::GitSubmodule(id)) => id.as_bytes().len().saturating_add(64),
++    }
++}
++
++/// Resolve only these selected path values, using stock line-merge semantics
++/// and one cumulative budget. No global tree resolution or unbounded merge is
++/// invoked. Missing/non-file terms and unresolved conflicts retain stock form.
++///
++/// Like the ordinary resolver, successful text resolution writes a derived FILE
++/// through `store`. Read-only query callers MUST supply an ephemeral backend;
++/// this API does not confer object authority or change backend I/O admission.
++pub async fn resolve_file_values_bounded(
++    store: &Arc<Store>,
++    path: &RepoPath,
++    values: MergedTreeValue,
++    budget: &mut crate::diff::LineDiffBudget,
++    mut check: impl FnMut() -> bool + Send,
++) -> Result<MergedTreeValue, BoundedFileResolveError> {
++    let resolved =
++        try_resolve_file_values_bounded(store, path, &values, budget, &mut check).await?;
++    Ok(resolved.unwrap_or(values))
++}
++
++async fn try_resolve_file_values_bounded(
++    store: &Arc<Store>,
++    path: &RepoPath,
++    values: &MergedTreeValue,
++    budget: &mut crate::diff::LineDiffBudget,
++    mut check: impl FnMut() -> bool + Send,
++) -> Result<Option<MergedTreeValue>, BoundedFileResolveError> {
++    use crate::diff::LineDiffError;
++    let options = store.merge_options();
++    if options.hunk_level != FileMergeHunkLevel::Line {
++        return Err(files::FileMergeError::UnsupportedHunkLevel.into());
++    }
++    let cost = |value: &Option<TreeValue>| bounded_value_bytes(value.as_ref());
++    if let Some(value) =
++        files::trivial_bounded(values, options.same_change, &cost, budget, &mut check)?
++    {
++        budget.charge_merge_work(cost(value), &mut check)?;
++        budget.charge_merge_allocation(cost(value))?;
++        return Ok(Some(Merge::resolved(value.clone())));
++    }
++    let count = values.as_slice().len();
++    budget.charge_merge_work(count, &mut check)?;
++    budget.charge_merge_allocation(
++        // Merge::map collects into SmallVec, which can round heap capacity
++        // up to the next power of two; reserve that conservative bound first.
++        count
++            .checked_mul(2)
++            .and_then(|slots| slots.checked_mul(std::mem::size_of::<Option<&TreeValue>>()))
++            .ok_or(LineDiffError::LimitExceeded)?,
++    )?;
++    let borrowed = values.map(Option::as_ref);
++    let simplified = files::simplify_bounded(
++        &borrowed,
++        &|value: &Option<&TreeValue>| bounded_value_bytes(*value),
++        budget,
++        &mut check,
++    )?;
++    // Match stock's early metadata checks before requesting any FILE body.
++    if simplified
++        .iter()
++        .any(|term| !matches!(term, Some(TreeValue::File { .. })))
++    {
++        return Ok(None);
++    }
++    let count = simplified.as_slice().len();
++    // Three Merge::map collections, each with at most twice the term count.
++    budget.charge_merge_allocation(
++        count
++            .checked_mul(6 * std::mem::size_of::<&backend::FileId>())
++            .ok_or(LineDiffError::LimitExceeded)?,
++    )?;
++    budget.charge_merge_work(
++        count.checked_mul(4).ok_or(LineDiffError::LimitExceeded)?,
++        &mut check,
++    )?;
++    let ids = simplified.map(|term| match term {
++        Some(TreeValue::File { id, .. }) => id,
++        _ => unreachable!(),
++    });
++    let executable = simplified.map(|term| match term {
++        Some(TreeValue::File { executable, .. }) => executable,
++        _ => unreachable!(),
++    });
++    let copies = simplified.map(|term| match term {
++        Some(TreeValue::File { copy_id, .. }) => copy_id,
++        _ => unreachable!(),
++    });
++    let Some(&&executable) = files::trivial_bounded(
++        &executable,
++        SameChange::Accept,
++        &|_: &&bool| 1,
++        budget,
++        &mut check,
++    )?
++    else {
++        return Ok(None);
++    };
++    let Some(&copy_id) = files::trivial_bounded(
++        &copies,
++        SameChange::Accept,
++        &|value: &&backend::CopyId| value.as_bytes().len(),
++        budget,
++        &mut check,
++    )?
++    else {
++        return Ok(None);
++    };
++    if let Some(&id) = files::trivial_bounded(
++        &ids,
++        options.same_change,
++        &|value: &&backend::FileId| value.as_bytes().len(),
++        budget,
++        &mut check,
++    )? {
++        let bytes = id
++            .as_bytes()
++            .len()
++            .saturating_add(copy_id.as_bytes().len())
++            .saturating_add(64);
++        budget.charge_merge_work(bytes, &mut check)?;
++        budget.charge_merge_allocation(bytes)?;
++        return Ok(Some(Merge::normal(TreeValue::File {
++            id: id.clone(),
++            executable,
++            copy_id: copy_id.clone(),
++        })));
++    }
++    let ids = files::simplify_bounded(
++        &ids,
++        &|value: &&backend::FileId| value.as_bytes().len(),
++        budget,
++        &mut check,
++    )?;
++    budget.charge_merge_allocation(
++        ids.as_slice()
++            .len()
++            .checked_mul(std::mem::size_of::<Vec<u8>>())
++            .ok_or(LineDiffError::LimitExceeded)?,
++    )?;
++    let mut contents = Vec::with_capacity(ids.as_slice().len());
++    let mut loaded = 0usize;
++    for id in &ids {
++        budget.charge_merge_work(1, &mut check)?;
++        let mut reader = store.read_file(path, id).await?;
++        budget.charge_merge_work(1, &mut check)?;
++        let mut bytes = Vec::new();
++        let mut chunk = [0u8; 16 * 1024];
++        loop {
++            budget.charge_merge_work(1, &mut check)?;
++            let count =
++                reader
++                    .read(&mut chunk)
++                    .await
++                    .map_err(|error| BackendError::ReadObject {
++                        object_type: id.object_type(),
++                        hash: id.hex(),
++                        source: error.into(),
++                    })?;
++            budget.charge_merge_work(count, &mut check)?;
++            if count == 0 {
++                break;
++            }
++            loaded = loaded
++                .checked_add(count)
++                .filter(|n| *n <= budget.remaining_input_bytes())
++                .ok_or(LineDiffError::LimitExceeded)?;
++            let required = bytes
++                .len()
++                .checked_add(count)
++                .ok_or(LineDiffError::LimitExceeded)?;
++            if required > bytes.capacity() {
++                budget.charge_merge_allocation(required)?;
++                bytes
++                    .try_reserve_exact(required - bytes.len())
++                    .map_err(|_| LineDiffError::LimitExceeded)?;
++            }
++            bytes.extend_from_slice(&chunk[..count]);
++        }
++        contents.push(bytes);
++    }
++    let contents = Merge::from_vec(contents);
++    let Some(merged) = files::try_merge_bounded(&contents, options, budget, &mut check)? else {
++        return Ok(None);
++    };
++    budget.charge_merge_work(merged.len().saturating_add(1), &mut check)?;
++    budget.charge_merge_allocation(copy_id.as_bytes().len().saturating_add(64))?;
++    let id = store.write_file(path, &mut merged.as_slice()).await?;
++    budget.charge_merge_work(1, &mut check)?;
++    Ok(Some(Merge::normal(TreeValue::File {
++        id,
++        executable,
++        copy_id: copy_id.clone(),
++    })))
++}
++
+ async fn try_resolve_file_values<T: Borrow<TreeValue>>(
+     store: &Arc<Store>,
+     path: &RepoPath,

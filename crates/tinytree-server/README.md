@@ -81,6 +81,12 @@ exhaustion and prevents replay until its absolute tombstone expiry. Closing befo
 the first evaluation also prevents a late request from creating that query. Canonical rows
 include verified commit envelopes, while graph edges describe the selected set.
 Response-byte limits can shorten pages; unsupported operators return explicit errors.
+`ChangedPath` policy 2 (`MERGED_PATH_GRAPH_V2`) compares exact-file and directory-prefix
+matches against recursively merged parents using line merging with identical changes
+accepted. It resolves only matched before-side FILE values and keeps derived content
+in disposable scratch storage. Graph, source-read and diff budgets remain cumulative
+across candidates and pages under the original query deadline. Policy 1 remains a
+metadata-only comparison against a single resolved parent.
 Revision-pinned `PathHistory` and `Blame` support bounded fixed-path linear
 history. Only the selected file body is returned; private metadata-only overlays
 do not grant file access. Unsupported ancestry and exhausted budgets carry

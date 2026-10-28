@@ -257,10 +257,12 @@ enum CapabilityFeature {
   DURABLE_RETAINED_OFFLOAD_V1 = 13;
   // Stateful annotation frontier pages with one cumulative command reservation.
   ANNOTATION_FRONTIER_PAGING_V1 = 14;
+  // Matcher-driven recursive-parent changed-path comparison, policy version 2.
+  MERGED_PATH_GRAPH_V2 = 15;
 }
 message GetCapabilitiesRequest {
   string repository_id = 1;
-  repeated CapabilityFeature features = 2; // Required, 1..13, unique ascending IDs.
+  repeated CapabilityFeature features = 2; // Required, 1..15, unique ascending IDs.
 }
 message FeatureCapability {
   CapabilityFeature feature = 1;

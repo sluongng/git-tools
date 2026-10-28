@@ -771,8 +771,12 @@ impl Index for NativeReadonlyIndex {
             selected.is_some(),
         )
         .map_err(rev_err)?;
+        if path_filter::has_merged_path(&expression) {
+            path_filter::validate_options(store).map_err(rev_err)?;
+        }
         Ok(Box::new(revsets::NativeRevset {
             index: self.clone(),
+            path_store: path_filter::has_path(&expression).then(|| store.clone()),
             expression,
             file_all: selected.map(|_| store.clone()),
         }))

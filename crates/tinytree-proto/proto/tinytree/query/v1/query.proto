@@ -276,13 +276,18 @@ message DagRangeExpr {
   GenerationRange generations_from_roots = 3;
 }
 message UnaryExpr { GraphExpr input = 1; }
-// Versioned fixed-path entry comparison against the single canonical parent.
-// No FILE body reads or rename following. Tree entries compare subtree IDs;
-// exact_file rejects a directory at this path rather than treating it as a file.
-// Merge/conflict/private-overlay boundaries are errors, never empty selections.
-// Clients may compose explicit selected local-draft IDs before graph projection.
+// Fixed-path changed-entry comparison; no rename following. Policy 1 compares
+// metadata against one canonical parent without FILE reads; merge/conflict and
+// private-overlay boundaries are errors, never empty selections.
+// Policy 2 compares the current entry with its matched recursive-parent value,
+// using fixed stock FileMergeHunkLevel::Line and SameChange::Accept semantics.
+// Resolve only the before side using the bounded recursive merge engine; selected
+// FILE bodies may be read for that resolution, never unmatched sibling bodies.
+// Paths select an exact entry or a directory prefix; exact_file rejects a
+// directory at the selected path rather than treating it as a file. Neither
+// policy changes authenticated scope identity or grants access to extra sources.
 message ChangedPathExpr {
-  uint32 policy_version = 1; // Exactly 1; requires EXACT_PATH_GRAPH_V1 capability.
+  uint32 policy_version = 1; // 1: EXACT_PATH_GRAPH_V1; 2: MERGED_PATH_GRAPH_V2.
   GraphExpr candidates = 2;
   string path = 3; // Nonempty normalized repository-relative path.
   bool exact_file = 4;

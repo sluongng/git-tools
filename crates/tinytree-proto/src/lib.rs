@@ -28,6 +28,12 @@ pub mod tinytree {
 }
 pub use tinytree::{cloud::v1 as cloud_v1, landing::v1 as landing_v1, query::v1 as query_v1, v1};
 
+/// Optional query admission metadata. This requests heavier resource accounting,
+/// not a query capability or permission.
+pub const QUERY_WORK_CLASS_HEADER: &str = "x-tinytree-query-work-class";
+/// Complete predecode reservation for merged-path graph queries.
+pub const MERGED_PATH_V2_WORK_CLASS: &str = "merged-path-v2";
+
 /// Descriptor set for the native-only protocol, including streaming cardinality.
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("tinytree_descriptor");
 

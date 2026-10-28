@@ -8,8 +8,10 @@ description = "Native repository gRPC service and standalone server"
 [dependencies]
 axum = "0.8"
 jj-lib = { version = "=0.46.0", default-features = false }
+jj-native-backend = { path = "../jj-native-backend" }
 anyhow = "1"
 async-stream = "0.3"
+async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
 fs2 = "0.4"
@@ -18,6 +20,7 @@ http-body = "1"
 grpc-transport = { path = "../grpc-transport" }
 tower = { version = "0.5", features = ["util"] }
 futures-core = "0.3"
+futures = "0.3"
 prost = "0.14"
 private-fs = { path = "../private-fs" }
 reapi = { path = "../reapi" }

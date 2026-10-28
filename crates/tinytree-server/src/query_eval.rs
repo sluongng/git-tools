@@ -137,12 +137,20 @@ pub(crate) trait PathPredicate {
         id: m::CommitId,
         path: &str,
         exact_file: bool,
+        policy_version: u32,
         budget: &mut WorkBudget,
     ) -> Result<bool>;
 }
 pub(crate) struct NoPathPredicate;
 impl PathPredicate for NoPathPredicate {
-    fn changed(&mut self, _: m::CommitId, _: &str, _: bool, _: &mut WorkBudget) -> Result<bool> {
+    fn changed(
+        &mut self,
+        _: m::CommitId,
+        _: &str,
+        _: bool,
+        _: u32,
+        _: &mut WorkBudget,
+    ) -> Result<bool> {
         Err(EvalError::Unsupported("path metadata reader unavailable"))
     }
 }
@@ -705,6 +713,7 @@ impl HasConflict {
 }
 struct ChangedPath {
     input: Box<Operator>,
+    policy_version: u32,
     path: String,
     exact_file: bool,
     look: Option<GraphNode>,
@@ -727,10 +736,13 @@ impl ChangedPath {
                 slots: 1,
                 intervals: 0,
             });
-            if ctx
-                .path
-                .changed(node.commit(), &self.path, self.exact_file, ctx.budget)?
-            {
+            if ctx.path.changed(
+                node.commit(),
+                &self.path,
+                self.exact_file,
+                self.policy_version,
+                ctx.budget,
+            )? {
                 return Ok(EvalStep::Row(node));
             }
         }
@@ -1303,6 +1315,12 @@ pub(crate) fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 pub(crate) fn has_path(expression: &q::GraphExpr) -> bool {
+    has_path_policy(expression, false)
+}
+pub(crate) fn has_merged_path(expression: &q::GraphExpr) -> bool {
+    has_path_policy(expression, true)
+}
+fn has_path_policy(expression: &q::GraphExpr, merged_only: bool) -> bool {
     use q::graph_expr::Expression as X;
     let mut todo = vec![expression];
     let mut seen = 0;
@@ -1312,7 +1330,12 @@ pub(crate) fn has_path(expression: &q::GraphExpr) -> bool {
             return true;
         }
         match value.expression.as_ref() {
-            Some(X::ChangedPath(_)) => return true,
+            Some(X::ChangedPath(v)) => {
+                if !merged_only || v.policy_version == 2 {
+                    return true;
+                }
+                todo.extend(v.candidates.as_deref());
+            }
             Some(X::Ancestors(v)) => todo.extend(v.heads.as_deref()),
             Some(X::Range(v)) => {
                 todo.extend(v.roots.as_deref());
@@ -1543,11 +1566,12 @@ impl Compiler<'_> {
                 }))
             }
             X::ChangedPath(value) => {
-                if value.policy_version != 1 {
+                if !matches!(value.policy_version, 1 | 2) {
                     return Err(EvalError::Unsupported("path policy version"));
                 }
                 validate_path(&value.path)?;
                 Ok(Operator::ChangedPath(ChangedPath {
+                    policy_version: value.policy_version,
                     input: Box::new(self.compile(child(&value.candidates)?, depth + 1)?),
                     path: value.path.clone(),
                     exact_file: value.exact_file,

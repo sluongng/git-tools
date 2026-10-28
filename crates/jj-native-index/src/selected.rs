@@ -13,27 +13,61 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Selected conflict-report work. The recursive merge worklist is a bounded
-//! adaptation of jj 0.46 `rewrite::find_recursive_merge_commits`; file-diff
-//! semantics follow its `default_index::revset_engine::has_diff_from_parent`.
+//! Selected conflict-report and private path work over a read-only scratch store.
+//! Recursive parent merging and matcher-driven before-side resolution are shared
+//! with the bounded stock-compatible path engine.
 use super::*;
-use futures::{AsyncRead as _, AsyncReadExt as _, StreamExt as _};
-use jj_lib::{
-    backend::{BackendError, BackendResult},
-    merge::Merge,
-    merged_tree::MergedTree,
-};
+use futures::AsyncReadExt as _;
+use jj_lib::backend::{BackendError, BackendResult};
 use std::sync::Mutex;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 /// Conservative logical selected-work accounting, not a process RSS metric.
 /// Provider transport/cache/staging admission remains independently enforced.
 pub(super) struct Work {
     items: usize,
     bytes: usize,
+    diff: Option<jj_lib::diff::LineDiffBudget>,
+    tree_terms: usize,
+    deadline: Option<std::time::Instant>,
 }
 impl Work {
-    fn reserve(&mut self, limits: &Limits, items: usize, bytes: usize) -> Result<(), Error> {
+    pub(super) fn exhausted() -> Self {
+        Self {
+            items: usize::MAX,
+            bytes: usize::MAX,
+            diff: None,
+            tree_terms: usize::MAX,
+            deadline: Some(std::time::Instant::now()),
+        }
+    }
+    pub(super) fn refund_bytes(&mut self, bytes: usize) -> Result<(), Error> {
+        self.bytes = self.bytes.checked_sub(bytes).ok_or(Error::Corrupt)?;
+        Ok(())
+    }
+    pub(super) fn with_deadline(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..Self::default()
+        }
+    }
+    pub(super) fn check(&self) -> Result<(), Error> {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            Err(Error::Query(tonic::Code::DeadlineExceeded))
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn reserve(
+        &mut self,
+        limits: &Limits,
+        items: usize,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        self.check()?;
         let next_items = self.items.checked_add(items).ok_or(Error::Limit)?;
         let next_bytes = self.bytes.checked_add(bytes).ok_or(Error::Limit)?;
         if next_items > limits.max_query_rows.min(limits.max_query_edges)
@@ -56,8 +90,12 @@ struct ReadOnlyIo {
     limits: Limits,
     work: Arc<Mutex<Work>>,
     files: Mutex<BTreeMap<m::FileId, Arc<[u8]>>>,
+    // A size bound only, not authority: retain the longest verified source
+    // prefix for every TREE ID, including aliases at different paths.
+    tree_prefixes: Mutex<BTreeMap<m::TreeId, usize>>,
     replies: Arc<Mutex<Vec<QueryOwner>>>,
     owner: QueryOwner,
+    deadline: std::time::Instant,
 }
 // jj Store drops its backend before its caches. Keep response owners outside
 // the backend too, so decoded cache payloads are destroyed before their guards.
@@ -76,6 +114,7 @@ struct SelectedMatcher {
     work: Arc<Mutex<Work>>,
     limits: Limits,
     failed: std::sync::atomic::AtomicBool,
+    inner: Box<dyn jj_lib::matchers::Matcher>,
 }
 impl SelectedMatcher {
     fn accept(&self, path: &jj_lib::repo_path::RepoPath) -> bool {
@@ -102,17 +141,13 @@ impl SelectedMatcher {
 }
 impl jj_lib::matchers::Matcher for SelectedMatcher {
     fn matches(&self, path: &jj_lib::repo_path::RepoPath) -> bool {
-        self.accept(path)
+        self.accept(path) && self.inner.matches(path)
     }
     fn visit(&self, path: &jj_lib::repo_path::RepoPath) -> jj_lib::matchers::Visit {
-        use jj_lib::matchers::{Visit, VisitDirs, VisitFiles};
         if self.accept(path) {
-            Visit::Specific {
-                dirs: VisitDirs::All,
-                files: VisitFiles::All,
-            }
+            self.inner.visit(path)
         } else {
-            Visit::Nothing
+            jj_lib::matchers::Visit::Nothing
         }
     }
 }
@@ -159,6 +194,7 @@ impl ReadOnlyIo {
                 .and_then(|n| n.checked_add(4096))
                 .ok_or_else(|| backend(Error::Limit))?;
             self.work.lock().map_err(|_| backend(Error::Corrupt))?.bytes -= maximum - actual;
+            self.metadata_resources(&value)?;
             return Ok(value);
         }
         let expected = self.prepare(key, owner.clone()).await?;
@@ -166,7 +202,98 @@ impl ReadOnlyIo {
         if value.descriptor() != expected {
             return Err(backend(Error::Canonical));
         }
+        self.metadata_resources(&value)?;
         Ok(value)
+    }
+    fn metadata_resources(&self, value: &jj_native_backend::VerifiedMetadata) -> BackendResult<()> {
+        self.charge(0, 0)?;
+        let descriptor = value.descriptor();
+        // VerifiedMetadata intentionally owns its model without exposing a
+        // borrowed accessor. The prepaid raw-codec allowance covers this bounded
+        // inspection model; it dies before NativeBackend consumes the original.
+        let object = m::decode(
+            value.bytes(),
+            m::Limits {
+                max_object_bytes: self.limits.max_metadata_bytes,
+                max_items: self.limits.max_query_edges.max(self.limits.max_parents),
+                max_field_bytes: self.limits.max_metadata_bytes,
+                max_path_bytes: MAX_DIFF_PATH_BYTES,
+            },
+        )
+        .map_err(|_| backend(Error::Canonical))?;
+        let prefix = if descriptor.key.kind == m::Kind::Tree {
+            *self
+                .tree_prefixes
+                .lock()
+                .map_err(|_| backend(Error::Corrupt))?
+                .get(&m::TreeId(descriptor.key.id.0))
+                .ok_or_else(|| backend(Error::Canonical))?
+        } else {
+            0
+        };
+        if let m::Object::Tree(tree) = &object {
+            let terms = self
+                .work
+                .lock()
+                .map_err(|_| backend(Error::Corrupt))?
+                .tree_terms
+                .max(1);
+            let items = tree
+                .entries
+                .len()
+                .checked_mul(terms)
+                .and_then(|n| n.checked_mul(terms))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| backend(Error::Limit))?;
+            let bytes = tree.entries.iter().try_fold(0usize, |sum, entry| {
+                let full_path = prefix
+                    .checked_add(entry.name.len())
+                    .ok_or_else(|| backend(Error::Limit))?;
+                let one = full_path
+                    .checked_add(256)
+                    .and_then(|n| n.checked_mul(terms))
+                    .and_then(|n| n.checked_mul(8))
+                    .ok_or_else(|| backend(Error::Limit))?;
+                sum.checked_add(one).ok_or_else(|| backend(Error::Limit))
+            })?;
+            self.charge(items, bytes)?;
+        }
+        let count = match &object {
+            m::Object::Commit(commit) => commit.root_tree.terms.len(),
+            m::Object::Tree(tree) => tree.entries.len(),
+            _ => 0,
+        };
+        self.charge(
+            count,
+            count
+                .checked_mul(256)
+                .ok_or_else(|| backend(Error::Limit))?,
+        )?;
+        let mut prefixes = self
+            .tree_prefixes
+            .lock()
+            .map_err(|_| backend(Error::Corrupt))?;
+        match &object {
+            m::Object::Commit(commit) => {
+                for id in &commit.root_tree.terms {
+                    prefixes.entry(*id).or_insert(0);
+                }
+            }
+            m::Object::Tree(tree) => {
+                for entry in &tree.entries {
+                    if let m::TreeValue::Tree(id) = &entry.value {
+                        let next = prefix
+                            .saturating_add(entry.name.len())
+                            .saturating_add(1)
+                            .min(MAX_DIFF_PATH_BYTES);
+                        let previous = prefixes.entry(*id).or_insert(next);
+                        *previous = (*previous).max(next);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn ephemeral(&self, key: m::ObjectKey) -> BackendResult<Option<Arc<[u8]>>> {
         if key.kind != m::Kind::File {
@@ -180,6 +307,9 @@ impl ReadOnlyIo {
             .cloned())
     }
     fn charge(&self, items: usize, bytes: usize) -> BackendResult<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(backend(Error::Query(tonic::Code::DeadlineExceeded)));
+        }
         self.work
             .lock()
             .map_err(|_| backend(Error::Corrupt))?
@@ -203,20 +333,13 @@ impl ReadOnlyIo {
         {
             return Err(backend(Error::Limit));
         }
-        // Canonical decode/model/string buffers and merge scratch are charged
-        // conservatively before physical payload reads, including repeated reads.
-        // A tree can expand short entry names into full paths in jj's diff
-        // frontier. Reserve the portable path cap per encoded byte as well as
-        // ordinary decode scratch, before reading/decoding any tree payload.
-        let factor = if key.kind == m::Kind::Tree {
-            MAX_DIFF_PATH_BYTES + 16
-        } else {
-            16
-        };
+        // Admit raw canonical bytes and bounded codec/model copies BEFORE the
+        // provider can fetch or decode. Stock TREE scratch is charged from the
+        // verified entry count below, before backend conversion or iteration.
         let bytes = usize::try_from(descriptor.size_bytes)
             .ok()
-            .and_then(|v| v.checked_mul(factor))
-            .and_then(|v| v.checked_add(4096))
+            .and_then(|n| n.checked_mul(16))
+            .and_then(|n| n.checked_add(4096))
             .ok_or_else(|| backend(Error::Limit))?;
         self.charge(1, bytes)?;
         Ok(descriptor)
@@ -377,8 +500,53 @@ pub(super) async fn changed(
     owner: QueryOwner,
     initial: Work,
 ) -> Result<(bool, Work), RevsetEvaluationError> {
+    changed_impl(caller, index, scope, id, owner, initial, None).await
+}
+pub(super) async fn changed_path(
+    caller: &Arc<Store>,
+    index: &NativeReadonlyIndex,
+    scope: Arc<CachedScope>,
+    id: CommitId,
+    owner: QueryOwner,
+    initial: Work,
+    filter: &q::ChangedPathExpr,
+) -> Result<(bool, Work), RevsetEvaluationError> {
+    if filter.policy_version != 2 {
+        return Err(rev_err(Error::Invalid));
+    }
+    path_filter::validate_options(caller).map_err(rev_err)?;
+    changed_impl(caller, index, scope, id, owner, initial, Some(filter)).await
+}
+async fn changed_impl(
+    caller: &Arc<Store>,
+    index: &NativeReadonlyIndex,
+    scope: Arc<CachedScope>,
+    id: CommitId,
+    owner: QueryOwner,
+    mut initial: Work,
+    filter: Option<&q::ChangedPathExpr>,
+) -> Result<(bool, Work), RevsetEvaluationError> {
+    let deadline = *initial.deadline.get_or_insert_with(|| {
+        std::time::Instant::now() + Duration::from_millis(index.core.limits.sync_query_timeout_ms)
+    });
+    initial.check().map_err(rev_err)?;
+    // Move the same cumulative ledger through every selected candidate. It is
+    // never copied or recreated after a successful candidate.
+    let mut diff_budget = initial.diff.take().unwrap_or_else(|| {
+        jj_lib::diff::LineDiffBudget::new(jj_lib::diff::LineDiffLimits {
+            max_input_bytes: index.core.limits.max_checkpoint_bytes,
+            max_lines: index.core.limits.max_query_rows,
+            max_work: index.core.limits.max_query_edges,
+            max_allocation_bytes: index.core.limits.max_checkpoint_bytes,
+            max_recursion_depth: index.core.limits.max_depth.min(128),
+        })
+    });
     let work = Arc::new(Mutex::new(initial));
     let replies = Arc::new(Mutex::new(Vec::new()));
+    // Backend initialization verifies this exact intrinsic object before any
+    // COMMIT is loaded. It is fixed protocol geometry, not an arbitrary ID grant.
+    reserve(&work, &index.core.limits, 1, 256)?;
+    let empty_tree = m::TreeId(m::empty_tree().descriptor.key.id.0);
     let io = Arc::new(ReadOnlyIo {
         inner: index.core.objects.clone(),
         query: index.core.query.clone(),
@@ -386,8 +554,10 @@ pub(super) async fn changed(
         limits: index.core.limits.clone(),
         work: work.clone(),
         files: Mutex::new(BTreeMap::new()),
+        tree_prefixes: Mutex::new(BTreeMap::from([(empty_tree, 0)])),
         replies: replies.clone(),
         owner,
+        deadline,
     });
     let mut config = jj_native_backend::Config::default();
     config.store.model_limits.max_object_bytes = index.core.limits.max_metadata_bytes;
@@ -404,7 +574,7 @@ pub(super) async fn changed(
     };
     let store = &scratch.store;
     let commit = store.get_commit_async(&id).await?;
-    if !commit.has_conflict() {
+    if filter.is_none() && !commit.has_conflict() {
         return Err(rev_err(Error::Corrupt));
     }
     let parent_count = commit.parent_ids().len();
@@ -420,195 +590,152 @@ pub(super) async fn changed(
             .ok_or_else(|| rev_err(Error::Limit))?,
     )?;
     let parents = commit.parents().await?;
-    let changed = if let [parent] = parents.as_slice() {
-        commit.tree_ids() != parent.tree_ids()
+    let changed = if filter.is_none() && parents.len() == 1 {
+        commit.tree_ids() != parents[0].tree_ids()
     } else {
-        let from = parent_tree(store, index, &parents, &work).await?;
-        let to = commit.tree();
+        let inner: Box<dyn jj_lib::matchers::Matcher> = if let Some(filter) = filter {
+            let path = RepoPathBuf::from_internal_string(&filter.path)
+                .map_err(|_| rev_err(Error::Invalid))?;
+            if filter.exact_file {
+                Box::new(jj_lib::matchers::FilesMatcher::new([path]))
+            } else {
+                Box::new(jj_lib::matchers::PrefixMatcher::new([path]))
+            }
+        } else {
+            Box::new(jj_lib::matchers::EverythingMatcher)
+        };
         let matcher = SelectedMatcher {
             work: work.clone(),
             limits: index.core.limits.clone(),
             failed: std::sync::atomic::AtomicBool::new(false),
+            inner,
         };
-        let mut diff = from.diff_stream(&to, &matcher);
-        let mut changed = false;
-        while let Some(entry) = diff.next().await {
-            matcher.check()?;
-            reserve(
-                &work,
-                &index.core.limits,
-                1,
-                entry.path.as_internal_file_string().len(),
-            )?;
-            let mut values = entry.values?;
-            values.before =
-                jj_lib::tree_merge::resolve_file_values(store, &entry.path, values.before).await?;
-            if values.is_changed() {
-                changed = true;
-                break;
-            }
-        }
-        matcher.check()?;
-        changed
-    };
-    let result = *work.lock().map_err(|_| rev_err(Error::Corrupt))?;
-    Ok((changed, result))
-}
-
-async fn parent_tree(
-    store: &Arc<Store>,
-    index: &NativeReadonlyIndex,
-    parents: &[Commit],
-    work: &Arc<Mutex<Work>>,
-) -> Result<MergedTree, RevsetEvaluationError> {
-    struct Frame {
-        ids: Vec<CommitId>,
-        next: usize,
-        result: Merge<CommitId>,
-    }
-    fn frame(ids: Vec<CommitId>) -> Frame {
-        let result = Merge::resolved(ids[0].clone());
-        Frame {
-            ids,
-            next: 1,
-            result,
-        }
-    }
-    fn combine(
-        frame: &mut Frame,
-        base: Merge<CommitId>,
-        work: &Arc<Mutex<Work>>,
-        limits: &Limits,
-    ) -> Result<(), RevsetEvaluationError> {
-        let terms = frame
-            .result
-            .iter()
-            .len()
-            .checked_add(base.iter().len())
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| rev_err(Error::Limit))?;
-        reserve(
-            work,
-            limits,
-            terms,
-            terms
-                .checked_mul(std::mem::size_of::<CommitId>() + 32)
-                .ok_or_else(|| rev_err(Error::Limit))?,
-        )?;
-        let previous = std::mem::replace(
-            &mut frame.result,
-            Merge::resolved(CommitId::from_bytes(&[0; 32])),
-        );
-        let other = Merge::resolved(frame.ids[frame.next].clone());
-        frame.result = Merge::from_vec(vec![previous, base, other]).flatten();
-        frame.next += 1;
-        Ok(())
-    }
-    let merge = match parents {
-        [] => Merge::resolved(store.root_commit_id().clone()),
-        [parent] => Merge::resolved(parent.id().clone()),
-        _ => {
-            reserve(
-                work,
-                &index.core.limits,
-                parents.len(),
-                parents
-                    .len()
-                    .checked_mul(64)
-                    .ok_or_else(|| rev_err(Error::Limit))?,
-            )?;
-            let ids = parents.iter().map(|p| p.id().clone()).collect();
-            reserve(work, &index.core.limits, 1, std::mem::size_of::<Frame>())?;
-            let mut frames = vec![frame(ids)];
-            loop {
-                if frames.last().unwrap().next == frames.last().unwrap().ids.len() {
-                    let done = frames.pop().unwrap().result;
-                    if let Some(parent) = frames.last_mut() {
-                        combine(parent, done, work, &index.core.limits)?;
-                    } else {
-                        break done;
-                    }
-                } else {
-                    reserve(work, &index.core.limits, 1, 0)?;
-                    let current = frames.last().unwrap();
-                    let bases = index
-                        .common_ancestors(
-                            &current.ids[..current.next],
-                            std::slice::from_ref(&current.ids[current.next]),
-                        )
-                        .await
-                        .map_err(|e| RevsetEvaluationError::Other(Box::new(e)))?;
-                    reserve(
-                        work,
-                        &index.core.limits,
-                        bases.len(),
-                        bases
-                            .len()
-                            .checked_mul(64)
-                            .ok_or_else(|| rev_err(Error::Limit))?,
-                    )?;
-                    match bases.as_slice() {
-                        [] => combine(
-                            frames.last_mut().unwrap(),
-                            Merge::resolved(store.root_commit_id().clone()),
-                            work,
-                            &index.core.limits,
-                        )?,
-                        [base] => combine(
-                            frames.last_mut().unwrap(),
-                            Merge::resolved(base.clone()),
-                            work,
-                            &index.core.limits,
-                        )?,
-                        _ => {
-                            reserve(work, &index.core.limits, 1, std::mem::size_of::<Frame>())?;
-                            frames.push(frame(bases));
-                        }
-                    }
+        let mut graph = ParentSource {
+            index,
+            work: &work,
+            matcher: &matcher,
+            deadline,
+        };
+        if let Some(filter) = filter.filter(|filter| filter.exact_file) {
+            use tinytree_annotate::{Budget as _, path::ParentGraph as _};
+            let before = tinytree_annotate::path::merged_parent_tree(store, &parents, &mut graph)
+                .await
+                .map_err(path_error)?;
+            let terms = before
+                .tree_ids()
+                .iter()
+                .len()
+                .checked_add(commit.tree_ids().iter().len())
+                .ok_or_else(|| rev_err(Error::Limit))?;
+            graph.prepare_diff(terms)?;
+            let path = RepoPathBuf::from_internal_string(&filter.path)
+                .map_err(|_| rev_err(Error::Invalid))?;
+            for tree in [before, commit.tree()] {
+                graph.check()?;
+                let value = tree.path_value(&path).await?;
+                if value
+                    .iter()
+                    .any(|term| matches!(term, Some(jj_lib::backend::TreeValue::Tree(_))))
+                {
+                    return Err(rev_err(Error::UnsupportedExpression(
+                        "path_exact_file_directory",
+                    )));
                 }
             }
         }
+        tinytree_annotate::path::changed_with_matcher(
+            store,
+            &commit,
+            &matcher,
+            &mut graph,
+            &mut diff_budget,
+        )
+        .await
+        .map_err(path_error)?
     };
-    reserve(
-        work,
-        &index.core.limits,
-        merge.iter().len(),
-        merge
-            .iter()
-            .len()
-            .checked_mul(std::mem::size_of::<(MergedTree, String)>())
-            .ok_or_else(|| rev_err(Error::Limit))?,
-    )?;
-    let mut trees = Vec::with_capacity(merge.iter().len());
-    for id in merge.iter() {
-        let commit = store.get_commit_async(id).await?;
-        let terms = commit.tree_ids().iter().len();
-        let existing_labels =
-            commit
-                .store_commit()
-                .conflict_labels
-                .iter()
-                .try_fold(0usize, |n, label| {
-                    n.checked_add(label.len())
-                        .ok_or_else(|| rev_err(Error::Limit))
-                })?;
-        let fallback = commit
-            .description()
-            .len()
-            .checked_add(128)
-            .ok_or_else(|| rev_err(Error::Limit))?;
-        let label_bytes = terms
-            .checked_mul(
-                std::mem::size_of::<jj_lib::backend::TreeId>() + std::mem::size_of::<String>(),
-            )
-            .and_then(|n| n.checked_add(existing_labels))
-            .and_then(|n| n.checked_add(fallback))
-            .and_then(|n| n.checked_mul(8))
-            .ok_or_else(|| rev_err(Error::Limit))?;
-        // Existing conflict labels survive labels_by_term; repeated cached
-        // commit terms must pay for each clone/flatten, not just their subject.
-        reserve(work, &index.core.limits, terms, label_bytes)?;
-        trees.push((commit.tree(), commit.conflict_label()));
+    // Quiesce scratch caches and payload owners before returning the spent
+    // ledger to the next selected candidate.
+    drop(commit);
+    drop(parents);
+    drop(scratch);
+    let mut result = std::mem::take(&mut *work.lock().map_err(|_| rev_err(Error::Corrupt))?);
+    result.diff = Some(diff_budget);
+    Ok((changed, result))
+}
+
+struct ParentSource<'a> {
+    index: &'a NativeReadonlyIndex,
+    work: &'a Arc<Mutex<Work>>,
+    matcher: &'a SelectedMatcher,
+    deadline: std::time::Instant,
+}
+impl tinytree_annotate::Budget for ParentSource<'_> {
+    type Error = RevsetEvaluationError;
+    fn check(&self) -> Result<(), Self::Error> {
+        self.matcher.check()?;
+        if std::time::Instant::now() >= self.deadline {
+            Err(rev_err(Error::Query(tonic::Code::DeadlineExceeded)))
+        } else {
+            Ok(())
+        }
     }
-    Ok(MergedTree::merge_no_resolve(Merge::from_vec(trees)))
+    fn charge(&mut self, items: u64, bytes: u64) -> Result<(), Self::Error> {
+        self.check()?;
+        reserve(
+            self.work,
+            &self.index.core.limits,
+            items.try_into().map_err(|_| rev_err(Error::Limit))?,
+            bytes.try_into().map_err(|_| rev_err(Error::Limit))?,
+        )
+    }
+    fn frontier(&mut self, entries: usize) -> Result<(), Self::Error> {
+        self.check()?;
+        if entries
+            > self
+                .index
+                .core
+                .limits
+                .max_parents
+                .min(self.index.core.limits.max_depth)
+        {
+            Err(rev_err(Error::Limit))
+        } else {
+            Ok(())
+        }
+    }
+    fn diff_active(&self) -> bool {
+        self.check().is_ok()
+    }
+}
+impl tinytree_annotate::path::ParentGraph for ParentSource<'_> {
+    fn prepare_diff(&mut self, raw_terms: usize) -> Result<(), Self::Error> {
+        use tinytree_annotate::Budget as _;
+        self.frontier(raw_terms)?;
+        self.work
+            .lock()
+            .map_err(|_| rev_err(Error::Corrupt))?
+            .tree_terms = raw_terms;
+        Ok(())
+    }
+    async fn common_ancestors(
+        &mut self,
+        left: &[CommitId],
+        right: &[CommitId],
+    ) -> Result<Vec<CommitId>, Self::Error> {
+        self.index
+            .common_ancestors(left, right)
+            .await
+            .map_err(|e| RevsetEvaluationError::Other(Box::new(e)))
+    }
+}
+fn path_error(
+    error: tinytree_annotate::path::Error<RevsetEvaluationError>,
+) -> RevsetEvaluationError {
+    use tinytree_annotate::path::Error as P;
+    match error {
+        P::Source(e) => e,
+        P::Backend(e) => e.into(),
+        P::Resolve(e) => RevsetEvaluationError::Other(Box::new(e)),
+        P::Limit => rev_err(Error::Limit),
+    }
 }

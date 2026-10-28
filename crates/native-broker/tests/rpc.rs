@@ -1868,6 +1868,8 @@ struct FakeQuery {
     scope_failure: std::sync::Mutex<Option<tonic::Status>>,
     transient_pages: std::sync::atomic::AtomicUsize,
     page_calls: std::sync::Mutex<Vec<([u8; 32], u64)>>,
+    begin_calls: std::sync::Mutex<Vec<native_broker::BeginQuery>>,
+    begin_failure: std::sync::Mutex<Option<tonic::Status>>,
     fact_calls: std::sync::atomic::AtomicUsize,
     history_calls: std::sync::atomic::AtomicUsize,
     blame_calls: std::sync::atomic::AtomicUsize,
@@ -1896,6 +1898,8 @@ impl FakeQuery {
             scope_failure: Default::default(),
             transient_pages: Default::default(),
             page_calls: Default::default(),
+            begin_calls: Default::default(),
+            begin_failure: Default::default(),
             fact_calls: Default::default(),
             history_calls: Default::default(),
             blame_calls: Default::default(),
@@ -2261,6 +2265,10 @@ impl native_broker::NativeQueryIo for FakeQuery {
         _: native_broker::QueryOwner,
     ) -> Result<native_broker::QueryReply<native_broker::QueryHandle>, tonic::Status> {
         self.scope(i.scope)?;
+        self.begin_calls.lock().unwrap().push(i);
+        if let Some(error) = self.begin_failure.lock().unwrap().clone() {
+            return Err(error);
+        }
         Ok(self.reply(native_broker::QueryHandle {
             handle: [self.marker + 10; 32],
             expires_at_unix_seconds: i64::MAX / 2,
@@ -2557,6 +2565,96 @@ fn query_service(root: &Path, a: Arc<FakeQuery>, b: Arc<FakeQuery>, cfg: Config)
     ]))
     .unwrap()
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_path_policies_keep_exact_intent_and_bounded_forwarding() {
+    use native_broker::{BeginQuery, NativeQueryIo, query_protocol as q};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    private(&root);
+    let cfg = query_config();
+    let provider = Arc::new(FakeQuery::new(1, 1024));
+    let service = query_service(
+        &root,
+        provider.clone(),
+        Arc::new(FakeQuery::new(2, 1024)),
+        cfg.clone(),
+    );
+    let socket = root.join("changed-path.sock");
+    let _host = Running::start_service(&socket, service.clone()).await;
+    let rpc = native_broker::BrokerQueryClient::connect(&socket, "first", cfg.clone())
+        .await
+        .unwrap();
+    let local = service.query_io("first").unwrap();
+    let request = |policy_version, path: String| BeginQuery {
+        scope: [1; 32],
+        expression: q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                q::ChangedPathExpr {
+                    candidates: Some(Box::new(q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: vec![q::CommitId { value: vec![3; 32] }],
+                        })),
+                    })),
+                    path,
+                    policy_version,
+                    exact_file: true,
+                },
+            ))),
+        },
+        projection: q::Projection::Canonical,
+        page_size: 7,
+        replay_key: [9; 32],
+    };
+    for client in [&rpc as &dyn NativeQueryIo, local.as_ref()] {
+        for policy in [1, 2] {
+            let input = request(policy, "src/main.rs".into());
+            client.begin(input.clone(), Arc::new(())).await.unwrap();
+            let delivered = provider.begin_calls.lock().unwrap().last().unwrap().clone();
+            assert_eq!(delivered.expression, input.expression);
+            assert_eq!(delivered.scope, input.scope);
+            assert_eq!(delivered.replay_key, input.replay_key);
+            assert_eq!(delivered.projection, input.projection);
+            assert_eq!(delivered.page_size, input.page_size);
+        }
+        let before = provider.begin_calls.lock().unwrap().len();
+        for (policy, path) in [
+            (0, "a".into()),
+            (3, "a".into()),
+            (2, "a/../b".into()),
+            (2, "a".repeat(4097)),
+        ] {
+            assert_eq!(
+                client
+                    .begin(request(policy, path), Arc::new(()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        assert_eq!(provider.begin_calls.lock().unwrap().len(), before);
+        *provider.begin_failure.lock().unwrap() = Some(tonic::Status::unimplemented(
+            "unsupported merged path capability",
+        ));
+        assert_eq!(
+            client
+                .begin(request(2, "src/main.rs".into()), Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            provider.begin_calls.lock().unwrap().len(),
+            before + 1,
+            "no legacy or empty-result fallback"
+        );
+        *provider.begin_failure.lock().unwrap() = None;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scoped_path_queries_route_exact_aliases_and_reject_invalid_results() {
     use native_broker::{NativeQueryIo, ScopedPathQuery, query_protocol as q};

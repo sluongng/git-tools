@@ -19,5 +19,5 @@ rust_test(
     name = "jj_bounded_diff_tests",
     srcs = ["jj_bounded_diff_test.rs"],
     edition = "2024",
-    deps = ["@crates//:jj-lib"],
+    deps = ["@crates//:jj-lib", "@crates//:futures", "@crates//:tempfile"],
 )

@@ -281,7 +281,12 @@ fn expression_hash(
                 number(h, v.policy_version as u64);
                 number(h, u64::from(v.exact_file));
                 raw(h, v.path.as_bytes());
-                if v.policy_version != 1 || v.path.is_empty() || v.path.len() > 4096 {
+                if !matches!(v.policy_version, 1 | 2)
+                    || v.path.is_empty()
+                    || v.path.len() > 4096
+                    || v.path.split('/').count() > limits.max_depth
+                    || RepoPathBuf::from_internal_string(&v.path).is_err()
+                {
                     return Err(Error::Invalid);
                 }
                 push!(v.candidates.as_deref());

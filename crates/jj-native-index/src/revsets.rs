@@ -134,7 +134,7 @@ pub(super) fn compile(
             return Err(Error::UnsupportedExpression("fileset_not_exact_path"));
         }
         Ok(expr(Q::ChangedPath(Box::new(q::ChangedPathExpr {
-            policy_version: 1,
+            policy_version: 2,
             candidates: Some(Box::new(build(
                 candidates,
                 depth + 1,
@@ -339,6 +339,14 @@ pub(super) fn compile(
                 todo.push((v.heads.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
             Q::ChangedPath(v) => {
+                if !matches!(v.policy_version, 1 | 2)
+                    || v.path.is_empty()
+                    || v.path.len() > 4096
+                    || v.path.split('/').count() > limits.max_depth
+                    || RepoPathBuf::from_internal_string(&v.path).is_err()
+                {
+                    return Err(Error::Invalid);
+                }
                 todo.push((v.candidates.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
             Q::Heads(v) | Q::Roots(v) | Q::HasConflict(v) => {
@@ -381,6 +389,7 @@ pub(super) struct NativeRevset {
     pub(super) index: NativeReadonlyIndex,
     pub(super) expression: q::GraphExpr,
     pub(super) file_all: Option<Arc<Store>>,
+    pub(super) path_store: Option<Arc<Store>>,
 }
 pub(super) struct Cursor {
     index: NativeReadonlyIndex,
@@ -392,15 +401,18 @@ pub(super) struct Cursor {
     edges: usize,
     closed: bool,
     projection: q::Projection,
+    page_size: u32,
 }
 impl Cursor {
     async fn begin(
         index: NativeReadonlyIndex,
         expression: q::GraphExpr,
         projection: q::Projection,
+        path_store: Option<Arc<Store>>,
     ) -> Result<Self, Error> {
         let scope = index.scope().await?;
-        let (expression, owner) = crate::path_filter::prepare(&index, &scope, expression).await?;
+        let (expression, owner) =
+            crate::path_filter::prepare(&index, &scope, expression, path_store).await?;
         Self::start_owned(index, scope, expression, projection, owner).await
     }
     pub(super) async fn start(
@@ -418,6 +430,14 @@ impl Cursor {
         projection: q::Projection,
         preparation: Option<Arc<crate::path_filter::Preparation>>,
     ) -> Result<Self, Error> {
+        // CLI consumer limits stop this stream, not the server AST. Request one
+        // V2 path match at a time so the first page cannot scan ahead merely to
+        // fill a batch that the caller will immediately discard.
+        let page_size = if crate::path_filter::has_merged_path(&expression) {
+            1
+        } else {
+            index.core.limits.page_size
+        };
         let reply = index
             .core
             .query
@@ -426,7 +446,7 @@ impl Cursor {
                     scope: scope.value.handle,
                     expression,
                     projection,
-                    page_size: index.core.limits.page_size,
+                    page_size,
                     replay_key: scope
                         .value
                         .bound_query_id(random()[..16].try_into().expect("fixed nonce width"))
@@ -449,6 +469,7 @@ impl Cursor {
             edges: 0,
             closed: false,
             projection,
+            page_size,
         })
     }
     fn owner(&self) -> QueryOwner {
@@ -467,8 +488,7 @@ impl Cursor {
             .page(self.handle, self.sequence, self.owner())
             .await
             .map_err(status_at(QueryStage::GraphPage))?;
-        if reply.value.sequence != self.sequence
-            || reply.value.rows.len() > self.index.core.limits.page_size as usize
+        if reply.value.sequence != self.sequence || reply.value.rows.len() > self.page_size as usize
         {
             return Err(Error::Corrupt);
         }
@@ -602,10 +622,11 @@ fn rows(
     expression: q::GraphExpr,
     projection: q::Projection,
     file_all: Option<Arc<Store>>,
+    path_store: Option<Arc<Store>>,
 ) -> LocalBoxStream<'static, Result<q::GraphRow, RevsetEvaluationError>> {
     Box::pin(async_stream::try_stream! {
         let wire_projection = if file_all.is_some() { q::Projection::Canonical } else { projection };
-        let mut cursor=Cursor::begin(index,expression,wire_projection).await.map_err(rev_err)?;
+        let mut cursor=Cursor::begin(index,expression,wire_projection,path_store).await.map_err(rev_err)?;
         let mut diff_entries = selected::Work::default();
         loop {
             let page=cursor.page().await.map_err(rev_err)?;
@@ -666,7 +687,7 @@ async fn selected_file_changed(
     let store = store.clone();
     let index = index.clone();
     let timeout = Duration::from_millis(index.core.limits.sync_query_timeout_ms);
-    let work = *entries;
+    let work = std::mem::replace(entries, selected::Work::exhausted());
     let scope = scope.clone();
     let owner: QueryOwner = Arc::new((store.clone(), index.clone(), scope.clone(), owner, permit));
     let (send, recv) = tokio::sync::oneshot::channel();
@@ -721,6 +742,7 @@ impl Revset for NativeRevset {
                 self.expression.clone(),
                 q::Projection::Canonical,
                 self.file_all.clone(),
+                self.path_store.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -740,6 +762,7 @@ impl Revset for NativeRevset {
                 self.expression.clone(),
                 q::Projection::Canonical,
                 self.file_all.clone(),
+                self.path_store.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -767,6 +790,7 @@ impl Revset for NativeRevset {
                 self.expression.clone(),
                 q::Projection::Canonical,
                 self.file_all.clone(),
+                self.path_store.clone(),
             )
             .map(|v| {
                 let row = v?;
@@ -791,7 +815,12 @@ impl Revset for NativeRevset {
         )
     }
     fn is_empty(&self) -> Result<bool, RevsetEvaluationError> {
-        sync_empty(&self.index, &self.expression, self.file_all.as_ref())
+        sync_empty(
+            &self.index,
+            &self.expression,
+            self.file_all.as_ref(),
+            self.path_store.as_ref(),
+        )
     }
     fn count_estimate(&self) -> Result<(usize, Option<usize>), RevsetEvaluationError> {
         Ok((0, None))
@@ -803,10 +832,12 @@ impl Revset for NativeRevset {
         let index = self.index.clone();
         let expression = self.expression.clone();
         let file_all = self.file_all.clone();
+        let path_store = self.path_store.clone();
         Box::new(move |id| {
             let index = index.clone();
             let expression = expression.clone();
             let file_all = file_all.clone();
+            let path_store = path_store.clone();
             let id = id.clone();
             Box::pin(async move {
                 if !index
@@ -823,7 +854,7 @@ impl Revset for NativeRevset {
                             commits(std::slice::from_ref(&id)).map_err(rev_err)?,
                         ],
                     }));
-                    return rows(index, exact, q::Projection::Ids, None)
+                    return rows(index, exact, q::Projection::Ids, None, path_store)
                         .next()
                         .await
                         .transpose()
@@ -890,6 +921,7 @@ fn sync_empty(
     index: &NativeReadonlyIndex,
     expression: &q::GraphExpr,
     file_all: Option<&Arc<Store>>,
+    path_store: Option<&Arc<Store>>,
 ) -> Result<bool, RevsetEvaluationError> {
     let runtime = sync_runtime().map_err(rev_err)?;
     // Acquire before spawning: neither Tokio's blocking queue nor accepted
@@ -903,13 +935,14 @@ fn sync_empty(
     let index = index.clone();
     let expression = expression.clone();
     let file_all = file_all.cloned();
+    let path_store = path_store.cloned();
     let timeout = Duration::from_millis(index.core.limits.sync_query_timeout_ms);
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     runtime.runtime.spawn_blocking(move || {
         // The LocalBoxStream is created and polled on this owned worker, never
         // nested inside the caller's LocalPool or current-thread runtime.
         let result = futures::executor::block_on(async {
-            rows(index, expression, q::Projection::Ids, file_all)
+            rows(index, expression, q::Projection::Ids, file_all, path_store)
                 .next()
                 .await
                 .transpose()

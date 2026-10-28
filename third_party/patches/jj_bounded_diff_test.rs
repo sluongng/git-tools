@@ -340,3 +340,357 @@ fn bounded_line_history_benchmark() {
         }
     }
 }
+
+fn line_options(same_change: jj_lib::merge::SameChange) -> jj_lib::tree_merge::MergeOptions {
+    jj_lib::tree_merge::MergeOptions {
+        hunk_level: jj_lib::files::FileMergeHunkLevel::Line,
+        same_change,
+    }
+}
+
+#[test]
+fn bounded_file_merge_preserves_stock_line_policy() {
+    use jj_lib::{
+        files,
+        merge::{Merge, SameChange},
+    };
+    struct Case {
+        name: &'static str,
+        terms: Vec<&'static [u8]>,
+    }
+    let cases = [
+        Case {
+            name: "resolved input",
+            terms: vec![b"one\ntwo\n"],
+        },
+        Case {
+            name: "independent edits",
+            terms: vec![
+                b"ONE\nmiddle\nthree\n",
+                b"one\nmiddle\nthree\n",
+                b"one\nmiddle\nTHREE\n",
+            ],
+        },
+        Case {
+            name: "same change",
+            terms: vec![b"new\n", b"base\n", b"new\n"],
+        },
+        Case {
+            name: "overlapping changes",
+            terms: vec![b"left\n", b"base\n", b"right\n"],
+        },
+        Case {
+            name: "repeated line alignment",
+            terms: vec![b"a\nb\na\na\n", b"a\na\nb\na\n", b"a\na\nb\na\na\n"],
+        },
+        Case {
+            name: "arbitrary bytes and no final newline",
+            terms: vec![b"\0\xff\nleft", b"\0\xff\nbase", b"\0\xff\nright"],
+        },
+        Case {
+            name: "canceling five terms",
+            terms: vec![b"left\n", b"base\n", b"right\n", b"right\n", b"base\n"],
+        },
+        Case {
+            name: "multiple remaining sides",
+            terms: vec![b"left\n", b"base\n", b"right\n", b"base\n", b"third\n"],
+        },
+    ];
+    for case in cases {
+        for same_change in [SameChange::Accept, SameChange::Keep] {
+            let input = Merge::from_vec(case.terms.clone());
+            let options = line_options(same_change);
+            let actual =
+                files::merge_bounded(&input, &options, &mut LineDiffBudget::new(limits()), || {
+                    true
+                })
+                .unwrap();
+            assert_eq!(
+                actual,
+                files::merge(&input, &options),
+                "{} {same_change:?}",
+                case.name
+            );
+            let actual = files::try_merge_bounded(
+                &input,
+                &options,
+                &mut LineDiffBudget::new(limits()),
+                || true,
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                files::try_merge(&input, &options),
+                "{} {same_change:?}",
+                case.name
+            );
+        }
+    }
+    // Exhaust short repeated-content merges; compare public result terms, not
+    // a duplicate implementation of the bounded collector.
+    let texts: &[&[u8]] = &[b"", b"a", b"a\n", b"a\na\n", b"a\nb\n", b"b\na\n"];
+    for left in texts {
+        for base in texts {
+            for right in texts {
+                for same_change in [SameChange::Accept, SameChange::Keep] {
+                    let input = Merge::from_vec(vec![*left, *base, *right]);
+                    let options = line_options(same_change);
+                    assert_eq!(
+                        files::merge_bounded(
+                            &input,
+                            &options,
+                            &mut LineDiffBudget::new(limits()),
+                            || true
+                        )
+                        .unwrap(),
+                        files::merge(&input, &options)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_file_merge_enforces_shared_limits_and_cancellation() {
+    use jj_lib::{
+        files::{self, FileMergeError},
+        merge::{Merge, SameChange},
+    };
+    let input = Merge::from_vec(vec![
+        b"ONE\nmiddle\nthree\n".as_slice(),
+        b"one\nmiddle\nthree\n",
+        b"one\nmiddle\nTHREE\n",
+    ]);
+    let options = line_options(SameChange::Accept);
+    let mut budget = LineDiffBudget::new(limits());
+    files::merge_bounded(&input, &options, &mut budget, || true).unwrap();
+    let used = budget.usage();
+    for (name, bounded) in [
+        (
+            "work",
+            LineDiffLimits {
+                max_work: used.work,
+                ..limits()
+            },
+        ),
+        (
+            "allocation",
+            LineDiffLimits {
+                max_allocation_bytes: used.allocation_bytes,
+                ..limits()
+            },
+        ),
+        (
+            "input",
+            LineDiffLimits {
+                max_input_bytes: used.input_bytes,
+                ..limits()
+            },
+        ),
+    ] {
+        let mut budget = LineDiffBudget::new(bounded);
+        files::merge_bounded(&input, &options, &mut budget, || true).unwrap();
+        assert!(
+            matches!(
+                files::merge_bounded(&input, &options, &mut budget, || true),
+                Err(FileMergeError::Budget(LineDiffError::LimitExceeded))
+            ),
+            "{name}"
+        );
+    }
+    let repeated = b"a\na\nb\na\n".repeat(40);
+    let input = Merge::from_vec(vec![
+        repeated.as_slice(),
+        repeated.as_slice(),
+        repeated.as_slice(),
+    ]);
+    for stop_at in 1..=128 {
+        let mut checks = 0;
+        let result =
+            files::merge_bounded(&input, &options, &mut LineDiffBudget::new(limits()), || {
+                checks += 1;
+                checks < stop_at
+            });
+        assert!(matches!(
+            result,
+            Err(FileMergeError::Budget(LineDiffError::Cancelled))
+        ));
+        assert_eq!(checks, stop_at);
+    }
+    let mut word = options.clone();
+    word.hunk_level = files::FileMergeHunkLevel::Word;
+    let mut budget = LineDiffBudget::new(limits());
+    assert!(matches!(
+        files::merge_bounded(&input, &word, &mut budget, || true),
+        Err(FileMergeError::UnsupportedHunkLevel)
+    ));
+    assert_eq!(budget.usage(), Default::default());
+}
+
+#[test]
+fn bounded_selected_value_resolution_preserves_stock_metadata_and_conflicts() {
+    use jj_lib::{
+        backend::{CopyId, TreeValue},
+        merge::{Merge, SameChange},
+        repo_path::RepoPath,
+        signing::Signer,
+        simple_backend::SimpleBackend,
+        store::Store,
+        tree_merge,
+    };
+    futures::executor::block_on(async {
+        for same_change in [SameChange::Accept, SameChange::Keep] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::new(
+                Box::new(SimpleBackend::init(directory.path())),
+                Signer::new(None, vec![]),
+                line_options(same_change),
+            );
+            let path = RepoPath::from_internal_string("selected").unwrap();
+            let mut ids = Vec::new();
+            for mut content in [
+                b"one\nmiddle\nthree\n".as_slice(),
+                b"ONE\nmiddle\nthree\n",
+                b"one\nmiddle\nTHREE\n",
+                b"OTHER\nmiddle\nthree\n",
+            ] {
+                ids.push(store.write_file(path, &mut content).await.unwrap());
+            }
+            let value = |at: usize, executable: bool, copy: u8| {
+                Some(TreeValue::File {
+                    id: ids[at].clone(),
+                    executable,
+                    copy_id: CopyId::from_bytes(&[copy; 16]),
+                })
+            };
+            let cases = [
+                (
+                    "text and metadata resolution",
+                    Merge::from_vec(vec![
+                        value(1, true, 1),
+                        value(0, false, 0),
+                        value(2, false, 0),
+                    ]),
+                ),
+                (
+                    "unresolved text",
+                    Merge::from_vec(vec![
+                        value(1, false, 0),
+                        value(0, false, 0),
+                        value(3, false, 0),
+                    ]),
+                ),
+                (
+                    "unresolved copy identity",
+                    Merge::from_vec(vec![
+                        value(1, false, 1),
+                        value(0, false, 0),
+                        value(2, false, 2),
+                    ]),
+                ),
+                (
+                    "absent term",
+                    Merge::from_vec(vec![value(1, false, 0), None, value(2, false, 0)]),
+                ),
+                (
+                    "same file identity",
+                    Merge::from_vec(vec![
+                        value(1, false, 0),
+                        value(0, false, 0),
+                        value(1, false, 0),
+                    ]),
+                ),
+                (
+                    "canceling terms",
+                    Merge::from_vec(vec![
+                        value(1, false, 0),
+                        value(0, false, 0),
+                        value(2, false, 0),
+                        value(2, false, 0),
+                        value(0, false, 0),
+                    ]),
+                ),
+            ];
+            for (name, values) in cases {
+                let expected = tree_merge::resolve_file_values(&store, path, values.clone())
+                    .await
+                    .unwrap();
+                let actual = tree_merge::resolve_file_values_bounded(
+                    &store,
+                    path,
+                    values,
+                    &mut LineDiffBudget::new(limits()),
+                    || true,
+                )
+                .await
+                .unwrap();
+                assert_eq!(actual, expected, "{name} {same_change:?}");
+            }
+            let values = Merge::from_vec(vec![
+                value(1, false, 0),
+                value(0, false, 0),
+                value(2, false, 0),
+            ]);
+            let count = || {
+                std::fs::read_dir(directory.path().join("files"))
+                    .unwrap()
+                    .count()
+            };
+            let before = count();
+            // Three nontrivial terms need rounded collection storage before
+            // any body can be read or any derived FILE can be written.
+            let mut allocation_limit = limits();
+            allocation_limit.max_allocation_bytes =
+                3 * std::mem::size_of::<Option<&TreeValue>>();
+            assert!(matches!(
+                tree_merge::resolve_file_values_bounded(
+                    &store,
+                    path,
+                    values.clone(),
+                    &mut LineDiffBudget::new(allocation_limit),
+                    || true
+                )
+                .await,
+                Err(tree_merge::BoundedFileResolveError::Budget(
+                    LineDiffError::LimitExceeded
+                ))
+            ));
+            assert_eq!(count(), before);
+            let mut bounded = limits();
+            bounded.max_input_bytes = 1;
+            assert!(matches!(
+                tree_merge::resolve_file_values_bounded(
+                    &store,
+                    path,
+                    values.clone(),
+                    &mut LineDiffBudget::new(bounded),
+                    || true
+                )
+                .await,
+                Err(tree_merge::BoundedFileResolveError::Budget(
+                    LineDiffError::LimitExceeded
+                ))
+            ));
+            assert_eq!(
+                count(),
+                before,
+                "refused reads must not write a derived file"
+            );
+            assert!(matches!(
+                tree_merge::resolve_file_values_bounded(
+                    &store,
+                    path,
+                    values,
+                    &mut LineDiffBudget::new(limits()),
+                    || false
+                )
+                .await,
+                Err(tree_merge::BoundedFileResolveError::Budget(
+                    LineDiffError::Cancelled
+                ))
+            ));
+            assert_eq!(count(), before);
+        }
+    });
+}

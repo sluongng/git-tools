@@ -8,7 +8,10 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
-use tinytree_proto::query_v1::repository_query_server::{RepositoryQuery, RepositoryQueryServer};
+use tinytree_proto::{
+    MERGED_PATH_V2_WORK_CLASS, QUERY_WORK_CLASS_HEADER,
+    query_v1::repository_query_server::{RepositoryQuery, RepositoryQueryServer},
+};
 use tonic::{
     Status, body::Body, codec::CompressionEncoding, metadata::MetadataMap, server::NamedService,
 };
@@ -101,8 +104,14 @@ where
         let history = request.uri().path().ends_with("/PathHistory")
             || request.uri().path().ends_with("/Blame")
             || request.uri().path().ends_with("/OpenAnnotationFrontier")
-            || request.uri().path().ends_with("/OpenAnnotationFrontierPaged")
-            || request.uri().path().ends_with("/ContinueAnnotationFrontier")
+            || request
+                .uri()
+                .path()
+                .ends_with("/OpenAnnotationFrontierPaged")
+            || request
+                .uri()
+                .path()
+                .ends_with("/ContinueAnnotationFrontier")
             || request.uri().path().ends_with("/ReadAnnotationInput");
         let cloud_open = request.uri().path().ends_with("/OpenCloudScope");
         let streaming = cloud_open
@@ -114,6 +123,32 @@ where
             self.repository
                 .query_identity(&metadata)
                 .and_then(|identity| {
+                    // Hints cannot disclose validation errors before authentication.
+                    // Exact routes prevent a hint from selecting cheaper admission.
+                    let classes = request.headers().get_all(QUERY_WORK_CLASS_HEADER);
+                    let mut classes = classes.iter();
+                    let merged_path = match classes.next() {
+                        None => false,
+                        Some(value) => {
+                            if classes.next().is_some()
+                                || value.as_bytes() != MERGED_PATH_V2_WORK_CLASS.as_bytes()
+                            {
+                                return Err(Status::invalid_argument("invalid query work class"));
+                            }
+                            match request.uri().path() {
+                                "/tinytree.query.v1.RepositoryQuery/Evaluate"
+                                | "/tinytree.query.v1.RepositoryQuery/QueryFacts"
+                                | "/tinytree.query.v1.RepositoryQuery/ResolveCommitPrefix"
+                                | "/tinytree.query.v1.RepositoryQuery/ResolveChangePrefix"
+                                | "/tinytree.query.v1.RepositoryQuery/ShortestPrefix" => true,
+                                _ => {
+                                    return Err(Status::invalid_argument(
+                                        "query work class is not supported for this method",
+                                    ));
+                                }
+                            }
+                        }
+                    };
                     let cloud = if cloud_open {
                         identity.cloud_capability()?;
                         let cloud = self.repository.cloud_host().ok_or_else(|| {
@@ -131,16 +166,18 @@ where
                         .repository
                         .query_host()
                         .ok_or_else(|| Status::unavailable("derived queries are not configured"))?;
-                    Ok((deadline, host, cloud))
+                    Ok((deadline, host, cloud, merged_path))
                 });
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
         Box::pin(async move {
-            let (deadline, host, cloud) = match context {
+            let (deadline, host, cloud, merged_path) = match context {
                 Ok(context) => context,
                 Err(status) => return Ok(status.into_http()),
             };
-            let admission = if search {
+            let admission = if merged_path {
+                host.admit_merged_path(deadline).await
+            } else if search {
                 host.admit_search(deadline).await
             } else if history {
                 host.admit_history(deadline).await
@@ -278,6 +315,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_work_class_errors_are_authenticated_static_and_predecode() {
+        let temporary = tempfile::tempdir().unwrap();
+        // No index: class validation must still occur only after authentication,
+        // and before disclosing host availability or polling the body.
+        let repository = repository(temporary.path());
+        for (name, values) in [
+            (
+                "unknown",
+                vec![http::HeaderValue::from_static("private-unknown-value")],
+            ),
+            (
+                "duplicate",
+                vec![
+                    http::HeaderValue::from_static(MERGED_PATH_V2_WORK_CLASS),
+                    http::HeaderValue::from_static(MERGED_PATH_V2_WORK_CLASS),
+                ],
+            ),
+            (
+                "malformed",
+                vec![http::HeaderValue::from_bytes(b"\xff").unwrap()],
+            ),
+            (
+                "whitespace",
+                vec![http::HeaderValue::from_static(" merged-path-v2")],
+            ),
+            (
+                "combined",
+                vec![http::HeaderValue::from_static(
+                    "merged-path-v2, merged-path-v2",
+                )],
+            ),
+        ] {
+            for authenticated in [false, true] {
+                let (mut request, polls) = request(authenticated);
+                for value in &values {
+                    request
+                        .headers_mut()
+                        .append(QUERY_WORK_CLASS_HEADER, value.clone());
+                }
+                let response = repository
+                    .query_grpc_service()
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.headers().get("grpc-status").unwrap(),
+                    if authenticated { "3" } else { "16" },
+                    "{name}"
+                );
+                if authenticated {
+                    assert_eq!(
+                        response.headers().get("grpc-message").unwrap(),
+                        "invalid%20query%20work%20class",
+                        "{name}"
+                    );
+                }
+                assert_eq!(polls.load(Ordering::SeqCst), 0, "{name}");
+            }
+        }
+        for method in [
+            "Search",
+            "PathHistory",
+            "Blame",
+            "OpenScope",
+            "OpenCloudScope",
+            "ForkScope",
+            "CloseScope",
+            "CloseQuery",
+            "OpenAnnotationFrontier",
+            "OpenAnnotationFrontierPaged",
+            "ContinueAnnotationFrontier",
+            "ReadAnnotationInput",
+            "CloseAnnotationFrontier",
+            "Unknown",
+        ] {
+            for authenticated in [false, true] {
+                let (mut request, polls) = request(authenticated);
+                *request.uri_mut() = format!("/tinytree.query.v1.RepositoryQuery/{method}")
+                    .parse()
+                    .unwrap();
+                request.headers_mut().insert(
+                    QUERY_WORK_CLASS_HEADER,
+                    MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+                );
+                let response = repository
+                    .query_grpc_service()
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.headers().get("grpc-status").unwrap(),
+                    if authenticated { "3" } else { "16" },
+                    "{method}"
+                );
+                if authenticated {
+                    assert_eq!(
+                        response.headers().get("grpc-message").unwrap(),
+                        "query%20work%20class%20is%20not%20supported%20for%20this%20method",
+                        "{method}"
+                    );
+                }
+                assert_eq!(polls.load(Ordering::SeqCst), 0, "{method}");
+            }
+        }
+        for method in [
+            "Evaluate",
+            "QueryFacts",
+            "ResolveCommitPrefix",
+            "ResolveChangePrefix",
+            "ShortestPrefix",
+        ] {
+            let (mut request, polls) = request(true);
+            *request.uri_mut() = format!("/tinytree.query.v1.RepositoryQuery/{method}")
+                .parse()
+                .unwrap();
+            request.headers_mut().insert(
+                QUERY_WORK_CLASS_HEADER,
+                MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+            );
+            let response = repository
+                .query_grpc_service()
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get("grpc-status").unwrap(),
+                "14",
+                "{method}"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_path_memory_is_complete_before_decoding_without_taxing_graph_calls() {
+        let temporary = tempfile::tempdir().unwrap();
+        let index =
+            tinytree_index::Index::open(temporary.path().join("index"), &Default::default())
+                .unwrap();
+        let store =
+            tinytree_store::Store::open(temporary.path().join("objects"), Default::default())
+                .unwrap();
+        store.create_repository("example").unwrap();
+        let mut config = ServiceConfig::default();
+        // Two ordinary graph owners fit at their unchanged cost. One complete
+        // heavy owner also fits, but not alongside an ordinary graph owner.
+        let graph_bytes = config.query.request_memory(config.max_request_bytes);
+        config.query.max_request_memory_bytes = 2 * graph_bytes;
+        let repository = RepositoryService::new(
+            store,
+            config,
+            vec!["example".into()],
+            vec![Principal::new("agent", TOKEN, vec!["example".into()], true).unwrap()],
+        )
+        .unwrap()
+        .with_query_index(index)
+        .unwrap();
+        let host = repository.query_host().unwrap();
+        let held = host
+            .admit(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!held.has_history_memory());
+        assert!(!held.has_merged_path_memory());
+        let service = repository.query_grpc_service();
+        let (mut blocked, polls) = request(true);
+        blocked.headers_mut().insert(
+            QUERY_WORK_CLASS_HEADER,
+            MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+        );
+        let response = service.clone().oneshot(blocked).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "4");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        drop(response);
+        let (ordinary, polls) = request(true);
+        let response = service.clone().oneshot(ordinary).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "9");
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        drop(response);
+        drop(held);
+        let (mut accepted, polls) = request(true);
+        accepted.headers_mut().insert(
+            QUERY_WORK_CLASS_HEADER,
+            MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+        );
+        let response = service.oneshot(accepted).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "9");
+        assert!(polls.load(Ordering::SeqCst) > 0);
+        // The response keeps the complete reservation alive, not just decoding.
+        assert_eq!(
+            host.admit(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::DeadlineExceeded
+        );
+        drop(response);
+        let heavy = host
+            .admit_merged_path(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(heavy.has_merged_path_memory());
+        assert!(heavy.has_history_memory());
+        assert!(!heavy.has_search_memory());
+        assert!(heavy.belongs_to(&host));
+    }
+
+    #[tokio::test]
     async fn unknown_size_zstd_window_is_bounded_by_generated_query_decoder() {
         let temporary = tempfile::tempdir().unwrap();
         let index =
@@ -333,20 +579,37 @@ mod tests {
             .await
             .unwrap();
         let service = repository.query_grpc_service();
-        let (blocked, polls) = request(true);
-        let response = service.clone().oneshot(blocked).await.unwrap();
-        assert_eq!(response.headers().get("grpc-status").unwrap(), "4");
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
-        drop(response);
+        for merged_path in [false, true] {
+            let (mut blocked, polls) = request(true);
+            if merged_path {
+                blocked.headers_mut().insert(
+                    QUERY_WORK_CLASS_HEADER,
+                    MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+                );
+            }
+            let response = service.clone().oneshot(blocked).await.unwrap();
+            assert_eq!(response.headers().get("grpc-status").unwrap(), "4");
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            drop(response);
+        }
         drop(held);
 
         // With a single global slot, taking a second permit after decoding would
-        // time out instead of reaching the real missing-scope lookup.
-        let (accepted, polls) = request(true);
-        let response = service.oneshot(accepted).await.unwrap();
-        assert_eq!(response.headers().get("grpc-status").unwrap(), "9");
-        assert!(polls.load(Ordering::SeqCst) > 0);
-        drop(response);
+        // time out instead of reaching the real missing-scope lookup. The heavy
+        // class must also reuse its one complete reservation in the handler.
+        for merged_path in [false, true] {
+            let (mut accepted, polls) = request(true);
+            if merged_path {
+                accepted.headers_mut().insert(
+                    QUERY_WORK_CLASS_HEADER,
+                    MERGED_PATH_V2_WORK_CLASS.parse().unwrap(),
+                );
+            }
+            let response = service.clone().oneshot(accepted).await.unwrap();
+            assert_eq!(response.headers().get("grpc-status").unwrap(), "9");
+            assert!(polls.load(Ordering::SeqCst) > 0);
+            drop(response);
+        }
         assert!(
             host.admit(tokio::time::Instant::now() + Duration::from_secs(1))
                 .await

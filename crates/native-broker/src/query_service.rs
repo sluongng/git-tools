@@ -289,7 +289,7 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
                 child!(v.heads.as_deref());
             }
             E::ChangedPath(v) => {
-                if v.policy_version != 1
+                if !matches!(v.policy_version, 1 | 2)
                     || v.path.is_empty()
                     || v.path.len() > 4096
                     || v.path.contains(['\\', '\0'])

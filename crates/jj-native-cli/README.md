@@ -29,8 +29,12 @@ debug fallback. The mount contains an opaque `.jj/native-workspace` marker;
 operation, index and working-copy state live in private external administration.
 Ordinary `log`, exact-path `log` and `file annotate` use lazy native queries by
 default. Multiple exact-file or prefix selectors in ordinary log form a bounded
-union. Glob patterns, intersections/negation, selected path-merge boundaries and
-exact-file histories crossing a directory remain explicit unsupported cases. Fetch an absent reference explicitly before its first push. Native
+union. Merge commits compare the selected paths against their recursively merged
+parents, using line merging with identical changes accepted. Only selected file
+contents needed for that comparison are read; synthesized content is not published.
+Glob patterns, intersections/negation, other merge options and exact-file histories
+crossing a directory remain explicit unsupported cases. Fetch an absent reference
+explicitly before its first push. Native
 publication is not Git push. Use the [checked landing workflow](#checked-landing)
 below for protected main.
 

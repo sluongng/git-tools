@@ -4,26 +4,52 @@ use futures::{FutureExt, future::BoxFuture};
 use prost::Message as _;
 
 pub(super) fn has_path(expression: &q::GraphExpr) -> bool {
+    has_policy(expression, None)
+}
+pub(super) fn has_merged_path(expression: &q::GraphExpr) -> bool {
+    has_policy(expression, Some(2))
+}
+fn has_policy(expression: &q::GraphExpr, policy: Option<u32>) -> bool {
     use q::graph_expr::Expression as X;
     match expression.expression.as_ref() {
-        Some(X::ChangedPath(_)) => true,
-        Some(X::Ancestors(v)) => v.heads.as_deref().is_some_and(has_path),
+        Some(X::ChangedPath(v)) => {
+            policy.is_none_or(|policy| v.policy_version == policy)
+                || v.candidates
+                    .as_deref()
+                    .is_some_and(|v| has_policy(v, policy))
+        }
+        Some(X::Ancestors(v)) => v.heads.as_deref().is_some_and(|v| has_policy(v, policy)),
         Some(X::Range(v)) => {
-            v.roots.as_deref().is_some_and(has_path) || v.heads.as_deref().is_some_and(has_path)
+            v.roots.as_deref().is_some_and(|v| has_policy(v, policy))
+                || v.heads.as_deref().is_some_and(|v| has_policy(v, policy))
         }
         Some(X::DagRange(v)) => {
-            v.roots.as_deref().is_some_and(has_path) || v.heads.as_deref().is_some_and(has_path)
+            v.roots.as_deref().is_some_and(|v| has_policy(v, policy))
+                || v.heads.as_deref().is_some_and(|v| has_policy(v, policy))
         }
         Some(X::Heads(v) | X::Roots(v) | X::HasConflict(v)) => {
-            v.input.as_deref().is_some_and(has_path)
+            v.input.as_deref().is_some_and(|v| has_policy(v, policy))
         }
-        Some(X::Union(v) | X::Intersection(v)) => v.inputs.iter().any(has_path),
+        Some(X::Union(v) | X::Intersection(v)) => v.inputs.iter().any(|v| has_policy(v, policy)),
         Some(X::Difference(v)) => {
-            v.left.as_deref().is_some_and(has_path) || v.right.as_deref().is_some_and(has_path)
+            v.left.as_deref().is_some_and(|v| has_policy(v, policy))
+                || v.right.as_deref().is_some_and(|v| has_policy(v, policy))
         }
-        Some(X::Latest(v)) => v.candidates.as_deref().is_some_and(has_path),
+        Some(X::Latest(v)) => v
+            .candidates
+            .as_deref()
+            .is_some_and(|v| has_policy(v, policy)),
         _ => false,
     }
+}
+pub(super) fn validate_options(store: &Store) -> Result<(), Error> {
+    let options = store.merge_options();
+    if options.hunk_level != jj_lib::files::FileMergeHunkLevel::Line
+        || options.same_change != jj_lib::merge::SameChange::Accept
+    {
+        return Err(Error::UnsupportedExpression("path_merge_options"));
+    }
+    Ok(())
 }
 fn expr(expression: q::graph_expr::Expression) -> q::GraphExpr {
     q::GraphExpr {
@@ -41,28 +67,7 @@ fn ids(values: &[m::CommitId]) -> q::GraphExpr {
             .collect(),
     }))
 }
-struct Work {
-    bytes: usize,
-    reads: usize,
-    deadline: std::time::Instant,
-}
-impl Work {
-    fn check(&self) -> Result<(), Error> {
-        if std::time::Instant::now() >= self.deadline {
-            return Err(Error::Query(tonic::Code::DeadlineExceeded));
-        }
-        Ok(())
-    }
-    fn reserve(&mut self, limits: &Limits, bytes: usize) -> Result<(), Error> {
-        self.check()?;
-        self.reads = self.reads.checked_add(1).ok_or(Error::Limit)?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or(Error::Limit)?;
-        if self.reads > limits.max_query_edges || self.bytes > limits.max_checkpoint_bytes {
-            return Err(Error::Limit);
-        }
-        Ok(())
-    }
-}
+use super::selected::Work;
 struct CommitRead {
     value: m::Commit,
     _owner: QueryOwner,
@@ -81,7 +86,7 @@ async fn commit(
         .checked_mul(16)
         .and_then(|n| n.checked_add(4096))
         .ok_or(Error::Limit)?;
-    work.reserve(&index.core.limits, maximum)?;
+    work.reserve(&index.core.limits, 1, maximum)?;
     let reply = index
         .core
         .query
@@ -102,7 +107,7 @@ async fn commit(
         .and_then(|n| n.checked_mul(16))
         .and_then(|n| n.checked_add(4096))
         .ok_or(Error::Limit)?;
-    work.bytes -= maximum - actual;
+    work.refund_bytes(maximum - actual)?;
     let m::Object::Commit(value) = reply.value.into_object() else {
         return Err(Error::Canonical);
     };
@@ -146,7 +151,7 @@ async fn path(
             .and_then(|n| n.checked_mul(16))
             .and_then(|n| n.checked_add(4096))
             .ok_or(Error::Limit)?;
-        work.reserve(&index.core.limits, charge)?;
+        work.reserve(&index.core.limits, 1, charge)?;
         let value = index
             .core
             .objects
@@ -216,6 +221,7 @@ pub(super) async fn prepare(
     index: &NativeReadonlyIndex,
     scope: &Arc<CachedScope>,
     expression: q::GraphExpr,
+    caller: Option<Arc<Store>>,
 ) -> Result<(q::GraphExpr, Option<Arc<Preparation>>), Error> {
     if !has_path(&expression)
         || index
@@ -228,6 +234,10 @@ pub(super) async fn prepare(
     }
     // A process-wide bounded physical job owns every snapshot and provider read
     // after caller cancellation. Public ancestry is never enumerated locally.
+    let caller = caller.ok_or(Error::Invalid)?;
+    if has_merged_path(&expression) {
+        validate_options(&caller)?;
+    }
     let timeout = Duration::from_millis(index.core.limits.sync_query_timeout_ms);
     let deadline = std::time::Instant::now() + timeout;
     let runtime = super::revsets::selected_runtime()?;
@@ -244,15 +254,12 @@ pub(super) async fn prepare(
     let (send, recv) = tokio::sync::oneshot::channel();
     runtime.runtime.spawn_blocking(move || {
         let owner: QueryOwner = Arc::new((index.clone(), scope.clone(), preparation.clone()));
-        let mut work = Work {
-            bytes: 0,
-            reads: 0,
-            deadline,
-        };
+        let mut work = Work::with_deadline(deadline);
         let result = futures::executor::block_on(rewrite(
             &index,
             &scope,
             expression,
+            &caller,
             owner.clone(),
             &mut work,
             0,
@@ -283,6 +290,7 @@ fn rewrite<'a>(
     index: &'a NativeReadonlyIndex,
     scope: &'a Arc<CachedScope>,
     mut expression: q::GraphExpr,
+    caller: &'a Arc<Store>,
     owner: QueryOwner,
     work: &'a mut Work,
     depth: usize,
@@ -296,8 +304,16 @@ fn rewrite<'a>(
         match expression.expression.as_mut().ok_or(Error::Invalid)? {
             X::ChangedPath(filter) => {
                 let candidates = *filter.candidates.take().ok_or(Error::Invalid)?;
-                let candidates =
-                    rewrite(index, scope, candidates, owner.clone(), work, depth + 1).await?;
+                let candidates = rewrite(
+                    index,
+                    scope,
+                    candidates,
+                    caller,
+                    owner.clone(),
+                    work,
+                    depth + 1,
+                )
+                .await?;
                 // Reserve bounded draft IDs, selected/matching vectors and
                 // rewritten wire fields before allocating them.
                 let draft_count = index.checkpoint.drafts.len();
@@ -310,7 +326,7 @@ fn rewrite<'a>(
                             .and_then(|m| n.checked_add(m))
                     })
                     .ok_or(Error::Limit)?;
-                work.reserve(&index.core.limits, scratch)?;
+                work.reserve(&index.core.limits, 1, scratch)?;
                 let private: Vec<_> = index
                     .checkpoint
                     .drafts
@@ -346,16 +362,28 @@ fn rewrite<'a>(
                             return Err(Error::Corrupt);
                         }
                         selected.push(id);
-                        if local_changed(
-                            index,
-                            scope,
-                            id,
-                            filter,
-                            Arc::new((owner.clone(), page.owner.clone())),
-                            work,
-                        )
-                        .await?
-                        {
+                        let owner: QueryOwner = Arc::new((owner.clone(), page.owner.clone()));
+                        let changed = match filter.policy_version {
+                            1 => local_changed(index, scope, id, filter, owner, work).await?,
+                            2 => {
+                                let initial = std::mem::replace(work, Work::exhausted());
+                                let (changed, spent) = selected::changed_path(
+                                    caller,
+                                    index,
+                                    scope.clone(),
+                                    jj_id(id),
+                                    owner,
+                                    initial,
+                                    filter,
+                                )
+                                .await
+                                .map_err(local_error)?;
+                                *work = spent;
+                                changed
+                            }
+                            _ => return Err(Error::Invalid),
+                        };
+                        if changed {
                             matches.push(id);
                         }
                     }
@@ -376,38 +404,38 @@ fn rewrite<'a>(
             X::Ancestors(v) => {
                 if let Some(c) = v.heads.take() {
                     v.heads = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
             X::Range(v) => {
                 if let Some(c) = v.roots.take() {
                     v.roots = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
                 if let Some(c) = v.heads.take() {
                     v.heads = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
             X::DagRange(v) => {
                 if let Some(c) = v.roots.take() {
                     v.roots = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
                 if let Some(c) = v.heads.take() {
                     v.heads = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
             X::Heads(v) | X::Roots(v) | X::HasConflict(v) => {
                 if let Some(c) = v.input.take() {
                     v.input = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
@@ -417,6 +445,7 @@ fn rewrite<'a>(
                         index,
                         scope,
                         std::mem::take(c),
+                        caller,
                         owner.clone(),
                         work,
                         depth + 1,
@@ -427,19 +456,19 @@ fn rewrite<'a>(
             X::Difference(v) => {
                 if let Some(c) = v.left.take() {
                     v.left = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
                 if let Some(c) = v.right.take() {
                     v.right = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
             X::Latest(v) => {
                 if let Some(c) = v.candidates.take() {
                     v.candidates = Some(Box::new(
-                        rewrite(index, scope, *c, owner.clone(), work, depth + 1).await?,
+                        rewrite(index, scope, *c, caller, owner.clone(), work, depth + 1).await?,
                     ));
                 }
             }
@@ -452,4 +481,31 @@ fn rewrite<'a>(
         Ok(expression)
     }
     .boxed()
+}
+
+fn local_error(error: RevsetEvaluationError) -> Error {
+    match error {
+        RevsetEvaluationError::Other(error)
+        | RevsetEvaluationError::Backend(jj_lib::backend::BackendError::Other(error)) => error
+            .downcast::<Error>()
+            .map(|error| *error)
+            .unwrap_or_else(|error| {
+                use jj_lib::diff::LineDiffError as D;
+                use jj_lib::files::FileMergeError as F;
+                use jj_lib::tree_merge::BoundedFileResolveError as B;
+                match error.downcast::<B>() {
+                    Ok(error) => match *error {
+                        B::Budget(D::LimitExceeded) | B::Merge(F::Budget(D::LimitExceeded)) => {
+                            Error::Limit
+                        }
+                        B::Budget(D::Cancelled) | B::Merge(F::Budget(D::Cancelled)) => {
+                            Error::Query(tonic::Code::DeadlineExceeded)
+                        }
+                        _ => Error::Canonical,
+                    },
+                    Err(_) => Error::Corrupt,
+                }
+            }),
+        _ => Error::Canonical,
+    }
 }

@@ -166,6 +166,9 @@ struct State {
     pending_row: Option<q::GraphRow>,
     scope: Option<Arc<Scoped>>,
     budget: WorkBudget,
+    path_state: Arc<Mutex<crate::query_history::path::PathState>>,
+    merged_path: bool,
+    path_deadline: Option<tokio::time::Instant>,
     next: u64,
     last: Option<(u64, Result<q::EvaluatePage, Status>)>,
     // Destroy evaluator, pending/raw rows and replay bytes before permits.
@@ -467,6 +470,11 @@ impl CursorHost {
                         pending_row: None,
                         scope: None,
                         budget: host.config.budget(),
+                        path_state: Arc::new(Mutex::new(
+                            crate::query_history::path::PathState::new(&host.config),
+                        )),
+                        merged_path: false,
+                        path_deadline: None,
                         next: 0,
                         last: None,
                         replay_memory: None,
@@ -519,8 +527,8 @@ impl CursorHost {
     /// from QueryFacts' accepted blocking job, including after cancellation.
     pub fn membership(
         &self,
-        host: &QueryHost,
-        scope: &Scoped,
+        host: &Arc<QueryHost>,
+        scope: &Arc<Scoped>,
         expression: q::GraphExpr,
         candidate: m::CommitId,
         budget: &mut WorkBudget,
@@ -528,6 +536,7 @@ impl CursorHost {
         deadline: tokio::time::Instant,
         remaining_steps: &mut u64,
         inputs: &mut usize,
+        path_state: &Arc<Mutex<crate::query_history::path::PathState>>,
     ) -> Result<bool, Status> {
         if *remaining_steps == 0 {
             return Err(Status::resource_exhausted(
@@ -585,6 +594,7 @@ impl CursorHost {
                 scope,
                 repository: &scope.wire.key.as_ref().unwrap().repository_id,
                 deadline,
+                state: path_state.clone(),
             };
             match evaluator
                 .step_with_path(budget, &mut path)
@@ -609,11 +619,31 @@ impl CursorHost {
     }
     pub fn evaluate(
         &self,
-        host: &QueryHost,
+        host: &Arc<QueryHost>,
+        owner: &str,
+        request: q::EvaluateRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<CursorPage, Status> {
+        self.evaluate_admitted(host, owner, request, deadline, false)
+    }
+    pub fn evaluate_admitted(
+        &self,
+        host: &Arc<QueryHost>,
         owner: &str,
         mut request: q::EvaluateRequest,
         deadline: tokio::time::Instant,
+        merged_admitted: bool,
     ) -> Result<CursorPage, Status> {
+        if request
+            .expression
+            .as_ref()
+            .is_some_and(crate::query_eval::has_merged_path)
+            && !merged_admitted
+        {
+            return Err(Status::failed_precondition(
+                "merged path requires predecode admission",
+            ));
+        }
         let key = request
             .scope
             .as_ref()
@@ -740,6 +770,12 @@ impl CursorHost {
                     expires,
                     active: AtomicBool::new(true),
                     state: Some(Mutex::new(State {
+                        merged_path: crate::query_eval::has_merged_path(&expression),
+                        path_deadline: crate::query_eval::has_merged_path(&expression)
+                            .then_some(deadline),
+                        path_state: Arc::new(Mutex::new(
+                            crate::query_history::path::PathState::new(&host.config),
+                        )),
                         pending: Some(expression),
                         evaluator: None,
                         pending_row: None,
@@ -799,6 +835,19 @@ impl CursorHost {
             return Err(Status::failed_precondition("query cursor expired"));
         }
         let mut state = record.state.as_ref().unwrap().lock().unwrap();
+        if state.merged_path && !merged_admitted {
+            return Err(Status::failed_precondition(
+                "merged path requires predecode admission",
+            ));
+        }
+        let deadline = state
+            .path_deadline
+            .map_or(deadline, |original| deadline.min(original));
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded(
+                "merged path original deadline expired",
+            ));
+        }
         if record.closed.load(Ordering::Acquire) {
             return Err(Status::failed_precondition("query is closed"));
         }
@@ -866,13 +915,17 @@ impl CursorHost {
                     Some(row)
                 } else {
                     let State {
-                        evaluator, budget, ..
+                        evaluator,
+                        budget,
+                        path_state,
+                        ..
                     } = &mut *state;
                     let mut path = crate::query_history::CanonicalPathPredicate {
                         host,
                         scope: scope.as_ref().unwrap(),
                         repository: &record.repository,
                         deadline,
+                        state: path_state.clone(),
                     };
                     match evaluator.as_mut().unwrap() {
                         RunningEvaluator::Ids(evaluator) => {

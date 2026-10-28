@@ -2808,12 +2808,431 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
         public.stdout,
         legacy_annotation_oracle(&mut fixture, &root, &public_args)
     );
-    let unsupported = fixture.run(
-        &root,
-        &["--ignore-working-copy", "log", "-r", "@", "hello.cc"],
+    let private_merge_args = ["--ignore-working-copy", "log", "-r", "@", "hello.cc"];
+    let private_merge = fixture.run(&root, &private_merge_args);
+    assert!(
+        private_merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&private_merge.stderr)
     );
-    assert!(!unsupported.status.success());
-    assert!(unsupported.stdout.is_empty());
+    assert_eq!(
+        private_merge.stdout,
+        legacy_annotation_oracle(&mut fixture, &root, &private_merge_args)
+    );
+
+    // Two independent line edits merge cleanly at the selected paths while an
+    // unrelated file remains unresolved. Neither exact nor prefix selection may
+    // hydrate that unrelated FILE or turn the clean merge into a path change.
+    fixture.success(&root, &["new", "-r", "main", "-m", "path merge base"]);
+    fs::write(root.join("hello.cc"), b"base\nanchor\nlast\n").unwrap();
+    fs::create_dir(root.join("selected")).unwrap();
+    fs::write(root.join("selected/child"), b"base\nanchor\nlast\n").unwrap();
+    fs::write(root.join("unrelated.txt"), b"unrelated base\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["bookmark", "set", "path-merge-base", "-r", "@"]);
+    fixture.success(
+        &root,
+        &["new", "-r", "path-merge-base", "-m", "path merge left"],
+    );
+    for path in ["hello.cc", "selected/child"] {
+        fs::write(root.join(path), b"left\nanchor\nlast\n").unwrap();
+    }
+    fs::write(root.join("unrelated.txt"), b"unrelated left\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["bookmark", "set", "path-merge-left", "-r", "@"]);
+    fixture.success(
+        &root,
+        &["new", "-r", "path-merge-base", "-m", "path merge right"],
+    );
+    for path in ["hello.cc", "selected/child"] {
+        fs::write(root.join(path), b"base\nanchor\nright\n").unwrap();
+    }
+    fs::write(root.join("unrelated.txt"), b"unrelated right\n").unwrap();
+    fixture.success(&root, &["status"]);
+    fixture.success(&root, &["bookmark", "set", "path-merge-right", "-r", "@"]);
+    // Historical unresolved candidates are supported without projecting their
+    // conflicted root into the working copy. Keep the mounted WC resolved.
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "--no-edit",
+            "-r",
+            "path-merge-left",
+            "-r",
+            "path-merge-right",
+            "-m",
+            "clean selected path merge",
+        ],
+    );
+    fixture.success(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "path-merge-clean",
+            "-r",
+            "heads(path-merge-left:: & path-merge-right::)",
+        ],
+    );
+    let clean = fixture.revision(&root, "path-merge-clean");
+    assert_eq!(
+        fixture
+            .success(
+                &root,
+                &["file", "show", "-r", "path-merge-clean", "hello.cc"]
+            )
+            .as_bytes(),
+        b"left\nanchor\nright\n"
+    );
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "path-merge-base",
+            "-m",
+            "resolved selected edit source",
+        ],
+    );
+    for path in ["hello.cc", "selected/child"] {
+        fs::write(root.join(path), b"edited\nanchor\nright\n").unwrap();
+    }
+    fixture.success(&root, &["status"]);
+    fixture.success(
+        &root,
+        &["bookmark", "set", "path-merge-edit-source", "-r", "@"],
+    );
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "--no-edit",
+            "-r",
+            "path-merge-left",
+            "-r",
+            "path-merge-right",
+            "-m",
+            "explicit selected path merge edit",
+        ],
+    );
+    fixture.success(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "path-merge-edit",
+            "-r",
+            "heads(path-merge-left:: & path-merge-right::) ~ path-merge-clean",
+        ],
+    );
+    // Rewrite only the selected paths into the unresolved historical commit;
+    // the unrelated conflict remains and the resolved source stays checked out.
+    fixture.success(
+        &root,
+        &[
+            "restore",
+            "--from",
+            "path-merge-edit-source",
+            "--into",
+            "path-merge-edit",
+            "hello.cc",
+            "selected/child",
+        ],
+    );
+    let edited = fixture.revision(&root, "path-merge-edit");
+    let sibling_selection = format!("{clean} | {edited}");
+    assert_eq!(
+        fixture.revision(&root, "@"),
+        fixture.revision(&root, "path-merge-edit-source"),
+        "historical conflict construction must leave the resolved source checked out"
+    );
+    assert_eq!(
+        fixture.success(
+            &root,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &sibling_selection,
+                "-T",
+                "if(conflict, \"conflict\\n\", \"resolved\\n\")"
+            ]
+        ),
+        "conflict\nconflict\n",
+        "both historical candidates must retain the unrelated unresolved conflict"
+    );
+    // Merging the sibling merges requires recursively merging their TWO common
+    // bases (left/right), rather than choosing one base or OR-ing parent diffs.
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "--no-edit",
+            "-r",
+            "path-merge-clean",
+            "-r",
+            "path-merge-edit",
+            "-m",
+            "recursive common-base path merge",
+        ],
+    );
+    fixture.success(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "path-merge-cc",
+            "-r",
+            "heads(path-merge-clean:: & path-merge-edit::)",
+        ],
+    );
+    let joined = fixture.revision(&root, "path-merge-cc");
+    fixture.success(
+        &root,
+        &[
+            "new",
+            "--no-edit",
+            "-r",
+            "path-merge-clean",
+            "-r",
+            "path-merge-edit",
+            "-m",
+            "resolve only previously unrelated path",
+        ],
+    );
+    fixture.success(
+        &root,
+        &[
+            "bookmark",
+            "set",
+            "path-merge-resolution",
+            "-r",
+            "heads(path-merge-clean:: & path-merge-edit::) ~ path-merge-cc",
+        ],
+    );
+    fixture.success(
+        &root,
+        &[
+            "restore",
+            "--from",
+            "path-merge-edit-source",
+            "--into",
+            "path-merge-resolution",
+            "unrelated.txt",
+        ],
+    );
+    let resolved = fixture.revision(&root, "path-merge-resolution");
+    let selection = format!("{clean} | {edited} | {joined} | {resolved}");
+    let selected_files: HashSet<_> = [
+        b"base\nanchor\nlast\n".as_slice(),
+        b"left\nanchor\nlast\n",
+        b"base\nanchor\nright\n",
+        b"left\nanchor\nright\n",
+        b"edited\nanchor\nright\n",
+    ]
+    .into_iter()
+    .map(|bytes| m::file_id(bytes).0)
+    .collect();
+    let unrelated_files: HashSet<_> = [
+        b"unrelated base\n".as_slice(),
+        b"unrelated left\n",
+        b"unrelated right\n",
+    ]
+    .into_iter()
+    .map(|bytes| m::file_id(bytes).0)
+    .collect();
+    let mut merge_observed = Vec::new();
+    for published in [false, true] {
+        if published {
+            // Retain the sibling merges, recursive-base join, and explicit
+            // resolution in one public closure without changing selected IDs.
+            fixture.success(
+                &root,
+                &[
+                    "new",
+                    "--no-edit",
+                    "-r",
+                    "path-merge-cc",
+                    "-r",
+                    "path-merge-resolution",
+                    "-m",
+                    "publish path merge fixture",
+                ],
+            );
+            fixture.success(
+                &root,
+                &[
+                    "bookmark",
+                    "set",
+                    "main",
+                    "-r",
+                    "heads(path-merge-cc:: & path-merge-resolution::)",
+                ],
+            );
+            fixture.success(
+                &root,
+                &[
+                    "tinytree",
+                    "push",
+                    "--reference",
+                    "main",
+                    "--bookmark",
+                    "main",
+                ],
+            );
+        }
+        let stage_public = upstream.public();
+        let stage_writes = upstream.metadata.writes.load(Ordering::SeqCst);
+        upstream.metadata.file_keys.lock().unwrap().clear();
+        let absent_reads = upstream.file_reads();
+        let absent_args = [
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &selection,
+            "-T",
+            "commit_id ++ \"\\n\"",
+            "absent-selected-path",
+        ];
+        let absent = fixture.run(&root, &absent_args);
+        assert!(
+            absent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&absent.stderr)
+        );
+        assert!(absent.stdout.is_empty());
+        assert_eq!(
+            upstream.file_reads(),
+            absent_reads,
+            "unmatched private/public merges must not read FILE bodies"
+        );
+        for selector in ["file:hello.cc", "selected"] {
+            let args = [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &selection,
+                "-T",
+                "commit_id ++ \"\\n\"",
+                selector,
+            ];
+            let output = fixture.run(&root, &args);
+            assert!(
+                output.status.success(),
+                "published={published}/{selector}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.stdout,
+                format!("{edited}\n").as_bytes(),
+                "clean automatic merge must be omitted, explicit merge edit included"
+            );
+            merge_observed.push((
+                args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                output.stdout,
+            ));
+        }
+        let requested = upstream.metadata.file_keys.lock().unwrap();
+        let new_requests = requested.clone();
+        assert!(
+            new_requests.is_subset(&selected_files),
+            "only matched FILE values may hydrate: {new_requests:?}"
+        );
+        assert!(
+            new_requests.is_disjoint(&unrelated_files),
+            "unrelated unresolved conflict must stay unhydrated"
+        );
+        drop(requested);
+        assert_eq!(
+            upstream.metadata.writes.load(Ordering::SeqCst),
+            stage_writes,
+            "ordinary path queries must not publish authoritative merge scratch"
+        );
+        assert_eq!(upstream.public(), stage_public);
+        // Select the unresolved path itself. Clean/edit preserve equal terms;
+        // the recursive join normalizes their raw term layout, which stock
+        // counts as a full-term change alongside the explicit resolution.
+        let unrelated_args = [
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &selection,
+            "-T",
+            "commit_id ++ \"\\n\"",
+            "file:unrelated.txt",
+        ];
+        let unrelated = fixture.run(&root, &unrelated_args);
+        assert!(
+            unrelated.status.success(),
+            "published={published}/unresolved: {}",
+            String::from_utf8_lossy(&unrelated.stderr)
+        );
+        merge_observed.push((
+            unrelated_args.into_iter().map(str::to_owned).collect(),
+            unrelated.stdout,
+        ));
+        let allowed: HashSet<_> = selected_files.union(&unrelated_files).copied().collect();
+        assert!(
+            upstream
+                .metadata
+                .file_keys
+                .lock()
+                .unwrap()
+                .is_subset(&allowed),
+            "the selected unresolved query may hydrate only its own FILE terms"
+        );
+        assert_eq!(
+            upstream.metadata.writes.load(Ordering::SeqCst),
+            stage_writes
+        );
+        assert_eq!(upstream.public(), stage_public);
+        // Counters above belong solely to native commands, not this eager
+        // compatibility oracle which retains identical native commit IDs.
+        for (args, expected) in merge_observed.drain(..) {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let stock = legacy_annotation_oracle(&mut fixture, &root, &args);
+            if args.last() == Some(&"file:unrelated.txt") {
+                // These two changes are siblings, so their topological tie
+                // ordering is unspecified. Compare membership, not tie order.
+                let mut actual = String::from_utf8(expected)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let mut oracle = String::from_utf8(stock)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                oracle.sort_unstable();
+                assert_eq!(
+                    actual, oracle,
+                    "unresolved native/stock membership published={published}"
+                );
+                let mut wanted = vec![joined.clone(), resolved.clone()];
+                wanted.sort_unstable();
+                assert_eq!(
+                    actual, wanted,
+                    "stock counts join normalization and explicit resolution"
+                );
+                assert!(
+                    !actual.contains(&clean) && !actual.contains(&edited),
+                    "equal unresolved terms in the original sibling merges must be excluded"
+                );
+            } else {
+                assert_eq!(
+                    expected, stock,
+                    "native/stock mismatch published={published}/{args:?}"
+                );
+            }
+        }
+    }
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
 }
@@ -5919,11 +6338,120 @@ fn exact_nonprimary_capture_upload_and_empty_cache_restore_preserve_all_raw_enco
     producer.configure_remote(&upstream.endpoint);
     producer.index_mode("federated");
     producer.capture_policy("after_command_best_effort");
+    // The focused merge ancestry adds authoring operations before the desired
+    // multi-head capture. Keep this fixture's pending catalog explicitly bounded
+    // without starving that final capture behind earlier best-effort tickets.
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&producer.daemon_config).unwrap()).unwrap();
+    config["native"]["workspaces"]["capture"]
+        .as_table_mut()
+        .unwrap()
+        .insert("max_pending".into(), 128.into());
+    fs::write(&producer.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+    workspace_daemon::config::Config::load(&producer.daemon_config).unwrap();
     producer.start();
     let base = producer.base().to_owned();
     let root = base.join("exact-variants");
     producer.clone_remote(&root);
     let binding = producer.binding(&root);
+    producer.success(&root, &["new", "-m", "frozen path merge base"]);
+    fs::write(root.join("merge-log.txt"), b"base\nanchor\nlast\n").unwrap();
+    producer.success(&root, &["status"]);
+    producer.success(&root, &["bookmark", "set", "frozen-merge-base", "-r", "@"]);
+    producer.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "frozen-merge-base",
+            "-m",
+            "frozen path merge left",
+        ],
+    );
+    fs::write(root.join("merge-log.txt"), b"left\nanchor\nlast\n").unwrap();
+    producer.success(&root, &["status"]);
+    producer.success(&root, &["bookmark", "set", "frozen-merge-left", "-r", "@"]);
+    producer.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "frozen-merge-base",
+            "-m",
+            "frozen path merge right",
+        ],
+    );
+    fs::write(root.join("merge-log.txt"), b"base\nanchor\nright\n").unwrap();
+    producer.success(&root, &["status"]);
+    producer.success(&root, &["bookmark", "set", "frozen-merge-right", "-r", "@"]);
+    producer.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "frozen-merge-left",
+            "-r",
+            "frozen-merge-right",
+            "-m",
+            "frozen clean path merge",
+        ],
+    );
+    producer.success(&root, &["bookmark", "set", "frozen-merge-clean", "-r", "@"]);
+    let clean = producer.revision(&root, "@");
+    producer.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "frozen-merge-left",
+            "-r",
+            "frozen-merge-right",
+            "-m",
+            "frozen explicit merge edit",
+        ],
+    );
+    fs::write(root.join("merge-log.txt"), b"edited\nanchor\nright\n").unwrap();
+    producer.success(&root, &["status"]);
+    producer.success(&root, &["bookmark", "set", "frozen-merge-edit", "-r", "@"]);
+    let edited = producer.revision(&root, "@");
+    producer.success(
+        &root,
+        &[
+            "new",
+            "-r",
+            "frozen-merge-clean",
+            "-r",
+            "frozen-merge-edit",
+            "-m",
+            "retain both path merge siblings",
+        ],
+    );
+    let joined = producer.revision(&root, "@");
+    let merge_candidates = format!("{clean} | {edited} | {joined}");
+    let merge_args = [
+        "--ignore-working-copy",
+        "log",
+        "--no-graph",
+        "-r",
+        &merge_candidates,
+        "-T",
+        "commit_id ++ \"\\n\"",
+        "file:merge-log.txt",
+    ];
+    let query_writes = upstream.metadata.writes.load(Ordering::SeqCst);
+    let native = producer.run(&root, &merge_args);
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(native.stdout, format!("{edited}\n").as_bytes());
+    assert_eq!(
+        upstream.metadata.writes.load(Ordering::SeqCst),
+        query_writes
+    );
+    let merge_expected = legacy_annotation_oracle(&mut producer, &root, &merge_args);
+    assert_eq!(native.stdout, merge_expected);
     producer.success(&root, &["new", "-m", "exact raw capture"]);
     let authored = b"private captured workspace exact representation\n";
     fs::write(root.join("capture-only.txt"), authored).unwrap();
@@ -6036,7 +6564,11 @@ fn exact_nonprimary_capture_upload_and_empty_cache_restore_preserve_all_raw_enco
         "exact upload cannot rewrite immutable capsules"
     );
     producer.stop_daemon();
-    let capture = verify_uploaded_capture(&upstream, &producer, &binding, &packs, count);
+    let mut capture = verify_uploaded_capture(&upstream, &producer, &binding, &packs, count);
+    capture.merged_path_log = Some(FrozenMergedPathLog {
+        candidates: merge_candidates,
+        expected: merge_expected,
+    });
     upstream.store.gc("example", 1_000_000_000_000).unwrap();
     let public = upstream.public();
     drop(pack_directory);
@@ -6832,6 +7364,11 @@ struct VerifiedRestoreCapture {
     selection: workspace_daemon::control::NativeRestoreSelection,
     data: tinytree_cloud::CaptureData,
     objects: Vec<tinytree_cloud::VerifiedObject>,
+    merged_path_log: Option<FrozenMergedPathLog>,
+}
+struct FrozenMergedPathLog {
+    candidates: String,
+    expected: Vec<u8>,
 }
 
 type RetainedCaptureVersion = (
@@ -7167,6 +7704,7 @@ fn verify_uploaded_capture(
                     },
                     data,
                     objects,
+                    merged_path_log: None,
                 });
             }
             matched = true;
@@ -7403,7 +7941,17 @@ fn restore_captured_workspace_with_watchdog(
         ],
     ))
     .unwrap();
-    assert_eq!(history["coverage"], "complete");
+    // The legacy PathHistory RPC remains explicitly linear. Only this focused
+    // fixture adds merge ancestry; ordinary V2 log below must still compare the
+    // complete selected merge set against its saved stock result.
+    assert_eq!(
+        history["coverage"],
+        if capture.merged_path_log.is_some() {
+            "merge_boundary"
+        } else {
+            "complete"
+        }
+    );
     assert_eq!(history["revision"], captured_revision);
     assert!(history["entries"]
         .as_array()
@@ -7492,6 +8040,61 @@ fn restore_captured_workspace_with_watchdog(
         ordinary_scopes_before,
         "frozen ordinary annotate must not open a live scope for origin metadata or prefixes"
     );
+    if let Some(merge) = &capture.merged_path_log {
+        let retained_before = upstream
+            .metadata
+            .retained_scope_opens
+            .load(Ordering::SeqCst);
+        for selector in ["file:merge-log.txt", "merge-log.txt"] {
+            let args = [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                &merge.candidates,
+                "-T",
+                "commit_id ++ \"\\n\"",
+                selector,
+            ];
+            let output = fixture.run(&root, &args);
+            assert!(
+                output.status.success(),
+                "frozen {selector}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.stdout, merge.expected,
+                "frozen ordinary log preserves the pre-capture stock native-ID result"
+            );
+        }
+        assert!(
+            upstream
+                .metadata
+                .retained_scope_opens
+                .load(Ordering::SeqCst)
+                > retained_before,
+            "ordinary frozen path log must use retained scope admission"
+        );
+        assert_eq!(
+            upstream
+                .metadata
+                .ordinary_scope_opens
+                .load(Ordering::SeqCst),
+            ordinary_scopes_before,
+            "frozen merge selection must not open a live source"
+        );
+        assert_eq!(
+            upstream.file_reads(),
+            file_reads_before,
+            "frozen merge work stays remote; no client historical FILE fallback"
+        );
+        assert_eq!(
+            upstream.metadata.writes.load(Ordering::SeqCst),
+            writes_before_queries,
+            "frozen merged-parent scratch is never authoritative"
+        );
+        assert_eq!(upstream.public(), public_before_queries);
+    }
     let search: serde_json::Value = serde_json::from_str(&fixture.success(
         &root,
         &[

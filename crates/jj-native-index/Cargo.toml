@@ -19,6 +19,7 @@ prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
+tinytree-annotate = { path = "../tinytree-annotate" }
 tinytree-proto = { path = "../tinytree-proto" }
 tinytree-model = { path = "../tinytree-model" }
 tinytree-cloud = { path = "../tinytree-cloud" }

@@ -16,6 +16,7 @@ use q::HistoryPathKind as PathKind;
 
 pub(crate) mod annotation;
 mod dag;
+pub(crate) mod path;
 
 const MAX_PATH_BYTES: usize = 4096;
 
@@ -91,7 +92,12 @@ impl Reader<'_> {
             .read_bytes
             .checked_add(size)
             .ok_or(Failure::Boundary(Coverage::HistoryReadLimit))?;
-        if size > maximum || total > self.read_limit.unwrap_or(self.host.config.max_history_read_bytes) {
+        if size > maximum
+            || total
+                > self
+                    .read_limit
+                    .unwrap_or(self.host.config.max_history_read_bytes)
+        {
             return Err(Failure::Boundary(Coverage::HistoryReadLimit));
         }
         self.budget.charge(1, 0, size as u64).map_err(index_error)?;
@@ -370,10 +376,11 @@ fn finish_failure(failure: Failure) -> Result<Coverage, Status> {
 }
 
 pub(crate) struct CanonicalPathPredicate<'a> {
-    pub host: &'a QueryHost,
-    pub scope: &'a Scoped,
+    pub host: &'a std::sync::Arc<QueryHost>,
+    pub scope: &'a std::sync::Arc<Scoped>,
     pub repository: &'a str,
     pub deadline: Instant,
+    pub state: std::sync::Arc<std::sync::Mutex<path::PathState>>,
 }
 impl crate::query_eval::PathPredicate for CanonicalPathPredicate<'_> {
     fn changed(
@@ -381,8 +388,23 @@ impl crate::query_eval::PathPredicate for CanonicalPathPredicate<'_> {
         id: m::CommitId,
         path: &str,
         exact_file: bool,
+        policy_version: u32,
         budget: &mut WorkBudget,
     ) -> Result<bool, crate::query_eval::EvalError> {
+        if policy_version == 2 {
+            return path::changed(
+                self.host.clone(),
+                self.scope.clone(),
+                self.repository,
+                id,
+                path,
+                exact_file,
+                budget,
+                self.deadline,
+                &self.state,
+            )
+            .map_err(crate::query_eval::EvalError::Read);
+        }
         changed_path(
             self.host,
             self.scope,

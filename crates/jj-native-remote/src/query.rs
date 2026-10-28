@@ -1047,12 +1047,18 @@ impl RemoteQueryIo {
                 }
                 E::ChangedPath(v) => {
                     ensure!(
-                        v.policy_version == 1 && !v.path.is_empty() && v.path.len() <= 4096,
+                        matches!(v.policy_version, 1 | 2)
+                            && !v.path.is_empty()
+                            && v.path.len() <= 4096
+                            && !v.path.contains(['\\', '\0'])
+                            && !v.path.split('/').any(|part| matches!(part, "" | "." | "..")),
                         "unsupported exact path filter"
                     );
-                    if let Some(c) = v.candidates.as_deref() {
-                        pending.push((c, depth + 1));
-                    }
+                    let candidates = v
+                        .candidates
+                        .as_deref()
+                        .context("native exact path candidates missing")?;
+                    pending.push((candidates, depth + 1));
                 }
                 E::Heads(v) | E::Roots(v) | E::HasConflict(v) => {
                     if let Some(c) = v.input.as_deref() {

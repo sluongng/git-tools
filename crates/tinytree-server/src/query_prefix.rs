@@ -46,8 +46,8 @@ pub(crate) struct PrefixSelection<'a> {
 }
 impl<'a> PrefixSelection<'a> {
     pub fn new(
-        host: &'a crate::query_index::QueryHost,
-        scope: &'a Scoped,
+        host: &'a Arc<crate::query_index::QueryHost>,
+        scope: &'a Arc<Scoped>,
         expression: &q::GraphExpr,
         config: &QueryConfig,
         cursors: &CursorHost,
@@ -60,6 +60,13 @@ impl<'a> PrefixSelection<'a> {
             scope,
             repository: &scope.wire.key.as_ref().unwrap().repository_id,
             deadline,
+            state: Arc::new(std::sync::Mutex::new(
+                if crate::query_eval::has_merged_path(expression) {
+                    crate::query_history::path::PathState::prefix(config, scope)
+                } else {
+                    crate::query_history::path::PathState::new(config)
+                },
+            )),
         });
         Ok(selected)
     }
@@ -78,6 +85,13 @@ impl<'a> PrefixSelection<'a> {
             .and_then(|n| {
                 n.checked_add(if crate::query_eval::has_path(expression) {
                     config.path_memory()
+                } else {
+                    0
+                })
+            })
+            .and_then(|n| {
+                n.checked_add(if crate::query_eval::has_merged_path(expression) {
+                    crate::query_history::path::prefix_memo_memory(config)
                 } else {
                     0
                 })

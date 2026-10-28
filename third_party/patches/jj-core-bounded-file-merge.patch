@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH] jj-core: Account merge work in cumulative line budgets
+
+Bounded file resolution also owns term comparisons, streamed input buffers and
+result copies. Expose explicit work/cancellation and allocation charges so the
+caller can use the same budget as the literal diff rather than resetting limits.
+Keep existing comparison entry points and accounting unchanged.
+---
+diff --git a/src/diff/bounded.rs b/src/diff/bounded.rs
+--- a/src/diff/bounded.rs
++++ b/src/diff/bounded.rs
+@@ -69,6 +69,28 @@
+     }
+     pub fn usage(&self) -> LineDiffUsage {
+         self.usage
++    }
++
++    /// Charge caller-owned merge work and poll the same cancellation predicate.
++    /// This extends the cumulative budget to input selection and output copies.
++    pub fn charge_merge_work(
++        &mut self,
++        amount: usize,
++        mut check: impl FnMut() -> bool,
++    ) -> Result<(), LineDiffError> {
++        self.work(amount, &mut check)
++    }
++    /// Precharge a merge allocation before allocating. Charges are cumulative,
++    /// including replaced buffers; caller input and backend admission are separate.
++    pub fn charge_merge_allocation(&mut self, bytes: usize) -> Result<(), LineDiffError> {
++        self.allocate(bytes)
++    }
++    /// Input capacity left for a subsequent comparison. A streaming adapter can
++    /// bound its buffers before the diff itself consumes the input charge.
++    pub fn remaining_input_bytes(&self) -> usize {
++        self.limits
++            .max_input_bytes
++            .saturating_sub(self.usage.input_bytes)
+     }
+ 
+     fn add(value: &mut usize, amount: usize, maximum: usize) -> Result<(), LineDiffError> {

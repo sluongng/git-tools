@@ -148,17 +148,22 @@ pub enum PrefixTarget {
     Change(ChangeId),
 }
 
-fn expression_has_path(expression: &q::GraphExpr) -> bool {
+fn expression_path_policies(expression: &q::GraphExpr) -> (bool, bool) {
     use q::graph_expr::Expression as E;
     let mut todo = vec![expression];
     let mut seen = 0;
+    let (mut linear, mut merged) = (false, false);
     while let Some(node) = todo.pop() {
         seen += 1;
         if seen > 1024 || todo.len() > 1024 {
-            return true;
+            return (true, true);
         }
         match node.expression.as_ref() {
-            Some(E::ChangedPath(_)) => return true,
+            Some(E::ChangedPath(value)) => {
+                linear |= value.policy_version == 1;
+                merged |= value.policy_version == 2;
+                todo.extend(value.candidates.as_deref());
+            }
             Some(E::Ancestors(v)) => todo.extend(v.heads.as_deref()),
             Some(E::Range(v)) => {
                 todo.extend(v.roots.as_deref());
@@ -171,7 +176,7 @@ fn expression_has_path(expression: &q::GraphExpr) -> bool {
             Some(E::Heads(v) | E::Roots(v) | E::HasConflict(v)) => todo.extend(v.input.as_deref()),
             Some(E::Union(v) | E::Intersection(v)) => {
                 if v.inputs.len() > 1024 {
-                    return true;
+                    return (true, true);
                 }
                 todo.extend(&v.inputs);
             }
@@ -183,38 +188,94 @@ fn expression_has_path(expression: &q::GraphExpr) -> bool {
             _ => {}
         }
     }
-    false
+    (linear, merged)
 }
 impl NativeClient {
-    async fn require_path_capability(&self, expression: &q::GraphExpr) -> Result<(), Status> {
-        if !expression_has_path(expression) {
-            return Ok(());
+    // Resource accounting only: this metadata does not substitute for capability
+    // negotiation, authenticated source scope or the original command deadline.
+    fn query_request<T>(&self, value: T, allowance: Duration, merged_path: bool) -> Request<T> {
+        let mut request = self.request(value, allowance);
+        if merged_path {
+            request.metadata_mut().insert(
+                tinytree_proto::QUERY_WORK_CLASS_HEADER,
+                tinytree_proto::MERGED_PATH_V2_WORK_CLASS
+                    .parse()
+                    .expect("fixed query work class"),
+            );
+        }
+        request
+    }
+    async fn query_retry<T, F, Fut>(
+        &self,
+        deadline: Instant,
+        merged_path: bool,
+        operation: F,
+    ) -> Result<T, Status>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Status>>,
+    {
+        let mut policy = self.inner.config.rpc.clone();
+        // A heavy refusal is terminal for this call. Never renew its deadline,
+        // retry with lighter admission or silently reroute to another policy.
+        if merged_path {
+            policy.retry.max_attempts = 1;
+        }
+        policy
+            .retry(deadline, policy.rpc_timeout(), operation)
+            .await
+    }
+    async fn require_path_capability(
+        &self,
+        expression: &q::GraphExpr,
+        deadline: Instant,
+    ) -> Result<bool, Status> {
+        self.require_path_policies(expression_path_policies(expression), deadline)
+            .await
+    }
+    async fn require_path_policies(
+        &self,
+        (linear, merged): (bool, bool),
+        deadline: Instant,
+    ) -> Result<bool, Status> {
+        let mut requested = Vec::new();
+        if linear {
+            requested.push(crate::CapabilityFeature::ExactPathGraphV1);
+        }
+        if merged {
+            requested.push(crate::CapabilityFeature::MergedPathGraphV2);
+        }
+        if requested.is_empty() {
+            return Ok(false);
         }
         let caps = self
-            .capabilities(&[crate::CapabilityFeature::ExactPathGraphV1])
+            .clone()
+            .with_operation_deadline(deadline)
+            .capabilities(&requested)
             .await
             .map_err(|e| {
                 if matches!(
                     e.code(),
                     tonic::Code::InvalidArgument | tonic::Code::Unimplemented
                 ) {
-                    Status::unimplemented("server does not support exact-path graph filtering")
+                    Status::unimplemented("server does not support requested changed-path policy")
                 } else {
                     e
                 }
             })?;
-        let feature = &caps.features[0];
-        if !feature.authorized {
-            return Err(Status::permission_denied(
-                "exact-path graph filter is not authorized",
-            ));
+        for feature in caps.features {
+            if !feature.authorized {
+                return Err(Status::permission_denied(
+                    "changed-path graph filter is not authorized",
+                ));
+            }
+            if !feature.supported {
+                return Err(Status::unimplemented(
+                    "server does not support requested changed-path policy",
+                ));
+            }
         }
-        if !feature.supported {
-            return Err(Status::unimplemented(
-                "server does not support exact-path graph filtering",
-            ));
-        }
-        Ok(())
+        Ok(merged)
     }
     pub(super) fn checked_scope(
         &self,
@@ -593,17 +654,21 @@ impl NativeClient {
         scope: &CheckedScopeHandle,
         facts: Vec<QueryFact>,
     ) -> Result<Vec<FactAnswer>, Status> {
+        let deadline = self.deadline();
         self.checked_scope(scope, false)?;
         self.batch(facts.len())?;
         let mut request_bytes = 256usize;
         let mut input_ids = 0usize;
         let mut expression_nodes = 0usize;
+        let mut path_policies = (false, false);
         for fact in &facts {
             let (count, bytes) = match fact {
                 QueryFact::Membership { expression, .. } => {
                     let (nodes, bytes, literals) =
                         validate_expression(expression, &self.inner.config.limits)?;
-                    self.require_path_capability(expression).await?;
+                    let policies = expression_path_policies(expression);
+                    path_policies.0 |= policies.0;
+                    path_policies.1 |= policies.1;
                     expression_nodes = expression_nodes.checked_add(nodes).ok_or_else(|| {
                         Status::resource_exhausted("query expression nodes exceed budget")
                     })?;
@@ -654,6 +719,7 @@ impl NativeClient {
                 return Err(Status::resource_exhausted("query request exceeds budget"));
             }
         }
+        let merged_path = self.require_path_policies(path_policies, deadline).await?;
         let small_cap = if facts.iter().all(|fact| {
             matches!(
                 fact,
@@ -676,7 +742,6 @@ impl NativeClient {
             .map(|cap| self.small_query_memory(cap))
             .transpose()?
             .flatten();
-        let deadline = self.deadline();
         let budget = self
             .admit(
                 deadline,
@@ -726,7 +791,7 @@ impl NativeClient {
             facts: wire,
         };
         self.bounded(&request)?;
-        self.retry(deadline, false, |allowance| {
+        self.query_retry(deadline, merged_path, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
             if small_memory.is_some() {
                 grpc = grpc
@@ -738,7 +803,7 @@ impl NativeClient {
             let expected = &facts;
             async move {
                 let reply = grpc
-                    .query_facts(self.request(request, allowance))
+                    .query_facts(self.query_request(request, allowance, merged_path))
                     .await?
                     .into_inner();
                 if reply.scope_digest.as_slice() != scope.digest
@@ -813,13 +878,15 @@ impl NativeClient {
         prefix: &str,
         selection: Option<&q::GraphExpr>,
     ) -> Result<CommitPrefix, Status> {
+        let deadline = self.deadline();
         self.checked_selection(selection, 256)?;
-        if let Some(expression) = selection {
-            self.require_path_capability(expression).await?;
-        }
+        let merged_path = if let Some(expression) = selection {
+            self.require_path_capability(expression, deadline).await?
+        } else {
+            false
+        };
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 64)?;
-        let deadline = self.deadline();
         let budget = self.admit(deadline, self.unary_memory()).await?;
         let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ResolveCommitPrefixRequest {
@@ -828,13 +895,13 @@ impl NativeClient {
             selection: selection.cloned(),
         };
         self.bounded(&request)?;
-        self.retry(deadline, false, |allowance| {
+        self.query_retry(deadline, merged_path, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 use q::commit_prefix_result::Result as R;
                 let reply = grpc
-                    .resolve_commit_prefix(self.request(request, allowance))
+                    .resolve_commit_prefix(self.query_request(request, allowance, merged_path))
                     .await?
                     .into_inner();
                 Self::checked_selection_digest(
@@ -885,6 +952,7 @@ impl NativeClient {
         mut visible_heads: Vec<CommitId>,
         selection: Option<&q::GraphExpr>,
     ) -> Result<ChangePrefix, Status> {
+        let deadline = self.deadline();
         self.checked_selection(
             selection,
             visible_heads
@@ -895,15 +963,16 @@ impl NativeClient {
                     Status::resource_exhausted("selected prefix request exceeds budget")
                 })?,
         )?;
-        if let Some(expression) = selection {
-            self.require_path_capability(expression).await?;
-        }
+        let merged_path = if let Some(expression) = selection {
+            self.require_path_capability(expression, deadline).await?
+        } else {
+            false
+        };
         self.checked_scope(scope, false)?;
         check_prefix(prefix, 32)?;
         self.batch(visible_heads.len())?;
         visible_heads.sort_unstable();
         visible_heads.dedup();
-        let deadline = self.deadline();
         let budget = self.admit(deadline, self.unary_memory()).await?;
         let expected_selection = selection.map(Self::prefix_selection_digest);
         let request = q::ResolveChangePrefixRequest {
@@ -913,13 +982,13 @@ impl NativeClient {
             selection: selection.cloned(),
         };
         self.bounded(&request)?;
-        self.retry(deadline, false, |allowance| {
+        self.query_retry(deadline, merged_path, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
             let request = request.clone();
             async move {
                 use q::change_prefix_result::Result as R;
                 let reply = grpc
-                    .resolve_change_prefix(self.request(request, allowance))
+                    .resolve_change_prefix(self.query_request(request, allowance, merged_path))
                     .await?
                     .into_inner();
                 Self::checked_selection_digest(
@@ -1011,6 +1080,7 @@ impl NativeClient {
         mut visible_heads: Vec<CommitId>,
         selection: Option<&q::GraphExpr>,
     ) -> Result<Option<u32>, Status> {
+        let deadline = self.deadline();
         self.checked_selection(
             selection,
             visible_heads
@@ -1021,9 +1091,11 @@ impl NativeClient {
                     Status::resource_exhausted("selected prefix request exceeds budget")
                 })?,
         )?;
-        if let Some(expression) = selection {
-            self.require_path_capability(expression).await?;
-        }
+        let merged_path = if let Some(expression) = selection {
+            self.require_path_capability(expression, deadline).await?
+        } else {
+            false
+        };
         self.checked_scope(scope, false)?;
         self.batch(visible_heads.len())?;
         visible_heads.sort_unstable();
@@ -1044,7 +1116,6 @@ impl NativeClient {
         };
         let response_cap = 1024.min(self.inner.config.limits.max_batch_bytes);
         let small_memory = self.small_query_memory(response_cap)?;
-        let deadline = self.deadline();
         let budget = self
             .admit(
                 deadline,
@@ -1059,7 +1130,7 @@ impl NativeClient {
             selection: selection.cloned(),
         };
         self.bounded(&request)?;
-        self.retry(deadline, false, |allowance| {
+        self.query_retry(deadline, merged_path, |allowance| {
             let mut grpc = self.rpc_client(budget.clone());
             if small_memory.is_some() {
                 grpc = grpc
@@ -1070,7 +1141,7 @@ impl NativeClient {
             let request = request.clone();
             async move {
                 let reply = grpc
-                    .shortest_prefix(self.request(request, allowance))
+                    .shortest_prefix(self.query_request(request, allowance, merged_path))
                     .await?
                     .into_inner();
                 Self::checked_selection_digest(
@@ -1227,6 +1298,7 @@ pub struct CheckedIdsQuery {
     client: NativeClient,
     scope: CheckedScopeHandle,
     expression: Arc<q::GraphExpr>,
+    merged_path: bool,
     query_id: [u8; 32],
     page_size: u32,
     deadline: Instant,
@@ -1416,6 +1488,7 @@ impl NativeClient {
         page_size: u32,
         query_id: [u8; 32],
     ) -> Result<CheckedIdsQuery, Status> {
+        let deadline = self.deadline();
         if scope.query_identity_version == 2
             && scope.bound_query_id(query_id[..16].try_into().unwrap())? != query_id
         {
@@ -1423,7 +1496,6 @@ impl NativeClient {
                 "query identity belongs to another scope",
             ));
         }
-        let deadline = self.deadline();
         self.checked_scope(scope, false)?;
         if page_size == 0
             || page_size as usize > self.inner.config.limits.max_batch_items
@@ -1433,7 +1505,7 @@ impl NativeClient {
         }
         let limits = &self.inner.config.limits;
         let (nodes, encoded, _) = validate_expression(expression, limits)?;
-        self.require_path_capability(expression).await?;
+        let merged_path = self.require_path_capability(expression, deadline).await?;
         // Membership intersections inherit their literal bound. This lets a
         // selected canonical read or template membership check coexist with its
         // still-live outer query without changing graph traversal reservations.
@@ -1484,6 +1556,7 @@ impl NativeClient {
             client: self.without_rpc_guards(),
             scope: scope.clone(),
             expression: Arc::new(expression.clone()),
+            merged_path,
             query_id,
             page_size,
             deadline,
@@ -1546,15 +1619,16 @@ impl NativeClient {
             query.memory.as_ref().ok_or_else(integrity)?.clone(),
             budget,
         ));
+        let merged_path = query.merged_path;
         let reply = self
-            .retry(query.deadline, false, |allowance| {
+            .query_retry(query.deadline, merged_path, |allowance| {
                 query.cleanup_armed = true;
                 query.cleanup_guards = self.guards.clone();
                 let mut grpc = self.inner.grpc.clone();
                 let request = request.clone();
                 let owner = owner.clone();
                 async move {
-                    grpc.evaluate(self.request(request, allowance), owner)
+                    grpc.evaluate(self.query_request(request, allowance, merged_path), owner)
                         .await
                         .map(|response| response.into_inner())
                 }
@@ -1842,15 +1916,16 @@ impl NativeClient {
             core.memory.as_ref().ok_or_else(integrity)?.clone(),
             budget.clone(),
         ));
+        let merged_path = core.merged_path;
         let reply = self
-            .retry(core.deadline, false, |allowance| {
+            .query_retry(core.deadline, merged_path, |allowance| {
                 core.cleanup_armed = true;
                 core.cleanup_guards = self.guards.clone();
                 let mut grpc = self.inner.grpc.clone();
                 let request = request.clone();
                 let owner = owner.clone();
                 async move {
-                    grpc.evaluate(self.request(request, allowance), owner)
+                    grpc.evaluate(self.query_request(request, allowance, merged_path), owner)
                         .await
                         .map(|r| r.into_inner())
                 }
@@ -2291,7 +2366,7 @@ fn validate_expression(
                 children.push(value.heads.as_deref().ok_or_else(invalid)?);
             }
             E::ChangedPath(value) => {
-                if value.policy_version != 1
+                if !matches!(value.policy_version, 1 | 2)
                     || value.path.is_empty()
                     || value.path.len() > 4096
                     || value.path.contains(['\\', '\0'])

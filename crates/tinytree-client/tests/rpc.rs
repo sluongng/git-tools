@@ -49,6 +49,7 @@ struct Running {
     canonical_bytes: Arc<AtomicUsize>,
     files: Arc<AtomicUsize>,
     queries: Arc<QueryCounts>,
+    capabilities: Arc<AtomicUsize>,
 }
 impl Running {
     async fn start(service: RepositoryService, mode: Mode) -> Self {
@@ -68,19 +69,23 @@ impl Running {
         let canonical_bytes = Arc::new(AtomicUsize::new(0));
         let files = Arc::new(AtomicUsize::new(0));
         let queries = Arc::new(QueryCounts::default());
-        let query_service = RepositoryQueryServer::new(QueryFaults {
+        let capabilities = Arc::new(AtomicUsize::new(0));
+        let query_service = service.query_grpc_service_with_adapter(QueryFaults {
             service: service.query_service(),
-            mode: QueryMode::Normal,
+            mode: if mode == Mode::CapabilitiesSlow {
+                QueryMode::SlowAfterCapability
+            } else {
+                QueryMode::Normal
+            },
             counts: queries.clone(),
             first_scope: Arc::new(std::sync::Mutex::new(None)),
             first_page: Arc::new(std::sync::Mutex::new(None)),
             first_search: Arc::new(std::sync::Mutex::new(None)),
             first_history_entry: Arc::new(std::sync::Mutex::new(None)),
             first_annotation: Arc::new(std::sync::Mutex::new(None)),
-        })
-        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+        });
         let faults = Faults {
+            capabilities: capabilities.clone(),
             service,
             mode,
             reads: files.clone(),
@@ -127,6 +132,7 @@ impl Running {
             canonical_bytes,
             files,
             queries,
+            capabilities,
         }
     }
     fn config(&self) -> Config {
@@ -176,6 +182,7 @@ enum Mode {
     CapabilitiesDenied,
     CapabilitiesLimited,
     CapabilitiesTransport,
+    CapabilitiesSlow,
     Normal,
     RetryFile,
     CorruptFile,
@@ -354,6 +361,7 @@ async fn additive_singleton_negotiation_distinguishes_legacy_from_denial_limits_
 
 #[derive(Clone)]
 struct Faults {
+    capabilities: Arc<AtomicUsize>,
     service: RepositoryService,
     mode: Mode,
     reads: Arc<AtomicUsize>,
@@ -371,13 +379,17 @@ impl Repository for Faults {
         &self,
         request: Request<p::GetCapabilitiesRequest>,
     ) -> Result<Response<p::Capabilities>, Status> {
+        self.capabilities.fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::CapabilitiesSlow {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         if self.mode == Mode::CapabilitiesAbsent {
             return Err(Status::unimplemented(
                 "capability negotiation is not installed",
             ));
         }
         if self.mode == Mode::CapabilitiesLegacyFeature
-            && matches!(request.get_ref().features.as_slice(), [11] | [13])
+            && matches!(request.get_ref().features.as_slice(), [11] | [13] | [15])
         {
             return Err(Status::invalid_argument(
                 "legacy capability vocabulary ends at10",
@@ -1794,6 +1806,8 @@ enum QueryMode {
     EvaluatePauseAfter,
     EvaluatePause,
     EvaluateDelay,
+    EvaluateAdmissionRefused,
+    SlowAfterCapability,
     EvaluateMissingExhausted,
     EvaluateWrongDigest,
     EvaluateWrongEpoch,
@@ -1835,6 +1849,7 @@ struct QueryCounts {
     change_prefixes: AtomicUsize,
     shortest_prefixes: AtomicUsize,
     evaluations: AtomicUsize,
+    work_classes: std::sync::Mutex<Vec<(&'static str, Option<String>, bool)>>,
     lost_final_attempts: AtomicUsize,
     query_closes: AtomicUsize,
     close_query_entered: tokio::sync::Notify,
@@ -1854,6 +1869,17 @@ struct QueryFaults {
     first_annotation: Arc<std::sync::Mutex<Option<q::AnnotationFrontierPage>>>,
 }
 impl QueryFaults {
+    fn record_work_class<T>(&self, method: &'static str, request: &Request<T>, continuation: bool) {
+        let class = request
+            .metadata()
+            .get(tinytree_proto::QUERY_WORK_CLASS_HEADER)
+            .map(|value| value.to_str().unwrap().to_owned());
+        self.counts
+            .work_classes
+            .lock()
+            .unwrap()
+            .push((method, class, continuation));
+    }
     fn annotation_page(&self, page: &mut q::AnnotationFrontierPage) {
         self.counts.annotation_nodes.fetch_add(
             page.frontier
@@ -2441,6 +2467,10 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<q::QueryFactsRequest>,
     ) -> Result<Response<q::GraphFacts>, Status> {
+        self.record_work_class("query_facts", &request, false);
+        if self.mode == QueryMode::SlowAfterCapability {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         self.counts.facts.fetch_add(1, Ordering::SeqCst);
         if self.mode == QueryMode::SmallUncompressed {
             assert!(request.metadata().get("grpc-accept-encoding").is_none());
@@ -2486,6 +2516,10 @@ impl RepositoryQuery for QueryFaults {
         &self,
         mut request: Request<q::ResolveCommitPrefixRequest>,
     ) -> Result<Response<q::CommitPrefixResult>, Status> {
+        self.record_work_class("resolve_commit_prefix", &request, false);
+        if self.mode == QueryMode::SlowAfterCapability {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         self.counts.commit_prefixes.fetch_add(1, Ordering::SeqCst);
         if self.mode == QueryMode::PrefixSelectionIgnored {
             request.get_mut().selection = None;
@@ -2508,6 +2542,10 @@ impl RepositoryQuery for QueryFaults {
         &self,
         mut request: Request<q::ResolveChangePrefixRequest>,
     ) -> Result<Response<q::ChangePrefixResult>, Status> {
+        self.record_work_class("resolve_change_prefix", &request, false);
+        if self.mode == QueryMode::SlowAfterCapability {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         self.counts.change_prefixes.fetch_add(1, Ordering::SeqCst);
         if self.mode == QueryMode::PrefixSelectionIgnored {
             request.get_mut().selection = None;
@@ -2530,6 +2568,10 @@ impl RepositoryQuery for QueryFaults {
         &self,
         mut request: Request<q::ShortestPrefixRequest>,
     ) -> Result<Response<q::ShortestPrefixResult>, Status> {
+        self.record_work_class("shortest_prefix", &request, false);
+        if self.mode == QueryMode::SlowAfterCapability {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         self.counts.shortest_prefixes.fetch_add(1, Ordering::SeqCst);
         if self.mode == QueryMode::SmallUncompressed {
             assert!(request.metadata().get("grpc-accept-encoding").is_none());
@@ -2565,7 +2607,14 @@ impl RepositoryQuery for QueryFaults {
         &self,
         request: Request<q::EvaluateRequest>,
     ) -> Result<Response<q::EvaluatePage>, Status> {
+        self.record_work_class("evaluate", &request, !request.get_ref().cursor.is_empty());
+        if self.mode == QueryMode::SlowAfterCapability {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
         let attempt = self.counts.evaluations.fetch_add(1, Ordering::SeqCst);
+        if self.mode == QueryMode::EvaluateAdmissionRefused {
+            return Err(Status::deadline_exceeded("query admission expired"));
+        }
         if self.mode == QueryMode::EvaluatePause {
             self.counts.evaluate_entered.notify_one();
             self.counts.evaluate_release.notified().await;
@@ -2715,6 +2764,19 @@ struct QueryRunning {
 }
 impl QueryRunning {
     async fn start(service: RepositoryService, mode: QueryMode) -> Self {
+        Self::start_with_transport(service, mode, false).await
+    }
+    /// Synthetic cloud replies test the client's untrusted wire/source-echo
+    /// validation, not a configured CloudHost or its authorization/admission.
+    /// Keep this explicit raw peer confined to those parser/lifetime tests.
+    async fn start_cloud_wire_peer(service: RepositoryService, mode: QueryMode) -> Self {
+        Self::start_with_transport(service, mode, true).await
+    }
+    async fn start_with_transport(
+        service: RepositoryService,
+        mode: QueryMode,
+        raw_cloud_wire_peer: bool,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let counts = Arc::new(QueryCounts::default());
@@ -2733,18 +2795,29 @@ impl QueryRunning {
         let cloud = CloudFaults::default();
         cloud.mode.store(30, Ordering::SeqCst);
         let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(RepositoryServer::new(service)
+            let routes = tonic::service::Routes::new(
+                RepositoryServer::new(service.clone())
                     .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-                    .send_compressed(tonic::codec::CompressionEncoding::Zstd))
-                .add_service(
+                    .send_compressed(tonic::codec::CompressionEncoding::Zstd),
+            )
+            .add_service(
+                tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(
+                    cloud,
+                )
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd),
+            );
+            let routes = if raw_cloud_wire_peer {
+                routes.add_service(
                     RepositoryQueryServer::new(faults)
                         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                         .send_compressed(tonic::codec::CompressionEncoding::Zstd),
                 )
-                .add_service(tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(cloud)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-                    .send_compressed(tonic::codec::CompressionEncoding::Zstd))
+            } else {
+                routes.add_service(service.query_grpc_service_with_adapter(faults))
+            };
+            tonic::transport::Server::builder()
+                .add_routes(routes)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
@@ -2906,7 +2979,14 @@ fn change_hex(id: tinytree_model::ChangeId) -> String {
 
 #[tokio::test]
 async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
-    for mode in [Mode::Normal, Mode::CapabilitiesAbsent] {
+    for (policy_version, mode, unsupported) in [
+        (1, Mode::Normal, false),
+        (1, Mode::CapabilitiesAbsent, true),
+        (1, Mode::CapabilitiesLegacyFeature, false),
+        (2, Mode::Normal, false),
+        (2, Mode::CapabilitiesAbsent, true),
+        (2, Mode::CapabilitiesLegacyFeature, true),
+    ] {
         let (_store, _index, service, root, _) = setup_query();
         let running = Running::start(service, mode).await;
         let client = running.client().await;
@@ -2915,7 +2995,7 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
             version: 1,
             expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
                 q::ChangedPathExpr {
-                    policy_version: 1,
+                    policy_version,
                     candidates: Some(Box::new(ids_commits(&[root]))),
                     path: "file".into(),
                     exact_file: true,
@@ -2925,7 +3005,7 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
         let result = client
             .begin_graph_query(&scope, &expression, 1, false)
             .await;
-        if mode == Mode::CapabilitiesAbsent {
+        if unsupported {
             assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
         } else {
             let mut query = result.unwrap();
@@ -2937,6 +3017,299 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
         client.close_query_scope(&scope).await.unwrap();
         running.stop().await;
     }
+}
+
+#[tokio::test]
+async fn changed_path_work_class_follows_policy_across_facts_prefixes_and_query_continuations() {
+    for policy_version in [1, 2] {
+        let mut config = ServiceConfig::default();
+        config.query.max_eval_quantum_steps = 1;
+        let fixture = setup_query_configured(config);
+        let root = fixture.root;
+        let change = fixture.change;
+        let running = QueryRunning::start(fixture.service.clone(), QueryMode::Normal).await;
+        let client = running.client().await;
+        let scope = client.open_query_scope(vec![root]).await.unwrap();
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                q::ChangedPathExpr {
+                    policy_version,
+                    candidates: Some(Box::new(ids_ancestors(root))),
+                    path: "hello.cc".into(),
+                    exact_file: true,
+                },
+            ))),
+        };
+        // Nested path predicates must select the same capability and work class
+        // on every GraphExpr-bearing route, not only top-level ChangedPath.
+        let expression = q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::Union(q::SetExpr {
+                inputs: vec![expression],
+            })),
+        };
+        client
+            .query_facts(
+                &scope,
+                vec![QueryFact::Membership {
+                    expression: expression.clone(),
+                    candidate: root,
+                }],
+            )
+            .await
+            .unwrap();
+        client
+            .resolve_commit_prefix_selected(&scope, "", &expression)
+            .await
+            .unwrap();
+        client
+            .resolve_change_prefix_selected(&scope, "", vec![root], &expression)
+            .await
+            .unwrap();
+        client
+            .shortest_prefix_selected(
+                &scope,
+                PrefixTarget::Change(change),
+                vec![root],
+                &expression,
+            )
+            .await
+            .unwrap();
+        let mut ids = client.begin_query(&scope, &expression, 1).await.unwrap();
+        while !ids.is_exhausted() {
+            client.evaluate_page(&mut ids).await.unwrap();
+        }
+        client.close_ids_query(&mut ids).await.unwrap();
+        let mut graph = client
+            .begin_graph_query(&scope, &expression, 1, false)
+            .await
+            .unwrap();
+        while !graph.is_exhausted() {
+            client.evaluate_graph_page(&mut graph).await.unwrap();
+        }
+        client.close_graph_query(&mut graph).await.unwrap();
+        {
+            let classes = running.counts.work_classes.lock().unwrap();
+            let expected =
+                (policy_version == 2).then_some(tinytree_proto::MERGED_PATH_V2_WORK_CLASS);
+            for (method, class, _) in classes.iter() {
+                assert_eq!(
+                    class.as_deref(),
+                    expected,
+                    "policy {policy_version}: {method}"
+                );
+            }
+            for method in [
+                "query_facts",
+                "resolve_commit_prefix",
+                "resolve_change_prefix",
+                "shortest_prefix",
+                "evaluate",
+            ] {
+                assert!(
+                    classes.iter().any(|(observed, _, _)| *observed == method),
+                    "{method}"
+                );
+            }
+            assert!(
+                classes
+                    .iter()
+                    .any(|(method, _, continuation)| *method == "evaluate" && *continuation)
+            );
+        }
+        // Ordinary graph expressions do not inherit a prior heavy query's class.
+        running.counts.work_classes.lock().unwrap().clear();
+        client
+            .query_facts(
+                &scope,
+                vec![QueryFact::Membership {
+                    expression: ids_commits(&[root]),
+                    candidate: root,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(
+            running
+                .counts
+                .work_classes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, class, _)| class.is_none())
+        );
+        client.close_query_scope(&scope).await.unwrap();
+        running.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn merged_path_admission_refusal_does_not_retry_or_downgrade_query() {
+    let fixture = setup_query_retained();
+    let running =
+        QueryRunning::start(fixture.service.clone(), QueryMode::EvaluateAdmissionRefused).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![fixture.root]).await.unwrap();
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+            q::ChangedPathExpr {
+                policy_version: 2,
+                candidates: Some(Box::new(ids_commits(&[fixture.root]))),
+                path: "hello.cc".into(),
+                exact_file: true,
+            },
+        ))),
+    };
+    let mut query = client.begin_query(&scope, &expression, 1).await.unwrap();
+    assert_eq!(
+        client.evaluate_page(&mut query).await.unwrap_err().code(),
+        Code::DeadlineExceeded
+    );
+    assert_eq!(running.counts.evaluations.load(Ordering::SeqCst), 1);
+    let classes = running.counts.work_classes.lock().unwrap().clone();
+    assert_eq!(
+        classes,
+        vec![(
+            "evaluate",
+            Some(tinytree_proto::MERGED_PATH_V2_WORK_CLASS.to_owned()),
+            false
+        )]
+    );
+    client.close_ids_query(&mut query).await.unwrap();
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn merged_path_capability_and_query_share_one_deadline_and_facts_validate_before_rpc() {
+    let (_store, _index, service, root, _) = setup_query();
+    let running = Running::start(service, Mode::CapabilitiesSlow).await;
+    let mut config = running.config();
+    config.rpc.operation_timeout_ms = 100;
+    config.rpc.rpc_timeout_ms = 1000;
+    let client = NativeClient::connect(config).await.unwrap();
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let expression = q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+            q::ChangedPathExpr {
+                policy_version: 2,
+                candidates: Some(Box::new(ids_commits(&[root]))),
+                path: "hello.cc".into(),
+                exact_file: true,
+            },
+        ))),
+    };
+    // Two valid 70ms RPC stages cannot each receive a fresh 100ms budget.
+    for (route, result) in [
+        (
+            "facts",
+            client
+                .query_facts(
+                    &scope,
+                    vec![QueryFact::Membership {
+                        expression: expression.clone(),
+                        candidate: root,
+                    }],
+                )
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "commit prefix",
+            client
+                .resolve_commit_prefix_selected(&scope, "", &expression)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "change prefix",
+            client
+                .resolve_change_prefix_selected(&scope, "", vec![root], &expression)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "shortest prefix",
+            client
+                .shortest_prefix_selected(
+                    &scope,
+                    PrefixTarget::Commit(root),
+                    vec![root],
+                    &expression,
+                )
+                .await
+                .map(|_| ()),
+        ),
+    ] {
+        assert_eq!(
+            result.unwrap_err().code(),
+            Code::DeadlineExceeded,
+            "{route}"
+        );
+    }
+    let mut linear = expression.clone();
+    if let Some(q::graph_expr::Expression::ChangedPath(path)) = linear.expression.as_mut() {
+        path.policy_version = 1;
+    }
+    let before_combined = running.capabilities.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .query_facts(
+                &scope,
+                vec![
+                    QueryFact::Membership {
+                        expression: linear,
+                        candidate: root
+                    },
+                    QueryFact::Membership {
+                        expression: expression.clone(),
+                        candidate: root
+                    },
+                ]
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    assert_eq!(
+        running.capabilities.load(Ordering::SeqCst),
+        before_combined + 1,
+        "a valid mixed-policy batch negotiates its combined feature set once"
+    );
+    let before = running.capabilities.load(Ordering::SeqCst);
+    let fact_calls = running.queries.facts.load(Ordering::SeqCst);
+    let invalid = q::GraphExpr {
+        version: 1,
+        expression: None,
+    };
+    assert_eq!(
+        client
+            .query_facts(
+                &scope,
+                vec![
+                    QueryFact::Membership {
+                        expression: expression.clone(),
+                        candidate: root
+                    },
+                    QueryFact::Membership {
+                        expression: invalid,
+                        candidate: root
+                    },
+                ]
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(running.capabilities.load(Ordering::SeqCst), before);
+    assert_eq!(running.queries.facts.load(Ordering::SeqCst), fact_calls);
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -8391,7 +8764,7 @@ async fn retained_native_reads_bind_fresh_versions_and_stream_files_beyond_cloud
 async fn cloud_scope_sdk_checks_source_echo_and_forks_without_wire_root_grants() {
     use tinytree_model::CommitId;
     let (_store, _index, service, _, _) = setup_query();
-    let running = QueryRunning::start(service, QueryMode::CloudRetry).await;
+    let running = QueryRunning::start_cloud_wire_peer(service, QueryMode::CloudRetry).await;
     let client = running.client().await;
     let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
@@ -8556,7 +8929,7 @@ async fn cloud_scope_sdk_never_accepts_missing_wrong_or_legacy_source_echoes() {
         (QueryMode::Normal, vec![CommitId([1; 32])]),
     ] {
         let (_store, _index, service, _, _) = setup_query();
-        let running = QueryRunning::start(service, mode).await;
+        let running = QueryRunning::start_cloud_wire_peer(service, mode).await;
         let client = running.client().await;
         let version = client.cloud_retained_version([8; 32], 1).await.unwrap();
         let error = client
@@ -8578,7 +8951,7 @@ async fn cloud_scope_sdk_never_accepts_missing_wrong_or_legacy_source_echoes() {
 #[tokio::test]
 async fn cancelled_cloud_scope_releases_transport_admission_after_physical_response_drains() {
     let (_store, _index, service, _, _) = setup_query();
-    let running = QueryRunning::start(service, QueryMode::CloudPause).await;
+    let running = QueryRunning::start_cloud_wire_peer(service, QueryMode::CloudPause).await;
     let mut config = running.config.clone();
     config.limits.max_inflight = 1;
     let client = NativeClient::connect(config).await.unwrap();

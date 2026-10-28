@@ -627,9 +627,13 @@ pub(crate) struct Work {
     _host: Arc<QueryHost>,
     history_admitted: bool,
     search_admitted: bool,
+    merged_path_admitted: bool,
 }
 
 impl Work {
+    pub fn has_merged_path_memory(&self) -> bool {
+        self.merged_path_admitted
+    }
     pub fn has_search_memory(&self) -> bool {
         self.search_admitted
     }
@@ -645,12 +649,7 @@ impl QueryHost {
     /// the accepted query owns its ordinary history reservation. Refusal leaves
     /// the linear policy's admission cost and physical ownership unchanged.
     pub(crate) fn admit_dag_history(&self) -> Result<OwnedSemaphorePermit, Status> {
-        let work_bytes = usize::try_from(self.config.max_work_bytes).unwrap_or(usize::MAX);
-        let bytes = self
-            .config
-            .max_history_read_bytes
-            .saturating_mul(4)
-            .saturating_add(work_bytes.saturating_mul(2));
+        let bytes = self.dag_history_memory();
         let total = self
             .request_memory
             .saturating_add(self.config.history_memory())
@@ -666,6 +665,14 @@ impl QueryHost {
             .clone()
             .try_acquire_many_owned(bytes)
             .map_err(|_| Status::resource_exhausted("DAG history memory is busy"))
+    }
+
+    fn dag_history_memory(&self) -> usize {
+        let work_bytes = usize::try_from(self.config.max_work_bytes).unwrap_or(usize::MAX);
+        self.config
+            .max_history_read_bytes
+            .saturating_mul(4)
+            .saturating_add(work_bytes.saturating_mul(2))
     }
 
     pub fn new(
@@ -897,25 +904,33 @@ impl QueryHost {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
-        self.admit_kind(deadline, false, false).await
+        self.admit_kind(deadline, false, false, false).await
     }
     pub async fn admit_history(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
-        self.admit_kind(deadline, true, false).await
+        self.admit_kind(deadline, true, false, false).await
     }
     pub async fn admit_search(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<Arc<Work>, Status> {
-        self.admit_kind(deadline, false, true).await
+        self.admit_kind(deadline, false, true, false).await
+    }
+    /// One complete reservation before decoding, with no ordinary owner to upgrade.
+    pub(crate) async fn admit_merged_path(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<Work>, Status> {
+        self.admit_kind(deadline, true, false, true).await
     }
     async fn admit_kind(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         history: bool,
         search: bool,
+        merged_path: bool,
     ) -> Result<Arc<Work>, Status> {
         if self.closing.load(Ordering::Acquire) {
             return Err(Status::unavailable("query host draining"));
@@ -924,6 +939,11 @@ impl QueryHost {
             self.config.history_memory()
         } else if search {
             self.config.search_memory()
+        } else {
+            0
+        });
+        let bytes = bytes.saturating_add(if merged_path {
+            self.dag_history_memory()
         } else {
             0
         });
@@ -955,6 +975,7 @@ impl QueryHost {
             _memory: memory,
             history_admitted: history,
             search_admitted: search,
+            merged_path_admitted: merged_path,
             scopes: Mutex::new(Vec::new()),
             query_owners: Mutex::new(Vec::new()),
         }))

@@ -59,6 +59,9 @@ struct Counters {
     query_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     graph_rpcs: Arc<AtomicUsize>,
     query_rpcs: Arc<AtomicUsize>,
+    merged_path_capability: Arc<AtomicUsize>,
+    capability_requests: Arc<std::sync::Mutex<Vec<Vec<i32>>>>,
+    query_work_classes: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     cloud_rpcs: Arc<AtomicUsize>,
     metadata_keys: Arc<AtomicUsize>,
     metadata_requests: Arc<std::sync::Mutex<Vec<p::ObjectKey>>>,
@@ -92,6 +95,9 @@ impl Counters {
             query_failure: Arc::new(std::sync::Mutex::new(None)),
             graph_rpcs: Arc::new(AtomicUsize::new(0)),
             query_rpcs: Arc::new(AtomicUsize::new(0)),
+            merged_path_capability: Arc::new(AtomicUsize::new(0)),
+            capability_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            query_work_classes: Arc::new(std::sync::Mutex::new(Vec::new())),
             cloud_rpcs: Arc::new(AtomicUsize::new(0)),
             metadata_keys: Arc::new(AtomicUsize::new(0)),
             metadata_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -124,7 +130,24 @@ impl Repository for Counting {
         &self,
         request: Request<p::GetCapabilitiesRequest>,
     ) -> Result<Response<p::Capabilities>, Status> {
-        self.service.get_capabilities(request).await
+        self.counts
+            .capability_requests
+            .lock()
+            .unwrap()
+            .push(request.get_ref().features.clone());
+        let mut response = self.service.get_capabilities(request).await?;
+        let mode = self.counts.merged_path_capability.load(Ordering::SeqCst);
+        for feature in &mut response.get_mut().features {
+            if feature.feature == 15 {
+                if mode == 1 {
+                    feature.supported = false;
+                }
+                if mode == 2 {
+                    feature.authorized = false;
+                }
+            }
+        }
+        Ok(response)
     }
 
     async fn open_repository(
@@ -384,6 +407,7 @@ impl Server {
         let capture_timeouts = counts.capture_timeouts.clone();
         let query_timeouts = counts.query_timeouts.clone();
         let query_failure = counts.query_failure.clone();
+        let query_work_classes = counts.query_work_classes.clone();
         let query = tonic::service::interceptor::InterceptedService::new(
             PreflightCloseFault {
                 inner: service.query_grpc_service(),
@@ -391,6 +415,10 @@ impl Server {
             },
             move |request: Request<()>| {
                 query_requests.fetch_add(1, Ordering::SeqCst);
+                query_work_classes.lock().unwrap().push(
+                    request.metadata().get("x-tinytree-query-work-class")
+                        .and_then(|value| value.to_str().ok()).map(str::to_owned),
+                );
                 if capture_timeouts.load(Ordering::SeqCst) {
                     query_timeouts.lock().unwrap().push(
                         request
@@ -6315,6 +6343,199 @@ async fn selected_file_conflicts_admit_only_needed_deep_bases_through_real_remot
         "selected canonical admission must not hydrate intervening history through BatchReadObjects"
     );
     assert_eq!(counts.graph_rpcs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merged_path_policy_keeps_capability_class_and_retained_query_identity() {
+    use native_broker::{BeginQuery, NativeQueryIo, OpenQueryScope, query_protocol as q};
+    let (_serverdir, store, _fixture, head, _) = seed_history(4);
+    let indexdir = private_dir();
+    let index = tinytree_index::Index::open(indexdir.path(), &Default::default()).unwrap();
+    let service = RepositoryService::new(
+        store,
+        ServiceConfig::default(),
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_retention(true),
+        ],
+    )
+    .unwrap()
+    .with_query_index(index)
+    .unwrap();
+    let counts = Counters::new();
+    let server = Server::start_service(service, counts.clone(), None).await;
+    let directory = private_dir();
+    let (_direct, repo) = local(
+        directory.path(),
+        cache(directory.path()),
+        config(&server),
+        true,
+    );
+    repo.control.admit_reference("main").await.unwrap();
+    let scope = repo
+        .query
+        .open_scope(
+            OpenQueryScope {
+                roots: vec![head],
+                overlay: vec![],
+                replay_key: [81; 32],
+                query_identity_version: 2,
+            },
+            Arc::new(()),
+        )
+        .await
+        .unwrap()
+        .value;
+    let request = |nonce: u8, policy_version, path: String| BeginQuery {
+        scope: scope.handle,
+        expression: q::GraphExpr {
+            version: 1,
+            expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+                q::ChangedPathExpr {
+                    candidates: Some(Box::new(q::GraphExpr {
+                        version: 1,
+                        expression: Some(q::graph_expr::Expression::Commits(q::CommitSet {
+                            commits: vec![q::CommitId {
+                                value: head.0.to_vec(),
+                            }],
+                        })),
+                    })),
+                    path,
+                    policy_version,
+                    exact_file: true,
+                },
+            ))),
+        },
+        projection: q::Projection::Canonical,
+        page_size: 1,
+        replay_key: scope.bound_query_id([nonce; 16]).unwrap(),
+    };
+    for (nonce, mode, expected) in [
+        (1, 1, tonic::Code::Unimplemented),
+        (2, 2, tonic::Code::PermissionDenied),
+    ] {
+        counts.merged_path_capability.store(mode, Ordering::SeqCst);
+        let before = counts.query_rpcs.load(Ordering::SeqCst);
+        assert_eq!(
+            repo.query
+                .begin(
+                    request(nonce, 2, "historical-0003.txt".into()),
+                    Arc::new(())
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(
+            counts.query_rpcs.load(Ordering::SeqCst),
+            before,
+            "unsupported/unauthorized V2 must not evaluate or downgrade"
+        );
+        assert_eq!(
+            counts.capability_requests.lock().unwrap().last().unwrap(),
+            &vec![15]
+        );
+    }
+    counts.merged_path_capability.store(0, Ordering::SeqCst);
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    let capabilities = counts.capability_requests.lock().unwrap().len();
+    for (policy, path) in [
+        (3, "file".into()),
+        (2, "a/../b".into()),
+        (2, "a".repeat(4097)),
+    ] {
+        assert!(
+            repo.query
+                .begin(request(3, policy, path), Arc::new(()))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
+    assert_eq!(
+        counts.capability_requests.lock().unwrap().len(),
+        capabilities
+    );
+    let intent = request(4, 2, "historical-0003.txt".into());
+    let query = repo
+        .query
+        .begin(intent.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .value;
+    let mut rows = Vec::new();
+    let mut sequence = 0;
+    let delivered = loop {
+        let page = repo
+            .query
+            .page(query.handle, sequence, Arc::new(()))
+            .await
+            .unwrap();
+        rows.extend(
+            page.value
+                .rows
+                .iter()
+                .map(|row| row.commit.as_ref().unwrap().value.clone()),
+        );
+        if page.value.exhausted {
+            break page;
+        }
+        sequence += 1;
+    };
+    assert_eq!(rows, vec![head.0.to_vec()]);
+    assert!(
+        counts
+            .query_work_classes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|class| class.as_deref() == Some("merged-path-v2"))
+    );
+    repo.query
+        .close_scope(scope.handle, Arc::new(()))
+        .await
+        .unwrap();
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    assert_eq!(
+        repo.query
+            .begin(intent.clone(), Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .handle,
+        query.handle
+    );
+    let replay = repo
+        .query
+        .page(query.handle, sequence, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(replay.value.rows, delivered.value.rows);
+    assert_eq!(
+        counts.query_rpcs.load(Ordering::SeqCst),
+        before,
+        "same-query replay must retain original cursor class"
+    );
+    let mut changed = intent;
+    let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+        changed.expression.expression.as_mut()
+    else {
+        unreachable!()
+    };
+    filter.policy_version = 1;
+    assert!(
+        repo.query.begin(changed, Arc::new(())).await.is_err(),
+        "policy is part of exact retained query identity"
+    );
+    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
+    repo.query
+        .close_query(query.handle, Arc::new(()))
+        .await
+        .unwrap();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

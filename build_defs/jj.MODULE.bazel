@@ -14,6 +14,7 @@ crate.annotation(
         "//third_party/patches:jj-merge-prepared-index.patch",
         "//third_party/patches:jj-lazy-prefix-context.patch",
         "//third_party/patches:jj-external-rewrites.patch",
+        "//third_party/patches:jj-lib-bounded-file-merge.patch",
     ],
     version = "0.46.0",
 )
@@ -25,6 +26,7 @@ crate.annotation(
     patches = [
         "//third_party/patches:jj-core-bounded-line-diff.patch",
         "//third_party/patches:jj-core-bounded-multi-line-diff.patch",
+        "//third_party/patches:jj-core-bounded-file-merge.patch",
     ],
     version = "0.46.0",
 )

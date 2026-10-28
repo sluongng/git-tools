@@ -5,6 +5,8 @@
 //! does not own an RPC, store, task, or physical admission permit. Callers retain
 //! those owners until this synchronous work and its output have been torn down.
 
+pub mod path;
+
 use std::sync::Arc;
 use tinytree_model as m;
 

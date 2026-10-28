@@ -443,8 +443,8 @@ impl Repository for RepositoryService {
             .admit(&identity, &input.repository_id, false, deadline)
             .await?;
         if input.features.is_empty()
-            || input.features.len() > 14
-            || input.features.iter().any(|id| !(1..=14).contains(id))
+            || input.features.len() > 15
+            || input.features.iter().any(|id| !(1..=15).contains(id))
             || input.features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(
@@ -463,7 +463,7 @@ impl Repository for RepositoryService {
             .into_iter()
             .map(|feature| {
                 let (supported, authorized) = match feature {
-                    1..=3 | 8 | 11 | 12 | 14 => (query, true),
+                    1..=3 | 8 | 11 | 12 | 14 | 15 => (query, true),
                     4 | 6 => (
                         captured,
                         identity
