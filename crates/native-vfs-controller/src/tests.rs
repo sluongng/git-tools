@@ -1456,53 +1456,191 @@ async fn lazy_recreated_tracked_file_keeps_policy_and_original_copy_lineage() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lazy_excluded_nested_local_directory_can_be_tracked_on_a_later_snapshot() {
-    let fixture = Fixture::lazy(false).await;
-    let controller = fixture.open(None).await;
-    let directory = fixture
-        .tree
-        .mkdir(fixture.tree.root_id(), "work", 0o755)
-        .await
-        .unwrap();
-    let node = fixture
-        .tree
-        .create(directory.id, "note", 0o644)
-        .await
-        .unwrap();
-    fixture.tree.write(node.id, 0, b"local note").await.unwrap();
-    let mut policy = options();
-    policy.max_new_file_size = 0;
-    let mut mutation = controller
-        .begin(&controller.inspect().unwrap())
-        .await
-        .unwrap();
-    let (first, _) = mutation.snapshot("exclude-nested", &policy).await.unwrap();
-    assert_eq!(first.after.tree.terms, vec![fixture.base.0]);
-    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
-    mutation
-        .finish(&first.after, &operation(), Some(&first))
-        .await
-        .unwrap();
-    drop(mutation);
-    let mut mutation = controller
-        .begin(&controller.inspect().unwrap())
-        .await
-        .unwrap();
-    let (second, _) = mutation.snapshot("track-nested", &options()).await.unwrap();
-    let root = files(
-        fixture.provider.as_ref(),
-        m::TreeId(second.after.tree.terms[0]),
-    )
-    .await;
-    let m::TreeValue::Tree(work) = root["work"] else {
-        panic!()
-    };
-    let leaves = files(fixture.provider.as_ref(), work).await;
-    assert!(leaves.contains_key("note"));
-    assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fixture.tree.resolve_source("work/note").await.unwrap().id,
-        node.id
-    );
+    #[derive(Clone, Copy)]
+    enum Change {
+        None,
+        NewSubdirectory,
+        UnlinkLeaf,
+        MoveParent,
+        RemoveParent,
+    }
+    for (name, action, expected_parent, expected_uploads) in [
+        ("later tracking", Change::None, Some("work"), 1),
+        (
+            "new nested file after exclusion ACK",
+            Change::NewSubdirectory,
+            Some("work"),
+            2,
+        ),
+        (
+            "unlink excluded leaf after ACK",
+            Change::UnlinkLeaf,
+            None,
+            0,
+        ),
+        (
+            "move retained parent after nested mkdir",
+            Change::MoveParent,
+            Some("moved"),
+            2,
+        ),
+        (
+            "delete retained parent after nested mkdir",
+            Change::RemoveParent,
+            None,
+            0,
+        ),
+    ] {
+        let fixture = Fixture::lazy(false).await;
+        let controller = fixture.open(None).await;
+        let directory = fixture
+            .tree
+            .mkdir(fixture.tree.root_id(), "work", 0o755)
+            .await
+            .unwrap();
+        let node = fixture
+            .tree
+            .create(directory.id, "note", 0o644)
+            .await
+            .unwrap();
+        fixture.tree.write(node.id, 0, b"local note").await.unwrap();
+        let mut policy = options();
+        policy.max_new_file_size = 0;
+        let mut mutation = controller
+            .begin(&controller.inspect().unwrap())
+            .await
+            .unwrap();
+        let (first, _) = mutation.snapshot("exclude-nested", &policy).await.unwrap();
+        assert_eq!(first.after.tree.terms, vec![fixture.base.0]);
+        assert_eq!(fixture.provider.uploads.load(Ordering::SeqCst), 0);
+        mutation
+            .finish(&first.after, &operation(), Some(&first))
+            .await
+            .unwrap();
+        drop(mutation);
+        let mut nested_node = None;
+        match action {
+            Change::None => {}
+            Change::NewSubdirectory | Change::MoveParent => {
+                let nested = fixture
+                    .tree
+                    .mkdir(directory.id, "nested", 0o755)
+                    .await
+                    .unwrap();
+                let child = fixture
+                    .tree
+                    .create(nested.id, "child", 0o644)
+                    .await
+                    .unwrap();
+                fixture
+                    .tree
+                    .write(child.id, 0, b"nested note")
+                    .await
+                    .unwrap();
+                nested_node = Some(child.id);
+                if matches!(action, Change::MoveParent) {
+                    fixture
+                        .tree
+                        .rename(
+                            fixture.tree.root_id(),
+                            "work",
+                            fixture.tree.root_id(),
+                            "moved",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            Change::UnlinkLeaf => {
+                fixture
+                    .tree
+                    .unlink_file(directory.id, "note")
+                    .await
+                    .unwrap();
+            }
+            Change::RemoveParent => {
+                fixture
+                    .tree
+                    .mkdir(directory.id, "temporary", 0o755)
+                    .await
+                    .unwrap();
+                fixture
+                    .tree
+                    .unlink_directory(directory.id, "temporary")
+                    .await
+                    .unwrap();
+                fixture
+                    .tree
+                    .unlink_file(directory.id, "note")
+                    .await
+                    .unwrap();
+                fixture
+                    .tree
+                    .unlink_directory(fixture.tree.root_id(), "work")
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut mutation = controller
+            .begin(&controller.inspect().unwrap())
+            .await
+            .unwrap();
+        let (second, _) = mutation.snapshot("track-nested", &options()).await.unwrap();
+        let mut root = files(
+            fixture.provider.as_ref(),
+            m::TreeId(second.after.tree.terms[0]),
+        )
+        .await;
+        if let Some(parent) = expected_parent {
+            let m::TreeValue::Tree(work) = root.remove(parent).unwrap() else {
+                panic!()
+            };
+            let mut leaves = files(fixture.provider.as_ref(), work).await;
+            assert!(leaves.remove("note").is_some(), "{name}");
+            assert_eq!(
+                fixture
+                    .tree
+                    .resolve_source(&format!("{parent}/note"))
+                    .await
+                    .unwrap()
+                    .id,
+                node.id,
+                "{name}"
+            );
+            if let Some(child) = nested_node {
+                let m::TreeValue::Tree(nested) = leaves.remove("nested").unwrap() else {
+                    panic!()
+                };
+                let nested = files(fixture.provider.as_ref(), nested).await;
+                assert_eq!(
+                    nested.keys().map(String::as_str).collect::<Vec<_>>(),
+                    vec!["child"],
+                    "{name}"
+                );
+                assert_eq!(
+                    fixture
+                        .tree
+                        .resolve_source(&format!("{parent}/nested/child"))
+                        .await
+                        .unwrap()
+                        .id,
+                    child,
+                    "{name}"
+                );
+            }
+            assert!(leaves.is_empty(), "{name}");
+        }
+        assert_eq!(
+            root,
+            files(fixture.provider.as_ref(), fixture.base).await,
+            "{name}: baseline leaves must be preserved exactly"
+        );
+        assert_eq!(
+            fixture.provider.uploads.load(Ordering::SeqCst),
+            expected_uploads,
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

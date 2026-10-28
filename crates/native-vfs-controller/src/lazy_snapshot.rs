@@ -129,6 +129,58 @@ impl<'a> Graph<'a> {
         }
         Ok(())
     }
+    /// A frozen successful namespace operation attests that its parent existed
+    /// at that point in journal order. An excluded local parent can survive ACK
+    /// after its mkdir was consumed without appearing in the canonical tree.
+    /// Recreate only missing structural links, never FILEs or baseline leaves.
+    async fn journal_directory(&mut self, path: &str) -> Result<()> {
+        self.load("", m::TreeId(self.snapshot.baseline_tree()))
+            .await?;
+        let mut current = String::new();
+        for name in path.split('/').filter(|name| !name.is_empty()) {
+            self.scope.check()?;
+            let next = if current.is_empty() {
+                name.into()
+            } else {
+                format!("{current}/{name}")
+            };
+            match self.directories[&current].entries.get(name).cloned() {
+                Some(m::TreeValue::Tree(id)) => self.load(&next, id).await?,
+                Some(_) => bail!("lazy snapshot ancestor is not a directory"),
+                None => {
+                    self.entries = self
+                        .entries
+                        .checked_add(1)
+                        .context("lazy snapshot entry overflow")?;
+                    ensure!(
+                        self.entries <= self.controller.inner.config.source_limits.max_entries,
+                        "lazy snapshot entry limit exceeded"
+                    );
+                    let empty = m::TreeId(
+                        m::encode(&m::Object::Tree(m::Tree::default()), m::Limits::default())?
+                            .descriptor
+                            .key
+                            .id
+                            .0,
+                    );
+                    self.directories
+                        .get_mut(&current)
+                        .unwrap()
+                        .entries
+                        .insert(name.into(), m::TreeValue::Tree(empty));
+                    self.directories.insert(
+                        next.clone(),
+                        Directory {
+                            entries: BTreeMap::new(),
+                            original: None,
+                        },
+                    );
+                }
+            }
+            current = next;
+        }
+        Ok(())
+    }
     async fn lookup(&mut self, path: &str) -> Result<Option<m::TreeValue>> {
         let (parent, name) = split(path);
         self.directory(parent).await?;
@@ -277,7 +329,7 @@ impl<'a> Graph<'a> {
             match change {
                 SourceNamespaceChange::MakeDirectory { path } => {
                     let (parent, name) = split(&path);
-                    self.directory(parent).await?;
+                    self.journal_directory(parent).await?;
                     // A new directory remains a temporary structural node. Empty
                     // new directories are pruned, matching jj tracking semantics.
                     let empty = m::TreeId(
@@ -302,7 +354,7 @@ impl<'a> Graph<'a> {
                 }
                 SourceNamespaceChange::Remove { path, origin, .. } => {
                     let (parent, name) = split(&path);
-                    self.directory(parent).await?;
+                    self.journal_directory(parent).await?;
                     let removed = self
                         .directories
                         .get_mut(parent)
@@ -318,7 +370,7 @@ impl<'a> Graph<'a> {
                 }
                 SourceNamespaceChange::Move { from, to, origin } => {
                     let (from_parent, from_name) = split(&from);
-                    self.directory(from_parent).await?;
+                    self.journal_directory(from_parent).await?;
                     let value = self
                         .directories
                         .get_mut(from_parent)
@@ -335,7 +387,7 @@ impl<'a> Graph<'a> {
                     }
                     let value = self.renamed(value, &from, &to).await?;
                     let (parent, name) = split(&to);
-                    self.directory(parent).await?;
+                    self.journal_directory(parent).await?;
                     self.directories
                         .get_mut(parent)
                         .unwrap()
