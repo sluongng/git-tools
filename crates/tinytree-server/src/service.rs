@@ -1280,6 +1280,18 @@ pub(crate) fn store_status(error: tinytree_store::Error) -> Status {
         E::IdempotencyConflict => {
             Status::already_exists("native idempotency key has another request")
         }
+        E::Limit("object closure") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+        E::Limit("closure edges") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreClosureEdges.message()),
+        E::Limit("closure metadata bytes") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreClosureMetadataBytes.message()),
+        E::Limit("tree path contexts") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathContexts.message()),
+        E::Limit("tree path length") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathLength.message()),
+        E::Limit("tree path context bytes") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathContextBytes.message()),
+        E::Limit("object size") => Status::resource_exhausted("native store limit: object_size"),
+        E::Limit("staging byte budget") => Status::resource_exhausted("native store limit: staging_byte_budget"),
+        E::Limit("staging upload budget") => Status::resource_exhausted("native store limit: staging_upload_budget"),
+        E::Limit("repository staging bytes") => Status::resource_exhausted("native store limit: repository_staging_bytes"),
+        E::Limit("repository staging objects") => Status::resource_exhausted("native store limit: repository_staging_objects"),
+        E::Limit("repository quota") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreRepositoryQuota.message()),
         E::Limit(_) => Status::resource_exhausted("native store limit exceeded"),
         E::Poisoned => Status::unavailable("native store requires recovery"),
         E::Io(_) | E::Database(_) => Status::internal("native storage operation failed"),
@@ -1498,6 +1510,35 @@ fn graph_difference(
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+    #[test]
+    fn store_limit_diagnostics_are_finite_static_and_keep_unknown_limits_private() {
+        use tinytree_proto::PublicationFailureReason as Reason;
+        for (term, expected) in [
+            ("object closure", Reason::StoreObjectClosure.message()),
+            ("closure edges", Reason::StoreClosureEdges.message()),
+            ("closure metadata bytes", Reason::StoreClosureMetadataBytes.message()),
+            ("tree path contexts", Reason::StoreTreePathContexts.message()),
+            ("tree path length", Reason::StoreTreePathLength.message()),
+            ("tree path context bytes", Reason::StoreTreePathContextBytes.message()),
+            ("repository quota", Reason::StoreRepositoryQuota.message()),
+            ("object size", "native store limit: object_size"),
+            ("staging byte budget", "native store limit: staging_byte_budget"),
+            ("staging upload budget", "native store limit: staging_upload_budget"),
+            ("repository staging bytes", "native store limit: repository_staging_bytes"),
+            ("repository staging objects", "native store limit: repository_staging_objects"),
+            ("object closure /private/fixture", "native store limit exceeded"),
+            ("staging byte budget /private/fixture", "native store limit exceeded"),
+            ("private-marker token=not-real", "native store limit exceeded"),
+        ] {
+            let error = store_status(tinytree_store::Error::Limit(term));
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(error.message(), expected);
+            assert!(error.details().is_empty());
+            assert!(!format!("{error:?}").contains("private-marker"));
+            assert!(!error.message().contains("/private/"));
+            assert!(!reapi::policy::retryable(&error));
+        }
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graph_handler_roots_survive_gc_only_until_physical_traversal_finishes() {
         let temporary = tempfile::tempdir().unwrap();

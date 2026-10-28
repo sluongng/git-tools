@@ -7016,7 +7016,12 @@ fn rolling_cloud_window_preserves_a_cold_host_pinned_restore_after_restart() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let initial = retained_capture_versions(&upstream, binding.workspace_id, first_count);
-    let selected = initial.last().unwrap();
+    // Fresh-first scheduling can publish the edited capture before the clone
+    // capture. Select logical capture order, not publication generation order.
+    let selected = initial
+        .iter()
+        .max_by_key(|version| version.3.history.recovery.sequence)
+        .unwrap();
     let selection = workspace_daemon::control::NativeRestoreSelection {
         workspace_id: binding.workspace_id,
         generation: selected.0,

@@ -1488,6 +1488,18 @@ impl native_broker::NativeRepositoryControl for FakeControl {
     ) -> Result<native_broker::ReferenceSnapshot, tonic::Status> {
         self.observations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if matches!(name, "closure-limit" | "closure-private" | "closure-wrong-code") {
+            let mut error = match name {
+                "closure-limit" => tonic::Status::resource_exhausted(
+                    tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+                "closure-wrong-code" => tonic::Status::unavailable(
+                    tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+                _ => tonic::Status::resource_exhausted(
+                    "workspace-cloud limit: store_object_closure /private/fixture"),
+            };
+            error.metadata_mut().insert("x-test-detail", "not-for-client".parse().unwrap());
+            return Err(error);
+        }
         if name == "offline" {
             let mut error = tonic::Status::unavailable("fixture diagnostic must stay server-side");
             error
@@ -1679,6 +1691,21 @@ async fn control_preserves_observation_generation_and_caller_cas_across_independ
     assert_eq!(error.code(), tonic::Code::Unavailable);
     assert!(!error.message().contains("fixture diagnostic"));
     assert!(error.metadata().get("x-test-detail").is_none());
+    for (name, code, message) in [
+        ("closure-limit", tonic::Code::ResourceExhausted,
+            tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+        ("closure-private", tonic::Code::ResourceExhausted,
+            "native repository control limit exceeded"),
+        ("closure-wrong-code", tonic::Code::Unavailable,
+            "native repository control outcome is unavailable; preserve the original intent"),
+    ] {
+        let error = client.observe_reference(name).await.unwrap_err();
+        assert_eq!(error.code(), code);
+        assert_eq!(error.message(), message);
+        assert!(error.details().is_empty());
+        assert!(error.metadata().get("x-test-detail").is_none());
+        assert!(!error.message().contains("/private/"));
+    }
     let local = native_broker::BrokerControlClient::connect(&socket, "local-only", config())
         .await
         .unwrap();

@@ -10,7 +10,11 @@ use tinytree_model::CommitId;
 use tonic::Status;
 fn status(error: anyhow::Error) -> Status {
     if let Some(status) = error.downcast_ref::<Status>() {
-        return Status::new(status.code(), "native repository control operation failed");
+        let reason = (status.code() == tonic::Code::ResourceExhausted)
+            .then(|| tinytree_proto::PublicationFailureReason::from_message(status.message()))
+            .flatten();
+        return Status::new(status.code(), reason.map(|reason| reason.message())
+            .unwrap_or("native repository control operation failed"));
     }
     Status::internal("native repository control operation failed")
 }

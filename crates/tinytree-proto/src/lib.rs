@@ -108,6 +108,15 @@ pub enum PublicationFailureReason {
     StoreIndexGraphWork,
     StoreIndexAggregatePayload,
     StoreIndexAnchorProof,
+    StoreObjectClosure,
+    StoreClosureEdges,
+    StoreClosureMetadataBytes,
+    StoreTreePathContexts,
+    StoreTreePathLength,
+    StoreTreePathContextBytes,
+    StorePromisedRootQuotaScan,
+    StorePrincipalClosureBytes,
+    StoreLogicalHeadBinding,
     UnknownStoreLimit,
 }
 impl PublicationFailureReason {
@@ -177,6 +186,15 @@ impl PublicationFailureReason {
             Self::StoreIndexGraphWork => "store_index_graph_work",
             Self::StoreIndexAggregatePayload => "store_index_aggregate_payload",
             Self::StoreIndexAnchorProof => "store_index_anchor_proof",
+            Self::StoreObjectClosure => "store_object_closure",
+            Self::StoreClosureEdges => "store_closure_edges",
+            Self::StoreClosureMetadataBytes => "store_closure_metadata_bytes",
+            Self::StoreTreePathContexts => "store_tree_path_contexts",
+            Self::StoreTreePathLength => "store_tree_path_length",
+            Self::StoreTreePathContextBytes => "store_tree_path_context_bytes",
+            Self::StorePromisedRootQuotaScan => "store_promised_root_quota_scan",
+            Self::StorePrincipalClosureBytes => "store_principal_closure_bytes",
+            Self::StoreLogicalHeadBinding => "store_logical_head_binding",
             Self::UnknownStoreLimit => "unknown_store_limit",
         }
     }
@@ -246,6 +264,15 @@ impl PublicationFailureReason {
             Self::StoreIndexGraphWork => "workspace-cloud limit: store_index_graph_work",
             Self::StoreIndexAggregatePayload => "workspace-cloud limit: store_index_aggregate_payload",
             Self::StoreIndexAnchorProof => "workspace-cloud limit: store_index_anchor_proof",
+            Self::StoreObjectClosure => "workspace-cloud limit: store_object_closure",
+            Self::StoreClosureEdges => "workspace-cloud limit: store_closure_edges",
+            Self::StoreClosureMetadataBytes => "workspace-cloud limit: store_closure_metadata_bytes",
+            Self::StoreTreePathContexts => "workspace-cloud limit: store_tree_path_contexts",
+            Self::StoreTreePathLength => "workspace-cloud limit: store_tree_path_length",
+            Self::StoreTreePathContextBytes => "workspace-cloud limit: store_tree_path_context_bytes",
+            Self::StorePromisedRootQuotaScan => "workspace-cloud limit: store_promised_root_quota_scan",
+            Self::StorePrincipalClosureBytes => "workspace-cloud limit: store_principal_closure_bytes",
+            Self::StoreLogicalHeadBinding => "workspace-cloud limit: store_logical_head_binding",
             Self::UnknownStoreLimit => "workspace-cloud limit: unknown_store_limit",
         }
     }
@@ -316,6 +343,15 @@ impl PublicationFailureReason {
             "workspace-cloud limit: store_index_graph_work" => Some(Self::StoreIndexGraphWork),
             "workspace-cloud limit: store_index_aggregate_payload" => Some(Self::StoreIndexAggregatePayload),
             "workspace-cloud limit: store_index_anchor_proof" => Some(Self::StoreIndexAnchorProof),
+            "workspace-cloud limit: store_object_closure" => Some(Self::StoreObjectClosure),
+            "workspace-cloud limit: store_closure_edges" => Some(Self::StoreClosureEdges),
+            "workspace-cloud limit: store_closure_metadata_bytes" => Some(Self::StoreClosureMetadataBytes),
+            "workspace-cloud limit: store_tree_path_contexts" => Some(Self::StoreTreePathContexts),
+            "workspace-cloud limit: store_tree_path_length" => Some(Self::StoreTreePathLength),
+            "workspace-cloud limit: store_tree_path_context_bytes" => Some(Self::StoreTreePathContextBytes),
+            "workspace-cloud limit: store_promised_root_quota_scan" => Some(Self::StorePromisedRootQuotaScan),
+            "workspace-cloud limit: store_principal_closure_bytes" => Some(Self::StorePrincipalClosureBytes),
+            "workspace-cloud limit: store_logical_head_binding" => Some(Self::StoreLogicalHeadBinding),
             "workspace-cloud limit: unknown_store_limit" => Some(Self::UnknownStoreLimit),
             "private workspace call budget exhausted" => Some(Self::ServerAdmissionCall),
             "private workspace memory budget exhausted" => Some(Self::ServerAdmissionMemory),
@@ -332,6 +368,26 @@ mod tests {
     use super::{FILE_DESCRIPTOR_SET, query_v1, v1};
     use prost::Message;
     use tonic::{codec::CompressionEncoding, transport::Channel};
+
+    #[test]
+    fn finite_store_resource_reasons_round_trip_without_accepting_extra_text() {
+        use super::PublicationFailureReason as Reason;
+        for (reason, name) in [
+            (Reason::StoreObjectClosure, "store_object_closure"),
+            (Reason::StoreClosureEdges, "store_closure_edges"),
+            (Reason::StoreClosureMetadataBytes, "store_closure_metadata_bytes"),
+            (Reason::StoreTreePathContexts, "store_tree_path_contexts"),
+            (Reason::StoreTreePathLength, "store_tree_path_length"),
+            (Reason::StoreTreePathContextBytes, "store_tree_path_context_bytes"),
+            (Reason::StorePromisedRootQuotaScan, "store_promised_root_quota_scan"),
+            (Reason::StorePrincipalClosureBytes, "store_principal_closure_bytes"),
+            (Reason::StoreLogicalHeadBinding, "store_logical_head_binding"),
+        ] {
+            assert_eq!(reason.as_str(), name);
+            assert_eq!(Reason::from_message(reason.message()), Some(reason));
+            assert_eq!(Reason::from_message(&format!("{} private-marker", reason.message())), None);
+        }
+    }
 
     #[test]
     fn durable_version_pins_have_explicit_unary_contracts() {

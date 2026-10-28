@@ -157,6 +157,21 @@ impl Repository for Counting {
         self.counts
             .reference_observations
             .fetch_add(1, Ordering::SeqCst);
+        if let [name] = r.get_ref().reference_names.as_slice() {
+            if matches!(name.as_str(), "closure-limit" | "closure-private" | "closure-wrong-code") {
+                let (code, message) = match name.as_str() {
+                    "closure-limit" => (tonic::Code::ResourceExhausted,
+                        tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+                    "closure-wrong-code" => (tonic::Code::Unavailable,
+                        tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+                    _ => (tonic::Code::ResourceExhausted,
+                        "workspace-cloud limit: store_object_closure /private/fixture"),
+                };
+                let mut error = Status::with_details(code, message, b"private-details".as_slice().into());
+                error.metadata_mut().insert("x-test-private", "not-for-client".parse().unwrap());
+                return Err(error);
+            }
+        }
         if self.counts.capture_timeouts.load(Ordering::SeqCst)
             && r.get_ref().reference_names == ["absent"]
         {
@@ -3254,6 +3269,23 @@ async fn private_broker_control_preserves_absent_tombstones_and_exact_historical
     })
     .await
     .unwrap();
+    // Exercise the actual RemoteRepositoryControl adapter and broker RPC, not
+    // a host fake that bypasses the anyhow-to-Status privacy boundary.
+    for (name, code, message) in [
+        ("closure-limit", tonic::Code::ResourceExhausted,
+            tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
+        ("closure-private", tonic::Code::ResourceExhausted,
+            "native repository control limit exceeded"),
+        ("closure-wrong-code", tonic::Code::Unavailable,
+            "native repository control outcome is unavailable; preserve the original intent"),
+    ] {
+        let error = client.observe_reference(name).await.unwrap_err();
+        assert_eq!(error.code(), code);
+        assert_eq!(error.message(), message);
+        assert!(error.details().is_empty());
+        assert!(error.metadata().get("x-test-private").is_none());
+        assert!(!error.message().contains("/private/"));
+    }
     let absent = client.observe_reference("new-reference").await.unwrap();
     assert_eq!(absent.generation, 0);
     assert!(absent.head.is_none());

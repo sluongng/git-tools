@@ -916,6 +916,7 @@ struct Worker {
     stats: Arc<Stats>,
     admission: Arc<Semaphore>,
     next_ticket: Mutex<Option<(u64, native_retention::CaptureId)>>,
+    fresh_turn: AtomicBool,
     next_retirement: Mutex<Option<(u64, native_retention::CaptureId)>>,
     availability_schedule: Mutex<availability::Schedule>,
     _hooks: Arc<TestHooks>,
@@ -978,6 +979,7 @@ async fn start_inner(
         stats,
         admission: Arc::new(Semaphore::new(1)),
         next_ticket: Mutex::new(None),
+        fresh_turn: AtomicBool::new(true),
         next_retirement: Mutex::new(None),
         availability_schedule: Mutex::new(Default::default()),
         _hooks: hooks,
@@ -1751,7 +1753,33 @@ impl Worker {
                 tickets.partition_point(|ticket| (ticket.registry_epoch, ticket.id) <= last);
             tickets.rotate_left(split);
         }
-        for ticket in tickets.iter().cloned() {
+        // Startup and every other turn prioritize the newest captured WIP,
+        // including a prepared family retrying transient failure. Historical
+        // round-robin retains the alternate turns and its independent cursor.
+        let mut fresh = None;
+        if self.fresh_turn.load(Ordering::Acquire) {
+            for ticket in &tickets {
+                if self.policy.policy == NativeCaptureUploadPolicy::Auto
+                    && !self.host.capture_auto_upload(ticket)?
+                {
+                    continue;
+                }
+                if path_absent(&self.directory, &format!("{}.published", hex(&ticket.id.0)))?
+                    && fresh.as_ref().is_none_or(|previous: &PendingCapture| {
+                        (ticket.registry_epoch, ticket.id) > (previous.registry_epoch, previous.id)
+                    })
+                {
+                    fresh = Some(ticket.clone());
+                }
+            }
+        }
+        let fresh_id = fresh.as_ref().map(|ticket| ticket.id);
+        let mut scheduled = tickets.clone();
+        if let Some(fresh) = fresh {
+            scheduled.retain(|ticket| ticket.id != fresh.id);
+            scheduled.insert(0, fresh);
+        }
+        for ticket in scheduled {
             if self.policy.policy == NativeCaptureUploadPolicy::Auto
                 && !self.host.capture_auto_upload(&ticket)?
             {
@@ -1770,11 +1798,15 @@ impl Worker {
                 .await??;
                 continue;
             }
-            *self
-                .next_ticket
-                .lock()
-                .map_err(|_| anyhow::anyhow!("capture cursor unavailable"))? =
-                Some((ticket.registry_epoch, ticket.id));
+            let selected_fresh = Some(ticket.id) == fresh_id;
+            if !selected_fresh {
+                *self
+                    .next_ticket
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture cursor unavailable"))? =
+                    Some((ticket.registry_epoch, ticket.id));
+            }
+            self.fresh_turn.store(!selected_fresh, Ordering::Release);
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             let worker = self.clone();
             let progress = Progress::new("routing");
@@ -1816,9 +1848,11 @@ impl Worker {
         // Reconciliation/replay must not consume the deadline before one queued
         // immutable backup gets its turn, even on an unavailable other source.
         let reconciliation_progress = Progress::new("retained_pin_reconciliation");
-        let reconciliation =
-            tokio::time::timeout_at(deadline, self.reconcile_retained_sources(admission.clone(), deadline))
-                .await;
+        let reconciliation = tokio::time::timeout_at(
+            deadline,
+            self.reconcile_retained_sources(admission.clone(), deadline),
+        )
+        .await;
         if !matches!(&reconciliation, Ok(Ok(()))) {
             self.stats
                 .outcome(true, &reconciliation_progress, &reconciliation);
@@ -4816,6 +4850,7 @@ max_manifest_members=1024
             stats: f.worker.stats.clone(),
             admission: f.worker.admission.clone(),
             next_ticket: Mutex::new(None),
+            fresh_turn: AtomicBool::new(true),
             next_retirement: Mutex::new(None),
             availability_schedule: Mutex::new(Default::default()),
             _hooks: f.worker._hooks.clone(),
@@ -4952,6 +4987,9 @@ max_manifest_members=1024
         handle.shutdown().await;
         let mut worker = Arc::try_unwrap(worker)
             .map_err(|_| anyhow::anyhow!("stopped fixture worker still owned"))?;
+        // These fixtures exercise historical saved-journal scheduling. Fresh
+        // startup/retry priority is exercised through reopen_worker below.
+        worker.fresh_turn.store(false, Ordering::Release);
         if retiring {
             worker.policy.policy = NativeCaptureUploadPolicy::PublishRetiringRedundant;
             worker.stats.retiring.store(true, Ordering::Release);
@@ -5372,6 +5410,7 @@ max_manifest_members=1024
             stats: worker.stats.clone(),
             admission: worker.admission.clone(),
             next_ticket: Mutex::new(None),
+            fresh_turn: AtomicBool::new(true),
             next_retirement: Mutex::new(None),
             availability_schedule: Mutex::new(Default::default()),
             _hooks: worker._hooks.clone(),
@@ -5968,7 +6007,14 @@ max_manifest_members=1024
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn advancing_head_exhausts_bounded_journal_without_mutating_original_or_roots()
     -> Result<()> {
-        let f = saved_uploads_with_data(0, false, None, true).await?;
+        let f = saved_uploads_with_window(0, false, None, true, false, false, true, false, None, 3)
+            .await?;
+        let fresh = &f.tickets[2];
+        let fresh_name = format!("{}.job", hex(&fresh.id.0));
+        // The shared fixture prebuilds saved jobs; leave this never-used capture
+        // unprepared to model an ordinary newly queued WIP obligation.
+        std::fs::remove_file(f.worker.directory.path().join(&fresh_name))?;
+        f.worker.sync_namespace()?;
         process_saved(&f.worker, &f.tickets[0]).await?;
         let ticket = &f.tickets[1];
         let original = f
@@ -5994,11 +6040,11 @@ max_manifest_members=1024
         let snapshots = (1..=MAX_SUCCESSORS)
             .map(|n| f.worker.read_durable(&attempt_name(&ticket.id.0, n)))
             .collect::<Result<Vec<_>>>()?;
-        assert!(
-            process_saved(&reopen_worker(&f.worker), ticket)
-                .await
-                .is_err()
-        );
+        let exhausted = process_saved(&reopen_worker(&f.worker), ticket)
+            .await
+            .err()
+            .context("old journal must remain bounded")?;
+        assert_eq!(exhausted.to_string(), "capture successor journal exhausted");
         assert_eq!(f.worker.saved_attempts(&ticket.id.0)?.len(), MAX_SUCCESSORS);
         for (n, bytes) in snapshots.iter().enumerate() {
             assert_eq!(
@@ -6011,6 +6057,61 @@ max_manifest_members=1024
                 .read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
             original
         );
+        assert_saved_tickets(&f).await?;
+        let worker = reopen_worker(&f.worker);
+        worker
+            ._hooks
+            .fail_before_publication
+            .store(true, Ordering::Release);
+        assert!(!worker.poll().await?);
+        let fresh_bytes = worker.read_durable(&fresh_name)?;
+        let fresh_header = Intent::decode(&fresh_bytes)?.header;
+        assert!(fresh_header.publication_identity.is_some());
+        assert!(worker.saved_attempts(&fresh.id.0)?.is_empty());
+        worker
+            ._hooks
+            .fail_before_publication
+            .store(false, Ordering::Release);
+        let failures = worker.stats.failed.load(Ordering::Acquire);
+        // The intervening historical turn must still visit the exhausted old
+        // family; it cannot consume a new identity or erase any queued bytes.
+        assert!(!worker.poll().await?);
+        assert_eq!(worker.stats.failed.load(Ordering::Acquire), failures + 1);
+        assert_eq!(worker.read_durable(&fresh_name)?, fresh_bytes);
+        assert!(
+            !worker
+                .directory
+                .path()
+                .join(format!("{}.published", hex(&fresh.id.0)))
+                .exists()
+        );
+        let reopened = reopen_worker(&worker);
+        assert!(
+            reopened.poll().await?,
+            "restart prioritizes newest prepared WIP over exhausted history"
+        );
+        assert_eq!(reopened.read_durable(&fresh_name)?, fresh_bytes);
+        let published: Header = serde_json::from_slice(
+            &reopened.read_durable(&format!("{}.published", hex(&fresh.id.0)))?,
+        )?;
+        assert!(published == fresh_header);
+        let receipt = f
+            .client
+            .cloud_publication_v2(fresh_header.identity()?.unwrap())
+            .await?
+            .context("fresh exact publication absent")?;
+        ensure_publication(&fresh_header, &receipt)?;
+        assert_eq!(
+            f.worker
+                .read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
+            original
+        );
+        for (n, bytes) in snapshots.iter().enumerate() {
+            assert_eq!(
+                &f.worker.read_durable(&attempt_name(&ticket.id.0, n + 1))?,
+                bytes
+            );
+        }
         assert_saved_tickets(&f).await?;
         let _ = f.stop.send(());
         f.server.await??;
@@ -6099,6 +6200,9 @@ max_manifest_members=1024
         let f = saved_uploads_with_data(0, false, None, true).await?;
         process_saved(&f.worker, &f.tickets[0]).await?;
         let mut reopened = reopen_worker(&f.worker);
+        // Exercise the historical published scan, not the alternating newest
+        // unpublished priority turn selected by a normal restart.
+        reopened.fresh_turn.store(false, Ordering::Release);
         Arc::get_mut(&mut reopened).unwrap().policy.timeout_ms = 100;
         let pause = Arc::new(CatalogPause::default());
         let release = ReleasePause(pause.clone());

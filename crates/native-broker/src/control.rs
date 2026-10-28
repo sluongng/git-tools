@@ -153,7 +153,9 @@ pub(crate) fn status(error: Status) -> Status {
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
             "native repository control access denied"
         }
-        tonic::Code::ResourceExhausted => "native repository control limit exceeded",
+        tonic::Code::ResourceExhausted => tinytree_proto::PublicationFailureReason::from_message(error.message())
+            .map(|reason| reason.message())
+            .unwrap_or("native repository control limit exceeded"),
         tonic::Code::DataLoss => "native repository integrity validation failed",
         tonic::Code::DeadlineExceeded => "native repository control deadline exceeded",
         tonic::Code::Unavailable => {
