@@ -3196,6 +3196,7 @@ dependencies = [
  "tinytree-fixture",
  "tinytree-index",
  "tinytree-model",
+ "tinytree-proto",
  "tinytree-server",
  "tinytree-store",
  "tokio",
@@ -5604,6 +5605,7 @@ dependencies = [
  "futures",
  "jj-lib",
  "tinytree-model",
+ "tinytree-proto",
 ]
 
 [[package]]

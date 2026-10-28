@@ -114,7 +114,7 @@ struct SelectedMatcher {
     work: Arc<Mutex<Work>>,
     limits: Limits,
     failed: std::sync::atomic::AtomicBool,
-    inner: Box<dyn jj_lib::matchers::Matcher>,
+    inner: Arc<dyn jj_lib::matchers::Matcher>,
 }
 impl SelectedMatcher {
     fn accept(&self, path: &jj_lib::repo_path::RepoPath) -> bool {
@@ -500,7 +500,7 @@ pub(super) async fn changed(
     owner: QueryOwner,
     initial: Work,
 ) -> Result<(bool, Work), RevsetEvaluationError> {
-    changed_impl(caller, index, scope, id, owner, initial, None).await
+    changed_impl(caller, index, scope, id, owner, initial, None, None).await
 }
 pub(super) async fn changed_path(
     caller: &Arc<Store>,
@@ -510,12 +510,24 @@ pub(super) async fn changed_path(
     owner: QueryOwner,
     initial: Work,
     filter: &q::ChangedPathExpr,
+    compiled: Option<Arc<tinytree_annotate::fileset::CompiledFileset>>,
 ) -> Result<(bool, Work), RevsetEvaluationError> {
-    if filter.policy_version != 2 {
+    if !matches!(filter.policy_version, 2 | 3) || (filter.policy_version == 3) != compiled.is_some()
+    {
         return Err(rev_err(Error::Invalid));
     }
     path_filter::validate_options(caller).map_err(rev_err)?;
-    changed_impl(caller, index, scope, id, owner, initial, Some(filter)).await
+    changed_impl(
+        caller,
+        index,
+        scope,
+        id,
+        owner,
+        initial,
+        Some(filter),
+        compiled,
+    )
+    .await
 }
 async fn changed_impl(
     caller: &Arc<Store>,
@@ -525,6 +537,7 @@ async fn changed_impl(
     owner: QueryOwner,
     mut initial: Work,
     filter: Option<&q::ChangedPathExpr>,
+    compiled: Option<Arc<tinytree_annotate::fileset::CompiledFileset>>,
 ) -> Result<(bool, Work), RevsetEvaluationError> {
     let deadline = *initial.deadline.get_or_insert_with(|| {
         std::time::Instant::now() + Duration::from_millis(index.core.limits.sync_query_timeout_ms)
@@ -593,16 +606,18 @@ async fn changed_impl(
     let changed = if filter.is_none() && parents.len() == 1 {
         commit.tree_ids() != parents[0].tree_ids()
     } else {
-        let inner: Box<dyn jj_lib::matchers::Matcher> = if let Some(filter) = filter {
+        let inner: Arc<dyn jj_lib::matchers::Matcher> = if let Some(compiled) = compiled {
+            compiled
+        } else if let Some(filter) = filter {
             let path = RepoPathBuf::from_internal_string(&filter.path)
                 .map_err(|_| rev_err(Error::Invalid))?;
             if filter.exact_file {
-                Box::new(jj_lib::matchers::FilesMatcher::new([path]))
+                Arc::new(jj_lib::matchers::FilesMatcher::new([path]))
             } else {
-                Box::new(jj_lib::matchers::PrefixMatcher::new([path]))
+                Arc::new(jj_lib::matchers::PrefixMatcher::new([path]))
             }
         } else {
-            Box::new(jj_lib::matchers::EverythingMatcher)
+            Arc::new(jj_lib::matchers::EverythingMatcher)
         };
         let matcher = SelectedMatcher {
             work: work.clone(),

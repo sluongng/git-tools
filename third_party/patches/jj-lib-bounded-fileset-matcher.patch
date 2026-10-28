@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH] jj-lib: Compile filesets with one aggregate stock matcher budget
+
+Remote filesets must bound total construction across compound expressions, not
+reset a regex budget at each leaf. Preflight AST node count/depth and literal
+syntax before constructing a matcher, and thread the same budget through stock
+union grouping, intersection, difference and glob compilation. Preserve matching
+and directory pruning and leave existing to_matcher callers unchanged. Return
+syntax/compiler refusal without falling back to unbounded construction. Parsed
+input AST storage and glob parsing remain caller-owned admission responsibilities.
+---
+diff --git a/src/fileset.rs b/src/fileset.rs
+--- a/src/fileset.rs
++++ b/src/fileset.rs
+@@ -45,6 +45,7 @@
+ use crate::matchers::PathGlobPattern;
+ use crate::matchers::PrefixMatcher;
+ use crate::matchers::UnionMatcher;
++use crate::matchers::{MatcherBuildBudget, MatcherBuildError};
+ use crate::repo_path::RelativePathParseError;
+ use crate::repo_path::RepoPath;
+ use crate::repo_path::RepoPathBuf;
+@@ -423,6 +424,44 @@
+             Self::Pattern(pattern) => pattern.as_path(),
+             _ => None,
+         })
++    }
++
++    /// Compile using stock matching/pruning with one aggregate construction
++    /// budget. The caller owns input AST storage and glob parsing admission.
++    /// Failure never falls through to the unbounded stock constructor.
++    pub fn to_matcher_bounded(
++        &self,
++        budget: &mut MatcherBuildBudget,
++    ) -> Result<Box<dyn Matcher>, MatcherBuildError> {
++        // Charge nodes before pushing them, so even a wide borrowed AST cannot
++        // allocate an unbounded traversal stack. Recursion begins only after
++        // the complete node/depth preflight succeeds.
++        budget.charge_node(1)?;
++        let mut pending = vec![(self, 1usize)];
++        while let Some((node, depth)) = pending.pop() {
++            match node {
++                Self::None | Self::All => {}
++                Self::Pattern(FilePattern::FilePath(path) | FilePattern::PrefixPath(path)) => {
++                    budget.charge_literal_bytes(path.as_internal_file_string().len())?;
++                }
++                // The bounded glob builder charges dir/glob syntax exactly
++                // once, before cloning paths or generating regex strings.
++                Self::Pattern(_) => {}
++                Self::UnionAll(children) => {
++                    for child in children.iter().rev() {
++                        budget.charge_node(depth + 1)?;
++                        pending.push((child, depth + 1));
++                    }
++                }
++                Self::Intersection(left, right) | Self::Difference(left, right) => {
++                    budget.charge_node(depth + 1)?;
++                    pending.push((right, depth + 1));
++                    budget.charge_node(depth + 1)?;
++                    pending.push((left, depth + 1));
++                }
++            }
++        }
++        build_union_matcher_bounded(self.as_union_all(), budget)
+     }
+ 
+     /// Transforms the expression tree to `Matcher` object.
+@@ -484,6 +523,61 @@
+         matchers.push(Some(Box::new(prefix_globs.build())));
+     }
+     union_all_matchers(&mut matchers)
++}
++
++// Keep stock grouping and its balanced union tree, including visit pruning.
++fn build_union_matcher_bounded(
++    expressions: &[FilesetExpression],
++    budget: &mut MatcherBuildBudget,
++) -> Result<Box<dyn Matcher>, MatcherBuildError> {
++    let mut file_paths = Vec::new();
++    let mut prefix_paths = Vec::new();
++    let mut file_globs = GlobsMatcher::builder().prefix_paths(false);
++    let mut prefix_globs = GlobsMatcher::builder().prefix_paths(true);
++    let mut matchers: Vec<Option<Box<dyn Matcher>>> = Vec::new();
++    for expr in expressions {
++        let matcher: Box<dyn Matcher> = match expr {
++            // None and All are supposed to be simplified by caller.
++            FilesetExpression::None => Box::new(NothingMatcher),
++            FilesetExpression::All => Box::new(EverythingMatcher),
++            FilesetExpression::Pattern(pattern) => {
++                match pattern {
++                    FilePattern::FilePath(path) => file_paths.push(path),
++                    FilePattern::PrefixPath(path) => prefix_paths.push(path),
++                    FilePattern::FileGlob { dir, pattern } => file_globs.add(dir, pattern),
++                    FilePattern::PrefixGlob { dir, pattern } => prefix_globs.add(dir, pattern),
++                }
++                continue;
++            }
++            // UnionAll is supposed to be flattened by caller.
++            FilesetExpression::UnionAll(exprs) => build_union_matcher_bounded(exprs, budget)?,
++            FilesetExpression::Intersection(expr1, expr2) => {
++                let m1 = build_union_matcher_bounded(expr1.as_union_all(), budget)?;
++                let m2 = build_union_matcher_bounded(expr2.as_union_all(), budget)?;
++                Box::new(IntersectionMatcher::new(m1, m2))
++            }
++            FilesetExpression::Difference(expr1, expr2) => {
++                let m1 = build_union_matcher_bounded(expr1.as_union_all(), budget)?;
++                let m2 = build_union_matcher_bounded(expr2.as_union_all(), budget)?;
++                Box::new(DifferenceMatcher::new(m1, m2))
++            }
++        };
++        matchers.push(Some(matcher));
++    }
++
++    if !file_paths.is_empty() {
++        matchers.push(Some(Box::new(FilesMatcher::new(file_paths))));
++    }
++    if !prefix_paths.is_empty() {
++        matchers.push(Some(Box::new(PrefixMatcher::new(prefix_paths))));
++    }
++    if !file_globs.is_empty() {
++        matchers.push(Some(Box::new(file_globs.build_bounded(budget)?)));
++    }
++    if !prefix_globs.is_empty() {
++        matchers.push(Some(Box::new(prefix_globs.build_bounded(budget)?)));
++    }
++    Ok(union_all_matchers(&mut matchers))
+ }
+ 
+ /// Concatenates all `matchers` as union.
+-- 
+2.47.0

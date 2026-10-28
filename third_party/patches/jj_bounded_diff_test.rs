@@ -694,3 +694,145 @@ fn bounded_selected_value_resolution_preserves_stock_metadata_and_conflicts() {
         }
     });
 }
+
+
+#[test]
+fn bounded_filesets_preserve_stock_matches_and_directory_pruning() {
+    use jj_lib::fileset::{FilePattern, FilesetExpression as F};
+    use jj_lib::matchers::{MatcherBuildBudget, MatcherBuildLimits, PathGlobPattern};
+    use jj_lib::repo_path::RepoPathBuf;
+    let path = |s: &str| RepoPathBuf::from_internal_string(s).unwrap();
+    let sensitive = PathGlobPattern::parse("**/*.{rs,md}").unwrap();
+    let insensitive = PathGlobPattern::parse_i("readme.*").unwrap();
+    assert!(!sensitive.case_insensitive());
+    assert!(insensitive.case_insensitive());
+    let glob = F::pattern(FilePattern::FileGlob {
+        dir: path("src"),
+        pattern: Box::new(sensitive),
+    });
+    let prefix_glob = F::pattern(FilePattern::PrefixGlob {
+        dir: path(""),
+        pattern: Box::new(insensitive),
+    });
+    let expression = F::union_all(vec![
+        glob.intersection(F::prefix_path(path("src")))
+            .difference(F::prefix_path(path("src/generated"))),
+        prefix_glob,
+        F::file_path(path("LICENSE")),
+    ]);
+    let stock = expression.to_matcher();
+    let mut budget = MatcherBuildBudget::new(MatcherBuildLimits::default());
+    let bounded = expression.to_matcher_bounded(&mut budget).unwrap();
+    for (name, expected) in [
+        ("src/lib.rs", true),
+        ("src/nested/guide.md", true),
+        ("src/generated/code.rs", false),
+        ("src/lib.txt", false),
+        ("README.MD", true),
+        ("ReadMe.md/child", true),
+        ("LICENSE", true),
+        ("LICENSE/child", false),
+        ("other/lib.rs", false),
+    ] {
+        let name = path(name);
+        assert_eq!(bounded.matches(&name), expected);
+        assert_eq!(bounded.matches(&name), stock.matches(&name));
+    }
+    for directory in [
+        "",
+        "src",
+        "src/nested",
+        "src/generated",
+        "README.MD",
+        "other",
+    ] {
+        let directory = path(directory);
+        assert_eq!(bounded.visit(&directory), stock.visit(&directory));
+    }
+    assert_eq!(budget.usage().regex_sets, 2);
+}
+
+#[test]
+fn bounded_filesets_refuse_aggregate_syntax_and_compiler_allowances() {
+    use jj_lib::fileset::{FilePattern, FilesetExpression as F};
+    use jj_lib::matchers::{
+        MatcherBuildBudget, MatcherBuildError, MatcherBuildLimits, PathGlobPattern,
+    };
+    use jj_lib::repo_path::RepoPathBuf;
+    let path = |s: &str| RepoPathBuf::from_internal_string(s).unwrap();
+    let glob = |dir: &str| {
+        F::pattern(FilePattern::FileGlob {
+            dir: path(dir),
+            pattern: Box::new(PathGlobPattern::parse("*.rs").unwrap()),
+        })
+    };
+    let expression = F::union_all(vec![glob("src"), glob("tests")]);
+    let defaults = MatcherBuildLimits::default();
+    let mut limits = defaults;
+    limits.max_total_regex_memory_bytes = defaults.max_regex_set_bytes;
+    let mut budget = MatcherBuildBudget::new(limits);
+    assert!(matches!(
+        expression.to_matcher_bounded(&mut budget),
+        Err(MatcherBuildError::LimitExceeded)
+    ));
+    assert!(budget.usage().regex_memory_bytes > limits.max_total_regex_memory_bytes);
+    // A shared budget is cumulative even across independently compiled ASTs.
+    let mut budget = MatcherBuildBudget::new(limits);
+    assert!(glob("src").to_matcher_bounded(&mut budget).is_ok());
+    assert!(matches!(
+        glob("tests").to_matcher_bounded(&mut budget),
+        Err(MatcherBuildError::LimitExceeded)
+    ));
+    for limits in [
+        MatcherBuildLimits {
+            max_ast_nodes: 2,
+            ..defaults
+        },
+        MatcherBuildLimits {
+            max_ast_depth: 1,
+            ..defaults
+        },
+        MatcherBuildLimits {
+            max_literal_bytes: 10,
+            ..defaults
+        },
+        MatcherBuildLimits {
+            max_regex_bytes: 1,
+            ..defaults
+        },
+    ] {
+        assert!(matches!(
+            expression.to_matcher_bounded(&mut MatcherBuildBudget::new(limits)),
+            Err(MatcherBuildError::LimitExceeded)
+        ));
+    }
+}
+
+#[test]
+fn bounded_filesets_report_regex_compilation_refusal_without_panicking() {
+    use jj_lib::fileset::{FilePattern, FilesetExpression as F};
+    use jj_lib::matchers::{
+        MatcherBuildBudget, MatcherBuildError, MatcherBuildLimits, PathGlobPattern,
+    };
+    use jj_lib::repo_path::RepoPathBuf;
+    let expression = F::pattern(FilePattern::FileGlob {
+        dir: RepoPathBuf::from_internal_string("").unwrap(),
+        pattern: Box::new(PathGlobPattern::parse("**/*.{rs,md,toml}").unwrap()),
+    });
+    let mut budget = MatcherBuildBudget::new(MatcherBuildLimits {
+        max_regex_set_bytes: 1,
+        ..MatcherBuildLimits::default()
+    });
+    assert!(matches!(
+        expression.to_matcher_bounded(&mut budget),
+        Err(MatcherBuildError::Regex(_))
+    ));
+    assert_eq!(budget.usage().regex_sets, 1);
+    assert_eq!(budget.usage().regex_memory_bytes, 1);
+    // The existing stock entry point remains usable after a bounded refusal.
+    assert!(
+        expression
+            .to_matcher()
+            .matches(&RepoPathBuf::from_internal_string("src/lib.rs").unwrap())
+    );
+}

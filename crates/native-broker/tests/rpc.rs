@@ -2600,6 +2600,7 @@ async fn changed_path_policies_keep_exact_intent_and_bounded_forwarding() {
                     path,
                     policy_version,
                     exact_file: true,
+                    matcher: None,
                 },
             ))),
         },
@@ -2607,6 +2608,50 @@ async fn changed_path_policies_keep_exact_intent_and_bounded_forwarding() {
         page_size: 7,
         replay_key: [9; 32],
     };
+    let glob = |pattern: &str| q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Glob(q::FilesetGlob {
+            directory: "src".into(),
+            pattern: pattern.into(),
+            case_insensitive: false,
+            prefix: false,
+        })),
+    };
+    let empty = q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Empty(q::EmptyFileset {})),
+    };
+    let compound = q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Difference(Box::new(
+            q::FilesetBinary {
+                left: Some(Box::new(glob("**/*.rs"))),
+                right: Some(Box::new(glob("**/tests/**"))),
+            },
+        ))),
+    };
+    let fileset_request = |matcher: q::FilesetExpr| {
+        let mut input = request(3, String::new());
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+            input.expression.expression.as_mut()
+        else {
+            unreachable!()
+        };
+        filter.exact_file = false;
+        filter.matcher = Some(matcher);
+        input
+    };
+    let first_digest = native_broker::prefix_selection_digest(
+        &fileset_request(glob("**/*.rs")).expression,
+        cfg.max_query_bytes,
+    )
+    .unwrap();
+    let second_digest = native_broker::prefix_selection_digest(
+        &fileset_request(glob("**/*.txt")).expression,
+        cfg.max_query_bytes,
+    )
+    .unwrap();
+    assert_ne!(
+        first_digest, second_digest,
+        "matcher bytes bind selected-query identity"
+    );
     for client in [&rpc as &dyn NativeQueryIo, local.as_ref()] {
         for policy in [1, 2] {
             let input = request(policy, "src/main.rs".into());
@@ -2617,6 +2662,18 @@ async fn changed_path_policies_keep_exact_intent_and_bounded_forwarding() {
             assert_eq!(delivered.replay_key, input.replay_key);
             assert_eq!(delivered.projection, input.projection);
             assert_eq!(delivered.page_size, input.page_size);
+        }
+        for matcher in [glob("**/*.rs"), compound.clone(), empty.clone()] {
+            let input = fileset_request(matcher);
+            client.begin(input.clone(), Arc::new(())).await.unwrap();
+            let delivered = provider.begin_calls.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                delivered.expression, input.expression,
+                "forward the complete resolved matcher, not commit-set approximations"
+            );
+            assert_eq!(delivered.scope, input.scope);
+            assert_eq!(delivered.replay_key, input.replay_key);
+            assert_eq!(delivered.projection, input.projection);
         }
         let before = provider.begin_calls.lock().unwrap().len();
         for (policy, path) in [
@@ -2632,6 +2689,59 @@ async fn changed_path_policies_keep_exact_intent_and_bounded_forwarding() {
                     .unwrap_err()
                     .code(),
                 tonic::Code::InvalidArgument
+            );
+        }
+        let mut legacy_with_matcher = fileset_request(glob("**/*.rs"));
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+            legacy_with_matcher.expression.expression.as_mut()
+        else {
+            unreachable!()
+        };
+        filter.policy_version = 2;
+        filter.path = "src/main.rs".into();
+        filter.exact_file = true;
+        let oversized_atom = fileset_request(glob(&"a".repeat(4097)));
+        let malformed_path = fileset_request(q::FilesetExpr {
+            expression: Some(q::fileset_expr::Expression::Literal(q::FilesetLiteral {
+                path: "src/../main.rs".into(),
+                exact_file: true,
+            })),
+        });
+        let mut aggregate = fileset_request(empty.clone());
+        let bounded_matcher = q::FilesetExpr {
+            expression: Some(q::fileset_expr::Expression::Union(q::FilesetUnion {
+                inputs: vec![empty.clone(); 63],
+            })),
+        };
+        aggregate.expression.expression = Some(q::graph_expr::Expression::Union(q::SetExpr {
+            inputs: vec![fileset_request(bounded_matcher).expression; 17],
+        }));
+        for (behavior, input, expected) in [
+            (
+                "legacy matcher ambiguity",
+                legacy_with_matcher,
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "oversized matcher atom",
+                oversized_atom,
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                "noncanonical matcher path",
+                malformed_path,
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                "aggregate graph and matcher nodes",
+                aggregate,
+                tonic::Code::ResourceExhausted,
+            ),
+        ] {
+            assert_eq!(
+                client.begin(input, Arc::new(())).await.unwrap_err().code(),
+                expected,
+                "{behavior}"
             );
         }
         assert_eq!(provider.begin_calls.lock().unwrap().len(), before);

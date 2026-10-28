@@ -87,6 +87,14 @@ accepted. It resolves only matched before-side FILE values and keeps derived con
 in disposable scratch storage. Graph, source-read and diff budgets remain cumulative
 across candidates and pages under the original query deadline. Policy 1 remains a
 metadata-only comparison against a single resolved parent.
+`ChangedPath` policy 3 (`FILESET_GRAPH_V3`) applies a bounded resolved fileset AST
+to the same merged-parent comparison. It supports literal paths, file and prefix
+globs, case-insensitive globs, union, intersection, difference, all and empty
+matchers. Boolean operations combine path matchers, not commit result sets.
+Compiled matchers share an aggregate allowance and retain their own memory
+reservation while a query is live; completion or explicit closure releases that
+reservation independently of replay tombstones. Policy 3 requires its advertised
+capability and the merged-path work class before decoding, with no legacy fallback.
 Revision-pinned `PathHistory` and `Blame` support bounded fixed-path linear
 history. Only the selected file body is returned; private metadata-only overlays
 do not grant file access. Unsupported ancestry and exhausted budgets carry

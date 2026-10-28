@@ -259,10 +259,12 @@ enum CapabilityFeature {
   ANNOTATION_FRONTIER_PAGING_V1 = 14;
   // Matcher-driven recursive-parent changed-path comparison, policy version 2.
   MERGED_PATH_GRAPH_V2 = 15;
+  // Bounded stock fileset matcher trees with recursive-parent path semantics.
+  FILESET_GRAPH_V3 = 18;
 }
 message GetCapabilitiesRequest {
   string repository_id = 1;
-  repeated CapabilityFeature features = 2; // Required, 1..15, unique ascending IDs.
+  repeated CapabilityFeature features = 2; // Required, known IDs 1..15 or 18, unique ascending IDs.
 }
 message FeatureCapability {
   CapabilityFeature feature = 1;

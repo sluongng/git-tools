@@ -113,6 +113,48 @@ pub(super) fn compile(
             return Err(Error::Limit);
         }
         *left -= 1;
+        fn legacy(fileset: &FilesetExpression) -> bool {
+            let mut pending = vec![(fileset, 1usize)];
+            let mut count = 0usize;
+            while let Some((fileset, depth)) = pending.pop() {
+                count += 1;
+                if count > 64 || depth > 16 {
+                    return false;
+                }
+                match fileset {
+                    FilesetExpression::Pattern(FilePattern::FilePath(_)) => {}
+                    FilesetExpression::Pattern(FilePattern::PrefixPath(path))
+                        if !path.is_root() => {}
+                    FilesetExpression::UnionAll(inputs) if !inputs.is_empty() => {
+                        if inputs.len() > 64usize.saturating_sub(count + pending.len()) {
+                            return false;
+                        }
+                        pending.extend(inputs.iter().map(|v| (v, depth + 1)));
+                    }
+                    _ => return false,
+                }
+            }
+            true
+        }
+        if !legacy(fileset) {
+            // One matcher tree, not commit-set intersection/difference: a
+            // commit can change distinct paths which satisfy separate leaves.
+            let matcher =
+                tinytree_annotate::fileset::from_stock(fileset).map_err(|_| Error::Limit)?;
+            return Ok(expr(Q::ChangedPath(Box::new(q::ChangedPathExpr {
+                policy_version: 3,
+                candidates: Some(Box::new(build(
+                    candidates,
+                    depth + 1,
+                    left,
+                    literals,
+                    limits,
+                )?)),
+                path: String::new(),
+                exact_file: false,
+                matcher: Some(matcher),
+            }))));
+        }
         let (path, exact_file) = match fileset {
             FilesetExpression::UnionAll(inputs) if !inputs.is_empty() => {
                 if inputs.len() > *left {
@@ -144,6 +186,7 @@ pub(super) fn compile(
             )?)),
             path: path.to_owned(),
             exact_file,
+            matcher: None,
         }))))
     }
     fn build(
@@ -339,13 +382,16 @@ pub(super) fn compile(
                 todo.push((v.heads.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }
             Q::ChangedPath(v) => {
-                if !matches!(v.policy_version, 1 | 2)
-                    || v.path.is_empty()
-                    || v.path.len() > 4096
-                    || v.path.split('/').count() > limits.max_depth
-                    || RepoPathBuf::from_internal_string(&v.path).is_err()
-                {
-                    return Err(Error::Invalid);
+                crate::path_filter::validate_filter(v, limits)?;
+                if let Some(matcher) = &v.matcher {
+                    let stats =
+                        tinytree_proto::validate_fileset(matcher).map_err(|_| Error::Invalid)?;
+                    nodes = nodes.checked_add(stats.nodes).ok_or(Error::Limit)?;
+                    if nodes > limits.max_expression_nodes
+                        || depth + stats.depth > limits.max_expression_depth
+                    {
+                        return Err(Error::Limit);
+                    }
                 }
                 todo.push((v.candidates.as_deref().ok_or(Error::Corrupt)?, depth + 1))
             }

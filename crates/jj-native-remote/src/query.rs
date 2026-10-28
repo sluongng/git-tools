@@ -1001,6 +1001,7 @@ impl RemoteQueryIo {
         let mut pending = vec![(expression, 1usize)];
         let mut count = 0usize;
         let mut literals = 0usize;
+        let mut matcher_bytes = 0usize;
         while let Some((node, depth)) = pending.pop() {
             count += 1;
             ensure!(
@@ -1022,6 +1023,11 @@ impl RemoteQueryIo {
                     ensure!(
                         literals <= self.inner.config.remote.limits.max_batch_items,
                         "native query literals exceeded"
+                    );
+                    ensure!(
+                        literals.saturating_mul(34).saturating_add(matcher_bytes)
+                            <= self.inner.config.remote.limits.max_request_bytes,
+                        tonic::Status::resource_exhausted("native query literals exceeded")
                     );
                 }
                 E::Ancestors(v) => {
@@ -1046,18 +1052,70 @@ impl RemoteQueryIo {
                     }
                 }
                 E::ChangedPath(v) => {
+                    match v.policy_version {
+                        1 | 2 => {
+                            ensure!(
+                                v.matcher.is_none()
+                                    && !v.path.is_empty()
+                                    && v.path.len() <= 4096
+                                    && !v.path.contains(['\\', '\0'])
+                                    && !v
+                                        .path
+                                        .split('/')
+                                        .any(|part| matches!(part, "" | "." | "..")),
+                                tonic::Status::invalid_argument("invalid exact path filter")
+                            );
+                        }
+                        3 => {
+                            ensure!(
+                                v.path.is_empty() && !v.exact_file,
+                                tonic::Status::invalid_argument("ambiguous fileset graph filter")
+                            );
+                            let matcher = v.matcher.as_ref().ok_or_else(|| {
+                                tonic::Status::invalid_argument("missing fileset graph matcher")
+                            })?;
+                            let stats =
+                                tinytree_proto::validate_fileset(matcher).map_err(|error| {
+                                    match error {
+                                        tinytree_proto::FilesetValidationError::Invalid => {
+                                            tonic::Status::invalid_argument(error.message())
+                                        }
+                                        tinytree_proto::FilesetValidationError::Limit => {
+                                            tonic::Status::resource_exhausted(error.message())
+                                        }
+                                    }
+                                })?;
+                            count = count.saturating_add(stats.nodes);
+                            ensure!(
+                                count <= self.inner.config.remote.limits.max_batch_items
+                                    && depth.saturating_add(stats.depth) <= 64,
+                                tonic::Status::resource_exhausted(
+                                    "native query AST limit exceeded"
+                                )
+                            );
+                            matcher_bytes = matcher_bytes.saturating_add(stats.string_bytes);
+                            ensure!(
+                                matcher_bytes <= tinytree_proto::fileset::MAX_FILESET_STRING_BYTES,
+                                tonic::Status::resource_exhausted(
+                                    "native fileset strings exceed aggregate bound"
+                                )
+                            );
+                        }
+                        _ => anyhow::bail!(tonic::Status::invalid_argument(
+                            "unsupported changed-path policy"
+                        )),
+                    }
                     ensure!(
-                        matches!(v.policy_version, 1 | 2)
-                            && !v.path.is_empty()
-                            && v.path.len() <= 4096
-                            && !v.path.contains(['\\', '\0'])
-                            && !v.path.split('/').any(|part| matches!(part, "" | "." | "..")),
-                        "unsupported exact path filter"
+                        literals.saturating_mul(34).saturating_add(matcher_bytes)
+                            <= self.inner.config.remote.limits.max_request_bytes,
+                        tonic::Status::resource_exhausted("native query literals exceeded")
                     );
                     let candidates = v
                         .candidates
                         .as_deref()
-                        .context("native exact path candidates missing")?;
+                        .ok_or_else(|| {
+                            tonic::Status::invalid_argument("native changed-path candidates missing")
+                        })?;
                     pending.push((candidates, depth + 1));
                 }
                 E::Heads(v) | E::Roots(v) | E::HasConflict(v) => {

@@ -179,6 +179,7 @@ enum Mode {
     CapabilitiesReadiness,
     CapabilitiesAbsent,
     CapabilitiesLegacyFeature,
+    CapabilitiesNoFileset,
     CapabilitiesDenied,
     CapabilitiesLimited,
     CapabilitiesTransport,
@@ -380,6 +381,9 @@ impl Repository for Faults {
         request: Request<p::GetCapabilitiesRequest>,
     ) -> Result<Response<p::Capabilities>, Status> {
         self.capabilities.fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::CapabilitiesNoFileset && request.get_ref().features.contains(&18) {
+            return Err(Status::invalid_argument("fileset capability is absent"));
+        }
         if self.mode == Mode::CapabilitiesSlow {
             tokio::time::sleep(Duration::from_millis(70)).await;
         }
@@ -2986,6 +2990,9 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
         (2, Mode::Normal, false),
         (2, Mode::CapabilitiesAbsent, true),
         (2, Mode::CapabilitiesLegacyFeature, true),
+        (3, Mode::Normal, false),
+        (3, Mode::CapabilitiesAbsent, true),
+        (3, Mode::CapabilitiesNoFileset, true),
     ] {
         let (_store, _index, service, root, _) = setup_query();
         let running = Running::start(service, mode).await;
@@ -2995,10 +3002,20 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
             version: 1,
             expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
                 q::ChangedPathExpr {
+                    matcher: (policy_version == 3).then(|| q::FilesetExpr {
+                        expression: Some(q::fileset_expr::Expression::Literal(q::FilesetLiteral {
+                            path: "file".into(),
+                            exact_file: true,
+                        })),
+                    }),
                     policy_version,
                     candidates: Some(Box::new(ids_commits(&[root]))),
-                    path: "file".into(),
-                    exact_file: true,
+                    path: if policy_version == 3 {
+                        String::new()
+                    } else {
+                        "file".into()
+                    },
+                    exact_file: policy_version != 3,
                 },
             ))),
         };
@@ -3021,7 +3038,7 @@ async fn exact_path_graph_requires_negotiated_support_without_eager_fallback() {
 
 #[tokio::test]
 async fn changed_path_work_class_follows_policy_across_facts_prefixes_and_query_continuations() {
-    for policy_version in [1, 2] {
+    for policy_version in [1, 2, 3] {
         let mut config = ServiceConfig::default();
         config.query.max_eval_quantum_steps = 1;
         let fixture = setup_query_configured(config);
@@ -3034,10 +3051,22 @@ async fn changed_path_work_class_follows_policy_across_facts_prefixes_and_query_
             version: 1,
             expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
                 q::ChangedPathExpr {
+                    matcher: (policy_version == 3).then(|| q::FilesetExpr {
+                        expression: Some(q::fileset_expr::Expression::Glob(q::FilesetGlob {
+                            directory: String::new(),
+                            pattern: "*.cc".into(),
+                            case_insensitive: false,
+                            prefix: false,
+                        })),
+                    }),
                     policy_version,
                     candidates: Some(Box::new(ids_ancestors(root))),
-                    path: "hello.cc".into(),
-                    exact_file: true,
+                    path: if policy_version == 3 {
+                        String::new()
+                    } else {
+                        "hello.cc".into()
+                    },
+                    exact_file: policy_version != 3,
                 },
             ))),
         };
@@ -3092,7 +3121,7 @@ async fn changed_path_work_class_follows_policy_across_facts_prefixes_and_query_
         {
             let classes = running.counts.work_classes.lock().unwrap();
             let expected =
-                (policy_version == 2).then_some(tinytree_proto::MERGED_PATH_V2_WORK_CLASS);
+                (policy_version >= 2).then_some(tinytree_proto::MERGED_PATH_V2_WORK_CLASS);
             for (method, class, _) in classes.iter() {
                 assert_eq!(
                     class.as_deref(),
@@ -3145,6 +3174,112 @@ async fn changed_path_work_class_follows_policy_across_facts_prefixes_and_query_
 }
 
 #[tokio::test]
+async fn fileset_graph_validates_complete_fact_batches_before_capability_or_query_rpc() {
+    use q::fileset_expr::Expression as F;
+    let (_store, _index, service, root, _) = setup_query();
+    let running = Running::start(service, Mode::Normal).await;
+    let client = running.client().await;
+    let scope = client.open_query_scope(vec![root]).await.unwrap();
+    let empty = || q::FilesetExpr {
+        expression: Some(F::Empty(q::EmptyFileset {})),
+    };
+    let predicate = |policy_version, path: &str, exact_file, matcher| q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
+            q::ChangedPathExpr {
+                policy_version,
+                candidates: Some(Box::new(ids_commits(&[root]))),
+                path: path.into(),
+                exact_file,
+                matcher,
+            },
+        ))),
+    };
+    let valid = predicate(3, "", false, Some(empty()));
+    for (behavior, expression, expected) in [
+        (
+            "v1 cannot ignore a new matcher",
+            predicate(1, "file", true, Some(empty())),
+            Code::InvalidArgument,
+        ),
+        (
+            "v2 cannot ignore a new matcher",
+            predicate(2, "file", true, Some(empty())),
+            Code::InvalidArgument,
+        ),
+        (
+            "v3 requires matcher",
+            predicate(3, "", false, None),
+            Code::InvalidArgument,
+        ),
+        (
+            "v3 rejects legacy path",
+            predicate(3, "file", false, Some(empty())),
+            Code::InvalidArgument,
+        ),
+        (
+            "v3 rejects legacy exact flag",
+            predicate(3, "", true, Some(empty())),
+            Code::InvalidArgument,
+        ),
+        (
+            "missing matcher node",
+            predicate(3, "", false, Some(q::FilesetExpr::default())),
+            Code::InvalidArgument,
+        ),
+        (
+            "wide matcher exceeds fixed structural bound",
+            predicate(
+                3,
+                "",
+                false,
+                Some(q::FilesetExpr {
+                    expression: Some(F::Union(q::FilesetUnion {
+                        inputs: vec![empty(); 64],
+                    })),
+                }),
+            ),
+            Code::ResourceExhausted,
+        ),
+    ] {
+        let before = running.capabilities.load(Ordering::SeqCst);
+        assert_eq!(
+            client
+                .query_facts(
+                    &scope,
+                    vec![
+                        QueryFact::Membership {
+                            expression: valid.clone(),
+                            candidate: root
+                        },
+                        QueryFact::Membership {
+                            expression,
+                            candidate: root
+                        },
+                    ]
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            expected,
+            "{behavior}"
+        );
+        assert_eq!(
+            running.capabilities.load(Ordering::SeqCst),
+            before,
+            "{behavior}"
+        );
+        assert_eq!(
+            running.queries.facts.load(Ordering::SeqCst),
+            0,
+            "{behavior}"
+        );
+    }
+    client.close_query_scope(&scope).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn merged_path_admission_refusal_does_not_retry_or_downgrade_query() {
     let fixture = setup_query_retained();
     let running =
@@ -3155,6 +3290,7 @@ async fn merged_path_admission_refusal_does_not_retry_or_downgrade_query() {
         version: 1,
         expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
             q::ChangedPathExpr {
+                matcher: None,
                 policy_version: 2,
                 candidates: Some(Box::new(ids_commits(&[fixture.root]))),
                 path: "hello.cc".into(),
@@ -3195,6 +3331,7 @@ async fn merged_path_capability_and_query_share_one_deadline_and_facts_validate_
         version: 1,
         expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
             q::ChangedPathExpr {
+                matcher: None,
                 policy_version: 2,
                 candidates: Some(Box::new(ids_commits(&[root]))),
                 path: "hello.cc".into(),

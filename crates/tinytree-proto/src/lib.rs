@@ -5,6 +5,9 @@
 //! These bindings provide identity/zstd negotiation, not server transport policy,
 //! authentication, canonical-form validation, or durable publication by themselves.
 
+pub mod fileset;
+pub use fileset::{FilesetStats, FilesetValidationError, validate_fileset};
+
 // Preserve protobuf package nesting for generated cross-package type paths.
 pub mod tinytree {
     pub mod landing {

@@ -228,6 +228,14 @@ pub(crate) struct CursorHost {
     cleanup: std::sync::mpsc::Sender<Garbage>,
 }
 impl CursorHost {
+    pub(crate) fn reserve_filesets(&self, bytes: usize) -> Result<OwnedSemaphorePermit, Status> {
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| Status::resource_exhausted("fileset memory exceeds permit range"))?;
+        self.memory
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| Status::resource_exhausted("fileset memory is busy"))
+    }
     pub(crate) fn reserve_annotation(&self, bytes: usize) -> Result<OwnedSemaphorePermit, Status> {
         let bytes = u32::try_from(bytes).map_err(|_| {
             Status::resource_exhausted("annotation context memory exceeds permit range")
@@ -492,6 +500,7 @@ impl CursorHost {
         // This method only runs in an owned blocking job. Physical previously
         // returned pages independently retain their scope and active reservation.
         state.evaluator = None;
+        state.path_state.lock().unwrap().clear_filesets();
         state.pending = None;
         state.pending_row = None;
         state.last = None;
@@ -565,8 +574,12 @@ impl CursorHost {
             .try_acquire_many_owned(bytes)
             .map_err(|_| Status::resource_exhausted("query membership memory exhausted"))?;
         let mut evaluator =
-            Evaluator::membership(scope.graph().clone(), expression, candidate, policy)
+            Evaluator::membership(scope.graph().clone(), expression.clone(), candidate, policy)
                 .map_err(eval_error)?;
+        path_state
+            .lock()
+            .map_err(|_| Status::internal("fileset state unavailable"))?
+            .prepare_filesets(&expression, self, budget, deadline)?;
         *inputs = inputs
             .saturating_add(evaluator.literal_count())
             .saturating_add(1);
@@ -851,6 +864,17 @@ impl CursorHost {
             .path_deadline
             .map_or(deadline, |original| deadline.min(original));
         if tokio::time::Instant::now() >= deadline {
+            // This deadline cannot be refreshed. Quiescent compiled state is
+            // no longer useful, even while its error/replay tombstone remains.
+            state.evaluator = None;
+            state.pending = None;
+            state.pending_row = None;
+            state.last = None;
+            state.replay_memory = None;
+            state.path_state.lock().unwrap().clear_filesets();
+            state.scope = None;
+            state.active_memory = None;
+            record.active.store(false, Ordering::Release);
             return Err(Status::deadline_exceeded(
                 "merged path original deadline expired",
             ));
@@ -889,8 +913,17 @@ impl CursorHost {
         let result = (|| {
             if let Some(expression) = state.pending.take() {
                 let graph = scope.as_ref().unwrap().graph().clone();
-                let ids = Evaluator::new(graph.clone(), expression, limits(&host.config))
+                let ids = Evaluator::new(graph.clone(), expression.clone(), limits(&host.config))
                     .map_err(eval_error)?;
+                {
+                    let State {
+                        path_state, budget, ..
+                    } = &mut *state;
+                    path_state
+                        .lock()
+                        .map_err(|_| Status::internal("fileset state unavailable"))?
+                        .prepare_filesets(&expression, self, budget, deadline)?;
+                }
                 state.evaluator = Some(if request.projection == q::Projection::Ids as i32 {
                     RunningEvaluator::Ids(ids)
                 } else {
@@ -1026,6 +1059,7 @@ impl CursorHost {
         state.last = Some((sequence, retained));
         if terminal {
             state.evaluator = None;
+            state.path_state.lock().unwrap().clear_filesets();
             state.pending = None;
             state.pending_row = None;
             state.scope = None;

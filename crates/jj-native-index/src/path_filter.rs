@@ -7,7 +7,7 @@ pub(super) fn has_path(expression: &q::GraphExpr) -> bool {
     has_policy(expression, None)
 }
 pub(super) fn has_merged_path(expression: &q::GraphExpr) -> bool {
-    has_policy(expression, Some(2))
+    has_policy(expression, Some(2)) || has_policy(expression, Some(3))
 }
 fn has_policy(expression: &q::GraphExpr, policy: Option<u32>) -> bool {
     use q::graph_expr::Expression as X;
@@ -41,6 +41,24 @@ fn has_policy(expression: &q::GraphExpr, policy: Option<u32>) -> bool {
             .is_some_and(|v| has_policy(v, policy)),
         _ => false,
     }
+}
+pub(super) fn validate_filter(filter: &q::ChangedPathExpr, limits: &Limits) -> Result<(), Error> {
+    if filter.policy_version == 3 {
+        if !filter.path.is_empty() || filter.exact_file {
+            return Err(Error::Invalid);
+        }
+        tinytree_proto::validate_fileset(filter.matcher.as_ref().ok_or(Error::Invalid)?)
+            .map_err(|_| Error::Invalid)?;
+    } else if !matches!(filter.policy_version, 1 | 2)
+        || filter.matcher.is_some()
+        || filter.path.is_empty()
+        || filter.path.len() > 4096
+        || filter.path.split('/').count() > limits.max_depth
+        || RepoPathBuf::from_internal_string(&filter.path).is_err()
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
 }
 pub(super) fn validate_options(store: &Store) -> Result<(), Error> {
     let options = store.merge_options();
@@ -348,6 +366,19 @@ fn rewrite<'a>(
                     q::Projection::Ids,
                 )
                 .await?;
+                let compiled = if filter.policy_version == 3 {
+                    let wire = filter.matcher.as_ref().ok_or(Error::Invalid)?;
+                    let bytes = tinytree_annotate::fileset::construction_bytes(wire)
+                        .map_err(|_| Error::Limit)?;
+                    work.reserve(&index.core.limits, 1, bytes)?;
+                    let matcher = Arc::new(
+                        tinytree_annotate::fileset::compile(wire).map_err(|_| Error::Limit)?,
+                    );
+                    work.check()?;
+                    Some(matcher)
+                } else {
+                    None
+                };
                 let mut selected = Vec::with_capacity(private.len());
                 let mut matches = Vec::with_capacity(private.len());
                 loop {
@@ -365,7 +396,7 @@ fn rewrite<'a>(
                         let owner: QueryOwner = Arc::new((owner.clone(), page.owner.clone()));
                         let changed = match filter.policy_version {
                             1 => local_changed(index, scope, id, filter, owner, work).await?,
-                            2 => {
+                            2 | 3 => {
                                 let initial = std::mem::replace(work, Work::exhausted());
                                 let (changed, spent) = selected::changed_path(
                                     caller,
@@ -375,6 +406,7 @@ fn rewrite<'a>(
                                     owner,
                                     initial,
                                     filter,
+                                    compiled.clone(),
                                 )
                                 .await
                                 .map_err(local_error)?;

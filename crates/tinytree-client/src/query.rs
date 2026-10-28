@@ -148,20 +148,21 @@ pub enum PrefixTarget {
     Change(ChangeId),
 }
 
-fn expression_path_policies(expression: &q::GraphExpr) -> (bool, bool) {
+fn expression_path_policies(expression: &q::GraphExpr) -> (bool, bool, bool) {
     use q::graph_expr::Expression as E;
     let mut todo = vec![expression];
     let mut seen = 0;
-    let (mut linear, mut merged) = (false, false);
+    let (mut linear, mut merged, mut fileset) = (false, false, false);
     while let Some(node) = todo.pop() {
         seen += 1;
         if seen > 1024 || todo.len() > 1024 {
-            return (true, true);
+            return (true, true, true);
         }
         match node.expression.as_ref() {
             Some(E::ChangedPath(value)) => {
                 linear |= value.policy_version == 1;
                 merged |= value.policy_version == 2;
+                fileset |= value.policy_version == 3;
                 todo.extend(value.candidates.as_deref());
             }
             Some(E::Ancestors(v)) => todo.extend(v.heads.as_deref()),
@@ -176,7 +177,7 @@ fn expression_path_policies(expression: &q::GraphExpr) -> (bool, bool) {
             Some(E::Heads(v) | E::Roots(v) | E::HasConflict(v)) => todo.extend(v.input.as_deref()),
             Some(E::Union(v) | E::Intersection(v)) => {
                 if v.inputs.len() > 1024 {
-                    return (true, true);
+                    return (true, true, true);
                 }
                 todo.extend(&v.inputs);
             }
@@ -188,7 +189,7 @@ fn expression_path_policies(expression: &q::GraphExpr) -> (bool, bool) {
             _ => {}
         }
     }
-    (linear, merged)
+    (linear, merged, fileset)
 }
 impl NativeClient {
     // Resource accounting only: this metadata does not substitute for capability
@@ -235,7 +236,7 @@ impl NativeClient {
     }
     async fn require_path_policies(
         &self,
-        (linear, merged): (bool, bool),
+        (linear, merged, fileset): (bool, bool, bool),
         deadline: Instant,
     ) -> Result<bool, Status> {
         let mut requested = Vec::new();
@@ -244,6 +245,9 @@ impl NativeClient {
         }
         if merged {
             requested.push(crate::CapabilityFeature::MergedPathGraphV2);
+        }
+        if fileset {
+            requested.push(crate::CapabilityFeature::FilesetGraphV3);
         }
         if requested.is_empty() {
             return Ok(false);
@@ -275,7 +279,7 @@ impl NativeClient {
                 ));
             }
         }
-        Ok(merged)
+        Ok(merged || fileset)
     }
     pub(super) fn checked_scope(
         &self,
@@ -660,7 +664,7 @@ impl NativeClient {
         let mut request_bytes = 256usize;
         let mut input_ids = 0usize;
         let mut expression_nodes = 0usize;
-        let mut path_policies = (false, false);
+        let mut path_policies = (false, false, false);
         for fact in &facts {
             let (count, bytes) = match fact {
                 QueryFact::Membership { expression, .. } => {
@@ -669,6 +673,7 @@ impl NativeClient {
                     let policies = expression_path_policies(expression);
                     path_policies.0 |= policies.0;
                     path_policies.1 |= policies.1;
+                    path_policies.2 |= policies.2;
                     expression_nodes = expression_nodes.checked_add(nodes).ok_or_else(|| {
                         Status::resource_exhausted("query expression nodes exceed budget")
                     })?;
@@ -2328,6 +2333,7 @@ fn validate_expression(
     let mut pending = vec![(expression, 1usize)];
     let mut nodes = 0usize;
     let mut literals = 0usize;
+    let mut matcher_string_bytes = 0usize;
     while let Some((node, depth)) = pending.pop() {
         nodes += 1;
         if depth > 64 || nodes > limits.max_batch_items {
@@ -2366,7 +2372,31 @@ fn validate_expression(
                 children.push(value.heads.as_deref().ok_or_else(invalid)?);
             }
             E::ChangedPath(value) => {
-                if !matches!(value.policy_version, 1 | 2)
+                if value.policy_version == 3 {
+                    if !value.path.is_empty() || value.exact_file {
+                        return Err(invalid());
+                    }
+                    let stats = tinytree_proto::validate_fileset(
+                        value.matcher.as_ref().ok_or_else(invalid)?,
+                    )
+                    .map_err(|error| match error {
+                        tinytree_proto::FilesetValidationError::Invalid => invalid(),
+                        tinytree_proto::FilesetValidationError::Limit => exceeded(),
+                    })?;
+                    nodes = nodes.checked_add(stats.nodes).ok_or_else(exceeded)?;
+                    matcher_string_bytes = matcher_string_bytes
+                        .checked_add(stats.string_bytes)
+                        .ok_or_else(exceeded)?;
+                    if nodes > limits.max_batch_items
+                        || depth
+                            .checked_add(stats.depth)
+                            .is_none_or(|depth| depth > 64)
+                        || matcher_string_bytes > tinytree_proto::fileset::MAX_FILESET_STRING_BYTES
+                    {
+                        return Err(exceeded());
+                    }
+                } else if !matches!(value.policy_version, 1 | 2)
+                    || value.matcher.is_some()
                     || value.path.is_empty()
                     || value.path.len() > 4096
                     || value.path.contains(['\\', '\0'])

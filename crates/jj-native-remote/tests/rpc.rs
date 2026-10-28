@@ -138,7 +138,7 @@ impl Repository for Counting {
         let mut response = self.service.get_capabilities(request).await?;
         let mode = self.counts.merged_path_capability.load(Ordering::SeqCst);
         for feature in &mut response.get_mut().features {
-            if feature.feature == 15 {
+            if matches!(feature.feature, 15 | 18) {
                 if mode == 1 {
                     feature.supported = false;
                 }
@@ -6405,12 +6405,35 @@ async fn merged_path_policy_keeps_capability_class_and_retained_query_identity()
                     path,
                     policy_version,
                     exact_file: true,
+                    matcher: None,
                 },
             ))),
         },
         projection: q::Projection::Canonical,
         page_size: 1,
         replay_key: scope.bound_query_id([nonce; 16]).unwrap(),
+    };
+    let glob = |pattern: &str| q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Glob(q::FilesetGlob {
+            directory: String::new(),
+            pattern: pattern.into(),
+            case_insensitive: false,
+            prefix: false,
+        })),
+    };
+    let empty = q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Empty(q::EmptyFileset {})),
+    };
+    let fileset_request = |nonce, matcher: q::FilesetExpr| {
+        let mut input = request(nonce, 3, String::new());
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+            input.expression.expression.as_mut()
+        else {
+            unreachable!()
+        };
+        filter.exact_file = false;
+        filter.matcher = Some(matcher);
+        input
     };
     for (nonce, mode, expected) in [
         (1, 1, tonic::Code::Unimplemented),
@@ -6439,6 +6462,33 @@ async fn merged_path_policy_keeps_capability_class_and_retained_query_identity()
             &vec![15]
         );
     }
+    for (nonce, mode, expected) in [
+        (5, 1, tonic::Code::Unimplemented),
+        (6, 2, tonic::Code::PermissionDenied),
+    ] {
+        counts.merged_path_capability.store(mode, Ordering::SeqCst);
+        let before = counts.query_rpcs.load(Ordering::SeqCst);
+        assert_eq!(
+            repo.query
+                .begin(
+                    fileset_request(nonce, glob("historical-*.txt")),
+                    Arc::new(())
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(
+            counts.query_rpcs.load(Ordering::SeqCst),
+            before,
+            "unsupported/unauthorized fileset policy must not evaluate or downgrade"
+        );
+        assert_eq!(
+            counts.capability_requests.lock().unwrap().last().unwrap(),
+            &vec![18]
+        );
+    }
     counts.merged_path_capability.store(0, Ordering::SeqCst);
     let before = counts.query_rpcs.load(Ordering::SeqCst);
     let capabilities = counts.capability_requests.lock().unwrap().len();
@@ -6452,6 +6502,51 @@ async fn merged_path_policy_keeps_capability_class_and_retained_query_identity()
                 .begin(request(3, policy, path), Arc::new(()))
                 .await
                 .is_err()
+        );
+    }
+    let mut ambiguous = fileset_request(7, glob("historical-*.txt"));
+    let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+        ambiguous.expression.expression.as_mut()
+    else {
+        unreachable!()
+    };
+    filter.policy_version = 2;
+    filter.path = "historical-0003.txt".into();
+    filter.exact_file = true;
+    let bounded_matcher = q::FilesetExpr {
+        expression: Some(q::fileset_expr::Expression::Union(q::FilesetUnion {
+            inputs: vec![empty.clone(); 63],
+        })),
+    };
+    let mut aggregate = fileset_request(7, empty.clone());
+    aggregate.expression.expression = Some(q::graph_expr::Expression::Union(q::SetExpr {
+        inputs: vec![fileset_request(7, bounded_matcher).expression; 17],
+    }));
+    for (behavior, input, expected) in [
+        (
+            "legacy matcher ambiguity",
+            ambiguous,
+            tonic::Code::InvalidArgument,
+        ),
+        (
+            "oversized matcher atom",
+            fileset_request(7, glob(&"a".repeat(4097))),
+            tonic::Code::ResourceExhausted,
+        ),
+        (
+            "aggregate graph and matcher nodes",
+            aggregate,
+            tonic::Code::ResourceExhausted,
+        ),
+    ] {
+        assert_eq!(
+            repo.query
+                .begin(input, Arc::new(()))
+                .await
+                .unwrap_err()
+                .code(),
+            expected,
+            "{behavior}"
         );
     }
     assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
@@ -6494,6 +6589,50 @@ async fn merged_path_policy_keeps_capability_class_and_retained_query_identity()
             .iter()
             .any(|class| class.as_deref() == Some("merged-path-v2"))
     );
+    let fileset_intent = fileset_request(
+        8,
+        q::FilesetExpr {
+            expression: Some(q::fileset_expr::Expression::Difference(Box::new(
+                q::FilesetBinary {
+                    left: Some(Box::new(glob("historical-*.txt"))),
+                    right: Some(Box::new(glob("historical-0000.txt"))),
+                },
+            ))),
+        },
+    );
+    let work_classes_before = counts.query_work_classes.lock().unwrap().len();
+    let fileset_query = repo
+        .query
+        .begin(fileset_intent.clone(), Arc::new(()))
+        .await
+        .unwrap()
+        .value;
+    let mut fileset_sequence = 0;
+    let mut fileset_rows = Vec::new();
+    let fileset_delivered = loop {
+        let page = repo
+            .query
+            .page(fileset_query.handle, fileset_sequence, Arc::new(()))
+            .await
+            .unwrap();
+        fileset_rows.extend(
+            page.value
+                .rows
+                .iter()
+                .map(|row| row.commit.as_ref().unwrap().value.clone()),
+        );
+        if page.value.exhausted {
+            break page;
+        }
+        fileset_sequence += 1;
+    };
+    assert_eq!(fileset_rows, vec![head.0.to_vec()]);
+    assert!(
+        counts.query_work_classes.lock().unwrap()[work_classes_before..]
+            .iter()
+            .any(|class| class.as_deref() == Some("merged-path-v2")),
+        "fileset predicates retain full merged-path admission"
+    );
     repo.query
         .close_scope(scope.handle, Arc::new(()))
         .await
@@ -6531,6 +6670,41 @@ async fn merged_path_policy_keeps_capability_class_and_retained_query_identity()
         "policy is part of exact retained query identity"
     );
     assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
+    assert_eq!(
+        repo.query
+            .begin(fileset_intent.clone(), Arc::new(()))
+            .await
+            .unwrap()
+            .value
+            .handle,
+        fileset_query.handle
+    );
+    let fileset_replay = repo
+        .query
+        .page(fileset_query.handle, fileset_sequence, Arc::new(()))
+        .await
+        .unwrap();
+    assert_eq!(fileset_replay.value.rows, fileset_delivered.value.rows);
+    let before = counts.query_rpcs.load(Ordering::SeqCst);
+    let mut different_matcher = fileset_intent;
+    let Some(q::graph_expr::Expression::ChangedPath(filter)) =
+        different_matcher.expression.expression.as_mut()
+    else {
+        unreachable!()
+    };
+    filter.matcher = Some(empty);
+    assert!(
+        repo.query
+            .begin(different_matcher, Arc::new(()))
+            .await
+            .is_err(),
+        "the complete matcher is part of exact retained query identity"
+    );
+    assert_eq!(counts.query_rpcs.load(Ordering::SeqCst), before);
+    repo.query
+        .close_query(fileset_query.handle, Arc::new(()))
+        .await
+        .unwrap();
     repo.query
         .close_query(query.handle, Arc::new(()))
         .await

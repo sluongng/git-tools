@@ -27,13 +27,23 @@ User workspaces always use a daemon-owned lazy jj-vfs mount. Both `init` and
 `clone` require `--broker SOCKET --store ALIAS`; there is no materialized or
 debug fallback. The mount contains an opaque `.jj/native-workspace` marker;
 operation, index and working-copy state live in private external administration.
-Ordinary `log`, exact-path `log` and `file annotate` use lazy native queries by
-default. Multiple exact-file or prefix selectors in ordinary log form a bounded
-union. Merge commits compare the selected paths against their recursively merged
+Ordinary `log`, path-filtered `log` and `file annotate` use lazy native queries by
+default. Path log supports exact-file and prefix selectors, glob patterns and
+compound filesets. Multiple selectors form a bounded union. For example:
+
+```sh
+"$JJ" log 'glob:**/*.rs ~ glob:**/tests/**'
+"$JJ" log 'prefix-glob:src & ~glob:**/generated/**'
+```
+
+Intersections and exclusions apply to each changed path, not independently to
+sets of commits. Merge commits compare selected paths against recursively merged
 parents, using line merging with identical changes accepted. Only selected file
 contents needed for that comparison are read; synthesized content is not published.
-Glob patterns, intersections/negation, other merge options and exact-file histories
-crossing a directory remain explicit unsupported cases. Fetch an absent reference
+Complex filesets and glob compilation have finite limits; exhausted limits fail
+explicitly rather than producing an empty successful result. Other merge options
+and exact-file histories crossing a directory remain explicit unsupported cases.
+Fetch an absent reference
 explicitly before its first push. Native
 publication is not Git push. Use the [checked landing workflow](#checked-landing)
 below for protected main.

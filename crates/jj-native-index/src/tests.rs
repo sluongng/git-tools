@@ -2444,6 +2444,148 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
                     FilesetExpression::prefix_path(RepoPathBuf::from_internal_string(path).unwrap())
                 })),
             };
+        // Compound filesets remain one per-entry matcher, and use the same
+        // bounded parent semantics as ordinary exact paths for private merges.
+        use jj_lib::fileset::FilePattern;
+        let literal =
+            || FilesetExpression::file_path(RepoPathBuf::from_internal_string("file").unwrap());
+        let missing =
+            || FilesetExpression::file_path(RepoPathBuf::from_internal_string("missing").unwrap());
+        let glob = |insensitive, prefix| {
+            FilesetExpression::Pattern(if prefix {
+                FilePattern::PrefixGlob {
+                    dir: RepoPathBuf::root(),
+                    pattern: Box::new(jj_lib::matchers::PathGlobPattern::parse("fi*").unwrap()),
+                }
+            } else {
+                FilePattern::FileGlob {
+                    dir: RepoPathBuf::root(),
+                    pattern: Box::new(
+                        if insensitive {
+                            jj_lib::matchers::PathGlobPattern::parse_i("FILE")
+                        } else {
+                            jj_lib::matchers::PathGlobPattern::parse("fi?e")
+                        }
+                        .unwrap(),
+                    ),
+                }
+            })
+        };
+        // Public factory admission must see braces after a backslash class:
+        // stock treats the backslash literally, so this `]` closes the class.
+        let glob_wire = |pattern: String| q::FilesetExpr {
+            expression: Some(q::fileset_expr::Expression::Glob(q::FilesetGlob {
+                directory: String::new(),
+                pattern,
+                case_insensitive: false,
+                prefix: false,
+            })),
+        };
+        let deep = glob_wire(String::from(r"[\]") + &"{".repeat(17) + "a" + &"}".repeat(17));
+        assert_eq!(
+            tinytree_annotate::fileset::construction_bytes(&deep),
+            Err(tinytree_annotate::fileset::Error::Limit)
+        );
+        assert!(matches!(
+            tinytree_annotate::fileset::compile(&deep),
+            Err(tinytree_annotate::fileset::Error::Limit)
+        ));
+        for pattern in [r"[\]", "[]]", "[!]]", "[fi]ile", r"\{file\}"] {
+            let compiled =
+                tinytree_annotate::fileset::compile(&glob_wire(pattern.to_owned())).unwrap();
+            let stock = FilesetExpression::Pattern(FilePattern::FileGlob {
+                dir: RepoPathBuf::root(),
+                pattern: Box::new(jj_lib::matchers::PathGlobPattern::parse(pattern).unwrap()),
+            })
+            .to_matcher();
+            for path in ["file", "]", "{file}", "unrelated"] {
+                let path = RepoPathBuf::from_internal_string(path).unwrap();
+                assert_eq!(
+                    jj_lib::matchers::Matcher::matches(&compiled, &path),
+                    stock.matches(&path),
+                    "{pattern}"
+                );
+                assert_eq!(
+                    jj_lib::matchers::Matcher::visit(&compiled, &path),
+                    stock.visit(&path),
+                    "{pattern}"
+                );
+            }
+        }
+        let mut semantic_keys = BTreeSet::new();
+        for (behavior, fileset, expected) in [
+            ("file glob", glob(false, false), true),
+            ("case insensitive glob", glob(true, false), true),
+            ("prefix glob", glob(false, true), true),
+            (
+                "matcher intersection",
+                FilesetExpression::Intersection(Box::new(literal()), Box::new(missing())),
+                false,
+            ),
+            (
+                "matcher difference",
+                FilesetExpression::Difference(Box::new(literal()), Box::new(missing())),
+                true,
+            ),
+            ("all paths", FilesetExpression::All, true),
+            ("no paths", FilesetExpression::None, false),
+        ] {
+            let wire = tinytree_annotate::fileset::from_stock(&fileset).unwrap();
+            let bounded = tinytree_annotate::fileset::compile(&wire).unwrap();
+            let stock = fileset.to_matcher();
+            for path in ["file", "FILE", "file/child", "unrelated"] {
+                let path = RepoPathBuf::from_internal_string(path).unwrap();
+                assert_eq!(
+                    jj_lib::matchers::Matcher::matches(&bounded, &path),
+                    stock.matches(&path),
+                    "{behavior}"
+                );
+                assert_eq!(
+                    jj_lib::matchers::Matcher::visit(&bounded, &path),
+                    stock.visit(&path),
+                    "{behavior}"
+                );
+            }
+            let expression = ResolvedExpression::FilterWithin {
+                candidates: Box::new(ResolvedExpression::Commits(
+                    ordinary_merges.iter().map(|c| c.id().clone()).collect(),
+                )),
+                predicate: P::Filter(F::File(fileset)),
+            };
+            let compiled = revsets::compile(&expression, &Limits::default(), false).unwrap();
+            let Some(q::graph_expr::Expression::ChangedPath(filter)) = &compiled.expression else {
+                panic!("one matcher predicate")
+            };
+            assert_eq!(filter.policy_version, 3);
+            assert!(filter.path.is_empty() && !filter.exact_file && filter.matcher.is_some());
+            let key = memo::fact_key(
+                [0; 32],
+                &q::graph_fact::Fact::Membership(q::Membership {
+                    expression: Some(compiled),
+                    candidate: Some(q::CommitId {
+                        value: model_id(ordinary_merges[1].id()).unwrap().0.to_vec(),
+                    }),
+                }),
+                &Limits::default(),
+            )
+            .unwrap();
+            assert!(
+                semantic_keys.insert(key),
+                "{behavior}: matcher AST must bind memo identity"
+            );
+            let revset = observed_index
+                .evaluate_revset(&expression, &jj_store)
+                .unwrap();
+            assert_eq!(
+                revset.stream().try_collect::<Vec<_>>().await.unwrap(),
+                if expected {
+                    vec![ordinary_merges[1].id().clone()]
+                } else {
+                    vec![]
+                },
+                "{behavior}"
+            );
+        }
         // Drain earlier short-circuit queries on the original Core before
         // attributing Close observations from this shared transport fixture.
         index_store
@@ -2485,6 +2627,32 @@ fn conflict_report_filters_selected_nonempty_changes_not_empty_children() {
             1,
             "dropping after the first non-exhausted row closes the query"
         );
+        assert!(io.queries.lock().unwrap().is_empty());
+        let glob_demand = ResolvedExpression::FilterWithin {
+            candidates: Box::new(ResolvedExpression::Commits(first_three.clone())),
+            predicate: P::Filter(F::File(glob(false, false))),
+        };
+        let demand = observed_index
+            .evaluate_revset(&glob_demand, &jj_store)
+            .unwrap();
+        let before_rows = io.merged_page_rows.load(Ordering::SeqCst);
+        let mut stream = demand.stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), *file_commits[2].id());
+        assert_eq!(
+            io.requested_page_sizes.lock().unwrap().last(),
+            Some(&(true, 1))
+        );
+        assert_eq!(io.merged_page_rows.load(Ordering::SeqCst) - before_rows, 1);
+        // First-row preparation closes its own private-selection query.
+        // Attribute only the subsequent consumer cursor close, as in V2 above.
+        let before_close = io.closes.load(Ordering::SeqCst);
+        drop(stream);
+        drop(demand);
+        observed_store
+            .cleanup_handle()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(io.closes.load(Ordering::SeqCst) - before_close, 1);
         assert!(io.queries.lock().unwrap().is_empty());
         let plain = observed_index
             .evaluate_revset(&ResolvedExpression::Commits(first_three), &jj_store)

@@ -15,6 +15,7 @@ crate.annotation(
         "//third_party/patches:jj-lazy-prefix-context.patch",
         "//third_party/patches:jj-external-rewrites.patch",
         "//third_party/patches:jj-lib-bounded-file-merge.patch",
+        "//third_party/patches:jj-lib-bounded-fileset-matcher.patch",
     ],
     version = "0.46.0",
 )
@@ -27,6 +28,15 @@ crate.annotation(
         "//third_party/patches:jj-core-bounded-line-diff.patch",
         "//third_party/patches:jj-core-bounded-multi-line-diff.patch",
         "//third_party/patches:jj-core-bounded-file-merge.patch",
+        "//third_party/patches:jj-core-bounded-fileset-matcher.patch",
     ],
     version = "0.46.0",
+)
+
+# Bounded stock matchers explicitly select a single runtime cache-pool shard.
+crate.annotation(
+    crate = "regex",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:regex-set-pool-capacity.patch"],
+    version = "1.13.1",
 )

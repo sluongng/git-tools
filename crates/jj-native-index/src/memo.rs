@@ -281,13 +281,17 @@ fn expression_hash(
                 number(h, v.policy_version as u64);
                 number(h, u64::from(v.exact_file));
                 raw(h, v.path.as_bytes());
-                if !matches!(v.policy_version, 1 | 2)
-                    || v.path.is_empty()
-                    || v.path.len() > 4096
-                    || v.path.split('/').count() > limits.max_depth
-                    || RepoPathBuf::from_internal_string(&v.path).is_err()
-                {
-                    return Err(Error::Invalid);
+                crate::path_filter::validate_filter(v, limits)?;
+                if let Some(matcher) = &v.matcher {
+                    let stats =
+                        tinytree_proto::validate_fileset(matcher).map_err(|_| Error::Invalid)?;
+                    nodes = nodes.checked_add(stats.nodes).ok_or(Error::Limit)?;
+                    if nodes > limits.max_expression_nodes
+                        || depth + stats.depth > limits.max_expression_depth
+                    {
+                        return Err(Error::Limit);
+                    }
+                    raw(h, &matcher.encode_to_vec());
                 }
                 push!(v.candidates.as_deref());
             }

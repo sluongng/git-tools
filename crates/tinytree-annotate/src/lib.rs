@@ -6,6 +6,7 @@
 //! those owners until this synchronous work and its output have been torn down.
 
 pub mod path;
+pub mod fileset;
 
 use std::sync::Arc;
 use tinytree_model as m;

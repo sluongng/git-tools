@@ -245,6 +245,7 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
     let mut pending = vec![(expression, 1usize)];
     let mut count = 0usize;
     let mut literals = 0usize;
+    let mut matcher_bytes = 0usize;
     while let Some((node, depth)) = pending.pop() {
         count += 1;
         if count > 1024 || depth > 64 {
@@ -259,8 +260,9 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
         }
         macro_rules! child {
             ($value:expr) => {{
-                let value = $value
-                    .ok_or_else(|| Status::invalid_argument("missing native query AST input"))?;
+                let value = $value.ok_or_else(|| {
+                    Status::invalid_argument("missing native query AST input")
+                })?;
                 pending.push((value, depth + 1));
             }};
         }
@@ -272,7 +274,10 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
         {
             E::Commits(v) => {
                 literals = literals.saturating_add(v.commits.len());
-                bounded_input(literals.saturating_mul(34), cap)?;
+                bounded_input(
+                    literals.saturating_mul(34).saturating_add(matcher_bytes),
+                    cap,
+                )?;
                 if v.commits.iter().any(|id| id.value.len() != 32) {
                     return Err(Status::invalid_argument(
                         "invalid native query literal commit ID",
@@ -289,14 +294,60 @@ pub(crate) fn expression_shape(expression: &q::GraphExpr, cap: usize) -> Result<
                 child!(v.heads.as_deref());
             }
             E::ChangedPath(v) => {
-                if !matches!(v.policy_version, 1 | 2)
-                    || v.path.is_empty()
-                    || v.path.len() > 4096
-                    || v.path.contains(['\\', '\0'])
-                    || v.path.split('/').any(|c| matches!(c, "" | "." | ".."))
-                {
-                    return Err(Status::invalid_argument("invalid exact-path graph filter"));
+                match v.policy_version {
+                    1 | 2 => {
+                        if v.matcher.is_some()
+                            || v.path.is_empty()
+                            || v.path.len() > 4096
+                            || v.path.contains(['\\', '\0'])
+                            || v.path.split('/').any(|c| matches!(c, "" | "." | ".."))
+                        {
+                            return Err(Status::invalid_argument(
+                                "invalid exact-path graph filter",
+                            ));
+                        }
+                    }
+                    3 => {
+                        if !v.path.is_empty() || v.exact_file {
+                            return Err(Status::invalid_argument(
+                                "ambiguous fileset graph filter",
+                            ));
+                        }
+                        let matcher = v.matcher.as_ref().ok_or_else(|| {
+                            Status::invalid_argument("missing fileset graph matcher")
+                        })?;
+                        let stats =
+                            tinytree_proto::validate_fileset(matcher).map_err(|error| {
+                                match error {
+                                    tinytree_proto::FilesetValidationError::Invalid => {
+                                        Status::invalid_argument(error.message())
+                                    }
+                                    tinytree_proto::FilesetValidationError::Limit => {
+                                        Status::resource_exhausted(error.message())
+                                    }
+                                }
+                            })?;
+                        count = count.saturating_add(stats.nodes);
+                        if count > 1024 || depth.saturating_add(stats.depth) > 64 {
+                            return Err(Status::resource_exhausted(
+                                "native query AST exceeds structural bounds",
+                            ));
+                        }
+                        matcher_bytes = matcher_bytes.saturating_add(stats.string_bytes);
+                        if matcher_bytes > tinytree_proto::fileset::MAX_FILESET_STRING_BYTES {
+                            return Err(Status::resource_exhausted(
+                                "native fileset strings exceed aggregate bound",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(Status::invalid_argument("unsupported changed-path policy"));
+                    }
                 }
+                bounded_input(
+                    literals.saturating_mul(34).saturating_add(matcher_bytes),
+                    cap,
+                )?;
                 child!(v.candidates.as_deref());
             }
             E::Heads(v) | E::Roots(v) | E::HasConflict(v) => child!(v.input.as_deref()),

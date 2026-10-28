@@ -794,7 +794,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let mut client = server.client().await;
         let input = p::GetCapabilitiesRequest {
             repository_id: "alpha".into(),
-            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15],
+            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 18],
         };
         assert_eq!(
             client
@@ -845,12 +845,12 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         .iter()
                         .map(|f| f.feature)
                         .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15]
+                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 18]
                 );
                 for feature in &result.features {
                     assert_eq!(
                         feature.supported,
-                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11 | 14 | 15) {
+                        if feature.feature <= 3 || matches!(feature.feature, 8 | 11 | 14 | 15 | 18) {
                             query
                         } else if feature.feature == 13 {
                             cloud && indexed && captured && offload
@@ -863,7 +863,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                     assert_eq!(
                         feature.authorized,
                         match feature.feature {
-                            1..=3 | 8 | 11 | 14 | 15 => true,
+                            1..=3 | 8 | 11 | 14 | 15 | 18 => true,
                             4 | 9 | 13 => cloud_read,
                             5 | 10 => cloud_write,
                             _ => unreachable!(),
@@ -6157,7 +6157,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     input.expression = Some(q::GraphExpr {
         version: 1,
         expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
-            q::ChangedPathExpr {
+            q::ChangedPathExpr { matcher: None,
                 policy_version: 1,
                 candidates: input.expression.take().map(Box::new),
                 path: "BUILD.bazel".into(),
@@ -8035,7 +8035,7 @@ async fn exact_path_graph_filters_before_selected_edges_and_refuses_unsupported_
         q::GraphExpr {
             version: 1,
             expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
-                q::ChangedPathExpr {
+                q::ChangedPathExpr { matcher: None,
                     policy_version: 1,
                     candidates: Some(Box::new(candidates)),
                     path: path.into(),
@@ -8277,7 +8277,7 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
             input.expression = Some(q::GraphExpr {
                 version: 1,
                 expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
-                    q::ChangedPathExpr {
+                    q::ChangedPathExpr { matcher: None,
                         policy_version: 1,
                         candidates: input.expression.take().map(Box::new),
                         path: "file".into(),
@@ -11387,7 +11387,7 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     input.expression = Some(q::GraphExpr {
         version: 1,
         expression: Some(q::graph_expr::Expression::ChangedPath(Box::new(
-            q::ChangedPathExpr {
+            q::ChangedPathExpr { matcher: None,
                 policy_version: 2,
                 candidates: input.expression.take().map(Box::new),
                 path: "crates/project/src/file".into(),
@@ -11612,10 +11612,113 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     let clean_shortest = client.shortest_prefix(merged_request(clean_shortest, ALPHA)).await.unwrap().into_inner();
     assert_eq!(clean_shortest.in_selection, Some(false));
     assert_eq!(clean_shortest.hex_length, 0);
+    // Policy 3 applies ONE stock matcher to paths, not boolean combinations
+    // of per-commit ChangedPath answers. Unmatched oversized conflict bodies
+    // remain pruned under the same 128-byte FILE limit used above.
+    use q::fileset_expr::Expression as F;
+    let fs = |expression| q::FilesetExpr { expression:Some(expression) };
+    let literal = |path:&str| fs(F::Literal(q::FilesetLiteral { path:path.into(), exact_file:true }));
+    let glob = |pattern:&str,case_insensitive| fs(F::Glob(q::FilesetGlob {
+        directory:"crates/project/src".into(),pattern:pattern.into(),case_insensitive,prefix:false,
+    }));
+    let pair = |left,right| Box::new(q::FilesetBinary { left:Some(Box::new(left)),right:Some(Box::new(right)) });
+    let fileset_selection = |matcher:q::FilesetExpr,candidates:q::GraphExpr| q::GraphExpr {
+        version:1,expression:Some(q::graph_expr::Expression::ChangedPath(Box::new(q::ChangedPathExpr {
+            policy_version:3,candidates:Some(Box::new(candidates)),path:String::new(),exact_file:false,matcher:Some(matcher),
+        }))),
+    };
+    let candidates = ids_evaluation(&scope,0,&[base,left,right,clean,edited]).expression.unwrap();
+    let fileset_selection = |matcher| fileset_selection(matcher,candidates.clone());
+    let file_glob = glob("f?le",false);
+    let fileset_expression = fileset_selection(file_glob.clone());
+    for (name,matcher,selected) in [
+        ("glob",file_glob.clone(),true),
+        ("case insensitive",glob("FILE",true),true),
+        ("case sensitive",glob("FILE",false),false),
+        ("disjoint intersection",fs(F::Intersection(pair(literal("crates/project/src/file"),literal("crates/project/src/noise")))),false),
+        ("union",fs(F::Union(q::FilesetUnion { inputs:vec![file_glob.clone(),literal("crates/project/src/file")] })),true),
+        ("all minus unrelated conflict",fs(F::Difference(pair(fs(F::All(q::EmptyFileset{})),literal("crates/project/src/noise")))),true),
+        ("empty",fs(F::Empty(q::EmptyFileset{})),false),
+    ] {
+        let expression=fileset_selection(matcher);
+        let input=q::QueryFactsRequest { scope:scope.key.clone(),facts:[base,left,right,clean,edited].into_iter().map(|id|q::GraphFact {
+            fact:Some(q::graph_fact::Fact::Membership(q::Membership { expression:Some(expression.clone()),candidate:Some(query_id(id)) })),
+        }).collect() };
+        assert_eq!(client.query_facts(request(input.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition,"{name}: no late heavy upgrade");
+        let output=client.query_facts(merged_request(input,ALPHA)).await.unwrap().into_inner();
+        assert_eq!(output.answers.iter().map(|a|a.answer.clone()).collect::<Vec<_>>(),[selected,selected,selected,false,selected].into_iter().map(|v|Some(q::graph_fact_answer::Answer::Membership(v))).collect::<Vec<_>>(),"{name}");
+    }
+    // Distinct matcher ASTs share a request cache but cannot alias.
+    let distinct=q::QueryFactsRequest { scope:scope.key.clone(),facts:[file_glob.clone(),fs(F::Intersection(pair(file_glob.clone(),glob("noise",false))))].into_iter().map(|m|q::GraphFact {
+        fact:Some(q::graph_fact::Fact::Membership(q::Membership { expression:Some(fileset_selection(m)),candidate:Some(query_id(edited)) })),
+    }).collect() };
+    assert_eq!(client.query_facts(merged_request(distinct,ALPHA)).await.unwrap().into_inner().answers.iter().map(|a|a.answer.clone()).collect::<Vec<_>>(),vec![Some(q::graph_fact_answer::Answer::Membership(true)),Some(q::graph_fact_answer::Answer::Membership(false))]);
+    // Compile before a negative membership answer; invalid stock grammar is an
+    // error even when the candidate would not match a valid filter.
+    let malformed=q::QueryFactsRequest { scope:scope.key.clone(),facts:vec![q::GraphFact {
+        fact:Some(q::graph_fact::Fact::Membership(q::Membership { expression:Some(fileset_selection(glob("[",false))),candidate:Some(query_id(clean)) })),
+    }] };
+    assert_eq!(client.query_facts(merged_request(malformed,ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    let mut v3_queries=[(ids_evaluation(&scope,20,&[]),Vec::new(),false),(ids_evaluation(&scope,21,&[]),Vec::new(),false)];
+    for (index,(input,rows,_)) in v3_queries.iter_mut().enumerate() {
+        input.expression=Some(fileset_expression.clone()); input.page_size=1;
+        input.projection=if index==0 {q::Projection::Graph as i32}else{q::Projection::Canonical as i32};
+        assert_eq!(client.evaluate(request(input.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+        let page=client.evaluate(merged_request(input.clone(),ALPHA)).await.expect("two live V3 cursor matcher reservations fit unchanged default pool").into_inner();
+        assert_eq!(page.exhausted,Some(false)); rows.extend(page.rows); input.cursor=page.cursor;
+        assert_eq!(client.evaluate(request(input.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+        let mut changed=input.clone();
+        let Some(q::graph_expr::Expression::ChangedPath(v))=changed.expression.as_mut().unwrap().expression.as_mut() else {unreachable!()};
+        v.matcher=Some(fs(F::Empty(q::EmptyFileset{})));
+        assert_eq!(client.evaluate(merged_request(changed,ALPHA)).await.unwrap_err().code(),Code::PermissionDenied,"cursor binds complete matcher AST");
+    }
+    for _ in 0..128 {
+        for (input,rows,done) in &mut v3_queries {
+            if *done {continue;}
+            let page=client.evaluate(merged_request(input.clone(),ALPHA)).await.unwrap().into_inner();
+            rows.extend(page.rows);*done=page.exhausted==Some(true);input.cursor=page.cursor;
+        }
+        if v3_queries.iter().all(|(_,_,done)|*done){break;}
+    }
+    for (_,rows,done) in &v3_queries {
+        assert!(*done); assert_eq!(rows.iter().map(|r|r.commit.as_ref().unwrap().value.clone()).collect::<std::collections::BTreeSet<_>>(),expected);
+    }
+    for row in &v3_queries[1].1 {
+        let (expected,bytes)=&expected_canonical[&row.commit.as_ref().unwrap().value];
+        let canonical=row.canonical.as_ref().expect("V3 canonical projection retains source metadata");
+        assert_eq!(canonical.descriptor,Some(descriptor(*expected)));
+        assert_eq!(&canonical.canonical_envelope,bytes);
+    }
+    let selected_prefix=q::ResolveCommitPrefixRequest {scope:scope.key.clone(),hex_prefix:hex(&edited.id.0),selection:Some(fileset_expression.clone())};
+    assert_eq!(client.resolve_commit_prefix(request(selected_prefix.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    assert!(matches!(client.resolve_commit_prefix(merged_request(selected_prefix,ALPHA)).await.unwrap().into_inner().result,Some(q::commit_prefix_result::Result::Single(_))));
+    let selected_change=q::ResolveChangePrefixRequest {scope:scope.key.clone(),hex_prefix:hex(&[145;16]),visible_heads:vec![],selection:Some(fileset_expression.clone())};
+    assert_eq!(client.resolve_change_prefix(request(selected_change.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    assert!(matches!(client.resolve_change_prefix(merged_request(selected_change,ALPHA)).await.unwrap().into_inner().result,Some(q::change_prefix_result::Result::Single(_))));
+    let selected_shortest=q::ShortestPrefixRequest {scope:scope.key.clone(),target:Some(q::shortest_prefix_request::Target::Commit(query_id(edited))),visible_heads:vec![],selection:Some(fileset_expression.clone())};
+    assert_eq!(client.shortest_prefix(request(selected_shortest.clone(),ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    assert!(client.shortest_prefix(merged_request(selected_shortest,ALPHA)).await.unwrap().into_inner().in_selection.unwrap());
+    // Completed and explicitly closed queries retain only scalar/replay state,
+    // not the 8MiB matcher reservation until TTL. Each branch exceeds the pool
+    // if its compiled state leaks across sequential commands.
+    for (start,close_early) in [(30u8,false),(60u8,true)] {
+        for n in 0..20 {
+            let mut input=ids_evaluation(&scope,start+n,&[]);
+            input.expression=Some(fileset_expression.clone());input.projection=q::Projection::Graph as i32;input.page_size=1;
+            let mut done=false;
+            for _ in 0..128 {
+                let page=client.evaluate(merged_request(input.clone(),ALPHA)).await.unwrap().into_inner();
+                input.cursor=page.cursor;
+                if close_early || page.exhausted==Some(true){done=true;break;}
+            }
+            assert!(done);
+            if close_early { client.close_query(request(q::CloseQueryRequest {scope:scope.key.clone(),query_id:input.query_id},ALPHA)).await.unwrap(); }
+        }
+    }
     let broad_scope = query_ready(&mut client, &[broad_head], 224).await;
     let heads = ids_evaluation(&broad_scope, 0, &[broad_head]).expression.unwrap();
     let ancestors = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Ancestors(Box::new(q::AncestorsExpr { heads:Some(Box::new(heads)), generations:None, parents:None }))) };
-    let changed = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::ChangedPath(Box::new(q::ChangedPathExpr { policy_version:2, candidates:Some(Box::new(ancestors)), path:"crates/project/src/file".into(), exact_file:true }))) };
+    let changed = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::ChangedPath(Box::new(q::ChangedPathExpr { matcher: None, policy_version:2, candidates:Some(Box::new(ancestors)), path:"crates/project/src/file".into(), exact_file:true }))) };
     let mut broad = ids_evaluation(&broad_scope, 225, &[]);
     broad.expression = Some(q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Latest(Box::new(q::LatestExpr { candidates:Some(Box::new(changed)),count:3 }))) });
     broad.projection = q::Projection::Graph as i32;
@@ -11632,7 +11735,7 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     client.close_scope(request(q::CloseScopeRequest{scope:broad_scope.key},ALPHA)).await.unwrap();
     // A peer cannot refresh the original query deadline using a new RPC budget.
     let mut expiry = ids_evaluation(&scope, 223, &[]);
-    expiry.expression = Some(selection);
+    expiry.expression = Some(fileset_expression);
     expiry.page_size = 1;
     let mut first = merged_request(expiry.clone(), ALPHA);
     first.set_timeout(Duration::from_secs(2));

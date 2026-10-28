@@ -10,6 +10,7 @@ use jj_lib::{
     store::Store,
 };
 use jj_native_backend::{NativeObjectIo, VerifiedMetadata};
+use prost::Message as _;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -18,19 +19,60 @@ use std::{
     },
 };
 use tinytree_annotate::Budget as _;
+use tokio::sync::OwnedSemaphorePermit;
 
 pub(crate) struct PathState {
     diff: Option<LineDiffBudget>,
     read_bytes: usize,
     failed: bool,
     memo: Option<PrefixMemo>,
+    filesets: Option<CompiledFilesets>,
+}
+const FILESET_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const FILESET_KEY_BYTES: usize = 256 * 1024;
+pub(crate) const FILESET_MEMORY_BYTES: usize = FILESET_OUTPUT_BYTES + FILESET_KEY_BYTES;
+struct OwnedMatcher {
+    inner: tinytree_annotate::fileset::CompiledFileset,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+impl std::fmt::Debug for OwnedMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedFilesetMatcher")
+            .finish_non_exhaustive()
+    }
+}
+impl Matcher for OwnedMatcher {
+    fn matches(&self, path: &RepoPath) -> bool {
+        self.inner.matches(path)
+    }
+    fn visit(&self, path: &RepoPath) -> jj_lib::matchers::Visit {
+        self.inner.visit(path)
+    }
+}
+struct CompiledFilesets {
+    rows: BTreeMap<Vec<u8>, Arc<OwnedMatcher>>,
+    budget: jj_lib::matchers::MatcherBuildBudget,
+    output_bytes: usize,
+    key_bytes: usize,
+    // Every escaping matcher handle shares this same physical reservation.
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+fn fileset_error(error: tinytree_annotate::fileset::Error) -> Status {
+    match error {
+        tinytree_annotate::fileset::Error::Invalid => {
+            Status::invalid_argument("invalid fileset matcher")
+        }
+        tinytree_annotate::fileset::Error::Limit => {
+            Status::resource_exhausted("fileset compiler limit exceeded")
+        }
+    }
 }
 // Query-local memoization is enabled only for repeated prefix probes. The
 // owning PrefixSelection reserves this exact bounded memory independently of
 // the actual graph/read/diff work already spent on producing each answer.
 struct PrefixMemo {
     scope: Arc<Scoped>,
-    rows: BTreeMap<(m::CommitId, String, bool), bool>,
+    rows: BTreeMap<(m::CommitId, Vec<u8>, String, bool), bool>,
     bytes: usize,
     maximum: usize,
     entries: usize,
@@ -51,7 +93,87 @@ impl PathState {
             read_bytes: 0,
             failed: false,
             memo: None,
+            filesets: None,
         }
+    }
+    pub(crate) fn clear_filesets(&mut self) {
+        self.filesets = None;
+    }
+    pub(crate) fn prepare_filesets(
+        &mut self,
+        expression: &q::GraphExpr,
+        cursors: &crate::query_cursor::CursorHost,
+        budget: &mut WorkBudget,
+        deadline: Instant,
+    ) -> Result<(), Status> {
+        let inputs = crate::query_eval::fileset_inputs(expression).map_err(|e| match e {
+            crate::query_eval::EvalError::Invalid(m) => Status::invalid_argument(m),
+            _ => limit(),
+        })?;
+        for wire in inputs {
+            check(deadline)?;
+            // Structural/constructor preflight precedes encoding, stock parsing
+            // and persistent allocation. The shared compiler ledger caps ALL
+            // filters, including facts with multiple distinct expressions.
+            let construction =
+                tinytree_annotate::fileset::construction_bytes(wire).map_err(fileset_error)?;
+            let stats = tinytree_proto::validate_fileset(wire).map_err(|_| limit())?;
+            if self.filesets.is_none() {
+                let permit = cursors.reserve_filesets(FILESET_MEMORY_BYTES)?;
+                self.filesets = Some(CompiledFilesets {
+                    rows: BTreeMap::new(),
+                    budget: jj_lib::matchers::MatcherBuildBudget::new(
+                        jj_lib::matchers::MatcherBuildLimits::default(),
+                    ),
+                    output_bytes: 0,
+                    key_bytes: 0,
+                    _permit: Arc::new(permit),
+                });
+            }
+            let cache = self.filesets.as_mut().unwrap();
+            let key_bytes = wire
+                .encoded_len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(512))
+                .ok_or_else(limit)?;
+            if cache
+                .key_bytes
+                .checked_add(key_bytes)
+                .is_none_or(|n| n > FILESET_KEY_BYTES)
+            {
+                return Err(limit());
+            }
+            budget
+                .charge(0, stats.nodes as u64, key_bytes as u64)
+                .map_err(index_error)?;
+            let key = wire.encode_to_vec();
+            if cache.rows.contains_key(&key) {
+                continue;
+            }
+            if cache
+                .output_bytes
+                .checked_add(construction)
+                .is_none_or(|n| n > FILESET_OUTPUT_BYTES)
+            {
+                return Err(limit());
+            }
+            budget
+                .charge(0, stats.nodes as u64, construction as u64)
+                .map_err(index_error)?;
+            let matcher = tinytree_annotate::fileset::compile_with_budget(wire, &mut cache.budget)
+                .map_err(fileset_error)?;
+            check(deadline)?;
+            cache.output_bytes += construction;
+            cache.key_bytes += key_bytes;
+            cache.rows.insert(
+                key,
+                Arc::new(OwnedMatcher {
+                    inner: matcher,
+                    _permit: cache._permit.clone(),
+                }),
+            );
+        }
+        Ok(())
     }
     pub(crate) fn prefix(config: &QueryConfig, scope: &Arc<Scoped>) -> Self {
         let mut state = Self::new(config);
@@ -659,7 +781,7 @@ impl NativeObjectIo for Io {
     }
 }
 struct PathMatcher {
-    inner: Box<dyn Matcher>,
+    inner: Arc<dyn Matcher>,
     shared: Shared,
     deadline: Instant,
     failed: AtomicBool,
@@ -785,6 +907,7 @@ pub(crate) fn changed(
     id: m::CommitId,
     path: &str,
     exact_file: bool,
+    fileset_key: Option<&[u8]>,
     budget: &mut WorkBudget,
     deadline: Instant,
     state: &Arc<Mutex<PathState>>,
@@ -804,19 +927,43 @@ pub(crate) fn changed(
         return Ok(false);
     }
     let mut memo_key = None;
-    let (mut diff, read_bytes) = {
+    let (mut diff, read_bytes, compiled) = {
         let mut state = state.lock().map_err(|_| corrupt())?;
         if state.failed {
             return Err(limit());
         }
+        let compiled = if let Some(key) = fileset_key {
+            budget
+                .charge(0, key.len() as u64 + 1, 64)
+                .map_err(index_error)?;
+            Some(
+                state
+                    .filesets
+                    .as_ref()
+                    .and_then(|c| c.rows.get(key))
+                    .cloned()
+                    .ok_or_else(|| Status::internal("fileset matcher was not precompiled"))?,
+            )
+        } else {
+            None
+        };
         if let Some(memo) = &state.memo {
             if !Arc::ptr_eq(&memo.scope, &scope) {
                 return Err(Status::permission_denied("merged path memo scope mismatch"));
             }
             budget
-                .charge(0, 1, path.len() as u64 + 64)
+                .charge(
+                    0,
+                    1,
+                    (path.len() + fileset_key.map_or(0, <[u8]>::len) + 64) as u64,
+                )
                 .map_err(index_error)?;
-            let key = (id, path.to_owned(), exact_file);
+            let key = (
+                id,
+                fileset_key.unwrap_or_default().to_vec(),
+                path.to_owned(),
+                exact_file,
+            );
             if let Some(answer) = memo.rows.get(&key) {
                 return Ok(*answer);
             }
@@ -828,6 +975,7 @@ pub(crate) fn changed(
                 .take()
                 .ok_or_else(|| Status::internal("merged path operation already active"))?,
             state.read_bytes,
+            compiled,
         )
     };
     let initial = std::mem::replace(budget, WorkBudget::new(0, 0, 0, 0));
@@ -854,8 +1002,10 @@ pub(crate) fn changed(
             allowed: Mutex::new(allowed),
             files: Mutex::new(BTreeMap::new()),
         });
-        if let Some(changed) = io.simple_file_change(id, path)? {
-            return Ok(changed);
+        if fileset_key.is_none() {
+            if let Some(changed) = io.simple_file_change(id, path)? {
+                return Ok(changed);
+            }
         }
         let mut config = jj_native_backend::Config::default();
         config.store.model_limits.max_object_bytes = host
@@ -881,10 +1031,12 @@ pub(crate) fn changed(
             .map_err(from_backend)?;
         let path = RepoPathBuf::from_internal_string(path)
             .map_err(|_| Status::invalid_argument("invalid merged path"))?;
-        let inner: Box<dyn Matcher> = if exact_file {
-            Box::new(jj_lib::matchers::FilesMatcher::new([path.clone()]))
+        let inner: Arc<dyn Matcher> = if let Some(compiled) = compiled {
+            compiled
+        } else if exact_file {
+            Arc::new(jj_lib::matchers::FilesMatcher::new([path.clone()]))
         } else {
-            Box::new(jj_lib::matchers::PrefixMatcher::new([path.clone()]))
+            Arc::new(jj_lib::matchers::PrefixMatcher::new([path.clone()]))
         };
         let matcher = PathMatcher {
             inner,
@@ -899,7 +1051,7 @@ pub(crate) fn changed(
             matcher: &matcher,
             deadline,
         };
-        if exact_file {
+        if fileset_key.is_none() && exact_file {
             use tinytree_annotate::{Budget as _, path::ParentGraph as _};
             let parents = commit.parents().await.map_err(from_backend)?;
             let before = tinytree_annotate::path::merged_parent_tree(&store, &parents, &mut graph)
@@ -955,7 +1107,8 @@ pub(crate) fn changed(
         let cost = key
             .1
             .len()
-            .checked_mul(2)
+            .checked_add(key.2.len())
+            .and_then(|n| n.checked_mul(2))
             .and_then(|n| n.checked_add(4096))
             .ok_or_else(limit)?;
         let next = memo.bytes.checked_add(cost).ok_or_else(limit)?;

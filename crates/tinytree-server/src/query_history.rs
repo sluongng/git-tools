@@ -383,6 +383,26 @@ pub(crate) struct CanonicalPathPredicate<'a> {
     pub state: std::sync::Arc<std::sync::Mutex<path::PathState>>,
 }
 impl crate::query_eval::PathPredicate for CanonicalPathPredicate<'_> {
+    fn changed_fileset(
+        &mut self,
+        id: m::CommitId,
+        matcher: &[u8],
+        budget: &mut WorkBudget,
+    ) -> Result<bool, crate::query_eval::EvalError> {
+        path::changed(
+            self.host.clone(),
+            self.scope.clone(),
+            self.repository,
+            id,
+            "",
+            false,
+            Some(matcher),
+            budget,
+            self.deadline,
+            &self.state,
+        )
+        .map_err(crate::query_eval::EvalError::Read)
+    }
     fn changed(
         &mut self,
         id: m::CommitId,
@@ -399,6 +419,7 @@ impl crate::query_eval::PathPredicate for CanonicalPathPredicate<'_> {
                 id,
                 path,
                 exact_file,
+                None,
                 budget,
                 self.deadline,
                 &self.state,

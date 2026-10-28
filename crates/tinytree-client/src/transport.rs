@@ -946,7 +946,7 @@ fn scan(
             let valid = match (shape, number) {
                 (Shape::Capabilities, _) => value == 1,
                 (Shape::AnnotationFrontier, 4) => matches!(value, 1 | 2 | 3),
-                (Shape::FeatureCapability, _) => (1..=15).contains(&value),
+                (Shape::FeatureCapability, _) => matches!(value, 1..=15 | 18),
                 (Shape::AnnotationFrontier, 8) => (0..=7).contains(&value),
                 (Shape::AnnotationFrontier, 9) => value <= u32::MAX as u64,
                 (Shape::AnnotationLimits, _) => value > 0 && value <= usize::MAX as u64,
@@ -1262,7 +1262,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Capabilities, 2) => text(128),
         (Shape::Capabilities, 3) => repeated(
             Shape::FeatureCapability,
-            15,
+            16,
             4 * std::mem::size_of::<p::FeatureCapability>(),
         ),
         (Shape::CloudWorkspacePage, 1) => repeated(
@@ -1486,25 +1486,22 @@ mod tests {
             )
         };
         check(&valid).unwrap();
-        // A real feature15 singleton must survive the bounded wire scan.
-        // Re-encode rather than rewriting an unrelated schema-version scalar.
-        let merged = p::Capabilities {
-            schema_version: 1,
-            repository_id: "example".into(),
-            features: vec![p::FeatureCapability {
-                feature: 15,
-                supported: true,
-                authorized: true,
-            }],
-            root_readiness: 1,
+        // Additive known IDs survive without admitting the reserved holes.
+        for feature in [15, 18] {
+            let value = p::Capabilities {
+                schema_version: 1,
+                repository_id: "example".into(),
+                features: vec![p::FeatureCapability { feature, supported: true, authorized: true }],
+                root_readiness: 1,
+            }.encode_to_vec();
+            check(&value).unwrap();
         }
-        .encode_to_vec();
-        check(&merged).unwrap();
         // Raw nested fields exercise values generated bool/enum setters cannot
         // produce, including a u32-truncating scalar before Prost decoding.
         for (name, nested) in [
             ("nonboolean support", vec![8, 1, 16, 2]),
-            ("next unknown feature", vec![8, 16]),
+            ("reserved feature16", vec![8, 16]),
+            ("reserved feature17", vec![8, 17]),
             ("unknown feature", vec![8, 99]),
             (
                 "u32 truncating feature",
@@ -1525,7 +1522,7 @@ mod tests {
                     supported: false,
                     authorized: false
                 };
-                16
+                17
             ],
             root_readiness: 1,
         }

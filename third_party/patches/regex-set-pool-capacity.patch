@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH] regex: Expose regex set search cache pool capacity
+
+The meta engine already supports configuring cache-pool shard count, but the
+regex set builder does not expose it. A regex used sequentially across many
+threads can otherwise retain one cache per shard despite serialized callers.
+Expose an additive builder passthrough for string and byte regex sets. Defaults
+and engine selection remain unchanged. This controls shard count, not the size
+of each cache or simultaneous-search admission; callers retain that ownership.
+---
+diff --git a/src/builders.rs b/src/builders.rs
+--- a/src/builders.rs
++++ b/src/builders.rs
+@@ -191,6 +191,11 @@
+         self
+     }
+ 
++    fn pool_capacity(&mut self, capacity: usize) -> &mut Builder {
++        self.metac = self.metac.clone().pool_capacity(capacity);
++        self
++    }
++
+     fn nest_limit(&mut self, limit: u32) -> &mut Builder {
+         self.syntaxc = self.syntaxc.nest_limit(limit);
+         self
+@@ -1311,6 +1316,18 @@
+             self
+         }
+ 
++        /// Set the number of cache-pool shards used by regex searches.
++        ///
++        /// This does not limit simultaneous searches or the size of each cache.
++        /// With one shard and externally serialized searches, the pool retains
++        /// at most the owner cache and one non-owner cache, independent of the
++        /// number of threads that sequentially use this regex set. Defaults
++        /// remain unchanged when this method is not called.
++        pub fn pool_capacity(&mut self, capacity: usize) -> &mut RegexSetBuilder {
++            self.builder.pool_capacity(capacity);
++            self
++        }
++
+         /// Set the nesting limit for this parser.
+         ///
+         /// The nesting limit controls how deep the abstract syntax tree is
+@@ -2495,6 +2512,18 @@
+             self
+         }
+ 
++        /// Set the number of cache-pool shards used by regex searches.
++        ///
++        /// This does not limit simultaneous searches or the size of each cache.
++        /// With one shard and externally serialized searches, the pool retains
++        /// at most the owner cache and one non-owner cache, independent of the
++        /// number of threads that sequentially use this regex set. Defaults
++        /// remain unchanged when this method is not called.
++        pub fn pool_capacity(&mut self, capacity: usize) -> &mut RegexSetBuilder {
++            self.builder.pool_capacity(capacity);
++            self
++        }
++
+         /// Set the nesting limit for this parser.
+         ///
+         /// The nesting limit controls how deep the abstract syntax tree is
+-- 
+2.47.0

@@ -24,6 +24,7 @@ tempfile = "3"
 tinytree-client = { path = "../tinytree-client" }
 tinytree-cloud = { path = "../tinytree-cloud" }
 tinytree-model = { path = "../tinytree-model" }
+tinytree-proto = { path = "../tinytree-proto" }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 tonic = "0.14"

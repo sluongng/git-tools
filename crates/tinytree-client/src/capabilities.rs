@@ -19,6 +19,7 @@ pub enum CapabilityFeature {
     DurableRetainedOffloadV1 = 13,
     AnnotationFrontierPagingV1 = 14,
     MergedPathGraphV2 = 15,
+    FilesetGraphV3 = 18,
 }
 impl CapabilityFeature {
     pub const ALL: [Self; 5] = [
@@ -144,7 +145,7 @@ impl NativeClient {
         features: &[CapabilityFeature],
     ) -> Result<Capabilities, Status> {
         if features.is_empty()
-            || features.len() > 15
+            || features.len() > 16
             || features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(

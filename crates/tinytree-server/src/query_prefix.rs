@@ -99,7 +99,7 @@ impl<'a> PrefixSelection<'a> {
             .ok_or_else(exhausted)?;
         let memory = cursors.reserve_ephemeral(config, extra)?;
         let policy = limits(config);
-        let mut counts = (0usize, 0usize);
+        let mut counts = (0usize, 0usize, 0usize);
         check_shape(expression, 1, &policy, &mut counts)?;
         if counts.1 > config.max_input_ids {
             return Err(exhausted());
@@ -169,6 +169,12 @@ impl<'a> PrefixSelection<'a> {
         policy.max_frontier = policy.max_frontier.min(budget.max_frontier.max(1));
         let mut evaluator = Evaluator::new(self.graph.clone(), self.expression.clone(), policy)
             .map_err(eval_error)?;
+        if let Some(path) = &self.path {
+            path.state
+                .lock()
+                .map_err(|_| Status::internal("fileset state unavailable"))?
+                .prepare_filesets(&self.expression, &path.host.cursors, budget, self.deadline)?;
+        }
         let mut previous = 0;
         let nonempty = loop {
             self.tick(0)?;
@@ -739,7 +745,7 @@ fn check_shape(
     expr: &q::GraphExpr,
     depth: usize,
     limits: &EvalLimits,
-    counts: &mut (usize, usize),
+    counts: &mut (usize, usize, usize),
 ) -> Result<()> {
     counts.0 = counts.0.checked_add(1).ok_or_else(exhausted)?;
     if depth > limits.max_ast_depth || counts.0 > limits.max_ast_nodes {
@@ -785,6 +791,29 @@ fn check_shape(
         X::ChangedPath(v) => {
             if let Some(c) = &v.candidates {
                 visit(c)?;
+            }
+            if v.policy_version == 3 {
+                let matcher = v
+                    .matcher
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("fileset matcher missing"))?;
+                let stats = tinytree_proto::validate_fileset(matcher).map_err(|e| match e {
+                    tinytree_proto::FilesetValidationError::Invalid => {
+                        Status::invalid_argument(e.message())
+                    }
+                    tinytree_proto::FilesetValidationError::Limit => exhausted(),
+                })?;
+                counts.0 = counts.0.checked_add(stats.nodes).ok_or_else(exhausted)?;
+                counts.2 = counts
+                    .2
+                    .checked_add(stats.string_bytes)
+                    .ok_or_else(exhausted)?;
+                if counts.0 > limits.max_ast_nodes
+                    || depth.saturating_add(stats.depth) > limits.max_ast_depth
+                    || counts.2 > tinytree_proto::fileset::MAX_FILESET_STRING_BYTES
+                {
+                    return Err(exhausted());
+                }
             }
         }
         X::Heads(v) | X::Roots(v) | X::HasConflict(v) => {

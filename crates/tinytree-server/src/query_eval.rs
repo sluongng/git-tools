@@ -2,6 +2,7 @@
 //! A quantum bounds operator transitions; one scoped literal lookup, bounded
 //! parent batch or interval union may perform more than one metadata probe.
 use crate::query_overlay::{GraphKey, GraphNode, OverlayGraph};
+use prost::Message as _;
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
@@ -132,6 +133,11 @@ impl Memory {
     }
 }
 pub(crate) trait PathPredicate {
+    fn changed_fileset(&mut self, _: m::CommitId, _: &[u8], _: &mut WorkBudget) -> Result<bool> {
+        Err(EvalError::Unsupported(
+            "fileset metadata reader unavailable",
+        ))
+    }
     fn changed(
         &mut self,
         id: m::CommitId,
@@ -230,6 +236,7 @@ impl Evaluator {
             limits: &limits,
             nodes: 0,
             literals: 0,
+            fileset_strings: 0,
         };
         let root = compiler.compile(&expression, 1)?;
         let literals = compiler.literals;
@@ -258,19 +265,34 @@ impl Evaluator {
     ) -> Result<Self> {
         let mut evaluator = Self::new(graph, expression, limits)?;
         let selected = std::mem::replace(&mut evaluator.root, Operator::Empty);
-        evaluator.root = Operator::Set(SetOperator {
-            left: Box::new(Operator::Commits(Commits {
-                ids: vec![candidate],
-                next: 0,
-                rows: BTreeMap::new(),
-            })),
-            right: Box::new(selected),
-            a: None,
-            b: None,
-            left_done: false,
-            right_done: false,
-            kind: SetKind::Intersection,
-        });
+        let intersect = |right| {
+            Operator::Set(SetOperator {
+                left: Box::new(Operator::Commits(Commits {
+                    ids: vec![candidate],
+                    next: 0,
+                    rows: BTreeMap::new(),
+                })),
+                right,
+                a: None,
+                b: None,
+                left_done: false,
+                right_done: false,
+                kind: SetKind::Intersection,
+            })
+        };
+        // The ORIGINAL expression has already been fully compiled above. A
+        // top-level path predicate is pointwise: intersecting its input with
+        // this same point avoids canonical path work for unrelated commits.
+        // Reuse the same two internal nodes; never push through graph operators
+        // such as ancestors, latest or heads, or rewrite wire/query identity.
+        evaluator.root = match selected {
+            Operator::ChangedPath(mut filter) => {
+                let candidates = filter.input;
+                filter.input = Box::new(intersect(candidates));
+                Operator::ChangedPath(filter)
+            }
+            selected => intersect(Box::new(selected)),
+        };
         Ok(evaluator)
     }
     pub fn literal_count(&self) -> usize {
@@ -714,6 +736,7 @@ impl HasConflict {
 struct ChangedPath {
     input: Box<Operator>,
     policy_version: u32,
+    matcher: Option<Vec<u8>>,
     path: String,
     exact_file: bool,
     look: Option<GraphNode>,
@@ -736,13 +759,19 @@ impl ChangedPath {
                 slots: 1,
                 intervals: 0,
             });
-            if ctx.path.changed(
-                node.commit(),
-                &self.path,
-                self.exact_file,
-                self.policy_version,
-                ctx.budget,
-            )? {
+            let changed = if let Some(matcher) = &self.matcher {
+                ctx.path
+                    .changed_fileset(node.commit(), matcher, ctx.budget)?
+            } else {
+                ctx.path.changed(
+                    node.commit(),
+                    &self.path,
+                    self.exact_file,
+                    self.policy_version,
+                    ctx.budget,
+                )?
+            };
+            if changed {
                 return Ok(EvalStep::Row(node));
             }
         }
@@ -1317,6 +1346,53 @@ pub(crate) fn validate_path(path: &str) -> Result<()> {
 pub(crate) fn has_path(expression: &q::GraphExpr) -> bool {
     has_path_policy(expression, false)
 }
+pub(crate) fn fileset_inputs(expression: &q::GraphExpr) -> Result<Vec<&q::FilesetExpr>> {
+    use q::graph_expr::Expression as X;
+    let mut todo = vec![expression];
+    let mut filesets = Vec::new();
+    let mut seen = 0usize;
+    while let Some(node) = todo.pop() {
+        seen += 1;
+        if seen > 1024 || todo.len() > 1024 {
+            return Err(limit());
+        }
+        match node.expression.as_ref() {
+            Some(X::ChangedPath(v)) => {
+                if v.policy_version == 3 {
+                    filesets.push(
+                        v.matcher
+                            .as_ref()
+                            .ok_or(EvalError::Invalid("fileset matcher missing"))?,
+                    );
+                }
+                todo.extend(v.candidates.as_deref());
+            }
+            Some(X::Ancestors(v)) => todo.extend(v.heads.as_deref()),
+            Some(X::Range(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(X::DagRange(v)) => {
+                todo.extend(v.roots.as_deref());
+                todo.extend(v.heads.as_deref());
+            }
+            Some(X::Heads(v) | X::Roots(v) | X::HasConflict(v)) => todo.extend(v.input.as_deref()),
+            Some(X::Union(v) | X::Intersection(v)) => {
+                if v.inputs.len() > 1024 {
+                    return Err(limit());
+                }
+                todo.extend(&v.inputs);
+            }
+            Some(X::Difference(v)) => {
+                todo.extend(v.left.as_deref());
+                todo.extend(v.right.as_deref());
+            }
+            Some(X::Latest(v)) => todo.extend(v.candidates.as_deref()),
+            _ => {}
+        }
+    }
+    Ok(filesets)
+}
 pub(crate) fn has_merged_path(expression: &q::GraphExpr) -> bool {
     has_path_policy(expression, true)
 }
@@ -1331,7 +1407,7 @@ fn has_path_policy(expression: &q::GraphExpr, merged_only: bool) -> bool {
         }
         match value.expression.as_ref() {
             Some(X::ChangedPath(v)) => {
-                if !merged_only || v.policy_version == 2 {
+                if !merged_only || matches!(v.policy_version, 2 | 3) {
                     return true;
                 }
                 todo.extend(v.candidates.as_deref());
@@ -1366,6 +1442,7 @@ struct Compiler<'a> {
     limits: &'a EvalLimits,
     nodes: usize,
     literals: usize,
+    fileset_strings: usize,
 }
 fn child<T: Borrow<q::GraphExpr>>(value: &Option<T>) -> Result<&q::GraphExpr> {
     value
@@ -1566,12 +1643,50 @@ impl Compiler<'_> {
                 }))
             }
             X::ChangedPath(value) => {
-                if !matches!(value.policy_version, 1 | 2) {
-                    return Err(EvalError::Unsupported("path policy version"));
-                }
-                validate_path(&value.path)?;
+                let matcher = match value.policy_version {
+                    1 | 2 => {
+                        if value.matcher.is_some() {
+                            return Err(EvalError::Invalid("legacy path policy has a fileset"));
+                        }
+                        validate_path(&value.path)?;
+                        None
+                    }
+                    3 => {
+                        if !value.path.is_empty() || value.exact_file {
+                            return Err(EvalError::Invalid(
+                                "fileset policy has legacy path fields",
+                            ));
+                        }
+                        let matcher = value
+                            .matcher
+                            .as_ref()
+                            .ok_or(EvalError::Invalid("fileset matcher missing"))?;
+                        let stats =
+                            tinytree_proto::validate_fileset(matcher).map_err(|e| match e {
+                                tinytree_proto::FilesetValidationError::Invalid => {
+                                    EvalError::Invalid(e.message())
+                                }
+                                tinytree_proto::FilesetValidationError::Limit => limit(),
+                            })?;
+                        self.nodes = self.nodes.checked_add(stats.nodes).ok_or_else(limit)?;
+                        self.fileset_strings = self
+                            .fileset_strings
+                            .checked_add(stats.string_bytes)
+                            .ok_or_else(limit)?;
+                        if self.nodes > self.limits.max_ast_nodes
+                            || depth.saturating_add(stats.depth) > self.limits.max_ast_depth
+                            || self.fileset_strings
+                                > tinytree_proto::fileset::MAX_FILESET_STRING_BYTES
+                        {
+                            return Err(limit());
+                        }
+                        Some(matcher.encode_to_vec())
+                    }
+                    _ => return Err(EvalError::Unsupported("path policy version")),
+                };
                 Ok(Operator::ChangedPath(ChangedPath {
                     policy_version: value.policy_version,
+                    matcher,
                     input: Box::new(self.compile(child(&value.candidates)?, depth + 1)?),
                     path: value.path.clone(),
                     exact_file: value.exact_file,

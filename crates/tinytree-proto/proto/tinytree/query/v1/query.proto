@@ -287,11 +287,45 @@ message UnaryExpr { GraphExpr input = 1; }
 // directory at the selected path rather than treating it as a file. Neither
 // policy changes authenticated scope identity or grants access to extra sources.
 message ChangedPathExpr {
-  uint32 policy_version = 1; // 1: EXACT_PATH_GRAPH_V1; 2: MERGED_PATH_GRAPH_V2.
+  uint32 policy_version = 1; // 1: EXACT_PATH_GRAPH_V1; 2: MERGED_PATH_GRAPH_V2; 3: FILESET_GRAPH_V3.
   GraphExpr candidates = 2;
   string path = 3; // Nonempty normalized repository-relative path.
   bool exact_file = 4;
+  // Policy 3 only: one path matcher evaluated against each changed entry, not
+  // intersection/difference of independently selected commit sets. Requires
+  // empty path and exact_file=false. Policies 1/2 must reject this field.
+  FilesetExpr matcher = 5;
 }
+
+// Repository-root-relative matcher tree. Aliases/cwd are resolved by the caller.
+// Fixed structural limits: 64 nodes, depth 16, 64 KiB aggregate string bytes,
+// and 4096 bytes per path/pattern. Glob syntax follows the pinned stock matcher;
+// it is never a caller-supplied regular expression. Compilation is fallible and
+// resource bounded separately from structural validation.
+message FilesetExpr {
+  oneof expression {
+    EmptyFileset empty = 1;
+    EmptyFileset all = 2;
+    FilesetLiteral literal = 3;
+    FilesetGlob glob = 4;
+    FilesetUnion union = 5;
+    FilesetBinary intersection = 6;
+    FilesetBinary difference = 7;
+  }
+}
+message EmptyFileset {}
+message FilesetLiteral {
+  string path = 1; // Normalized; empty permitted only for a root prefix.
+  bool exact_file = 2;
+}
+message FilesetGlob {
+  string directory = 1; // Normalized base directory; empty denotes root.
+  string pattern = 2; // Nonempty stock glob text, preserving escape syntax.
+  bool case_insensitive = 3;
+  bool prefix = 4; // PrefixGlob rather than FileGlob semantics.
+}
+message FilesetUnion { repeated FilesetExpr inputs = 1; } // Empty means none.
+message FilesetBinary { FilesetExpr left = 1; FilesetExpr right = 2; }
 
 // Empty union is empty. Empty intersection is invalid, not an implicit request
 // to enumerate the entire scoped graph.

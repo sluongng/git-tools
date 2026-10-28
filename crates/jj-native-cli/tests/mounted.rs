@@ -2611,6 +2611,12 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
     fs::create_dir(root.join("nested")).unwrap();
     fs::write(root.join("nested/new.txt"), b"unrelated entry\n").unwrap();
     fixture.success(&root, &["status"]);
+    fixture.success(&root, &["new", "-m", "distinct fileset paths in one change"]);
+    fs::write(root.join("hello.cc"), b"selected mixed change\n").unwrap();
+    fs::write(root.join("nested/new.txt"), b"excluded mixed change\n").unwrap();
+    fs::write(root.join("nested/UPPER.RS"), b"case-sensitive fileset\n").unwrap();
+    fixture.success(&root, &["status"]);
+    let mixed_paths = fixture.revision(&root, "@");
     fixture.success(&root, &["new", "-m", "dirty selected path"]);
     fs::write(
         root.join("hello.cc"),
@@ -2734,20 +2740,71 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
     assert!(
         String::from_utf8_lossy(&limited.stderr).contains("native index resource limit exceeded")
     );
-    for unsupported_fileset in ["hello.cc & nested", "~hello.cc"] {
+    // A matcher applies to each changed path, not independently to the commit
+    // sets selected by its operands. The mixed commit above changes both paths.
+    for (fileset, expected_mixed) in [
+        ("hello.cc & nested", false),
+        ("hello.cc ~ nested", true),
+        ("glob:**/*.rs", false),
+        ("glob-i:**/*.rs", true),
+    ] {
+        let args = [
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "ancestors(@)",
+            "-T",
+            "commit_id ++ \"\\n\"",
+            fileset,
+        ];
+        let output = fixture.run(&root, &args);
+        assert!(
+            output.status.success(),
+            "{fileset}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ids = String::from_utf8(output.stdout.clone()).unwrap();
+        assert_eq!(
+            ids.lines().any(|id| id == mixed_paths),
+            expected_mixed,
+            "{fileset}: match paths within one commit, including case policy"
+        );
+        if fileset == "hello.cc & nested" {
+            assert!(ids.is_empty(), "disjoint path matchers cannot intersect");
+        }
+        observed.push((args.into_iter().map(str::to_owned).collect(), output.stdout));
+    }
+    for (selection, fileset) in [
+        ("ancestors(main)", "glob:*.cc"),
+        ("ancestors(@)", "glob:**/*.cc"),
+        ("ancestors(@)", "glob-i:**/*.CC"),
+        ("ancestors(@)", "prefix-glob:shape"),
+        ("ancestors(@)", "prefix-glob-i:SHAPE"),
+        ("ancestors(@)", "hello.cc | (glob:**/*.txt ~ nested)"),
+        ("ancestors(@)", "~hello.cc"),
+        ("ancestors(@)", "all()"),
+        ("ancestors(@)", "none()"),
+    ] {
+        let args = [
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            selection,
+            "-T",
+            "commit_id ++ \"\\n\"",
+            fileset,
+        ];
         let output = fixture.run(
             &root,
-            &[
-                "--ignore-working-copy",
-                "log",
-                "-r",
-                "ancestors(@)",
-                unsupported_fileset,
-            ],
+            &args,
         );
-        assert!(!output.status.success(), "{unsupported_fileset}");
-        assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("fileset_not_exact_path"));
+        assert!(
+            output.status.success(),
+            "{selection}/{fileset}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        observed.push((args.into_iter().map(str::to_owned).collect(), output.stdout));
     }
     let default_args = [
         "--ignore-working-copy",
@@ -2762,18 +2819,25 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
         default_args.into_iter().map(str::to_owned).collect(),
         default_output.stdout,
     ));
-    let unsupported = fixture.run(
-        &root,
-        &[
-            "--ignore-working-copy",
-            "log",
-            "-r",
-            "ancestors(main)",
-            "glob:*.cc",
-        ],
+    let default_fileset_args = [
+        "--ignore-working-copy",
+        "log",
+        "-n",
+        "3",
+        "-r",
+        "ancestors(@)",
+        "glob:**/*.cc ~ nested",
+    ];
+    let default_fileset = fixture.run(&root, &default_fileset_args);
+    assert!(
+        default_fileset.status.success(),
+        "default fileset display: {}",
+        String::from_utf8_lossy(&default_fileset.stderr)
     );
-    assert!(!unsupported.status.success());
-    assert!(unsupported.stdout.is_empty());
+    observed.push((
+        default_fileset_args.into_iter().map(str::to_owned).collect(),
+        default_fileset.stdout,
+    ));
     assert_eq!(
         upstream.file_reads(),
         reads,
@@ -3109,7 +3173,14 @@ fn ordinary_exact_path_log_filters_graphs_over_public_private_and_dirty_entries(
             absent_reads,
             "unmatched private/public merges must not read FILE bodies"
         );
-        for selector in ["file:hello.cc", "selected"] {
+        for selector in [
+            "file:hello.cc",
+            "selected",
+            "glob:*.cc",
+            "prefix-glob:selected",
+            "glob:*.cc & ~glob:unrelated.*",
+            "all() ~ unrelated.txt",
+        ] {
             let args = [
                 "--ignore-working-copy",
                 "log",
@@ -6452,6 +6523,22 @@ fn exact_nonprimary_capture_upload_and_empty_cache_restore_preserve_all_raw_enco
     );
     let merge_expected = legacy_annotation_oracle(&mut producer, &root, &merge_args);
     assert_eq!(native.stdout, merge_expected);
+    for selector in ["glob:merge-*.txt", "glob:*.txt ~ capture-only.txt"] {
+        let mut args = merge_args;
+        *args.last_mut().unwrap() = selector;
+        let output = producer.run(&root, &args);
+        assert!(
+            output.status.success(),
+            "pre-capture {selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, merge_expected);
+        assert_eq!(
+            output.stdout,
+            legacy_annotation_oracle(&mut producer, &root, &args),
+            "pre-capture matcher preserves the same stock merge selection"
+        );
+    }
     producer.success(&root, &["new", "-m", "exact raw capture"]);
     let authored = b"private captured workspace exact representation\n";
     fs::write(root.join("capture-only.txt"), authored).unwrap();
@@ -8045,7 +8132,12 @@ fn restore_captured_workspace_with_watchdog(
             .metadata
             .retained_scope_opens
             .load(Ordering::SeqCst);
-        for selector in ["file:merge-log.txt", "merge-log.txt"] {
+        for selector in [
+            "file:merge-log.txt",
+            "merge-log.txt",
+            "glob:merge-*.txt",
+            "glob:*.txt ~ capture-only.txt",
+        ] {
             let args = [
                 "--ignore-working-copy",
                 "log",

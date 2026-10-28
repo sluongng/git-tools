@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sluongng <26684313+sluongng@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH] jj-core: Bound stock glob matcher construction without panic
+
+Stock glob matcher construction assumes regex compilation cannot fail. Remote
+filesets need fallible compilation and aggregate admission rather than one
+unlimited compiler allocation per leaf. Add a shared syntax/compiler budget and
+bounded builder while preserving the original builder and stock regex/pruning.
+Reserve each regex set's configured compiled/cache allowance before compiling;
+never refund failed work. Regex engine limits are approximate, not allocator RSS.
+Callers admit parsed AST storage, parser work, containers and concurrency
+separately. Expose case sensitivity so callers can preserve parsed glob identity.
+---
+diff --git a/src/matchers.rs b/src/matchers.rs
+--- a/src/matchers.rs
++++ b/src/matchers.rs
+@@ -14,6 +14,9 @@
+ 
+ //! Contains the [`Matcher`] trait which is used for matching against
+ //! [`RepoPath`]s and guiding walks of directory trees.
++
++mod bounded;
++pub use bounded::{MatcherBuildBudget, MatcherBuildError, MatcherBuildLimits, MatcherBuildUsage};
+ 
+ use std::collections::HashSet;
+ use std::fmt;
+@@ -381,11 +384,67 @@
+             matches_prefix_paths,
+         }
+     }
++
++    /// Compile with aggregate syntax and regex admission shared across the
++    /// complete fileset. Every directory's RegexSet reserves its full configured
++    /// allowance before compilation. No per-leaf budget reset or panic fallback.
++    /// Searches use one cache-pool shard. Callers must serialize physical
++    /// searches (including visit) or separately admit concurrent cache copies.
++    pub fn build_bounded(
++        self,
++        budget: &mut MatcherBuildBudget,
++    ) -> Result<GlobsMatcher, MatcherBuildError> {
++        let Self {
++            mut dir_patterns,
++            matches_prefix_paths,
++        } = self;
++        budget.reserve_globs(dir_patterns.len())?;
++        // Charge borrowed syntax before cloning paths or generating prefix regexes.
++        for (dir, pattern) in &dir_patterns {
++            budget.charge_literal_bytes(dir.as_internal_file_string().len())?;
++            budget.charge_literal_bytes(pattern.as_str().len())?;
++            let bytes = pattern
++                .as_regex()
++                .len()
++                .checked_add(if matches_prefix_paths { 6 } else { 0 })
++                .ok_or(MatcherBuildError::LimitExceeded)?;
++            budget.charge_regex_bytes(bytes)?;
++        }
++        dir_patterns.sort_unstable_by_key(|&(dir, _)| dir);
++
++        let mut tree: RepoPathTree<Option<regex::bytes::RegexSet>> = Default::default();
++        for (dir, chunk) in &dir_patterns.into_iter().chunk_by(|&(dir, _)| dir) {
++            // Based on new_regex() in globset. We don't use GlobSet because
++            // RepoPath separator should be "/" on all platforms.
++            let (compiled_limit, cache_limit) = budget.reserve_regex_set()?;
++            let mut regex_builder = if matches_prefix_paths {
++                let regex_patterns = chunk.map(|(_, pattern)| pattern.to_prefix_regex());
++                regex::bytes::RegexSetBuilder::new(regex_patterns)
++            } else {
++                regex::bytes::RegexSetBuilder::new(chunk.map(|(_, pattern)| pattern.as_regex()))
++            };
++            let regex = regex_builder
++                .dot_matches_new_line(true)
++                .size_limit(compiled_limit)
++                .dfa_size_limit(cache_limit)
++                .pool_capacity(1)
++                .build()
++                .map_err(MatcherBuildError::Regex)?;
++            let sub = tree.add(dir);
++            assert!(sub.value().is_none());
++            sub.set_value(Some(regex));
++        }
++
++        Ok(GlobsMatcher {
++            tree,
++            matches_prefix_paths,
++        })
++    }
+ }
+ 
+ /// Wrapper for a [`Glob`] parsed with `literal_separator = true`.
+ #[derive(Clone)]
+-pub struct PathGlobPattern(Glob);
++pub struct PathGlobPattern(Glob, bool);
+ 
+ impl Debug for PathGlobPattern {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+@@ -413,12 +472,17 @@
+             .literal_separator(true)
+             .case_insensitive(icase)
+             .build()?;
+-        Ok(Self(glob))
++        Ok(Self(glob, icase))
+     }
+ 
+     /// Returns the original glob pattern.
+     pub fn as_str(&self) -> &str {
+         self.0.glob()
++    }
++
++    /// Whether this pattern was parsed with case-insensitive matching.
++    pub fn case_insensitive(&self) -> bool {
++        self.1
+     }
+ 
+     /// Returns the regular expression string for this glob.
+diff --git a/src/matchers/bounded.rs b/src/matchers/bounded.rs
+new file mode 100644
+--- /dev/null
++++ b/src/matchers/bounded.rs
+@@ -0,0 +1,143 @@
++// Copyright 2026 The Jujutsu Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++/// Aggregate construction limits shared by all leaves of one or more matchers.
++/// Input AST storage/parsing is caller-owned. Regex sizes are the engine's
++/// approximate compiled-size/cache limits, not allocator RSS measurements.
++/// Callers separately admit AST/output containers, concurrency and clones.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct MatcherBuildLimits {
++    pub max_ast_nodes: usize,
++    /// Additionally capped at 256 to bound recursive stock matcher construction.
++    pub max_ast_depth: usize,
++    pub max_literal_bytes: usize,
++    pub max_regex_bytes: usize,
++    pub max_regex_set_bytes: usize,
++    pub max_regex_cache_bytes: usize,
++    pub max_total_regex_memory_bytes: usize,
++}
++impl Default for MatcherBuildLimits {
++    fn default() -> Self {
++        Self {
++            max_ast_nodes: 64,
++            max_ast_depth: 16,
++            max_literal_bytes: 64 * 1024,
++            max_regex_bytes: 1024 * 1024,
++            max_regex_set_bytes: 128 * 1024,
++            max_regex_cache_bytes: 0,
++            max_total_regex_memory_bytes: 8 * 1024 * 1024,
++        }
++    }
++}
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct MatcherBuildUsage {
++    pub ast_nodes: usize,
++    pub max_depth: usize,
++    pub literal_bytes: usize,
++    pub regex_bytes: usize,
++    pub regex_sets: usize,
++    /// Full configured compiled/cache allowances, not just successful outputs.
++    /// Reservations are cumulative and are never refunded on compile failure.
++    pub regex_memory_bytes: usize,
++}
++#[derive(Debug)]
++pub enum MatcherBuildError {
++    LimitExceeded,
++    Regex(regex::Error),
++}
++impl std::fmt::Display for MatcherBuildError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::LimitExceeded => f.write_str("matcher construction limit exceeded"),
++            Self::Regex(_) => f.write_str("matcher regex compilation failed"),
++        }
++    }
++}
++impl std::error::Error for MatcherBuildError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Regex(error) => Some(error),
++            _ => None,
++        }
++    }
++}
++#[derive(Clone, Debug)]
++pub struct MatcherBuildBudget {
++    limits: MatcherBuildLimits,
++    usage: MatcherBuildUsage,
++    glob_patterns: usize,
++}
++impl MatcherBuildBudget {
++    pub fn new(limits: MatcherBuildLimits) -> Self {
++        Self {
++            limits,
++            usage: MatcherBuildUsage::default(),
++            glob_patterns: 0,
++        }
++    }
++    pub fn usage(&self) -> MatcherBuildUsage {
++        self.usage
++    }
++    fn add(counter: &mut usize, amount: usize, maximum: usize) -> Result<(), MatcherBuildError> {
++        *counter = counter
++            .checked_add(amount)
++            .ok_or(MatcherBuildError::LimitExceeded)?;
++        if *counter > maximum {
++            return Err(MatcherBuildError::LimitExceeded);
++        }
++        Ok(())
++    }
++    pub fn charge_node(&mut self, depth: usize) -> Result<(), MatcherBuildError> {
++        Self::add(&mut self.usage.ast_nodes, 1, self.limits.max_ast_nodes)?;
++        self.usage.max_depth = self.usage.max_depth.max(depth);
++        if depth == 0 || depth > self.limits.max_ast_depth.min(256) {
++            return Err(MatcherBuildError::LimitExceeded);
++        }
++        Ok(())
++    }
++    pub fn charge_literal_bytes(&mut self, bytes: usize) -> Result<(), MatcherBuildError> {
++        Self::add(
++            &mut self.usage.literal_bytes,
++            bytes,
++            self.limits.max_literal_bytes,
++        )
++    }
++    pub fn charge_regex_bytes(&mut self, bytes: usize) -> Result<(), MatcherBuildError> {
++        Self::add(
++            &mut self.usage.regex_bytes,
++            bytes,
++            self.limits.max_regex_bytes,
++        )
++    }
++    pub(super) fn reserve_globs(&mut self, count: usize) -> Result<(), MatcherBuildError> {
++        Self::add(&mut self.glob_patterns, count, self.limits.max_ast_nodes)
++    }
++    pub(super) fn reserve_regex_set(&mut self) -> Result<(usize, usize), MatcherBuildError> {
++        let bytes = self
++            .limits
++            .max_regex_set_bytes
++            .checked_add(self.limits.max_regex_cache_bytes)
++            .ok_or(MatcherBuildError::LimitExceeded)?;
++        Self::add(
++            &mut self.usage.regex_memory_bytes,
++            bytes,
++            self.limits.max_total_regex_memory_bytes,
++        )?;
++        Self::add(&mut self.usage.regex_sets, 1, self.limits.max_ast_nodes)?;
++        Ok((
++            self.limits.max_regex_set_bytes,
++            self.limits.max_regex_cache_bytes,
++        ))
++    }
++}
+-- 
+2.47.0
