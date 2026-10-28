@@ -50,6 +50,7 @@ struct Running {
     files: Arc<AtomicUsize>,
     queries: Arc<QueryCounts>,
     capabilities: Arc<AtomicUsize>,
+    cloud_calls: Arc<AtomicUsize>,
 }
 impl Running {
     async fn start(service: RepositoryService, mode: Mode) -> Self {
@@ -96,6 +97,10 @@ impl Running {
             canonical_bytes: canonical_bytes.clone(),
             publications: Arc::new(AtomicUsize::new(0)),
         };
+        let cloud_faults = CloudFaults::default();
+        let cloud_calls = cloud_faults.calls.clone();
+        let cloud_service = matches!(mode, Mode::CapabilitiesOutOfRange | Mode::CapabilitiesParentUnavailable).then(||
+            tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(cloud_faults));
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(
@@ -106,6 +111,7 @@ impl Running {
                         .max_encoding_message_size(20 * 1024 * 1024),
                 )
                 .add_service(query_service)
+                .add_optional_service(cloud_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |result| {
                         result.and_then(|stream| {
@@ -133,6 +139,7 @@ impl Running {
             files,
             queries,
             capabilities,
+            cloud_calls,
         }
     }
     fn config(&self) -> Config {
@@ -183,6 +190,7 @@ enum Mode {
     CapabilitiesDenied,
     CapabilitiesLimited,
     CapabilitiesOutOfRange,
+    CapabilitiesParentUnavailable,
     CapabilitiesTransport,
     CapabilitiesSlow,
     Normal,
@@ -251,16 +259,37 @@ async fn structured_publication_requires_its_exact_capability_without_legacy_fal
         assert_eq!(running.capabilities.load(Ordering::SeqCst), 2);
         running.stop().await;
     }
-    // A capability error cannot prove that an accepted pin identity is terminal.
-    let (_directory, _store, service) = setup();
-    let running = Running::start(service, Mode::CapabilitiesOutOfRange).await;
-    assert_eq!(running.client().await.acquire_cloud_version_pin(
-        [71; 32], tinytree_client::CloudVersionPinIdentity {
-            pin_id: [19; 16], acquire_not_after_unix_seconds: 120,
-        }, tinytree_client::CloudPinSelection::LatestCaptured,
-    ).await.unwrap_err().code(), Code::FailedPrecondition);
-    assert_eq!(running.capabilities.load(Ordering::SeqCst), 1);
-    running.stop().await;
+    // A capability error cannot prove pin/publication expiry or missing ancestry.
+    for mode in [Mode::CapabilitiesOutOfRange, Mode::CapabilitiesParentUnavailable] {
+        let (_directory, _store, service) = setup();
+        let running = Running::start(service, mode).await;
+        assert_eq!(running.client().await.acquire_cloud_version_pin(
+            [71; 32], tinytree_client::CloudVersionPinIdentity {
+                pin_id: [19; 16], acquire_not_after_unix_seconds: 120,
+            }, tinytree_client::CloudPinSelection::LatestCaptured,
+        ).await.unwrap_err().code(), Code::FailedPrecondition);
+        assert_eq!(running.capabilities.load(Ordering::SeqCst), 1);
+        let client = running.client().await;
+        let identity = tinytree_client::CloudPublicationIdentity {
+            workspace_id: [71; 32], generation: 1, nonce: [19; 16],
+        };
+        let error = client.cloud_publication_v2(identity).await.unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(error.message(), "cloud publication capability negotiation unavailable",
+            "capability failure is neither publication expiry nor missing-parent evidence");
+        let intent = tinytree_client::CloudPublishIntent {
+            workspace_id: identity.workspace_id, expected_generation: 0,
+            idempotency_key: identity.token(), manifest: b"capability preflight fixture".to_vec(),
+            staging_leases: vec![],
+        };
+        let error = client.cloud_publish_version_v2(&intent, identity).await.unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(error.message(), "cloud publication capability negotiation unavailable");
+        assert_eq!(running.capabilities.load(Ordering::SeqCst), 3);
+        assert_eq!(running.cloud_calls.load(Ordering::SeqCst), 0,
+            "failed negotiation must not issue a publication lookup or publish RPC");
+        running.stop().await;
+    }
 
 }
 
@@ -467,6 +496,9 @@ impl Repository for Faults {
         }
         if self.mode == Mode::CapabilitiesOutOfRange {
             return Err(Status::out_of_range("capability fixture unavailable"));
+        }
+        if self.mode == Mode::CapabilitiesParentUnavailable {
+            return Err(Status::failed_precondition("cloud manifest parent unavailable"));
         }
         if self.mode == Mode::CapabilitiesTransport {
             return Err(Status::unavailable("capability transport unavailable"));
@@ -6735,6 +6767,21 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
         staging_leases: publication_leases,
     };
     assert!(sdk.cloud_publication_v2(identity).await.unwrap().is_none());
+    let mut missing_parent = manifest.clone();
+    missing_parent.parents = vec![tinytree_cloud::ManifestId([91; 32])];
+    let missing_parent = tinytree_client::CloudPublishIntent {
+        workspace_id: intent.workspace_id,
+        expected_generation: intent.expected_generation,
+        idempotency_key: intent.idempotency_key.clone(),
+        manifest: tinytree_cloud::encode_manifest(&missing_parent, Default::default()).unwrap(),
+        staging_leases: intent.staging_leases.clone(),
+    };
+    let error = sdk.cloud_publish_version_v2(&missing_parent, identity).await.unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(error.message(), "cloud manifest parent unavailable");
+    assert!(error.details().is_empty());
+    assert!(sdk.cloud_publication_v2(identity).await.unwrap().is_none(),
+        "a missing parent must reject publication without consuming its identity");
     let published = sdk
         .cloud_publish_version_v2(&intent, identity)
         .await
@@ -7559,6 +7606,9 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         _: Request<tinytree_client::cloud_protocol::GetPublicationRequest>,
     ) -> Result<Response<tinytree_client::cloud_protocol::GetPublicationResponse>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == 65 {
+            return Err(Status::out_of_range("structured publication expired"));
+        }
         Ok(Response::new(
             tinytree_client::cloud_protocol::GetPublicationResponse {
                 publication: self.publication.lock().unwrap().clone(),
@@ -9772,6 +9822,13 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
         Some(selector.manifest_id)
     );
     assert_eq!(intent.capture_data(), data);
+    faults.mode.store(65, Ordering::SeqCst);
+    let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(client.cloud_publication_v2(tinytree_client::CloudPublicationIdentity {
+        workspace_id: [1; 32], generation: 1, nonce: [19; 16],
+    }).await.unwrap_err().code(), Code::OutOfRange,
+        "real publication endpoint expiry remains terminal evidence");
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before + 1);
     faults.mode.store(40, Ordering::SeqCst);
     let pin_identity = tinytree_client::CloudVersionPinIdentity {
         pin_id: [21; 16],

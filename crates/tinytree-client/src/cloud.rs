@@ -1039,6 +1039,10 @@ impl NativeClient {
                     tonic::Code::InvalidArgument | tonic::Code::Unimplemented
                 ) {
                     Status::unimplemented("structured cloud publication is not supported")
+                } else if matches!(error.code(), tonic::Code::OutOfRange | tonic::Code::FailedPrecondition) {
+                    // Negotiation does not establish publication expiry or a
+                    // definitive missing parent for an accepted publication.
+                    Status::failed_precondition("cloud publication capability negotiation unavailable")
                 } else {
                     error
                 }

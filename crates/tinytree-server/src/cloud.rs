@@ -693,7 +693,9 @@ fn native_authority(
     }
 }
 fn status(error: s::Error) -> Status {
-    if matches!(error, s::Error::Limit("cloud native read deadline")) {
+    if matches!(error, s::Error::Invalid("cloud manifest parent unavailable")) {
+        Status::failed_precondition("cloud manifest parent unavailable")
+    } else if matches!(error, s::Error::Limit("cloud native read deadline")) {
         Status::deadline_exceeded("retained native read deadline exceeded")
     } else if let s::Error::Limit(limit) = error {
         use tinytree_proto::PublicationFailureReason as Reason;

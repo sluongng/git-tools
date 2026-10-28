@@ -78,6 +78,14 @@ fn safe_publication_reason(error: &anyhow::Error) -> Option<&'static str> {
     }
     None
 }
+fn definitive_missing_manifest_parent(error: &anyhow::Error) -> bool {
+    error.chain().take(32).any(|cause| {
+        cause.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            status.code() == tonic::Code::FailedPrecondition
+                && status.message() == "cloud manifest parent unavailable"
+        })
+    })
+}
 fn safe_error(error: &anyhow::Error) -> (&'static str, &'static str) {
     // Never inspect Display, RPC messages/details/metadata, paths, payloads or
     // arbitrary context strings. Only fixed projections of known error types.
@@ -468,6 +476,17 @@ const SUCCESSOR_MEMORY: u64 = 128 * 1024;
 struct Successor {
     original: native_retention::BundleDescriptor,
     predecessors: Vec<native_retention::BundleDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ancestry: Option<SuccessorAncestry>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SuccessorAncestry {
+    parent: [u8; 32],
+    // Same-generation replacement is admitted only after the server's specific
+    // missing-parent refusal. This is not permission to replay an uncertain ID.
+    #[serde(default)]
+    missing_parent_refusal: bool,
 }
 fn attempt_name(ticket: &[u8; 32], ordinal: usize) -> String {
     format!("{}.attempt-{ordinal}", hex(ticket))
@@ -528,6 +547,7 @@ impl Header {
                     && s.predecessors
                         .iter()
                         .all(|p| p.size_bytes > 0 && p.size_bytes <= 4096)
+                    && (s.ancestry.is_none() || typed)
                     && (typed
                         || self.key
                             == format!(
@@ -543,14 +563,39 @@ impl Header {
             && self.capture_size <= 8 * 1024 * 1024
     }
 }
+enum PublicationLookup {
+    Accepted(tinytree_client::CloudPublication),
+    Absent,
+    ReplayExpired,
+}
+async fn publication_lookup(
+    client: &tinytree_client::NativeClient,
+    header: &Header,
+) -> Result<PublicationLookup> {
+    let result = match header.identity()? {
+        Some(identity) => client.cloud_publication_v2(identity).await,
+        None => client.cloud_publication(&header.key).await,
+    };
+    Ok(match result {
+        Ok(Some(receipt)) => PublicationLookup::Accepted(receipt),
+        Ok(None) => PublicationLookup::Absent,
+        // An expired receipt is terminal, not evidence of nonpublication.
+        // Only a subsequent generation fence can authorize a successor.
+        Err(error) if error.code() == tonic::Code::OutOfRange => PublicationLookup::ReplayExpired,
+        Err(error) => return Err(error.into()),
+    })
+}
 async fn publication(
     client: &tinytree_client::NativeClient,
     header: &Header,
 ) -> Result<Option<tinytree_client::CloudPublication>> {
-    Ok(match header.identity()? {
-        Some(identity) => client.cloud_publication_v2(identity).await?,
-        None => client.cloud_publication(&header.key).await?,
-    })
+    match publication_lookup(client, header).await? {
+        PublicationLookup::Accepted(receipt) => Ok(Some(receipt)),
+        PublicationLookup::Absent => Ok(None),
+        PublicationLookup::ReplayExpired => {
+            Err(tonic::Status::out_of_range("cloud publication replay expired").into())
+        }
+    }
 }
 async fn publish(
     client: &tinytree_client::NativeClient,
@@ -720,6 +765,8 @@ struct Intent {
     original_job: Option<native_retention::BundleDescriptor>,
     header: Header,
     manifest: Vec<u8>,
+    // Original bytes remain the sole source for deterministic parent changes.
+    original_manifest: Option<Vec<u8>>,
     capture: Vec<u8>,
 }
 impl Intent {
@@ -781,6 +828,7 @@ impl Intent {
             original_job: Some(raw_descriptor(bytes)),
             header,
             manifest,
+            original_manifest: None,
             capture,
         };
         value.sdk()?;
@@ -835,6 +883,8 @@ struct TestHooks {
     disable_server_retained_contract: bool,
     #[cfg(test)]
     provider_pending_limit: Option<usize>,
+    #[cfg(test)]
+    rolling_window: Option<u64>,
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -1131,13 +1181,39 @@ impl Worker {
                 header.valid()
                     && successor.original == original_descriptor
                     && successor.predecessors == descriptors
-                    && header.expected_generation
-                        > headers.last().unwrap_or(&original).expected_generation,
+                    && (header.expected_generation
+                        > headers.last().unwrap_or(&original).expected_generation
+                        || (header.expected_generation
+                            == headers.last().unwrap_or(&original).expected_generation
+                            && header.publication_identity.is_some()
+                            && (headers
+                                .last()
+                                .unwrap_or(&original)
+                                .publication_identity
+                                .is_none()
+                                || successor.ancestry.as_ref().is_some_and(|ancestry| {
+                                    ancestry.missing_parent_refusal
+                                        && headers
+                                            .last()
+                                            .unwrap_or(&original)
+                                            .successor
+                                            .as_ref()
+                                            .and_then(|s| s.ancestry.as_ref())
+                                            .map(|a| a.parent)
+                                            != Some(ancestry.parent)
+                                        && header.manifest_id
+                                            != headers.last().unwrap_or(&original).manifest_id
+                                })))),
                 "capture successor chain differs"
             );
             ensure!(
-                header.publication_identity.is_some() == original.publication_identity.is_some(),
-                "capture successor publication family differs"
+                headers
+                    .last()
+                    .unwrap_or(&original)
+                    .publication_identity
+                    .is_none()
+                    || header.publication_identity.is_some(),
+                "capture successor cannot downgrade structured publication"
             );
             let mut normalized = header.clone();
             normalized.version = original.version;
@@ -1145,6 +1221,10 @@ impl Worker {
             normalized.key = original.key.clone();
             normalized.successor = None;
             normalized.publication_identity = original.publication_identity.clone();
+            if successor.ancestry.is_some() {
+                normalized.manifest_id = original.manifest_id;
+                normalized.manifest_size = original.manifest_size;
+            }
             ensure!(
                 normalized == original && serde_json::to_vec(&header)? == bytes,
                 "capture successor payload binding differs"
@@ -1168,6 +1248,7 @@ impl Worker {
             "capture publication does not select exact journal envelope"
         );
         intent.header = header;
+        self.materialize_selected(intent)?;
         Ok(())
     }
     fn sync_namespace(&self) -> Result<()> {
@@ -2172,6 +2253,34 @@ impl Worker {
                 candidates.partition_point(|ticket| (ticket.registry_epoch, ticket.id) <= last);
             candidates.rotate_left(split);
         }
+        // A rolling discovery window can expire ancient proofs while queued
+        // local capsules remain. Use the freshest published proof first rather
+        // than allowing an unreadable historical capsule to block useful GC.
+        // This changes scheduling only: exact source and canonical coverage are
+        // still proved below, and the newest capture can never be a candidate.
+        let worker = self.clone();
+        let inventory = candidates.clone();
+        let generations = blocking_owned(admission.clone() as Owner, move || {
+            let mut generations = BTreeMap::new();
+            for ticket in inventory {
+                let name = format!("{}.published", hex(&ticket.id.0));
+                if !path_absent(&worker.directory, &name)? {
+                    let header: Header =
+                        serde_json::from_slice(&worker.read_bounded_durable(&name, 4096)?)?;
+                    ensure!(
+                        header.valid()
+                            && header.ticket == ticket.id.0
+                            && header.ticket_binding == ticket.binding(),
+                        "retirement scheduling publication differs"
+                    );
+                    generations.insert(ticket.id, header.expected_generation);
+                }
+            }
+            Ok(generations)
+        })
+        .await?
+        .value;
+        candidates.sort_by_key(|ticket| std::cmp::Reverse(generations.get(&ticket.id).copied()));
         for old in candidates {
             let Some(newer) = tickets
                 .iter()
@@ -2806,6 +2915,169 @@ impl Worker {
                 descriptors.contains(&(entry.kind, entry.id.clone(), entry.blake3, entry.size))
             }))
     }
+    fn ancestry_manifest(
+        &self,
+        original: &[u8],
+        capture_bytes: usize,
+        parent: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        // Reuse the job's sequential decoder allowance, not a new pool. Raw
+        // original/derived/SDK copies coexist outside this codec scratch.
+        const SCRATCH: u64 = 1024 * 1024 * 1024;
+        let retained = original
+            .len()
+            .checked_add(capture_bytes)
+            .and_then(|n| n.checked_mul(4))
+            .context("ancestry retained bytes overflow")? as u64;
+        ensure!(
+            retained
+                .checked_add(SUCCESSOR_MEMORY)
+                .and_then(|n| n.checked_add(SCRATCH))
+                .is_some_and(|n| n <= self.policy.max_memory_bytes),
+            "capture ancestry materialization memory unavailable"
+        );
+        let mut limits = c::ManifestV3Limits::default();
+        limits.history.recovery.max_decode_bytes = limits
+            .history
+            .recovery
+            .max_decode_bytes
+            .min(SCRATCH as usize);
+        limits.history.artifacts.max_decode_bytes = limits
+            .history
+            .artifacts
+            .max_decode_bytes
+            .min(SCRATCH as usize);
+        let mut decoded = c::decode_manifest_v3(original, c::ManifestId::of(original), limits)?;
+        decoded.history.recovery.parents = vec![c::ManifestId(parent)];
+        let bytes = c::encode_manifest_v3(&decoded, limits)?;
+        ensure!(
+            bytes.len() <= 8 * 1024 * 1024,
+            "derived capture manifest byte limit"
+        );
+        Ok(bytes)
+    }
+    fn materialize_selected(&self, intent: &mut Intent) -> Result<()> {
+        if let Some(ancestry) = intent
+            .header
+            .successor
+            .as_ref()
+            .and_then(|s| s.ancestry.as_ref())
+        {
+            let original = intent
+                .original_manifest
+                .as_ref()
+                .unwrap_or(&intent.manifest);
+            let derived =
+                self.ancestry_manifest(original, intent.capture.len(), ancestry.parent)?;
+            ensure!(
+                c::ManifestId::of(&derived).0 == intent.header.manifest_id
+                    && derived.len() as u64 == intent.header.manifest_size,
+                "capture successor ancestry binding differs"
+            );
+            if intent.original_manifest.is_none() {
+                intent.original_manifest = Some(std::mem::replace(&mut intent.manifest, derived));
+            } else {
+                intent.manifest = derived;
+            }
+        } else if let Some(original) = intent.original_manifest.take() {
+            intent.manifest = original;
+        }
+        Ok(())
+    }
+    async fn prepare_successor(
+        self: &Arc<Self>,
+        original: Header,
+        descriptor: native_retention::BundleDescriptor,
+        generation: u64,
+        structured: bool,
+        ancestry: Option<SuccessorAncestry>,
+        owner: Owner,
+    ) -> Result<Header> {
+        let worker = self.clone();
+        Ok(blocking_owned(owner, move || {
+            let attempts = worker.saved_attempts(&original.ticket)?;
+            ensure!(
+                attempts.len() < MAX_SUCCESSORS,
+                "capture successor journal exhausted"
+            );
+            let previous = attempts.last().unwrap_or(&original);
+            ensure!(
+                generation > previous.expected_generation
+                    || (generation == previous.expected_generation
+                        && structured
+                        && (previous.publication_identity.is_none()
+                            || ancestry
+                                .as_ref()
+                                .is_some_and(|next| next.missing_parent_refusal
+                                    && previous
+                                        .successor
+                                        .as_ref()
+                                        .and_then(|s| s.ancestry.as_ref())
+                                        .map(|a| a.parent)
+                                        != Some(next.parent)))),
+                "capture successor generation did not advance"
+            );
+            ensure!(
+                previous.publication_identity.is_none() || structured,
+                "capture successor cannot downgrade structured publication"
+            );
+            let mut header = original.clone();
+            header.version = 2;
+            header.expected_generation = generation;
+            header.key = format!(
+                "capture_{}_attempt_{}",
+                hex(&original.ticket),
+                attempts.len() + 1
+            );
+            if structured {
+                header.use_new_v2_identity()?;
+            }
+            header.successor = Some(Successor {
+                original: descriptor,
+                predecessors: attempts
+                    .iter()
+                    .map(|h| serde_json::to_vec(h).map(|b| raw_descriptor(&b)))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                ancestry,
+            });
+            if let Some(ancestry) = header.successor.as_ref().and_then(|s| s.ancestry.as_ref()) {
+                ensure!(
+                    structured,
+                    "capture ancestry requires structured publication"
+                );
+                let original_intent = Intent::decode(
+                    &worker.read_durable(&format!("{}.job", hex(&original.ticket)))?,
+                )?;
+                let derived = worker.ancestry_manifest(
+                    &original_intent.manifest,
+                    original_intent.capture.len(),
+                    ancestry.parent,
+                )?;
+                header.manifest_id = c::ManifestId::of(&derived).0;
+                header.manifest_size = derived.len() as u64;
+                ensure!(
+                    !ancestry.missing_parent_refusal || header.manifest_id != previous.manifest_id,
+                    "capture parent repair did not change ancestry"
+                );
+            }
+            let bytes = serde_json::to_vec(&header)?;
+            ensure!(bytes.len() <= 4096, "capture successor header limit");
+            worker.persist(&attempt_name(&original.ticket, attempts.len() + 1), &bytes)?;
+            #[cfg(test)]
+            {
+                if let Some(pause) = worker._hooks.attempt_pause.lock().unwrap().take() {
+                    pause.block();
+                }
+                ensure!(
+                    !worker._hooks.fail_after_attempt.load(Ordering::Acquire),
+                    "injected failure after attempt persistence"
+                );
+            }
+            Ok(header)
+        })
+        .await?
+        .value)
+    }
     async fn process(
         self: Arc<Self>,
         ticket: PendingCapture,
@@ -2921,6 +3193,7 @@ impl Worker {
                 original_job: intent.original_job,
                 header: intent.header.clone(),
                 manifest: intent.manifest.clone(),
+                original_manifest: None,
                 capture: intent.capture.clone(),
             };
             tokio::task::spawn_blocking(move || {
@@ -2943,23 +3216,35 @@ impl Worker {
             "capture original job changed during publication"
         );
         let original = intent.header.clone();
-        let mut accepted = None;
+        let mut accepted: Option<Header> = None;
+        let mut expired = false;
+        let mut latest_expired = false;
         // Always reconcile every prepared key before choosing another envelope.
         // A current head match is never an idempotency receipt.
         for header in std::iter::once(&original).chain(attempts.iter()) {
-            if let Some(receipt) = publication(&client, header).await? {
-                ensure_publication(header, &receipt)?;
-                ensure!(accepted.is_none(), "multiple capture publication receipts");
-                accepted = Some(header.clone());
+            match publication_lookup(&client, header).await? {
+                PublicationLookup::Accepted(receipt) => {
+                    ensure_publication(header, &receipt)?;
+                    ensure!(accepted.is_none(), "multiple capture publication receipts");
+                    accepted = Some(header.clone());
+                }
+                PublicationLookup::ReplayExpired => {
+                    expired = true;
+                    latest_expired |= header == attempts.last().unwrap_or(&original);
+                }
+                PublicationLookup::Absent => {}
             }
         }
-        let mut existing = accepted.is_some();
-        if let Some(header) = accepted {
+        let latest = attempts.last().unwrap_or(&original);
+        if let Some(header) = &accepted {
             ensure!(
-                header == *attempts.last().unwrap_or(&original),
+                header == latest,
                 "capture receipt precedes prepared successor"
             );
-            intent.value.header = header;
+        }
+        let mut existing = accepted.as_ref().is_some_and(|header| header == latest);
+        if existing {
+            intent.value.header = accepted.unwrap();
         } else {
             if let Some(last) = attempts.last() {
                 intent.value.header = last.clone();
@@ -2980,79 +3265,81 @@ impl Worker {
             // checked under its commit gate, incremented with checked_add, and
             // never reset by retention. A strictly newer generation fences every
             // older absent request even if its physical RPC outcome was lost.
-            if current.generation > intent.header.expected_generation {
+            // A terminal legacy replay floor closes that request namespace.
+            // At equal generation its target is still future and cannot win;
+            // typed expiry instead requires a strictly advancing CAS fence.
+            let promote_terminal_legacy = latest_expired
+                && intent.header.publication_identity.is_none()
+                && current.generation == intent.header.expected_generation;
+            ensure!(
+                !latest_expired
+                    || current.generation > intent.header.expected_generation
+                    || promote_terminal_legacy,
+                "expired publication lacks monotonic generation fence"
+            );
+            if current.generation > intent.header.expected_generation || promote_terminal_legacy {
                 // The fence must precede authoritative absence: an old remote
                 // RPC could have committed between the first lookup and this
                 // generation read, even after its local waiter was released.
-                let mut fenced_receipt = None;
+                let mut fenced_receipt: Option<Header> = None;
                 for header in std::iter::once(&original).chain(attempts.iter()) {
-                    if let Some(receipt) = publication(&client, header).await? {
-                        ensure_publication(header, &receipt)?;
-                        ensure!(
-                            fenced_receipt.is_none(),
-                            "multiple capture publication receipts"
-                        );
-                        fenced_receipt = Some(header.clone());
+                    match publication_lookup(&client, header).await? {
+                        PublicationLookup::Accepted(receipt) => {
+                            ensure_publication(header, &receipt)?;
+                            ensure!(
+                                fenced_receipt.is_none(),
+                                "multiple capture publication receipts"
+                            );
+                            fenced_receipt = Some(header.clone());
+                        }
+                        PublicationLookup::ReplayExpired => expired = true,
+                        PublicationLookup::Absent => {}
                     }
                 }
-                if let Some(header) = fenced_receipt {
-                    ensure!(
-                        header == *attempts.last().unwrap_or(&original),
-                        "capture receipt precedes prepared successor"
-                    );
-                    intent.value.header = header;
+                if fenced_receipt
+                    .as_ref()
+                    .is_some_and(|header| header == latest)
+                {
+                    intent.value.header = fenced_receipt.unwrap();
                     existing = true;
                 } else {
                     ensure!(
-                        attempts.len() < MAX_SUCCESSORS,
-                        "capture successor journal exhausted"
+                        fenced_receipt.is_none(),
+                        "capture receipt precedes prepared successor"
                     );
-                    let mut header = original.clone();
-                    header.version = 2;
-                    header.expected_generation = current.generation;
-                    header.key = format!(
-                        "capture_{}_attempt_{}",
-                        hex(&ticket.id.0),
-                        attempts.len() + 1
-                    );
-                    if original.publication_identity.is_some() {
-                        header.use_new_v2_identity()?;
+                    let structured = expired || intent.header.publication_identity.is_some();
+                    if structured {
+                        require_new_publication_v2(&client).await?;
                     }
-                    header.successor = Some(Successor {
-                        original: saved_descriptor,
-                        predecessors: attempts
-                            .iter()
-                            .map(|h| serde_json::to_vec(h).map(|b| raw_descriptor(&b)))
-                            .collect::<std::result::Result<Vec<_>, _>>()?,
-                    });
-                    let worker = self.clone();
-                    let saved = header.clone();
-                    blocking_owned(owner.clone(), move || {
-                        worker.persist(
-                            &attempt_name(
-                                &saved.ticket,
-                                saved.successor.as_ref().unwrap().predecessors.len() + 1,
-                            ),
-                            &serde_json::to_vec(&saved)?,
-                        )?;
-                        #[cfg(test)]
-                        {
-                            if let Some(pause) = worker._hooks.attempt_pause.lock().unwrap().take()
-                            {
-                                pause.block();
-                            }
-                            ensure!(
-                                !worker._hooks.fail_after_attempt.load(Ordering::Acquire),
-                                "injected failure after attempt persistence"
-                            );
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                    intent.value.header = header;
+                    intent.value.header = self
+                        .prepare_successor(
+                            original.clone(),
+                            saved_descriptor,
+                            current.generation,
+                            structured,
+                            if structured {
+                                Some(SuccessorAncestry {
+                                    parent: current
+                                        .manifest_id
+                                        .context("capture ancestry head absent")?
+                                        .0,
+                                    missing_parent_refusal: false,
+                                })
+                            } else {
+                                None
+                            },
+                            owner.clone(),
+                        )
+                        .await?;
                 }
             }
         }
+        let worker = self.clone();
+        intent = blocking_owned(owner.clone(), move || {
+            worker.materialize_selected(&mut intent.value)?;
+            Ok(intent.value)
+        })
+        .await?;
         if !existing {
             // Automatically enrolled workspaces reuse authenticated retained
             // boundaries and transfer only their local frontier. An unavailable
@@ -3063,9 +3350,11 @@ impl Worker {
                 c::ManifestId(intent.header.manifest_id),
                 c::ManifestV3Limits::default(),
             )?;
-            let retained = (intent.manifest.len() + intent.capture.len())
-                .checked_mul(4)
-                .context("capture retained bytes overflow")? as u64
+            let retained = (intent.manifest.len()
+                + intent.capture.len()
+                + intent.original_manifest.as_ref().map_or(0, Vec::len))
+            .checked_mul(4)
+            .context("capture retained bytes overflow")? as u64
                 + 128 * 1024 * 1024
                 + SUCCESSOR_MEMORY;
             let transfer = jj_native_remote::NativeTransferLimits {
@@ -3237,7 +3526,140 @@ impl Worker {
                 )
                 .await?;
             progress.at("publication");
-            let receipt = publish(&client, &intent).await?;
+            let receipt = match publish(&client, &intent).await {
+                Ok(receipt) => receipt,
+                Err(error)
+                    if intent.header.publication_identity.is_none()
+                        && safe_publication_reason(&error)
+                            == Some("store_retained_version_quota") =>
+                {
+                    // Legacy publication cannot roll a full window. That quota
+                    // blocks a same-generation legacy winner; freeing space by
+                    // retirement also closes its legacy namespace. An advanced
+                    // generation instead fences it by CAS. Preserve the original
+                    // job and prove the outcome before journaling a replacement.
+                    require_new_publication_v2(&client).await?;
+                    let previous = intent.header.clone();
+                    match publication_lookup(&client, &previous).await? {
+                        PublicationLookup::Accepted(receipt) => {
+                            ensure_publication(&previous, &receipt)?;
+                            receipt
+                        }
+                        PublicationLookup::Absent | PublicationLookup::ReplayExpired => {
+                            let current = client.cloud_workspace(workspace).await?;
+                            ensure!(
+                                current.generation >= previous.expected_generation,
+                                "capture generation fence regressed"
+                            );
+                            let after = publication_lookup(&client, &previous).await?;
+                            match after {
+                                PublicationLookup::Accepted(receipt) => {
+                                    ensure_publication(&previous, &receipt)?;
+                                    receipt
+                                }
+                                _ => {
+                                    intent.value.header = self
+                                        .prepare_successor(
+                                            original.clone(),
+                                            saved_descriptor,
+                                            current.generation,
+                                            true,
+                                            Some(SuccessorAncestry {
+                                                parent: current
+                                                    .manifest_id
+                                                    .context("capture ancestry head absent")?
+                                                    .0,
+                                                missing_parent_refusal: false,
+                                            }),
+                                            owner.clone(),
+                                        )
+                                        .await?;
+                                    let worker = self.clone();
+                                    intent = blocking_owned(owner.clone(), move || {
+                                        worker.materialize_selected(&mut intent.value)?;
+                                        Ok(intent.value)
+                                    })
+                                    .await?;
+                                    // One bounded promotion retry uses the exact
+                                    // fsynced identity and already transferred
+                                    // payload. Deferring it would rotate behind
+                                    // every remaining legacy queue entry.
+                                    progress.at("publication_source_pins");
+                                    source
+                                        .control
+                                        .reconcile_retained_source_pins_before_publish_until(
+                                            intent.header.workspace,
+                                            owner.clone(),
+                                            deadline,
+                                        )
+                                        .await?;
+                                    progress.at("publication");
+                                    publish(&client, &intent).await?
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) if definitive_missing_manifest_parent(&error) => {
+                    // Only this definitive publication refusal permits repairing
+                    // an already-prepared typed request at the same generation.
+                    // Capability failures and generic InvalidArgument never do.
+                    require_new_publication_v2(&client).await?;
+                    let previous = intent.header.clone();
+                    let before = publication_lookup(&client, &previous).await?;
+                    let current = client.cloud_workspace(workspace).await?;
+                    ensure!(
+                        current.generation >= previous.expected_generation,
+                        "capture generation fence regressed"
+                    );
+                    let after = publication_lookup(&client, &previous).await?;
+                    match (before, after) {
+                        (_, PublicationLookup::Accepted(receipt)) => {
+                            ensure_publication(&previous, &receipt)?;
+                            receipt
+                        }
+                        (PublicationLookup::Accepted(_), _) => {
+                            anyhow::bail!("capture accepted receipt changed during parent repair")
+                        }
+                        _ => {
+                            intent.value.header = self
+                                .prepare_successor(
+                                    original.clone(),
+                                    saved_descriptor,
+                                    current.generation,
+                                    true,
+                                    Some(SuccessorAncestry {
+                                        parent: current
+                                            .manifest_id
+                                            .context("capture ancestry head absent")?
+                                            .0,
+                                        missing_parent_refusal: true,
+                                    }),
+                                    owner.clone(),
+                                )
+                                .await?;
+                            let worker = self.clone();
+                            intent = blocking_owned(owner.clone(), move || {
+                                worker.materialize_selected(&mut intent.value)?;
+                                Ok(intent.value)
+                            })
+                            .await?;
+                            progress.at("publication_source_pins");
+                            source
+                                .control
+                                .reconcile_retained_source_pins_before_publish_until(
+                                    intent.header.workspace,
+                                    owner.clone(),
+                                    deadline,
+                                )
+                                .await?;
+                            progress.at("publication");
+                            publish(&client, &intent).await?
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             ensure_publication(&intent.header, &receipt)?;
         }
         progress.at("retained_verification");
@@ -3499,6 +3921,7 @@ impl Worker {
             original_job: None,
             header,
             manifest: prepared.bytes().to_vec(),
+            original_manifest: None,
             capture,
         })
     }
@@ -3517,6 +3940,8 @@ impl Worker {
         owner: Owner,
         reserved: u64,
     ) -> Result<[u8; 32]> {
+        let reserved = reserved.checked_add(intent.original_manifest.as_ref().map_or(0, Vec::len) as u64)
+            .context("capture original manifest charge overflow")?;
         let (objects, artifacts, roots, capture) = self.proofs_reserved(ticket, owner, reserved)?;
         ensure!(capture == intent.capture, "saved capture DATA differs");
         let graph =
@@ -3946,6 +4371,11 @@ max_manifest_members=1024
 "#,
         )?;
         profile.service.cloud.durable_retained_offload = !hooks.disable_server_retained_contract;
+        if let Some(window) = hooks.rolling_window {
+            profile.store.cloud.retirement_enabled = true;
+            profile.store.cloud.rolling_retention_enabled = true;
+            profile.store.cloud.max_versions_per_workspace = window;
+        }
         profile.validate()?;
         let store = tinytree_store::Store::open(
             server_root.path(),
@@ -4482,14 +4912,41 @@ max_manifest_members=1024
         server_contract: bool,
         typed: bool,
     ) -> Result<SavedUploads> {
+        saved_uploads_with_window(
+            newer_generation,
+            retiring,
+            memory,
+            distinct_workspaces,
+            dropped_remote_head,
+            managed_collection,
+            server_contract,
+            typed,
+            None,
+            2,
+        )
+        .await
+    }
+    async fn saved_uploads_with_window(
+        newer_generation: u64,
+        retiring: bool,
+        memory: Option<u64>,
+        distinct_workspaces: bool,
+        dropped_remote_head: bool,
+        managed_collection: bool,
+        server_contract: bool,
+        typed: bool,
+        rolling_window: Option<u64>,
+        count: usize,
+    ) -> Result<SavedUploads> {
         let hooks = Arc::new(TestHooks {
             start_stopped: true,
             managed_collection,
+            rolling_window,
             disable_server_retained_contract: !server_contract,
             ..Default::default()
         });
         let (root, handle, client, stop, server, denied) =
-            ready_uploads_with_data(2, true, hooks, distinct_workspaces, dropped_remote_head)
+            ready_uploads_with_data(count, true, hooks, distinct_workspaces, dropped_remote_head)
                 .await?;
         let worker = handle.worker.clone();
         handle.shutdown().await;
@@ -5151,9 +5608,361 @@ max_manifest_members=1024
             owner,
         )?;
         intent.header.key = format!("competing_publication_{}", current.generation);
+        if f.worker._hooks.rolling_window.is_some() {
+            intent.header.use_new_v2_identity()?;
+            publish(&f.client, &intent).await?;
+        } else {
+            f.client
+                .cloud_publish_captured_version(&intent.sdk()?)
+                .await?;
+        }
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_quota_promotion_preserves_full_queue_and_retires_fresh_proof_first()
+    -> Result<()> {
+        let mut f = saved_uploads_with_window(
+            2,
+            false,
+            Some(1024 * 1024 * 1024 + PAIR_RETAINED_BYTES),
+            false,
+            false,
+            false,
+            true,
+            false,
+            Some(2),
+            4,
+        )
+        .await?;
+        Arc::get_mut(&mut f.worker)
+            .context("fixture worker still shared")?
+            .policy
+            .max_jobs = 4;
+        process_saved(&f.worker, &f.tickets[0]).await?;
+        // Fill the second slot with an ordinary legacy publication, so the
+        // server has never yet rolled or closed legacy receipt discovery.
+        // Use a distinct manifest so the target reaches quota, not the
+        // repeated-current-manifest refusal that precedes it.
+        let mut seed = Intent::decode(
+            &f.worker
+                .read_durable(&format!("{}.job", hex(&f.tickets[2].id.0)))?,
+        )?;
+        seed.header.expected_generation = 1;
+        seed.header.key = "legacy-window-seed".into();
         f.client
-            .cloud_publish_captured_version(&intent.sdk()?)
+            .cloud_publish_captured_version(&seed.sdk()?)
             .await?;
+        let ticket = f.tickets[1].clone();
+        let name = format!("{}.job", hex(&ticket.id.0));
+        let original = f.worker.read_durable(&name)?;
+        let pack = f
+            .worker
+            .config
+            .state_dir
+            .join("native-commands/captures")
+            .join(format!("{}.pack", hex(&ticket.bundle.blake3)));
+        let pack_bytes = std::fs::read(&pack)?;
+        // A supported single-job budget avoids the optional pair preference.
+        // One ordinary poll must finish promotion, not enqueue its retry behind
+        // the other unpublished tickets in this already-full local queue.
+        assert!(f.worker.poll().await?);
+        assert_eq!(f.worker.stats.failed.load(Ordering::Acquire), 0);
+        assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 3);
+        let attempts = f.worker.saved_attempts(&ticket.id.0)?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].expected_generation, 2);
+        assert!(attempts[0].publication_identity.is_some());
+        assert!(
+            Intent::decode(&original)?
+                .header
+                .publication_identity
+                .is_none()
+        );
+        assert_eq!(f.worker.read_durable(&name)?, original);
+        assert_eq!(std::fs::read(&pack)?, pack_bytes);
+        assert_saved_tickets(&f).await?;
+        let saved_attempt = f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?;
+        process_saved(&reopen_worker(&f.worker), &ticket).await?;
+        assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 3);
+        assert_eq!(
+            f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?,
+            saved_attempt
+        );
+        let marker = f
+            .worker
+            .read_durable(&format!("{}.published", hex(&ticket.id.0)))?;
+        assert!(
+            validate_attempt_cleanup(&f.worker.directory, &marker)?
+                .iter()
+                .all(Option::is_some)
+        );
+        // Generation1 is now expired. It must remain local, but must not block
+        // retirement of generation3, whose exact proof is still in N=2.
+        let ancient = format!("{}.job", hex(&f.tickets[0].id.0));
+        let ancient_bytes = f.worker.read_durable(&ancient)?;
+        assert!(matches!(
+            f.worker
+                .retire_one(
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                    cleanup_admission(&f.worker).await?,
+                    Progress::new("test_backlog"),
+                )
+                .await?,
+            RetirementAttempt::Changed
+        ));
+        let pending = f.worker.host.capture_registry().pending_captures().await?;
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.iter().any(|value| value.id == ticket.id));
+        assert!(pending.iter().any(|value| value.id == f.tickets[3].id));
+        assert_eq!(f.worker.read_durable(&ancient)?, ancient_bytes);
+        assert_eq!(f.worker.policy.max_jobs, 4);
+        // Another queued original can now advance through a terminal legacy
+        // lookup and free a second slot under the same bounded configuration.
+        process_saved(&f.worker, &f.tickets[2]).await?;
+        assert!(matches!(
+            f.worker
+                .retire_one(
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                    cleanup_admission(&f.worker).await?,
+                    Progress::new("test_backlog"),
+                )
+                .await?,
+            RetirementAttempt::Changed
+        ));
+        let pending = f.worker.host.capture_registry().pending_captures().await?;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|value| value.id == f.tickets[0].id));
+        assert!(pending.iter().any(|value| value.id == f.tickets[3].id));
+        assert_eq!(f.worker.read_durable(&ancient)?, ancient_bytes);
+        let _ = f.stop.send(());
+        f.server.await??;
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_typed_receipt_republishes_only_through_a_fenced_successor() -> Result<()> {
+        let f =
+            saved_uploads_with_window(0, false, None, true, false, false, true, true, Some(2), 2)
+                .await?;
+        let ticket = &f.tickets[0];
+        let name = format!("{}.job", hex(&ticket.id.0));
+        let original = f.worker.read_durable(&name)?;
+        f.worker
+            ._hooks
+            .fail_before_marker
+            .store(true, Ordering::Release);
+        assert!(process_saved(&f.worker, ticket).await.is_err());
+        f.worker
+            ._hooks
+            .fail_before_marker
+            .store(false, Ordering::Release);
+        competing_publication(&f).await?;
+        competing_publication(&f).await?;
+        let header = Intent::decode(&original)?.header;
+        assert!(matches!(
+            publication_lookup(&f.client, &header).await?,
+            PublicationLookup::ReplayExpired
+        ));
+        f.worker
+            ._hooks
+            .fail_after_attempt
+            .store(true, Ordering::Release);
+        assert!(process_saved(&f.worker, ticket).await.is_err());
+        let attempt = f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?;
+        let saved = f.worker.saved_attempts(&ticket.id.0)?;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].expected_generation, 3);
+        assert_ne!(
+            saved[0].identity()?.unwrap().nonce,
+            header.identity()?.unwrap().nonce
+        );
+        f.worker
+            ._hooks
+            .fail_after_attempt
+            .store(false, Ordering::Release);
+        process_saved(&reopen_worker(&f.worker), ticket).await?;
+        assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 4);
+        assert_eq!(f.worker.read_durable(&name)?, original);
+        assert_eq!(
+            f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?,
+            attempt
+        );
+        assert_saved_tickets(&f).await?;
+        let _ = f.stop.send(());
+        f.server.await??;
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_parent_repair_reopens_exact_derived_manifest_and_rejects_forgery() -> Result<()>
+    {
+        let f =
+            saved_uploads_with_window(0, false, None, true, false, false, true, true, Some(2), 2)
+                .await?;
+        process_saved(&f.worker, &f.tickets[0]).await?;
+        let parent = f
+            .client
+            .cloud_workspace([7; 32])
+            .await?
+            .manifest_id
+            .context("seed head")?;
+        let parent_bytes = Intent::decode(
+            &f.worker
+                .read_durable(&format!("{}.job", hex(&f.tickets[0].id.0)))?,
+        )?
+        .manifest;
+        let ticket = &f.tickets[1];
+        // Arrange the target's original durable capture as a normal generation1
+        // observation with one parent, before this target has ever been used.
+        let owner: Owner = cleanup_admission(&f.worker).await?;
+        let mut target = f.worker.prepare(
+            ticket,
+            c::CaptureExportIdentity {
+                workspace: [7; 32],
+                exporter: ticket.registration.workspace.0,
+                sequence: ticket.registry_epoch,
+                parents: vec![c::ManifestId(parent.0)],
+            },
+            1,
+            owner.clone(),
+        )?;
+        target.header.use_new_v2_identity()?;
+        let original = target.encode()?;
+        let name = format!("{}.job", hex(&ticket.id.0));
+        private_file(&f.worker.directory.path().join(&name), &original)?;
+        drop(owner);
+        competing_publication(&f).await?;
+        competing_publication(&f).await?;
+        // N=2 has physically removed generation1's unprotected parent. Model an
+        // actual pre-materialization header-only typed attempt already at gen3.
+        let expired = f
+            .client
+            .cloud_retained_version_selected(
+                RetainedVersionSelector {
+                    workspace_id: [7; 32],
+                    generation: 1,
+                    manifest_id: parent,
+                },
+                CloudRawDigest::of(&parent_bytes),
+            )
+            .await
+            .err()
+            .context("parent must be retired")?;
+        assert_eq!(expired.code(), tonic::Code::OutOfRange);
+        f.worker
+            .prepare_successor(
+                target.header.clone(),
+                raw_descriptor(&original),
+                3,
+                true,
+                None,
+                cleanup_admission(&f.worker).await?,
+            )
+            .await?;
+        f.worker
+            ._hooks
+            .fail_after_attempt
+            .store(true, Ordering::Release);
+        assert!(process_saved(&f.worker, ticket).await.is_err());
+        assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 3);
+        let attempts = f.worker.saved_attempts(&ticket.id.0)?;
+        assert_eq!(
+            attempts.len(),
+            2,
+            "specific server refusal permits one same-gen repair"
+        );
+        assert_eq!(
+            attempts[0].expected_generation,
+            attempts[1].expected_generation
+        );
+        assert!(
+            attempts[1]
+                .successor
+                .as_ref()
+                .unwrap()
+                .ancestry
+                .as_ref()
+                .unwrap()
+                .missing_parent_refusal
+        );
+        assert_eq!(f.worker.read_durable(&name)?, original);
+        let attempt_name = attempt_name(&ticket.id.0, 2);
+        let saved = f.worker.read_durable(&attempt_name)?;
+        f.worker
+            ._hooks
+            .fail_after_attempt
+            .store(false, Ordering::Release);
+        for change_parent in [true, false] {
+            let mut forged: Header = serde_json::from_slice(&saved)?;
+            if change_parent {
+                forged
+                    .successor
+                    .as_mut()
+                    .unwrap()
+                    .ancestry
+                    .as_mut()
+                    .unwrap()
+                    .parent = [99; 32];
+            } else {
+                forged.manifest_id[0] ^= 1;
+            }
+            private_file(
+                &f.worker.directory.path().join(&attempt_name),
+                &serde_json::to_vec(&forged)?,
+            )?;
+            assert!(
+                process_saved(&reopen_worker(&f.worker), ticket)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 3);
+            assert_eq!(f.worker.read_durable(&name)?, original);
+        }
+        private_file(&f.worker.directory.path().join(&attempt_name), &saved)?;
+        process_saved(&reopen_worker(&f.worker), ticket).await?;
+        assert_eq!(f.client.cloud_workspace([7; 32]).await?.generation, 4);
+        assert_eq!(f.worker.read_durable(&attempt_name)?, saved);
+        assert_eq!(f.worker.read_durable(&name)?, original);
+        let marker = f
+            .worker
+            .read_durable(&format!("{}.published", hex(&ticket.id.0)))?;
+        let mut derived = Intent::decode(&original)?;
+        f.worker.apply_published(&mut derived, &marker)?;
+        let mut before = c::decode_manifest_v3(
+            &target.manifest,
+            c::ManifestId::of(&target.manifest),
+            Default::default(),
+        )?;
+        let mut after = c::decode_manifest_v3(
+            &derived.manifest,
+            c::ManifestId::of(&derived.manifest),
+            Default::default(),
+        )?;
+        before.history.recovery.parents.clear();
+        after.history.recovery.parents.clear();
+        assert!(
+            c::encode_manifest_v3(&before, Default::default())?
+                == c::encode_manifest_v3(&after, Default::default())?
+        );
+        assert_eq!(derived.capture, target.capture);
+        let retained = f
+            .client
+            .cloud_retained_version_selected(
+                RetainedVersionSelector {
+                    workspace_id: [7; 32],
+                    generation: 4,
+                    manifest_id: CloudManifestId(derived.header.manifest_id),
+                },
+                CloudRawDigest::of(&derived.manifest),
+            )
+            .await?;
+        assert!(retained.manifest() == derived.manifest);
+        drop(retained);
+        assert!(
+            validate_attempt_cleanup(&f.worker.directory, &marker)?
+                .iter()
+                .all(Option::is_some)
+        );
+        let _ = f.stop.send(());
+        f.server.await??;
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
