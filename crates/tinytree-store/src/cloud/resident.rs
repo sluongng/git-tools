@@ -271,6 +271,51 @@ impl Budget {
         self.state.lock().map_err(|_| Error::Poisoned)?.active = Arc::downgrade(&reservation);
         Ok(Some(reservation))
     }
+    /// Reenter the same physical operation after releasing the Store gate.
+    /// Catalog growth during validation must be admitted without reserving a
+    /// second arena or refunding capacity still retained by the caller.
+    pub(crate) fn reenter(
+        self: &Arc<Self>,
+        retained: Option<&Arc<Reservation>>,
+    ) -> Result<Option<Arc<Reservation>>> {
+        let Some(limits) = self.limits else {
+            if retained.is_some() {
+                return Err(Error::Poisoned);
+            }
+            return Ok(None);
+        };
+        let arena = retained.ok_or(Error::Poisoned)?;
+        if !Arc::ptr_eq(self, &arena.budget) {
+            return Err(Error::Poisoned);
+        }
+        let mut state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        if state.pending.is_some() {
+            return Err(Error::Poisoned);
+        }
+        let current = state.catalog.charge()?;
+        let old_bytes = arena.bytes.load(Ordering::Relaxed);
+        let old_entries = arena.entries.load(Ordering::Relaxed);
+        let bytes = old_bytes.max(current.bytes);
+        let entries = old_entries.max(current.entries);
+        let used = Charge {
+            bytes: state
+                .used
+                .bytes
+                .checked_add(bytes - old_bytes)
+                .ok_or(Error::Limit("cloud resident memory"))?,
+            entries: state
+                .used
+                .entries
+                .checked_add(entries - old_entries)
+                .ok_or(Error::Limit("cloud resident memory"))?,
+        };
+        within(limits, used)?;
+        state.used = used;
+        arena.bytes.store(bytes, Ordering::Relaxed);
+        arena.entries.store(entries, Ordering::Relaxed);
+        state.active = Arc::downgrade(arena);
+        Ok(Some(arena.clone()))
+    }
     pub(crate) fn lease(self: &Arc<Self>) -> Result<Option<Arc<Reservation>>> {
         if self.limits.is_none() {
             return Ok(None);

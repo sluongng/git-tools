@@ -221,7 +221,14 @@ impl Store {
     /// The trusted embedding must own journal.lock and its shared in-process gate
     /// through dispatch/recovery/expiry decisions; this method does not hold them.
     pub fn enable_external_checks(&self) -> Result<PathBuf> {
-        let _gate = self.inner.lock()?;
+        let gate = self.inner.lock()?;
+        self.enable_external_checks_locked(&gate)
+    }
+    /// The caller already owns the healthy physical Store gate and its arena.
+    pub(super) fn enable_external_checks_locked(
+        &self,
+        _gate: &RuntimeGuard<'_>,
+    ) -> Result<PathBuf> {
         let active = self.inner.external_checks_active()?;
         let root = &self.inner.root;
         let _root = private_dir(root)?;

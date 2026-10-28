@@ -1826,6 +1826,21 @@ impl Inner {
             _arena: arena,
         })
     }
+    fn lock_reusing_arena(
+        &self,
+        retained: Option<&Arc<cloud::resident::Reservation>>,
+    ) -> Result<RuntimeGuard<'_>> {
+        let mut guard = self.gate.lock().map_err(|_| Error::Poisoned)?;
+        if self.uncertain_commit.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        let arena = self.resident.reenter(retained)?;
+        guard.resident_arena = arena.as_ref().map(Arc::downgrade).unwrap_or_default();
+        Ok(RuntimeGuard {
+            guard,
+            _arena: arena,
+        })
+    }
     fn commit(&self, tx: fjall::SingleWriterWriteTx<'_>) -> Result<()> {
         // A failed journal sync may already be visible in memory. Never turn
         // that uncertain write into a successful replay ACK in this process.

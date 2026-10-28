@@ -5027,12 +5027,52 @@ fn retained_version_arenas_follow_leases_and_refuse_gc_without_deleting() {
         .charge()
         .unwrap();
     assert!(arena.bytes > 65536);
+    // Calibrate one prospective arena from this closed fixture, not a second
+    // simultaneous validation arena. A same-shaped next version grows by the
+    // same catalog charge; no production policy is changed by this fixture.
+    let calibration = Store::open_existing(directory.path(), config()).unwrap();
+    let mut next_manifest = manifest.clone();
+    next_manifest.sequence = 2;
+    let calibration_request = cloud_request(&next_manifest, 1, "resident-calibration", &[]);
+    calibration
+        .publish_cloud_version("demo", owner, &calibration_request, 1, &Default::default())
+        .unwrap();
+    drop(calibration);
+    let current_arena = cloud::resident::preflight(directory.path(), &policy)
+        .unwrap()
+        .charge()
+        .unwrap();
     let mut single_reader_policy = policy.clone();
+    let max_bytes = current_arena.bytes + (current_arena.bytes - arena.bytes) + 65536;
+    assert!(
+        max_bytes < 2 * current_arena.bytes,
+        "fixture cannot admit a second arena"
+    );
     single_reader_policy.cloud.resident = Some(CloudResidentLimits {
-        max_bytes: arena.bytes + 65536,
+        max_bytes,
         max_entries: 65_536,
     });
+    let store = Store::open_existing(directory.path(), single_reader_policy.clone()).unwrap();
+    next_manifest.sequence = 3;
+    let bounded_request = cloud_request(&next_manifest, 2, "resident-bounded-publish", &[]);
+    let published = store
+        .publish_cloud_version("demo", owner, &bounded_request, 1, &Default::default())
+        .unwrap();
+    assert_eq!(published.workspace.generation, 3);
+    assert_eq!(
+        store
+            .publish_cloud_version("demo", owner, &bounded_request, 1, &Default::default())
+            .unwrap(),
+        published
+    );
+    drop(store);
     let store = Store::open_existing(directory.path(), single_reader_policy).unwrap();
+    assert_eq!(
+        store
+            .cloud_publication("demo", owner, &bounded_request.idempotency_key)
+            .unwrap(),
+        Some(published)
+    );
     let first = store
         .read_cloud_version("demo", owner, manifest.workspace, 1, Default::default())
         .unwrap();
@@ -8810,6 +8850,22 @@ fn landing_capture_activates_its_atomic_feature_and_rejects_downgraded_reopen() 
                 .next()
                 .is_none()
         );
+        // Feature-nine validation retains its arena across the layout fence.
+        // A quota refusal needs only the current catalog plus pin slack, not a
+        // second independently admitted arena for external-check activation.
+        drop(store);
+        let mut resident_policy = config();
+        resident_policy.cloud.resident = Some(CloudResidentLimits {
+            max_bytes: 2 * 1024 * 1024 * 1024,
+            max_entries: 65_536,
+        });
+        let arena = cloud::resident::preflight(directory.path(), &resident_policy)
+            .unwrap()
+            .charge()
+            .unwrap();
+        assert!(arena.bytes > 65536);
+        resident_policy.cloud.resident.as_mut().unwrap().max_bytes = arena.bytes + 65536;
+        let store = Store::open_existing(directory.path(), resident_policy).unwrap();
         let mut quota = CloudPublicationLimits::default();
         quota.retention.max_unique_bytes_per_principal = 1;
         assert!(matches!(
@@ -8836,6 +8892,8 @@ fn landing_capture_activates_its_atomic_feature_and_rejects_downgraded_reopen() 
                 .unwrap()
                 .is_none()
         );
+        drop(store);
+        let store = Store::open_existing(directory.path(), config()).unwrap();
         let publication = store
             .publish_captured_cloud_version("demo", owner, &request, 1, &Default::default())
             .unwrap();

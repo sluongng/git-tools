@@ -2278,13 +2278,13 @@ impl Store {
             Some(true),
             capture_data,
         )?;
+        let mut _gate = self.inner.lock_reusing_arena(guard._resident.as_ref())?;
         if roots.capture_feature >= 9 {
             // Feature nine includes the earlier Store-owned layout fence. This
             // establishes only the empty durable namespace, never a runner or
             // permission to dispatch checks.
-            self.enable_external_checks()?;
+            self.enable_external_checks_locked(&_gate)?;
         }
-        let mut _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
             return Ok(receipt);
