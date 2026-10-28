@@ -11375,6 +11375,11 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     let mut config = ServiceConfig::default();
     config.query.max_blame_file_bytes = 128; // Unrelated conflict bodies cannot fit.
     config.query.max_eval_quantum_steps = 1;
+    assert_eq!(config.query.max_cursor_memory_bytes, 128 * 1024 * 1024);
+    let expected_canonical = [base, left, right, edited]
+        .into_iter()
+        .map(|key| (key.id.0.to_vec(), store.read_metadata("alpha", key).unwrap()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let server = Running::start_query(store, config, index).await;
     let mut client = server.query_client().await;
     let scope = query_ready(&mut client, &[clean, edited], 221).await;
@@ -11402,25 +11407,33 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
         Code::FailedPrecondition,
         "decoded V2 cannot upgrade ordinary admission"
     );
-    let mut rows = Vec::new();
+    // Ordinary native logs need Graph/Canonical projections. Keep two distinct
+    // merged-path cursors LIVE before draining either, under the unchanged
+    // default cursor pool. Retaining duplicate transient path scratch makes
+    // the second creation fail even when its first page has no rows yet.
+    let mut peer_input = ids_evaluation(&scope, 226, &[]);
+    peer_input.expression = input.expression.clone();
+    peer_input.projection = q::Projection::Canonical as i32;
+    peer_input.page_size = 1;
+    let mut queries = [(input, Vec::new(), false), (peer_input, Vec::new(), false)];
     let mut checked_continuation = false;
-    let mut exhausted = false;
-    for _ in 0..128 {
+    for (query, rows, _) in &mut queries {
         let page = client
-            .evaluate(merged_request(input.clone(), ALPHA))
+            .evaluate(merged_request(query.clone(), ALPHA))
             .await
-            .unwrap()
+            .expect("two live merged-path Graph/Canonical cursors must fit the default quota")
             .into_inner();
+        assert_eq!(
+            page.exhausted,
+            Some(false),
+            "one quantum keeps each cursor live"
+        );
         rows.extend(page.rows);
-        if page.exhausted == Some(true) {
-            exhausted = true;
-            break;
-        }
-        input.cursor = page.cursor;
+        query.cursor = page.cursor;
         if !checked_continuation {
             assert_eq!(
                 client
-                    .evaluate(request(input.clone(), ALPHA))
+                    .evaluate(request(query.clone(), ALPHA))
                     .await
                     .unwrap_err()
                     .code(),
@@ -11430,19 +11443,66 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
             checked_continuation = true;
         }
     }
-    assert!(checked_continuation && exhausted, "bounded paging must reach complete graph output");
-    let actual: std::collections::BTreeSet<_> = rows
-        .iter()
-        .map(|r| r.commit.as_ref().unwrap().value.clone())
-        .collect();
+    // Interleave physical pages: both independent evaluators and cumulative
+    // path ledgers must progress, not just admit a second idle query handle.
+    for _ in 0..128 {
+        for (query, rows, exhausted) in &mut queries {
+            if *exhausted {
+                continue;
+            }
+            let page = client
+                .evaluate(merged_request(query.clone(), ALPHA))
+                .await
+                .unwrap()
+                .into_inner();
+            rows.extend(page.rows);
+            *exhausted = page.exhausted == Some(true);
+            query.cursor = page.cursor;
+        }
+        if queries.iter().all(|(_, _, done)| *done) {
+            break;
+        }
+    }
+    assert!(
+        checked_continuation && queries.iter().all(|(_, _, done)| *done),
+        "both bounded path cursors must reach complete output"
+    );
     let expected: std::collections::BTreeSet<_> = [base, left, right, edited]
         .iter()
         .map(|id| id.id.0.to_vec())
         .collect();
-    assert_eq!(
-        actual, expected,
-        "clean automatic merge is not a path edit; extra edit is"
-    );
+    for (_, rows, _) in &queries {
+        let actual = rows
+            .iter()
+            .map(|row| row.commit.as_ref().unwrap().value.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "clean automatic merge is not a path edit; extra edit is"
+        );
+    }
+    for row in &queries[1].1 {
+        let (expected, bytes) = &expected_canonical[&row.commit.as_ref().unwrap().value];
+        let canonical = row
+            .canonical
+            .as_ref()
+            .expect("canonical log projection keeps verified commit metadata");
+        assert_eq!(canonical.descriptor, Some(descriptor(*expected)));
+        assert_eq!(&canonical.canonical_envelope, bytes);
+        tinytree_model::verify(expected, &canonical.canonical_envelope, Limits::default()).unwrap();
+    }
+    for (query, _, _) in &queries {
+        client
+            .close_query(request(
+                q::CloseQueryRequest {
+                    scope: scope.key.clone(),
+                    query_id: query.query_id.clone(),
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap();
+    }
     let mut point_selection = selection.clone();
     let Some(q::graph_expr::Expression::ChangedPath(filter)) = point_selection.expression.as_mut() else { unreachable!() };
     filter.candidates = ids_evaluation(&scope, 0, &[clean, edited]).expression.map(Box::new);

@@ -732,7 +732,14 @@ impl CursorHost {
                         u32::try_from(active_memory(
                             &host.config,
                             request.projection,
-                            crate::query_eval::has_path(&expression),
+                            // Merged-path Work already owns the physical path
+                            // scratch through the blocking job and response.
+                            // Cursor PathState retains counters only (no memo);
+                            // evaluator/graph/page/canonical state stays charged.
+                            // Keep the old scratch charge for V1-only queries,
+                            // even when a caller supplies a heavy work header.
+                            crate::query_eval::has_path(&expression)
+                                && !crate::query_eval::has_merged_path(&expression),
                         ))
                         .map_err(|_| {
                             Status::resource_exhausted("query cursor memory exceeds budget")
