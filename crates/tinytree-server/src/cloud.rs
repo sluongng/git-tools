@@ -24,9 +24,9 @@ pub struct CloudConfig {
     pub enabled: bool,
     pub indexed_versions: bool,
     pub captured_versions: bool,
-    /// Advertise full Store-owned retained backing only when the effective
-    /// backing implements it. Disabling this policy prevents new offloads;
-    /// it never removes previously published dependencies or alters GC roots.
+    /// Legacy capability13 promises full Store-owned retained backing only when
+    /// the effective backing implements it. Disabling this legacy promise does
+    /// not disable capability17 pin-aware offloads or alter existing GC roots.
     pub durable_retained_offload: bool,
     pub max_capture_bytes: usize,
     pub max_native_proof_steps: usize,
@@ -106,6 +106,7 @@ impl CloudConfig {
             ("PublishVersion", store_work),
             ("GetVersion", store_work),
             ("GetLatestCapturedVersion", store_work),
+            ("AcquireVersionPin", store_work),
             (
                 "ReadCapture",
                 if self.captured_versions {
@@ -197,6 +198,49 @@ fn kib(bytes: u64) -> Result<u32, ConfigError> {
     )
     .map_err(|_| ConfigError("private workspace memory bound"))
 }
+fn exact_pin_selector(exact: &p::ExactVersionSelection) -> Result<s::CloudVersionSelector, Status> {
+    let version = exact
+        .version
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing cloud pin version"))?;
+    let selected = exact
+        .manifest_selected
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing cloud pin digest"))?;
+    if version.generation == 0 || selected.size_bytes == 0 {
+        return Err(Status::invalid_argument("invalid cloud pin selector"));
+    }
+    Ok(s::CloudVersionSelector {
+        workspace: array(&version.workspace_id)?,
+        generation: version.generation,
+        manifest: tinytree_cloud::ManifestId(array(&version.manifest_id)?),
+        selected: tinytree_cloud::BlobDigest {
+            blake3: array(&selected.blake3)?,
+            size_bytes: selected.size_bytes,
+        },
+    })
+}
+fn structured_publication_identity(
+    value: Option<&p::PublicationIdentity>,
+    token: &str,
+) -> Result<Option<s::CloudPublicationIdentity>, Status> {
+    value
+        .map(|value| {
+            let identity = s::CloudPublicationIdentity {
+                workspace: array(&value.workspace_id)?,
+                generation: value.target_generation,
+                nonce: array(&value.nonce)?,
+            };
+            if identity.generation == 0 || token != identity.token() {
+                return Err(Status::invalid_argument(
+                    "invalid structured cloud publication binding",
+                ));
+            }
+            Ok(identity)
+        })
+        .transpose()
+}
+
 pub(crate) struct CloudHost {
     pub config: CloudConfig,
     pub store: s::Store,
@@ -289,7 +333,9 @@ impl CloudHost {
             ));
         }
         let store = match method {
-            "PublishVersion" | "GetVersion" | "GetLatestCapturedVersion" => self.store_work,
+            "PublishVersion" | "GetVersion" | "GetLatestCapturedVersion" | "AcquireVersionPin" => {
+                self.store_work
+            }
             "PutIndexArtifact" | "ReadIndexArtifact" => self.profile.index_artifact_bytes,
             "ReadNativeClosure" => self.profile.native_read_bytes,
             "ReadCapture" => self.profile.capture_read_bytes,
@@ -665,20 +711,42 @@ fn status(error: s::Error) -> Status {
             "cloud index native proof memory" => Reason::StoreIndexNativeProofMemory,
             "cloud index native proof steps" => Reason::StoreIndexNativeProofSteps,
             "cloud index proof work" => Reason::StoreIndexProofWork,
-            "cloud validation catalog budget exceeded: records" => Reason::StoreValidationCatalogRecords,
-            "cloud validation catalog budget exceeded: metadata" => Reason::StoreValidationCatalogMetadata,
-            "cloud validation catalog budget exceeded: records_metadata" => Reason::StoreValidationCatalogRecordsMetadata,
-            "cloud validation catalog budget exceeded: payload" => Reason::StoreValidationCatalogPayload,
-            "cloud validation catalog budget exceeded: records_payload" => Reason::StoreValidationCatalogRecordsPayload,
-            "cloud validation catalog budget exceeded: metadata_payload" => Reason::StoreValidationCatalogMetadataPayload,
-            "cloud validation catalog budget exceeded: records_metadata_payload" => Reason::StoreValidationCatalogRecordsMetadataPayload,
+            "cloud validation catalog budget exceeded: records" => {
+                Reason::StoreValidationCatalogRecords
+            }
+            "cloud validation catalog budget exceeded: metadata" => {
+                Reason::StoreValidationCatalogMetadata
+            }
+            "cloud validation catalog budget exceeded: records_metadata" => {
+                Reason::StoreValidationCatalogRecordsMetadata
+            }
+            "cloud validation catalog budget exceeded: payload" => {
+                Reason::StoreValidationCatalogPayload
+            }
+            "cloud validation catalog budget exceeded: records_payload" => {
+                Reason::StoreValidationCatalogRecordsPayload
+            }
+            "cloud validation catalog budget exceeded: metadata_payload" => {
+                Reason::StoreValidationCatalogMetadataPayload
+            }
+            "cloud validation catalog budget exceeded: records_metadata_payload" => {
+                Reason::StoreValidationCatalogRecordsMetadataPayload
+            }
             "cloud index proof work exceeded: records" => Reason::StoreIndexProofRecords,
             "cloud index proof work exceeded: metadata" => Reason::StoreIndexProofMetadata,
-            "cloud index proof work exceeded: records_metadata" => Reason::StoreIndexProofRecordsMetadata,
+            "cloud index proof work exceeded: records_metadata" => {
+                Reason::StoreIndexProofRecordsMetadata
+            }
             "cloud index proof work exceeded: payload" => Reason::StoreIndexProofPayload,
-            "cloud index proof work exceeded: records_payload" => Reason::StoreIndexProofRecordsPayload,
-            "cloud index proof work exceeded: metadata_payload" => Reason::StoreIndexProofMetadataPayload,
-            "cloud index proof work exceeded: records_metadata_payload" => Reason::StoreIndexProofRecordsMetadataPayload,
+            "cloud index proof work exceeded: records_payload" => {
+                Reason::StoreIndexProofRecordsPayload
+            }
+            "cloud index proof work exceeded: metadata_payload" => {
+                Reason::StoreIndexProofMetadataPayload
+            }
+            "cloud index proof work exceeded: records_metadata_payload" => {
+                Reason::StoreIndexProofRecordsMetadataPayload
+            }
             "cloud index artifact allocation" => Reason::StoreIndexArtifactAllocation,
             "cloud index artifact count" => Reason::StoreIndexArtifactCount,
             "cloud index loader memory" => Reason::StoreIndexLoaderMemory,
@@ -712,6 +780,32 @@ fn status(error: s::Error) -> Status {
 }
 fn now() -> Result<i64, Status> {
     crate::service::now()
+}
+fn pin_now() -> s::Result<i64> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| s::Error::Invalid("cloud pin clock"))?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| s::Error::Invalid("cloud pin clock"))
+}
+fn pin_identity(pin_id: &[u8], acquire_not_after_unix_seconds: i64)
+    -> Result<s::CloudVersionPinIdentity, Status>
+{
+    let pin_id = array(pin_id)?;
+    if pin_id == [0; 16] || acquire_not_after_unix_seconds <= 0 {
+        return Err(Status::invalid_argument("invalid cloud pin identity"));
+    }
+    Ok(s::CloudVersionPinIdentity { pin_id, acquire_not_after_unix_seconds })
+}
+fn pin_status(error: s::Error) -> Status {
+    match error {
+        // Only a durable admission fence proves that no older accepted worker
+        // can create this identity. Source availability does not prove that.
+        s::Error::CloudReplayExpired => Status::out_of_range("cloud pin admission closed"),
+        s::Error::CloudVersionExpired => Status::failed_precondition("cloud pin source version expired"),
+        s::Error::Invalid("cloud version unavailable") => Status::not_found("cloud pin source version unavailable"),
+        error => status(error),
+    }
 }
 fn response<T>(value: T, work: Arc<Work>, extra: impl Send + Sync + 'static) -> Response<T> {
     let mut response = Response::new(value);
@@ -1199,6 +1293,18 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
     ) -> Result<Response<p::Publication>, Status> {
         let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
         let input = request.into_inner();
+        let identity = structured_publication_identity(
+            input.publication_identity.as_ref(),
+            &input.idempotency_key,
+        )?;
+        if identity.is_some_and(|identity| {
+            identity.workspace.as_slice() != input.workspace_id
+                || Some(identity.generation) != input.expected_generation.checked_add(1)
+        }) {
+            return Err(Status::invalid_argument(
+                "invalid structured cloud publication binding",
+            ));
+        }
         use tinytree_proto::PublicationFailureReason as Reason;
         if input.manifest.len() > host.config.max_manifest_bytes {
             return Err(Status::resource_exhausted(Reason::ManifestBytes.message()));
@@ -1207,7 +1313,9 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             return Err(Status::resource_exhausted(Reason::CaptureBytes.message()));
         }
         if input.staging_leases.len() > host.config.max_staging_leases {
-            return Err(Status::resource_exhausted(Reason::StagingLeaseCount.message()));
+            return Err(Status::resource_exhausted(
+                Reason::StagingLeaseCount.message(),
+            ));
         }
         // The opt-in reserves the complete indexed Store profile before decode.
         let indexed_format = input.manifest.get(..8) == Some(b"TTCLOUD\0".as_slice())
@@ -1241,18 +1349,45 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         };
         let value = execute(work.clone(), move || {
             if captured {
-                store.publish_captured_cloud_version(
-                    &input.repository_id,
-                    owner,
-                    &s::PublishCapturedCloudRequest {
-                        publication: publish,
-                        capture_data: input.capture_data,
-                    },
-                    now()?,
-                    &limits,
-                )
+                let request = s::PublishCapturedCloudRequest {
+                    publication: publish,
+                    capture_data: input.capture_data,
+                };
+                match identity {
+                    Some(identity) => store.publish_captured_cloud_version_v2(
+                        &input.repository_id,
+                        owner,
+                        identity,
+                        &request,
+                        now()?,
+                        &limits,
+                    ),
+                    None => store.publish_captured_cloud_version(
+                        &input.repository_id,
+                        owner,
+                        &request,
+                        now()?,
+                        &limits,
+                    ),
+                }
             } else {
-                store.publish_cloud_version(&input.repository_id, owner, &publish, now()?, &limits)
+                match identity {
+                    Some(identity) => store.publish_cloud_version_v2(
+                        &input.repository_id,
+                        owner,
+                        identity,
+                        &publish,
+                        now()?,
+                        &limits,
+                    ),
+                    None => store.publish_cloud_version(
+                        &input.repository_id,
+                        owner,
+                        &publish,
+                        now()?,
+                        &limits,
+                    ),
+                }
             }
             .map_err(status)
         })
@@ -1340,6 +1475,8 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
                     .collect(),
                 continuation: page.continuation,
                 through_generation: page.through_generation,
+                retired_through: page.retired_through,
+                retention_revision: page.retention_revision,
             },
             work,
             (),
@@ -1632,6 +1769,168 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
             held,
         ))
     }
+    async fn acquire_version_pin(
+        &self,
+        request: Request<p::AcquireVersionPinRequest>,
+    ) -> Result<Response<p::VersionPin>, Status> {
+        let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
+        if !host.config.indexed_versions || !host.config.captured_versions {
+            return Err(Status::unimplemented(
+                "durable cloud version pins are disabled",
+            ));
+        }
+        let input = request.into_inner();
+        let workspace = array(&input.workspace_id)?;
+        let identity = pin_identity(&input.pin_id, input.acquire_not_after_unix_seconds)?;
+        let selection = input
+            .selection
+            .ok_or_else(|| Status::invalid_argument("missing cloud pin selection"))?;
+        use p::acquire_version_pin_request::Selection;
+        match &selection {
+            Selection::LatestCaptured(true) => {}
+            Selection::Generation(generation) if *generation > 0 => {}
+            Selection::Exact(exact) if exact_pin_selector(exact)?.workspace == workspace => {}
+            _ => return Err(Status::invalid_argument("invalid cloud pin selection")),
+        }
+        let store = host.store.clone();
+        let mut limits = tinytree_cloud::ManifestLimits::default();
+        limits.max_manifest_bytes = host.config.max_manifest_bytes;
+        let repository = input.repository_id.clone();
+        let authority_repo = repository.clone();
+        let deadline = work.deadline.into_std();
+        let value = execute(work.clone(), move || {
+            let validate = |selector: s::CloudVersionSelector| -> Result<(), Status> {
+                match &selection {
+                    Selection::Generation(generation) if *generation != selector.generation => {
+                        return Err(Status::already_exists("cloud pin selection conflicts"));
+                    }
+                    Selection::Exact(exact) if exact_pin_selector(exact)? != selector => {
+                        return Err(Status::already_exists("cloud pin selection conflicts"));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            };
+            let read_existing = |selector: s::CloudVersionSelector| {
+                validate(selector)?;
+                let read = store
+                    .read_cloud_version(&repository, owner, workspace, selector.generation, limits)
+                    .map_err(pin_status)?;
+                if read.manifest_bytes().get(8..10) != Some([3u8, 0].as_slice()) {
+                    return Err(Status::invalid_argument(
+                        "cloud pin requires captured version",
+                    ));
+                }
+                if read.version().manifest != selector.manifest
+                    || tinytree_cloud::BlobDigest::of(read.manifest_bytes()) != selector.selected
+                {
+                    return Err(Status::data_loss("cloud pin selection differs"));
+                }
+                Ok(read)
+            };
+            if let Some(existing) = store
+                .cloud_version_pin(&repository, owner, workspace, identity, pin_now)
+                .map_err(pin_status)?
+            {
+                return read_existing(existing);
+            }
+            let read = match &selection {
+                Selection::LatestCaptured(true) => store
+                    .read_latest_captured_cloud_version(
+                        &repository,
+                        owner,
+                        workspace,
+                        limits,
+                        deadline,
+                    )
+                    .map_err(pin_status)?
+                    .ok_or_else(|| Status::not_found("no captured cloud version"))?,
+                Selection::Generation(generation) => store
+                    .read_cloud_version(&repository, owner, workspace, *generation, limits)
+                    .map_err(pin_status)?,
+                Selection::Exact(exact) => read_existing(exact_pin_selector(exact)?)?,
+                _ => unreachable!(),
+            };
+            if read.manifest_bytes().get(8..10) != Some([3u8, 0].as_slice()) {
+                return Err(Status::invalid_argument(
+                    "cloud pin requires captured version",
+                ));
+            }
+            match store.pin_cloud_version_from_read_guard(&repository, owner, identity, &read, pin_now) {
+                Ok(_) => Ok(read),
+                Err(s::Error::IdempotencyConflict) => {
+                    // Release the losing version arena BEFORE opening the winner.
+                    drop(read);
+                    let winner = store
+                        .cloud_version_pin(&repository, owner, workspace, identity, pin_now)
+                        .map_err(pin_status)?
+                        .ok_or_else(|| Status::aborted("cloud pin selection changed"))?;
+                    read_existing(winner)
+                }
+                Err(error) => Err(pin_status(error)),
+            }
+        })
+        .await?;
+        let version = value.version();
+        let output = p::Version {
+            workspace_id: version.workspace.to_vec(),
+            generation: version.generation,
+            manifest_id: version.manifest.0.to_vec(),
+            previous_manifest_id: version.previous.map(|id| id.0.to_vec()),
+            manifest: value.manifest_bytes().to_vec(),
+            native_authority: Some(native_authority(
+                owner,
+                &authority_repo,
+                version.workspace,
+                version.generation,
+                version.manifest.0,
+                value.manifest_bytes(),
+            )),
+        };
+        Ok(response(
+            p::VersionPin {
+                pin_id: identity.pin_id.to_vec(),
+                acquire_not_after_unix_seconds: identity.acquire_not_after_unix_seconds,
+                version: Some(output),
+            },
+            work,
+            value,
+        ))
+    }
+    async fn release_version_pin(
+        &self,
+        request: Request<p::ReleaseVersionPinRequest>,
+    ) -> Result<Response<p::VersionPinReleased>, Status> {
+        let (host, work, owner) = self.context(&request, &request.get_ref().repository_id, true)?;
+        if !host.config.indexed_versions || !host.config.captured_versions {
+            return Err(Status::unimplemented(
+                "durable cloud version pins are disabled",
+            ));
+        }
+        let input = request.into_inner();
+        let identity = pin_identity(&input.pin_id, input.acquire_not_after_unix_seconds)?;
+        let selector = exact_pin_selector(
+            input
+                .exact
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("missing cloud pin selector"))?,
+        )?;
+        let store = host.store.clone();
+        execute(work.clone(), move || {
+            store
+                .release_cloud_version_pin(&input.repository_id, owner, identity, selector, pin_now)
+                .map_err(pin_status)
+        })
+        .await?;
+        Ok(response(
+            p::VersionPinReleased {
+                pin_id: identity.pin_id.to_vec(),
+                acquire_not_after_unix_seconds: identity.acquire_not_after_unix_seconds,
+            },
+            work,
+            (),
+        ))
+    }
     async fn get_publication(
         &self,
         request: Request<p::GetPublicationRequest>,
@@ -1639,11 +1938,19 @@ impl p::workspace_cloud_server::WorkspaceCloud for CloudService {
         let (host, work, owner) =
             self.context(&request, &request.get_ref().repository_id, false)?;
         let input = request.into_inner();
+        let identity = structured_publication_identity(
+            input.publication_identity.as_ref(),
+            &input.idempotency_key,
+        )?;
         let store = host.store.clone();
         let value = execute(work.clone(), move || {
-            store
-                .cloud_publication(&input.repository_id, owner, &input.idempotency_key)
-                .map_err(status)
+            match identity {
+                Some(identity) => store.cloud_publication_v2(&input.repository_id, owner, identity),
+                None => {
+                    store.cloud_publication(&input.repository_id, owner, &input.idempotency_key)
+                }
+            }
+            .map_err(status)
         })
         .await?;
         Ok(response(
@@ -1721,31 +2028,97 @@ mod indexed_adapter_tests {
         assert!(!reapi::policy::retryable(&permanent));
         use tinytree_proto::PublicationFailureReason as Reason;
         for (limit, expected) in [
-            ("cloud validation catalog budget", Reason::StoreValidationCatalogBudget),
-            ("cloud version decoded object budget", Reason::StoreVersionDecodedObjectBudget),
-            ("cloud validation catalog budget exceeded: records", Reason::StoreValidationCatalogRecords),
-            ("cloud validation catalog budget exceeded: metadata", Reason::StoreValidationCatalogMetadata),
-            ("cloud validation catalog budget exceeded: records_metadata", Reason::StoreValidationCatalogRecordsMetadata),
-            ("cloud validation catalog budget exceeded: payload", Reason::StoreValidationCatalogPayload),
-            ("cloud validation catalog budget exceeded: records_payload", Reason::StoreValidationCatalogRecordsPayload),
-            ("cloud validation catalog budget exceeded: metadata_payload", Reason::StoreValidationCatalogMetadataPayload),
-            ("cloud validation catalog budget exceeded: records_metadata_payload", Reason::StoreValidationCatalogRecordsMetadataPayload),
-            ("cloud index proof work exceeded: records", Reason::StoreIndexProofRecords),
-            ("cloud index proof work exceeded: metadata", Reason::StoreIndexProofMetadata),
-            ("cloud index proof work exceeded: records_metadata", Reason::StoreIndexProofRecordsMetadata),
-            ("cloud index proof work exceeded: payload", Reason::StoreIndexProofPayload),
-            ("cloud index proof work exceeded: records_payload", Reason::StoreIndexProofRecordsPayload),
-            ("cloud index proof work exceeded: metadata_payload", Reason::StoreIndexProofMetadataPayload),
-            ("cloud index proof work exceeded: records_metadata_payload", Reason::StoreIndexProofRecordsMetadataPayload),
+            (
+                "cloud validation catalog budget",
+                Reason::StoreValidationCatalogBudget,
+            ),
+            (
+                "cloud version decoded object budget",
+                Reason::StoreVersionDecodedObjectBudget,
+            ),
+            (
+                "cloud validation catalog budget exceeded: records",
+                Reason::StoreValidationCatalogRecords,
+            ),
+            (
+                "cloud validation catalog budget exceeded: metadata",
+                Reason::StoreValidationCatalogMetadata,
+            ),
+            (
+                "cloud validation catalog budget exceeded: records_metadata",
+                Reason::StoreValidationCatalogRecordsMetadata,
+            ),
+            (
+                "cloud validation catalog budget exceeded: payload",
+                Reason::StoreValidationCatalogPayload,
+            ),
+            (
+                "cloud validation catalog budget exceeded: records_payload",
+                Reason::StoreValidationCatalogRecordsPayload,
+            ),
+            (
+                "cloud validation catalog budget exceeded: metadata_payload",
+                Reason::StoreValidationCatalogMetadataPayload,
+            ),
+            (
+                "cloud validation catalog budget exceeded: records_metadata_payload",
+                Reason::StoreValidationCatalogRecordsMetadataPayload,
+            ),
+            (
+                "cloud index proof work exceeded: records",
+                Reason::StoreIndexProofRecords,
+            ),
+            (
+                "cloud index proof work exceeded: metadata",
+                Reason::StoreIndexProofMetadata,
+            ),
+            (
+                "cloud index proof work exceeded: records_metadata",
+                Reason::StoreIndexProofRecordsMetadata,
+            ),
+            (
+                "cloud index proof work exceeded: payload",
+                Reason::StoreIndexProofPayload,
+            ),
+            (
+                "cloud index proof work exceeded: records_payload",
+                Reason::StoreIndexProofRecordsPayload,
+            ),
+            (
+                "cloud index proof work exceeded: metadata_payload",
+                Reason::StoreIndexProofMetadataPayload,
+            ),
+            (
+                "cloud index proof work exceeded: records_metadata_payload",
+                Reason::StoreIndexProofRecordsMetadataPayload,
+            ),
             ("cloud resident memory", Reason::StoreResidentMemory),
             ("cloud index graph work", Reason::StoreIndexGraphWork),
-            ("cloud index aggregate payload", Reason::StoreIndexAggregatePayload),
+            (
+                "cloud index aggregate payload",
+                Reason::StoreIndexAggregatePayload,
+            ),
             ("cloud index anchor proof", Reason::StoreIndexAnchorProof),
-            ("cloud resident memory /private/fixture", Reason::UnknownStoreLimit),
-            ("cloud index graph work /private/fixture", Reason::UnknownStoreLimit),
-            ("cloud index aggregate payload /private/fixture", Reason::UnknownStoreLimit),
-            ("cloud index anchor proof /private/fixture", Reason::UnknownStoreLimit),
-            ("synthetic-sensitive-marker /private/fixture token=not-real", Reason::UnknownStoreLimit),
+            (
+                "cloud resident memory /private/fixture",
+                Reason::UnknownStoreLimit,
+            ),
+            (
+                "cloud index graph work /private/fixture",
+                Reason::UnknownStoreLimit,
+            ),
+            (
+                "cloud index aggregate payload /private/fixture",
+                Reason::UnknownStoreLimit,
+            ),
+            (
+                "cloud index anchor proof /private/fixture",
+                Reason::UnknownStoreLimit,
+            ),
+            (
+                "synthetic-sensitive-marker /private/fixture token=not-real",
+                Reason::UnknownStoreLimit,
+            ),
         ] {
             let failure = status(s::Error::Limit(limit));
             assert_eq!(failure.code(), tonic::Code::ResourceExhausted);
@@ -1755,12 +2128,206 @@ mod indexed_adapter_tests {
             assert!(!format!("{failure:?}").contains("synthetic-sensitive-marker"));
             assert!(!failure.message().contains("/private/"));
             assert_eq!(Reason::from_message(expected.message()), Some(expected));
-            assert_eq!(expected.message(), format!("workspace-cloud limit: {}", expected.as_str()));
+            assert_eq!(
+                expected.message(),
+                format!("workspace-cloud limit: {}", expected.as_str())
+            );
             let wrong_code = status(s::Error::Invalid(limit));
             assert_eq!(wrong_code.code(), tonic::Code::InvalidArgument);
             assert_eq!(Reason::from_message(wrong_code.message()), None);
         }
     }
+    #[tokio::test]
+    async fn released_pin_rejects_a_detached_acquire_after_waiter_cancellation() {
+        use tinytree_cloud as c;
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile: crate::Config =
+            toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
+        profile.service.cloud.indexed_versions = true;
+        profile.service.cloud.captured_versions = true;
+        // Match the supported captured RPC profile. The intrinsic fixture has
+        // a small capsule and a bounded owned catalog; do not reserve the
+        // legacy worst-case scan arena for this two-worker ordering test.
+        profile.service.cloud.max_capture_bytes = 128 * 1024;
+        profile.store.cloud.resident = Some(s::CloudResidentLimits {
+            max_bytes: 16 * 1024 * 1024,
+            max_entries: 4096,
+        });
+        profile.service.cloud.max_inflight = 4;
+        profile.service.cloud.max_inflight_per_repository = 4;
+        // This source contains only the intrinsic operation and one index root.
+        // Bound its proof geometry so two physically accepted acquisitions fit
+        // the unchanged service pool; production quotas remain untouched.
+        profile.service.max_metadata_bytes = 64 * 1024;
+        profile.service.cloud.max_object_bytes = 64 * 1024;
+        profile.service.cloud.max_manifest_bytes = 128 * 1024;
+        profile.store.cloud.max_object_bytes = 64 * 1024;
+        profile.store.cloud.max_decode_bytes = 4 * 1024 * 1024;
+        profile.store.cloud.max_version_decode_bytes = 16 * 1024 * 1024;
+        profile.store.cloud.max_manifest_bytes = 128 * 1024;
+        profile.store.cloud.max_manifest_decode_bytes = 2 * 1024 * 1024;
+        profile.store.max_closure_objects = 128;
+        profile.store.max_closure_edges = 512;
+        profile.store.max_path_contexts = 128;
+        profile.store.max_path_context_bytes = 128 * 1024;
+        let mut policy = profile.store.materialize(profile.service.max_metadata_bytes);
+        // Index verification reserves one complete configured snapshot decoder,
+        // even for an intrinsic-only graph. Keep that decoder and the artifact
+        // builder's aggregate reservation inside the version proof envelope.
+        let index_policy = c::IndexArtifactLimits {
+            snapshot: c::IndexSnapshotLimits {
+                max_encoded_bytes: 64 * 1024,
+                max_decode_bytes: 1024 * 1024,
+                max_roots: 16,
+                max_drafts: 16,
+                max_parents: 16,
+                max_edges: 64,
+                max_metadata_bytes: 64 * 1024,
+            },
+            max_artifact_bytes: 64 * 1024,
+            max_artifacts: 64,
+            max_snapshots: 8,
+            max_total_artifact_bytes: 128 * 1024,
+            max_decode_bytes: 2 * 1024 * 1024,
+            // V3 binding shares this work limit with graph traversal: it
+            // charges capsule bytes, artifact bytes and history shape (5,388
+            // units for this intrinsic fixture), not just node/edge counts.
+            max_graph_steps: profile.service.cloud.max_capture_bytes
+                + 128 * 1024
+                + 8 * 1024,
+        };
+        policy.cloud.index_artifacts = index_policy;
+        let store = s::Store::open(directory.path(), policy).unwrap();
+        store.create_repository("example").unwrap();
+        let repository = RepositoryService::new(store.clone(), profile.service,
+            vec!["example".into()], Vec::new()).unwrap();
+        let owner = s::CloudOwner { principal: crate::retention::owner_hash(
+            &repository.query_identity(&Default::default()).unwrap()) };
+        let indexed = c::build_index_artifacts(&c::PortableIndexSnapshot {
+            roots: vec![tinytree_model::CommitId::ROOT], drafts: vec![],
+        }, index_policy).unwrap();
+        let mut leases = Vec::new();
+        let mut blobs = Vec::new();
+        let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        for artifact in &indexed.artifacts {
+            let receipt = store.put_cloud_index_artifact("example", owner,
+                artifact.descriptor, &artifact.bytes, 1, index_policy).unwrap();
+            leases.push(receipt.staging_lease);
+            let (kind, id) = match artifact.descriptor.id {
+                c::IndexArtifactId::Root(id) => (3, id.0),
+                c::IndexArtifactId::Node(id) => (4, id.0),
+            };
+            blobs.push(c::BlobRecord { kind, id: hex(&id),
+                blake3: artifact.descriptor.selected.blake3,
+                size: artifact.descriptor.selected.size_bytes });
+        }
+        blobs.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+        let tree = tinytree_model::synthetic_root().root_tree;
+        let empty = tinytree_model::empty_tree().descriptor.key;
+        let history = c::ManifestV2 {
+            recovery: c::Manifest {
+                workspace: [81; 32], exporter: [82; 16], sequence: 1,
+                operation_heads: vec![[0; 64]], undo_operations: vec![], intent_operations: vec![],
+                working_copy: c::WorkingCopy { workspace_name: "task".into(), wc_operation: [0; 64],
+                    snapshot_operation: [0; 64], snapshot_commit: [0; 32], tree: tree.clone() },
+                parents: vec![], members: vec![], intent_roots: vec![], native_roots: vec![empty],
+                coverage: c::Coverage::FullRequired, detached: vec![],
+            },
+            operation_indexes: vec![c::OperationIndex { operation: [0; 64], root: indexed.root.id }],
+            index_roots: vec![indexed.root],
+        };
+        let data = c::CaptureData {
+            version: 1, policy: c::CapturePolicy::HostQuiescentV1, codec: c::CODEC.into(),
+            operation_heads: vec![hex(&[0; 64])],
+            working_copy: c::PortableWorkingCopy { workspace: "task".into(),
+                wc_operation: hex(&[0; 64]), snapshot_operation: hex(&[0; 64]),
+                snapshot_commit: [0; 32],
+                tree: c::CaptureTree { terms: tree.terms.iter().map(|id| id.0).collect(), labels: vec![] } },
+            operations: vec![c::OperationRecord { operation: hex(&[0; 64]), view: hex(&[0; 64]), parents: vec![] }],
+            indexes: vec![c::IndexRecord { operation: hex(&[0; 64]), root: indexed.root.id.0 }],
+            blobs, roots: vec![c::CapturedRoot { kind: empty.kind as u8, id: empty.id.0 }], remote: None,
+        };
+        let data = c::encode_capture_data(&data, Default::default()).unwrap();
+        let manifest = c::encode_manifest_v3(&c::ManifestV3 {
+            history, capture: c::CaptureDescriptor::of(&data),
+        }, Default::default()).unwrap();
+        store.publish_captured_cloud_version("example", owner, &s::PublishCapturedCloudRequest {
+            publication: s::PublishCloudRequest { workspace: [81; 32], expected_generation: 0,
+                idempotency_key: "pin-race-source".into(), manifest: c::ManifestId::of(&manifest),
+                manifest_bytes: manifest, staging_leases: leases }, capture_data: data,
+        }, 1, &Default::default()).unwrap();
+        let host = repository.cloud_host().unwrap();
+        let service = CloudService::new(repository);
+        let not_after = pin_now().unwrap() + 120;
+        let input = p::AcquireVersionPinRequest { repository_id: "example".into(),
+            workspace_id: vec![81; 32], pin_id: vec![83; 16],
+            acquire_not_after_unix_seconds: not_after,
+            selection: Some(p::acquire_version_pin_request::Selection::LatestCaptured(true)) };
+        let request = |input, method| {
+            let mut request = Request::new(input);
+            request.extensions_mut().insert(host.admit(method,
+                Instant::now() + std::time::Duration::from_secs(5)).unwrap());
+            request
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        struct Resume(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Resume { fn drop(&mut self) { if let Some(sender) = self.0.take() { let _ = sender.send(()); } } }
+        let mut resume = Resume(Some(resume_tx));
+        host.pause_job(entered_tx, resume_rx);
+        let first_request = request(input.clone(), "AcquireVersionPin");
+        let first_service = service.clone();
+        let first = tokio::spawn(async move { first_service.acquire_version_pin(first_request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(host.active_jobs(), 1, "accepted worker retains physical ownership after its waiter leaves");
+        let acquired = service.acquire_version_pin(request(input.clone(), "AcquireVersionPin"))
+            .await.unwrap().into_inner();
+        assert_eq!(acquired.acquire_not_after_unix_seconds, not_after);
+        let version = acquired.version.unwrap();
+        let release = p::ReleaseVersionPinRequest { repository_id: "example".into(), pin_id: vec![83; 16],
+            acquire_not_after_unix_seconds: not_after,
+            exact: Some(p::ExactVersionSelection {
+                version: Some(p::RetainedVersionSelector { workspace_id: version.workspace_id,
+                    generation: version.generation, manifest_id: version.manifest_id }),
+                manifest_selected: Some(p::RawDigest { blake3: blake3::hash(&version.manifest).as_bytes().to_vec(),
+                    size_bytes: version.manifest.len() as u64 }),
+            }) };
+        let mut release_request = Request::new(release.clone());
+        release_request.extensions_mut().insert(host.admit("ReleaseVersionPin",
+            Instant::now() + std::time::Duration::from_secs(5)).unwrap());
+        let released = service.release_version_pin(release_request).await.unwrap().into_inner();
+        assert_eq!(released.acquire_not_after_unix_seconds, not_after);
+        assert!(pin_now().unwrap() < not_after, "release precedes admission expiry");
+        resume.0.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while host.active_jobs() != 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert_eq!(service.acquire_version_pin(request(input, "AcquireVersionPin"))
+            .await.unwrap_err().code(), tonic::Code::OutOfRange,
+            "the detached older worker must not recreate a released pin");
+        let mut retry_release = Request::new(release.clone());
+        retry_release.extensions_mut().insert(host.admit("ReleaseVersionPin",
+            Instant::now() + std::time::Duration::from_secs(5)).unwrap());
+        service.release_version_pin(retry_release).await.unwrap();
+        assert_eq!(host.active_jobs(), 0);
+        // An unavailable exact source is not a terminal admission outcome: an
+        // independently accepted request for this identity could still commit.
+        let mut unavailable = release.exact.unwrap();
+        unavailable.version.as_mut().unwrap().generation += 1;
+        let missing_identity = s::CloudVersionPinIdentity { pin_id: [84; 16],
+            acquire_not_after_unix_seconds: not_after };
+        assert_eq!(service.acquire_version_pin(request(p::AcquireVersionPinRequest {
+            repository_id: "example".into(), workspace_id: vec![81; 32],
+            pin_id: missing_identity.pin_id.to_vec(),
+            acquire_not_after_unix_seconds: missing_identity.acquire_not_after_unix_seconds,
+            selection: Some(p::acquire_version_pin_request::Selection::Exact(unavailable)),
+        }, "AcquireVersionPin")).await.unwrap_err().code(), tonic::Code::NotFound);
+        assert!(store.cloud_version_pin("example", owner, [81; 32], missing_identity, pin_now)
+            .unwrap().is_none(), "source failure must not create a terminal release fence");
+    }
+
     #[tokio::test]
     async fn legacy_rpc_rejects_indexed_publish_and_read_before_artifact_work() {
         let directory = tempfile::tempdir().unwrap();
@@ -1838,6 +2405,7 @@ mod indexed_adapter_tests {
         let host = repository.cloud_host().unwrap();
         let service = CloudService::new(repository);
         let mut request = Request::new(p::PublishVersionRequest {
+            publication_identity: None,
             repository_id: "example".into(),
             workspace_id: vec![41; 32],
             expected_generation: 0,
@@ -1926,6 +2494,7 @@ mod indexed_adapter_tests {
             1
         );
         let mut metadata = Request::new(p::GetPublicationRequest {
+            publication_identity: None,
             repository_id: "example".into(),
             idempotency_key: "indexed-adapter-gate".into(),
         });

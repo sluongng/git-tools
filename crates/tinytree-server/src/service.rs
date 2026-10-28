@@ -443,8 +443,8 @@ impl Repository for RepositoryService {
             .admit(&identity, &input.repository_id, false, deadline)
             .await?;
         if input.features.is_empty()
-            || input.features.len() > 16
-            || input.features.iter().any(|id| !matches!(*id, 1..=15 | 18))
+            || input.features.len() > 18
+            || input.features.iter().any(|id| !(1..=18).contains(id))
             || input.features.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(Status::invalid_argument(
@@ -474,7 +474,8 @@ impl Repository for RepositoryService {
                         captured,
                         identity.authorize_cloud(&input.repository_id, true).is_ok(),
                     ),
-                    9 => (
+                    17 => (captured, identity.authorize_cloud(&input.repository_id, true).is_ok()),
+                    9 | 16 => (
                         self.cloud.is_some(),
                         identity
                             .authorize_cloud(&input.repository_id, false)
@@ -1273,6 +1274,9 @@ pub(crate) fn store_status(error: tinytree_store::Error) -> Status {
         E::Corrupt(_) => Status::data_loss("native store integrity check failed"),
         E::StaleReference(_) => Status::aborted("native reference generation changed"),
         E::StaleCloudWorkspace(_) => Status::aborted("cloud workspace generation changed"),
+        E::CloudVersionExpired => Status::out_of_range("exact cloud version expired"),
+        E::CloudReplayExpired => Status::out_of_range("cloud publication replay expired"),
+        E::CloudRetentionChanged => Status::aborted("cloud retention changed"),
         E::IdempotencyConflict => {
             Status::already_exists("native idempotency key has another request")
         }

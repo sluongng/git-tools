@@ -766,7 +766,10 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let directory = tempfile::tempdir().unwrap();
         let mut profile: tinytree_server::Config =
             toml::from_str(include_str!("../examples/cloud.toml")).unwrap();
-        assert!(profile.service.cloud.durable_retained_offload, "supported owned backing contract is enabled by default");
+        assert!(
+            profile.service.cloud.durable_retained_offload,
+            "supported owned backing contract is enabled by default"
+        );
         profile.service.cloud.enabled = cloud;
         profile.service.cloud.durable_retained_offload = offload;
         profile.service.cloud.indexed_versions = indexed;
@@ -794,7 +797,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
         let mut client = server.client().await;
         let input = p::GetCapabilitiesRequest {
             repository_id: "alpha".into(),
-            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 18],
+            features: vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18],
         };
         assert_eq!(
             client
@@ -845,7 +848,7 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         .iter()
                         .map(|f| f.feature)
                         .collect::<Vec<_>>(),
-                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 18]
+                    vec![1, 2, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18]
                 );
                 for feature in &result.features {
                     assert_eq!(
@@ -854,6 +857,8 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                             query
                         } else if feature.feature == 13 {
                             cloud && indexed && captured && offload
+                        } else if feature.feature == 17 {
+                            cloud && indexed && captured
                         } else if feature.feature >= 9 {
                             cloud
                         } else {
@@ -864,8 +869,8 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
                         feature.authorized,
                         match feature.feature {
                             1..=3 | 8 | 11 | 14 | 15 | 18 => true,
-                            4 | 9 | 13 => cloud_read,
-                            5 | 10 => cloud_write,
+                            4 | 9 | 13 | 16 => cloud_read,
+                            5 | 10 | 17 => cloud_write,
                             _ => unreachable!(),
                         }
                     );
@@ -5287,11 +5292,22 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         assert_eq!(bytes, object.payload().unwrap());
     }
     let bytes = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    let structured = tinytree_store::CloudPublicationIdentity {
+        workspace: manifest.workspace,
+        generation: 2,
+        nonce: [19; 16],
+    };
+    let structured_wire = c::PublicationIdentity {
+        workspace_id: structured.workspace.to_vec(),
+        target_generation: structured.generation,
+        nonce: structured.nonce.to_vec(),
+    };
     let first = c::PublishVersionRequest {
+        publication_identity: None,
         repository_id: "alpha".into(),
         workspace_id: manifest.workspace.to_vec(),
         expected_generation: 0,
-        idempotency_key: "first-cloud-capture".into(),
+        idempotency_key: structured.token(),
         manifest_id: tinytree_cloud::ManifestId::of(&bytes).0.to_vec(),
         manifest: bytes.clone(),
         staging_leases: leases,
@@ -5310,6 +5326,21 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .unwrap()
             .into_inner(),
         published
+    );
+    let lookup_structured = c::GetPublicationRequest {
+        repository_id: "alpha".into(),
+        idempotency_key: structured.token(),
+        publication_identity: Some(structured_wire.clone()),
+    };
+    assert!(
+        client
+            .get_publication(request(lookup_structured.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication
+            .is_none(),
+        "legacy lookalike must not occupy the structured namespace"
     );
     manifest.sequence = 2;
     manifest.parents = vec![tinytree_cloud::ManifestId::of(&bytes)];
@@ -5577,8 +5608,9 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     .unwrap();
     let indexed_bytes = next.clone();
     let second = c::PublishVersionRequest {
+        publication_identity: Some(structured_wire.clone()),
         expected_generation: 1,
-        idempotency_key: "second-cloud-capture".into(),
+        idempotency_key: structured.token(),
         manifest_id: tinytree_cloud::ManifestId::of(&next).0.to_vec(),
         manifest: next,
         staging_leases: index_leases,
@@ -5588,6 +5620,96 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         .publish_version(request(second.clone(), ALPHA))
         .await
         .unwrap();
+    let structured_receipt = client
+        .publish_version(request(second.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(structured_receipt.workspace.as_ref().unwrap().generation, 2);
+    assert_eq!(
+        client
+            .get_publication(request(lookup_structured.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication,
+        Some(structured_receipt)
+    );
+    assert!(
+        client
+            .get_publication(request(lookup_structured.clone(), PEER))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .get_publication(request(lookup_structured.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let mut legacy_lookup = lookup_structured.clone();
+    legacy_lookup.publication_identity = None;
+    assert_eq!(
+        client
+            .get_publication(request(legacy_lookup, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .publication
+            .unwrap()
+            .workspace
+            .unwrap()
+            .generation,
+        1
+    );
+    for bad_identity in [
+        c::PublicationIdentity {
+            workspace_id: vec![1; 31],
+            ..structured_wire.clone()
+        },
+        c::PublicationIdentity {
+            nonce: vec![1; 15],
+            ..structured_wire.clone()
+        },
+        c::PublicationIdentity {
+            target_generation: 0,
+            ..structured_wire.clone()
+        },
+        c::PublicationIdentity {
+            target_generation: 3,
+            ..structured_wire.clone()
+        },
+    ] {
+        let mut bad = second.clone();
+        bad.publication_identity = Some(bad_identity);
+        assert_eq!(
+            client
+                .publish_version(request(bad, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    let mut changed = indexed_manifest.clone();
+    changed.recovery.exporter = [73; 16];
+    let changed = tinytree_cloud::encode_manifest_v2(&changed, Default::default()).unwrap();
+    let mut conflict = second.clone();
+    conflict.manifest_id = tinytree_cloud::ManifestId::of(&changed).0.to_vec();
+    conflict.manifest = changed;
+    assert_eq!(
+        client
+            .publish_version(request(conflict, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
     let catalog_request = c::ListWorkspacesRequest {
         repository_id: "alpha".into(),
         page_size: 1,
@@ -5696,6 +5818,9 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     assert_eq!(peer.workspace.unwrap().generation, 0);
     assert!(peer.versions.is_empty());
     let mut stale = second.clone();
+    // This is a new opaque legacy intent with a valid shape but stale CAS,
+    // not a malformed structured token/identity pair.
+    stale.publication_identity = None;
     stale.idempotency_key = "stale-cloud-capture".into();
     assert_eq!(
         client
@@ -6118,14 +6243,24 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .iter()
             .all(|range| range.origin == Some(query_id(root(&data))))
     );
-    let frozen_dag = query.blame(request(q::BlameRequest {
-        scope: scope.key.clone(),
-        revision: Some(query_id(frozen[1].descriptor.key)),
-        path: "BUILD.bazel".into(),
-        policy: q::HistoryPolicy::JjResolvedFixedPathV1 as i32,
-        max_commits: 0,
-    }, ALPHA)).await.unwrap().into_inner();
-    assert_eq!(frozen_dag.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    let frozen_dag = query
+        .blame(request(
+            q::BlameRequest {
+                scope: scope.key.clone(),
+                revision: Some(query_id(frozen[1].descriptor.key)),
+                path: "BUILD.bazel".into(),
+                policy: q::HistoryPolicy::JjResolvedFixedPathV1 as i32,
+                max_commits: 0,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        frozen_dag.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
     assert_eq!(frozen_dag.target, frozen_blame.target);
     assert_eq!(frozen_dag.target_bytes, frozen_blame.target_bytes);
     assert_eq!(frozen_dag.ranges, frozen_blame.ranges);
@@ -6167,33 +6302,40 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     });
     for policy in [1, 2] {
         let mut expression = input.expression.clone().unwrap();
-        let Some(q::graph_expr::Expression::ChangedPath(filter)) = expression.expression.as_mut() else { unreachable!() };
+        let Some(q::graph_expr::Expression::ChangedPath(filter)) = expression.expression.as_mut()
+        else {
+            unreachable!()
+        };
         filter.policy_version = policy;
         let facts = q::QueryFactsRequest {
-                scope: scope.key.clone(),
-                facts: [frozen[1].descriptor.key, root(&data)]
-                    .into_iter()
-                    .map(|candidate| q::GraphFact {
-                        fact: Some(q::graph_fact::Fact::Membership(q::Membership {
-                            expression: Some(expression.clone()),
-                            candidate: Some(query_id(candidate)),
-                        })),
-                    })
-                    .collect(),
-            };
-        let request = if policy == 2 { merged_request(facts, ALPHA) } else { request(facts, ALPHA) };
+            scope: scope.key.clone(),
+            facts: [frozen[1].descriptor.key, root(&data)]
+                .into_iter()
+                .map(|candidate| q::GraphFact {
+                    fact: Some(q::graph_fact::Fact::Membership(q::Membership {
+                        expression: Some(expression.clone()),
+                        candidate: Some(query_id(candidate)),
+                    })),
+                })
+                .collect(),
+        };
+        let request = if policy == 2 {
+            merged_request(facts, ALPHA)
+        } else {
+            request(facts, ALPHA)
+        };
         let changed = query.query_facts(request).await.unwrap().into_inner();
-    assert_eq!(
-        changed
-            .answers
-            .iter()
-            .map(|a| a.answer.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            Some(q::graph_fact_answer::Answer::Membership(false)),
-            Some(q::graph_fact_answer::Answer::Membership(true)),
-        ]
-    );
+        assert_eq!(
+            changed
+                .answers
+                .iter()
+                .map(|a| a.answer.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(q::graph_fact_answer::Answer::Membership(false)),
+                Some(q::graph_fact_answer::Answer::Membership(true)),
+            ]
+        );
     }
     let selected_prefix = query
         .resolve_commit_prefix(request(
@@ -6545,6 +6687,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         indexed_bytes
     );
     let captured_request = c::PublishVersionRequest {
+        publication_identity: None,
         repository_id: "alpha".into(),
         workspace_id: manifest.workspace.to_vec(),
         expected_generation: 2,
@@ -6580,6 +6723,38 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .unwrap()
             .into_inner(),
         captured_publication
+    );
+    let pin_not_after = i64::try_from(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()).unwrap() + 120;
+    let acquire_pin = c::AcquireVersionPinRequest {
+        acquire_not_after_unix_seconds: pin_not_after,
+        repository_id: "alpha".into(),
+        workspace_id: manifest.workspace.to_vec(),
+        pin_id: vec![31; 16],
+        selection: Some(c::acquire_version_pin_request::Selection::LatestCaptured(
+            true,
+        )),
+    };
+    // Discard the first accepted response: replay must preserve that selection.
+    client
+        .acquire_version_pin(request(acquire_pin.clone(), ALPHA))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .acquire_version_pin(request(acquire_pin.clone(), READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .acquire_version_pin(request(acquire_pin.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
     );
     let latest_request = c::GetLatestCapturedVersionRequest {
         repository_id: "alpha".into(),
@@ -6620,6 +6795,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     let delayed_bytes =
         tinytree_cloud::encode_manifest_v3(&delayed_manifest, Default::default()).unwrap();
     let delayed = c::PublishVersionRequest {
+        publication_identity: None,
         expected_generation: 3,
         idempotency_key: "delayed-older-capture".into(),
         manifest_id: tinytree_cloud::ManifestId::of(&delayed_bytes).0.to_vec(),
@@ -6716,6 +6892,185 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
     }
     assert!(capture_eof);
     assert_eq!(transferred_capture, capture_bytes);
+    let mut newest_manifest = tinytree_cloud::decode_manifest_v3(
+        &captured_manifest,
+        tinytree_cloud::ManifestId::of(&captured_manifest),
+        Default::default(),
+    )
+    .unwrap();
+    newest_manifest.history.recovery.sequence = 4;
+    let newest_bytes =
+        tinytree_cloud::encode_manifest_v3(&newest_manifest, Default::default()).unwrap();
+    let newest_request = c::PublishVersionRequest {
+        expected_generation: 4,
+        idempotency_key: "newer-captured-for-pin".into(),
+        manifest_id: tinytree_cloud::ManifestId::of(&newest_bytes).0.to_vec(),
+        manifest: newest_bytes,
+        ..captured_request.clone()
+    };
+    client
+        .publish_version(request(newest_request, ALPHA))
+        .await
+        .unwrap();
+    let original_pin = client
+        .acquire_version_pin(request(acquire_pin.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(original_pin.version.as_ref().unwrap().generation, 3);
+    assert_eq!(original_pin.acquire_not_after_unix_seconds, pin_not_after);
+    let fresh_pin = client
+        .acquire_version_pin(request(
+            c::AcquireVersionPinRequest {
+                pin_id: vec![32; 16],
+                ..acquire_pin.clone()
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fresh_pin.version.as_ref().unwrap().generation, 5);
+    let old_version = original_pin.version.as_ref().unwrap();
+    let exact = c::ExactVersionSelection {
+        version: Some(c::RetainedVersionSelector {
+            workspace_id: manifest.workspace.to_vec(),
+            generation: 3,
+            manifest_id: old_version.manifest_id.clone(),
+        }),
+        manifest_selected: Some(c::RawDigest {
+            blake3: blake3::hash(&old_version.manifest).as_bytes().to_vec(),
+            size_bytes: old_version.manifest.len() as u64,
+        }),
+    };
+    assert_eq!(
+        client
+            .acquire_version_pin(request(
+                c::AcquireVersionPinRequest {
+                    selection: Some(c::acquire_version_pin_request::Selection::Generation(5)),
+                    ..acquire_pin.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(
+        client
+            .acquire_version_pin(request(
+                c::AcquireVersionPinRequest {
+                    selection: Some(c::acquire_version_pin_request::Selection::Exact(
+                        exact.clone()
+                    )),
+                    ..acquire_pin.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .version
+            .unwrap()
+            .generation,
+        3,
+        "saved exact selection reattaches the same original latest job"
+    );
+    let mut wrong = exact.clone();
+    wrong.manifest_selected.as_mut().unwrap().blake3[0] ^= 1;
+    assert_eq!(
+        client
+            .acquire_version_pin(request(
+                c::AcquireVersionPinRequest {
+                    selection: Some(c::acquire_version_pin_request::Selection::Exact(
+                        wrong.clone()
+                    )),
+                    ..acquire_pin.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(
+        client
+            .acquire_version_pin(request(
+                c::AcquireVersionPinRequest {
+                    pin_id: vec![0; 15],
+                    ..acquire_pin.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let release = c::ReleaseVersionPinRequest {
+        acquire_not_after_unix_seconds: pin_not_after,
+        repository_id: "alpha".into(),
+        pin_id: vec![31; 16],
+        exact: Some(exact),
+    };
+    assert_eq!(
+        client
+            .release_version_pin(request(
+                c::ReleaseVersionPinRequest {
+                    exact: Some(wrong),
+                    ..release.clone()
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    // A changed expiry is a distinct identity and cannot release the original.
+    client.release_version_pin(request(c::ReleaseVersionPinRequest {
+        acquire_not_after_unix_seconds: pin_not_after + 1,
+        ..release.clone()
+    }, ALPHA)).await.unwrap();
+    assert_eq!(client.acquire_version_pin(request(acquire_pin.clone(), ALPHA))
+        .await.unwrap().into_inner().version.unwrap().generation, 3);
+    let released = client
+        .release_version_pin(request(release.clone(), ALPHA))
+        .await
+        .unwrap().into_inner();
+    assert_eq!(released.acquire_not_after_unix_seconds, pin_not_after);
+    assert_eq!(client.acquire_version_pin(request(acquire_pin.clone(), ALPHA))
+        .await.unwrap_err().code(), Code::OutOfRange,
+        "released latest identity cannot reselect a newer generation");
+    client
+        .release_version_pin(request(release, ALPHA))
+        .await
+        .unwrap();
+    let fresh = fresh_pin.version.unwrap();
+    client
+        .release_version_pin(request(
+            c::ReleaseVersionPinRequest {
+                repository_id: "alpha".into(),
+                pin_id: vec![32; 16],
+                acquire_not_after_unix_seconds: pin_not_after,
+                exact: Some(c::ExactVersionSelection {
+                    version: Some(c::RetainedVersionSelector {
+                        workspace_id: manifest.workspace.to_vec(),
+                        generation: fresh.generation,
+                        manifest_id: fresh.manifest_id,
+                    }),
+                    manifest_selected: Some(c::RawDigest {
+                        blake3: blake3::hash(&fresh.manifest).as_bytes().to_vec(),
+                        size_bytes: fresh.manifest.len() as u64,
+                    }),
+                }),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
     drop(client);
     server.stop().await;
     drop(store);
@@ -6736,7 +7091,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
             .unwrap()
             .into_inner()
             .generation,
-        3
+        5
     );
     let mut capture_stream = client
         .read_capture(request(captured_read, ALPHA))
@@ -6790,6 +7145,7 @@ async fn cloud_rpc_private_compressed_history_replay_gc_and_restart() {
         client
             .get_publication(request(
                 c::GetPublicationRequest {
+                    publication_identity: None,
                     repository_id: "alpha".into(),
                     idempotency_key: first.idempotency_key.clone()
                 },
@@ -6881,24 +7237,51 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
     assert!(!reapi::policy::retryable(&error));
     use tinytree_proto::PublicationFailureReason as Reason;
     for (name, manifest, capture_data, staging_leases, reason) in [
-        ("manifest-bytes", vec![0; 1025], vec![], vec![], Reason::ManifestBytes),
-        ("capture-bytes", vec![], vec![0; capture_limit + 1], vec![], Reason::CaptureBytes),
-        ("staging-lease-count", vec![], vec![], vec!["a".repeat(64); 2], Reason::StagingLeaseCount),
+        (
+            "manifest-bytes",
+            vec![0; 1025],
+            vec![],
+            vec![],
+            Reason::ManifestBytes,
+        ),
+        (
+            "capture-bytes",
+            vec![],
+            vec![0; capture_limit + 1],
+            vec![],
+            Reason::CaptureBytes,
+        ),
+        (
+            "staging-lease-count",
+            vec![],
+            vec![],
+            vec!["a".repeat(64); 2],
+            Reason::StagingLeaseCount,
+        ),
     ] {
-        let error = client.publish_version(request(
-            c::PublishVersionRequest {
-                repository_id: "alpha".into(),
-                workspace_id: vec![1; 32],
-                expected_generation: 0,
-                idempotency_key: name.into(),
-                manifest_id: vec![2; 32],
-                manifest,
-                staging_leases,
-                capture_data,
-            }, ALPHA,
-        )).await.unwrap_err();
+        let error = client
+            .publish_version(request(
+                c::PublishVersionRequest {
+                    publication_identity: None,
+                    repository_id: "alpha".into(),
+                    workspace_id: vec![1; 32],
+                    expected_generation: 0,
+                    idempotency_key: name.into(),
+                    manifest_id: vec![2; 32],
+                    manifest,
+                    staging_leases,
+                    capture_data,
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), Code::ResourceExhausted, "{name}");
-        assert_eq!(Reason::from_message(error.message()), Some(reason), "{name}");
+        assert_eq!(
+            Reason::from_message(error.message()),
+            Some(reason),
+            "{name}"
+        );
         assert!(error.details().is_empty());
         assert!(!reapi::policy::retryable(&error));
     }
@@ -6921,6 +7304,7 @@ async fn cloud_rpc_decompressed_and_semantic_request_bounds_reject_before_store_
         client
             .get_publication(request(
                 c::GetPublicationRequest {
+                    publication_identity: None,
                     repository_id: "alpha".into(),
                     idempotency_key: "manifest-bytes".into()
                 },
@@ -7022,7 +7406,19 @@ fn history_commit(
     value: Option<tinytree_model::TreeValue>,
     change: u8,
 ) -> tinytree_model::EncodedObject {
-    history_tree_commit(store, index, parents, value.into_iter().map(|value| tinytree_model::TreeEntry { name: "file".into(), value }).collect(), change)
+    history_tree_commit(
+        store,
+        index,
+        parents,
+        value
+            .into_iter()
+            .map(|value| tinytree_model::TreeEntry {
+                name: "file".into(),
+                value,
+            })
+            .collect(),
+        change,
+    )
 }
 fn history_tree_commit(
     store: &Store,
@@ -7032,9 +7428,7 @@ fn history_tree_commit(
     change: u8,
 ) -> tinytree_model::EncodedObject {
     let tree = tinytree_model::encode(
-        &Object::Tree(tinytree_model::Tree {
-            entries,
-        }),
+        &Object::Tree(tinytree_model::Tree { entries }),
         Limits::default(),
     )
     .unwrap();
@@ -7107,36 +7501,20 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
         tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
     let copied_file = |bytes: &[u8]| {
         let mut value = history_file(&store, bytes, false);
-        if let tinytree_model::TreeValue::File { copy_id, .. } = &mut value { *copy_id = Some(tinytree_model::CopyId([7;32])); }
+        if let tinytree_model::TreeValue::File { copy_id, .. } = &mut value {
+            *copy_id = Some(tinytree_model::CopyId([7; 32]));
+        }
         value
     };
-    let base = history_commit(
-        &store,
-        &index,
-        &[],
-        Some(copied_file(b"x\n")),
-        141,
-    )
-    .descriptor
-    .key;
-    let left = history_commit(
-        &store,
-        &index,
-        &[base],
-        Some(copied_file(b"a\nx\n")),
-        142,
-    )
-    .descriptor
-    .key;
-    let right = history_commit(
-        &store,
-        &index,
-        &[base],
-        Some(copied_file(b"x\na\n")),
-        143,
-    )
-    .descriptor
-    .key;
+    let base = history_commit(&store, &index, &[], Some(copied_file(b"x\n")), 141)
+        .descriptor
+        .key;
+    let left = history_commit(&store, &index, &[base], Some(copied_file(b"a\nx\n")), 142)
+        .descriptor
+        .key;
+    let right = history_commit(&store, &index, &[base], Some(copied_file(b"x\na\n")), 143)
+        .descriptor
+        .key;
     let merge = history_commit(
         &store,
         &index,
@@ -7152,7 +7530,7 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
     let mut client = server.query_client().await;
     let scope = query_ready(&mut client, &[merge], 171).await;
     let open = q::OpenAnnotationFrontierRequest {
-            limits: None,
+        limits: None,
         scope: scope.key.clone(),
         version: 1,
         anchors: vec![q::CommitId {
@@ -7216,7 +7594,7 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
             .code(),
         Code::FailedPrecondition
     );
-    assert_eq!(selected.value.as_ref().unwrap().copy_id, vec![7;32]);
+    assert_eq!(selected.value.as_ref().unwrap().copy_id, vec![7; 32]);
     let input = q::ReadAnnotationInputRequest {
         scope: scope.key.clone(),
         context: frontier.context.clone(),
@@ -7318,7 +7696,7 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
     let partial = client
         .open_annotation_frontier(request(
             q::OpenAnnotationFrontierRequest {
-            limits: None,
+                limits: None,
                 scope: partial_scope.key.clone(),
                 version: 1,
                 anchors: vec![q::CommitId {
@@ -7360,16 +7738,39 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
     // Multiple canonical anchors form one ancestry union. Root is extra to the
     // non-root scan cap; no anchor becomes a forced annotation target.
     let union_scope = query_ready(&mut client, &[merge], 174).await;
-    let mut anchors = vec![q::CommitId { value: left.id.0.to_vec() }, q::CommitId { value: right.id.0.to_vec() }];
-    anchors.sort_by(|a,b|a.value.cmp(&b.value));
-    let union = client.open_annotation_frontier(request(q::OpenAnnotationFrontierRequest {
-            limits: None,
-        scope: union_scope.key, version: 1, anchors, path: "file".into(), max_commits: 3,
-    }, ALPHA)).await.unwrap().into_inner();
+    let mut anchors = vec![
+        q::CommitId {
+            value: left.id.0.to_vec(),
+        },
+        q::CommitId {
+            value: right.id.0.to_vec(),
+        },
+    ];
+    anchors.sort_by(|a, b| a.value.cmp(&b.value));
+    let union = client
+        .open_annotation_frontier(request(
+            q::OpenAnnotationFrontierRequest {
+                limits: None,
+                scope: union_scope.key,
+                version: 1,
+                anchors,
+                path: "file".into(),
+                max_commits: 3,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(union.coverage, q::HistoryCoverage::HistoryComplete as i32);
     assert_eq!(union.scanned_commits, 3);
     assert_eq!(union.nodes.len(), 4);
-    assert!(union.nodes.iter().all(|n|n.revision.as_ref().unwrap().value != merge.id.0));
+    assert!(
+        union
+            .nodes
+            .iter()
+            .all(|n| n.revision.as_ref().unwrap().value != merge.id.0)
+    );
 
     // A command can reserve a strict remote slice. Operator caps still win;
     // exhausted context replay never resets the accepted reservation.
@@ -7377,29 +7778,76 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
     let mut lowered = open.clone();
     lowered.scope = lowered_scope.key.clone();
     lowered.version = 2;
-    lowered.limits = Some(q::AnnotationLimits { work_nodes:1_000_000,work_edges:1_000_000,
-        work_bytes:16*1024*1024,frontier:8192,read_bytes:1,diff_input_bytes:16*1024*1024,
-        diff_lines:1_000_000,diff_work:4_000_000,diff_allocation_bytes:16*1024*1024,diff_depth:64 });
+    lowered.limits = Some(q::AnnotationLimits {
+        work_nodes: 1_000_000,
+        work_edges: 1_000_000,
+        work_bytes: 16 * 1024 * 1024,
+        frontier: 8192,
+        read_bytes: 1,
+        diff_input_bytes: 16 * 1024 * 1024,
+        diff_lines: 1_000_000,
+        diff_work: 4_000_000,
+        diff_allocation_bytes: 16 * 1024 * 1024,
+        diff_depth: 64,
+    });
     let mut unsupported_shape = lowered.clone();
     unsupported_shape.version = 1;
-    assert_eq!(client.open_annotation_frontier(request(unsupported_shape, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(unsupported_shape, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
     let mut unsupported_shape = lowered.clone();
     unsupported_shape.limits = None;
-    assert_eq!(client.open_annotation_frontier(request(unsupported_shape, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
-    let exhausted = client.open_annotation_frontier(request(lowered.clone(), ALPHA)).await.unwrap().into_inner();
-    assert_eq!(exhausted.version,2);
-    assert_eq!(exhausted.coverage, q::HistoryCoverage::HistoryReadLimit as i32);
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(unsupported_shape, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let exhausted = client
+        .open_annotation_frontier(request(lowered.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exhausted.version, 2);
+    assert_eq!(
+        exhausted.coverage,
+        q::HistoryCoverage::HistoryReadLimit as i32
+    );
     assert!(exhausted.nodes.is_empty());
-    assert_eq!(exhausted.limits.as_ref().unwrap().read_bytes,1);
-    assert!(exhausted.limits.as_ref().unwrap().diff_allocation_bytes<=8*1024*1024, "operator allocation cap cannot be widened");
-    assert_eq!(client.open_annotation_frontier(request(lowered.clone(), ALPHA)).await.unwrap().into_inner(),exhausted);
-    lowered.limits.as_mut().unwrap().read_bytes=1024;
-    assert_eq!(client.open_annotation_frontier(request(lowered, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    assert_eq!(exhausted.limits.as_ref().unwrap().read_bytes, 1);
+    assert!(
+        exhausted.limits.as_ref().unwrap().diff_allocation_bytes <= 8 * 1024 * 1024,
+        "operator allocation cap cannot be widened"
+    );
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(lowered.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        exhausted
+    );
+    lowered.limits.as_mut().unwrap().read_bytes = 1024;
+    assert_eq!(
+        client
+            .open_annotation_frontier(request(lowered, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
 
     // A fresh per-RPC deadline cannot extend the first open's absolute deadline.
     let expiry_scope = query_ready(&mut client, &[merge], 173).await;
     let expiry_input = q::OpenAnnotationFrontierRequest {
-            limits: None,
+        limits: None,
         scope: expiry_scope.key.clone(),
         version: 1,
         anchors: vec![q::CommitId {
@@ -7452,28 +7900,73 @@ async fn annotation_frontier_is_nonforced_exact_and_cumulatively_bounded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
     let (temporary, store) = setup();
-    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
     // Keep the selected FILE absent until frontier completion. Metadata-only
     // traversal must not need it, even though all path values refer to it.
     let selected_file = tinytree_model::describe_file(b"selected\n");
     let content = tinytree_model::TreeValue::File {
-        id:tinytree_model::FileId(selected_file.key.id.0), executable:false,
-        size_bytes:selected_file.size_bytes,copy_id:None,
+        id: tinytree_model::FileId(selected_file.key.id.0),
+        executable: false,
+        size_bytes: selected_file.size_bytes,
+        copy_id: None,
     };
     let mut head = None;
     let (mut base, mut short_head) = (None, None);
     for change in 0..300usize {
         let parents = head.into_iter().collect::<Vec<_>>();
-        head = Some(history_commit(&store, &index, &parents, Some(content.clone()), change as u8).descriptor.key);
-        if change == 0 { base = head; }
-        if change == 3 { short_head = head; }
+        head = Some(
+            history_commit(
+                &store,
+                &index,
+                &parents,
+                Some(content.clone()),
+                change as u8,
+            )
+            .descriptor
+            .key,
+        );
+        if change == 0 {
+            base = head;
+        }
+        if change == 3 {
+            short_head = head;
+        }
     }
     let head = head.unwrap();
-    let empty = history_commit(&store, &index, &[head], Some(history_file(&store,b"",false)), 31).descriptor.key;
-    let absent = history_commit(&store, &index, &[head], None, 32).descriptor.key;
-    let empty_tree=tinytree_model::encode(&Object::Tree(tinytree_model::Tree{entries:Vec::new()}),Limits::default()).unwrap();
-    store.put("alpha",empty_tree.descriptor,&empty_tree.bytes,0).unwrap();
-    let directory=history_commit(&store,&index,&[head],Some(tinytree_model::TreeValue::Tree(TreeId(empty_tree.descriptor.key.id.0))),33).descriptor.key;
+    let empty = history_commit(
+        &store,
+        &index,
+        &[head],
+        Some(history_file(&store, b"", false)),
+        31,
+    )
+    .descriptor
+    .key;
+    let absent = history_commit(&store, &index, &[head], None, 32)
+        .descriptor
+        .key;
+    let empty_tree = tinytree_model::encode(
+        &Object::Tree(tinytree_model::Tree {
+            entries: Vec::new(),
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store
+        .put("alpha", empty_tree.descriptor, &empty_tree.bytes, 0)
+        .unwrap();
+    let directory = history_commit(
+        &store,
+        &index,
+        &[head],
+        Some(tinytree_model::TreeValue::Tree(TreeId(
+            empty_tree.descriptor.key.id.0,
+        ))),
+        33,
+    )
+    .descriptor
+    .key;
 
     // A body outside the selected path must not be needed for discovery/selection.
     let _unrelated = history_file(&store, &vec![b'z'; 64 * 1024], false);
@@ -7482,32 +7975,106 @@ async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
     let server = Running::start_query(store.clone(), config, index).await;
     let mut client = server.query_client().await;
     let scope = query_ready(&mut client, &[head], 181).await;
-    let limits = q::AnnotationLimits { work_nodes:100_000, work_edges:1_000_000,
-        work_bytes:32*1024*1024, frontier:100_000, read_bytes:4*1024*1024,
-        diff_input_bytes:4096, diff_lines:1_000_000, diff_work:4_000_000,
-        diff_allocation_bytes:8*1024*1024, diff_depth:64 };
-    let open = q::OpenAnnotationFrontierPagedRequest {
-        input: Some(q::OpenAnnotationFrontierRequest { scope:scope.key.clone(), version:3,
-            anchors:vec![query_id(head)], path:"file".into(), max_commits:300, limits:Some(limits) }),
-        page_size:7, scan_quantum:17, server_attribution:false,
+    let limits = q::AnnotationLimits {
+        work_nodes: 100_000,
+        work_edges: 1_000_000,
+        work_bytes: 32 * 1024 * 1024,
+        frontier: 100_000,
+        read_bytes: 4 * 1024 * 1024,
+        diff_input_bytes: 4096,
+        diff_lines: 1_000_000,
+        diff_work: 4_000_000,
+        diff_allocation_bytes: 8 * 1024 * 1024,
+        diff_depth: 64,
     };
-    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), BETA)).await.unwrap_err().code(), Code::PermissionDenied);
-    let first = client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap().into_inner();
+    let open = q::OpenAnnotationFrontierPagedRequest {
+        input: Some(q::OpenAnnotationFrontierRequest {
+            scope: scope.key.clone(),
+            version: 3,
+            anchors: vec![query_id(head)],
+            path: "file".into(),
+            max_commits: 300,
+            limits: Some(limits),
+        }),
+        page_size: 7,
+        scan_quantum: 17,
+        server_attribution: false,
+    };
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(open.clone(), BETA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let first = client
+        .open_annotation_frontier_paged(request(open.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
     assert!(first.has_more);
-    assert_eq!(first.sequence,0);
-    assert_eq!(first.frontier.as_ref().unwrap().coverage,0);
-    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap().into_inner(),first);
-    let mut changed = open.clone(); changed.page_size += 1;
-    assert_eq!(client.open_annotation_frontier_paged(request(changed, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
-    let first_request = q::ContinueAnnotationFrontierRequest { scope:scope.key.clone(),
-        context:first.frontier.as_ref().unwrap().context.clone(), cursor:first.next_cursor.clone() };
-    let mut wrong = first_request.clone(); wrong.context[0] ^= 1;
-    assert_eq!(client.continue_annotation_frontier(request(wrong, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
-    let mut wrong = first_request.clone(); wrong.cursor[0] ^= 1;
-    assert_eq!(client.continue_annotation_frontier(request(wrong, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument);
-    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest {
-        scope:scope.key.clone(),context:first_request.context.clone(),revision:Some(query_id(head)),expected:None,
-    }, ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    assert_eq!(first.sequence, 0);
+    assert_eq!(first.frontier.as_ref().unwrap().coverage, 0);
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(open.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        first
+    );
+    let mut changed = open.clone();
+    changed.page_size += 1;
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(changed, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let first_request = q::ContinueAnnotationFrontierRequest {
+        scope: scope.key.clone(),
+        context: first.frontier.as_ref().unwrap().context.clone(),
+        cursor: first.next_cursor.clone(),
+    };
+    let mut wrong = first_request.clone();
+    wrong.context[0] ^= 1;
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(wrong, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut wrong = first_request.clone();
+    wrong.cursor[0] ^= 1;
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(wrong, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .read_annotation_input(request(
+                q::ReadAnnotationInputRequest {
+                    scope: scope.key.clone(),
+                    context: first_request.context.clone(),
+                    revision: Some(query_id(head)),
+                    expected: None,
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
     let mut page = first.clone();
     let mut nodes = Vec::new();
     let mut previous_usage = q::AnnotationUsage::default();
@@ -7515,139 +8082,348 @@ async fn annotation_frontier_pages_preserve_one_deep_source_and_budget() {
     let mut rounds = 0;
     while page.has_more {
         assert!(page.frontier.as_ref().unwrap().nodes.len() <= 7);
-        assert_eq!(page.frontier.as_ref().unwrap().coverage,0);
+        assert_eq!(page.frontier.as_ref().unwrap().coverage, 0);
         let usage = page.usage.as_ref().unwrap();
-        assert!(usage.work_nodes >= previous_usage.work_nodes && usage.work_edges >= previous_usage.work_edges && usage.work_bytes >= previous_usage.work_bytes);
-        assert!(usage.read_bytes >= previous_usage.read_bytes && usage.read_bytes <= 4*1024*1024);
+        assert!(
+            usage.work_nodes >= previous_usage.work_nodes
+                && usage.work_edges >= previous_usage.work_edges
+                && usage.work_bytes >= previous_usage.work_bytes
+        );
+        assert!(
+            usage.read_bytes >= previous_usage.read_bytes && usage.read_bytes <= 4 * 1024 * 1024
+        );
         assert!(page.operations >= previous_ops);
-        previous_usage = usage.clone(); previous_ops = page.operations;
+        previous_usage = usage.clone();
+        previous_ops = page.operations;
         nodes.extend(page.frontier.as_ref().unwrap().nodes.clone());
-        let advance = q::ContinueAnnotationFrontierRequest { scope:scope.key.clone(),
-            context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone() };
-        let next = client.continue_annotation_frontier(request(advance.clone(), ALPHA)).await.unwrap().into_inner();
-        assert_eq!(next.sequence,page.sequence+1);
-        assert_eq!(client.continue_annotation_frontier(request(advance, ALPHA)).await.unwrap().into_inner(),next,"last accepted page is replayed without recharge");
-        page = next; rounds += 1; assert!(rounds < 200);
+        let advance = q::ContinueAnnotationFrontierRequest {
+            scope: scope.key.clone(),
+            context: page.frontier.as_ref().unwrap().context.clone(),
+            cursor: page.next_cursor.clone(),
+        };
+        let next = client
+            .continue_annotation_frontier(request(advance.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(next.sequence, page.sequence + 1);
+        assert_eq!(
+            client
+                .continue_annotation_frontier(request(advance, ALPHA))
+                .await
+                .unwrap()
+                .into_inner(),
+            next,
+            "last accepted page is replayed without recharge"
+        );
+        page = next;
+        rounds += 1;
+        assert!(rounds < 200);
     }
     assert!(rounds > 40);
     assert!(page.next_cursor.is_empty());
     let final_frontier = page.frontier.as_ref().unwrap();
-    assert_eq!(final_frontier.coverage,q::HistoryCoverage::HistoryComplete as i32);
-    assert_eq!(final_frontier.scanned_commits,300);
-    assert_eq!(page.emitted_nodes,301);
+    assert_eq!(
+        final_frontier.coverage,
+        q::HistoryCoverage::HistoryComplete as i32
+    );
+    assert_eq!(final_frontier.scanned_commits, 300);
+    assert_eq!(page.emitted_nodes, 301);
     nodes.extend(final_frontier.nodes.clone());
-    assert_eq!(nodes.len(),301);
+    assert_eq!(nodes.len(), 301);
     let mut seen = std::collections::BTreeSet::new();
     for node in &nodes {
-        assert!(node.parents.iter().all(|p|seen.contains(&p.value)));
+        assert!(node.parents.iter().all(|p| seen.contains(&p.value)));
         assert!(seen.insert(node.revision.as_ref().unwrap().value.clone()));
     }
-    assert_eq!(client.continue_annotation_frontier(request(first_request, ALPHA)).await.unwrap_err().code(),Code::InvalidArgument,"old cursor cannot restart traversal");
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(first_request, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+        "old cursor cannot restart traversal"
+    );
     store.put("alpha", selected_file, b"selected\n", 0).unwrap();
-    let selected = nodes.iter().find(|node|node.revision.as_ref().unwrap().value==head.id.0).unwrap();
-    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest {
-        scope:scope.key.clone(),context:final_frontier.context.clone(),revision:selected.revision.clone(),expected:selected.value.clone(),
-    }, ALPHA)).await.unwrap().into_inner().data,b"selected\n");
-    client.close_annotation_frontier(request(q::CloseAnnotationFrontierRequest { scope:scope.key.clone(),context:final_frontier.context.clone() },ALPHA)).await.unwrap();
-    assert_eq!(client.open_annotation_frontier_paged(request(open.clone(), ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
+    let selected = nodes
+        .iter()
+        .find(|node| node.revision.as_ref().unwrap().value == head.id.0)
+        .unwrap();
+    assert_eq!(
+        client
+            .read_annotation_input(request(
+                q::ReadAnnotationInputRequest {
+                    scope: scope.key.clone(),
+                    context: final_frontier.context.clone(),
+                    revision: selected.revision.clone(),
+                    expected: selected.value.clone(),
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .data,
+        b"selected\n"
+    );
+    client
+        .close_annotation_frontier(request(
+            q::CloseAnnotationFrontierRequest {
+                scope: scope.key.clone(),
+                context: final_frontier.context.clone(),
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(open.clone(), ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
 
     // Canonical-only mode returns just the final target/origins, never the
     // canonical ancestry nodes collected by the mixed/private adapter.
-    let attributed_scope=query_ready(&mut client,&[head],184).await;
-    let mut attributed=open.clone();
-    attributed.server_attribution=true;
-    attributed.input.as_mut().unwrap().scope=attributed_scope.key.clone();
-    let mut page=client.open_annotation_frontier_paged(request(attributed.clone(),ALPHA)).await.unwrap().into_inner();
-    let mut changed_mode=attributed.clone();changed_mode.server_attribution=false;
-    assert_eq!(client.open_annotation_frontier_paged(request(changed_mode,ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
-    let mut last_advance=None;let mut advances=0;
+    let attributed_scope = query_ready(&mut client, &[head], 184).await;
+    let mut attributed = open.clone();
+    attributed.server_attribution = true;
+    attributed.input.as_mut().unwrap().scope = attributed_scope.key.clone();
+    let mut page = client
+        .open_annotation_frontier_paged(request(attributed.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut changed_mode = attributed.clone();
+    changed_mode.server_attribution = false;
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(changed_mode, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let mut last_advance = None;
+    let mut advances = 0;
     loop {
         assert!(page.frontier.as_ref().unwrap().nodes.is_empty());
-        assert_eq!(page.emitted_nodes,0,"server mode never transfers canonical graph nodes");
-        if !page.has_more { break; }
-        assert!(page.blame.is_none());assert_eq!(page.frontier.as_ref().unwrap().coverage,0);
-        let next=q::ContinueAnnotationFrontierRequest {scope:attributed_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone()};
-        page=client.continue_annotation_frontier(request(next.clone(),ALPHA)).await.unwrap().into_inner();
-        last_advance=Some(next);advances+=1;assert!(advances<200);
+        assert_eq!(
+            page.emitted_nodes, 0,
+            "server mode never transfers canonical graph nodes"
+        );
+        if !page.has_more {
+            break;
+        }
+        assert!(page.blame.is_none());
+        assert_eq!(page.frontier.as_ref().unwrap().coverage, 0);
+        let next = q::ContinueAnnotationFrontierRequest {
+            scope: attributed_scope.key.clone(),
+            context: page.frontier.as_ref().unwrap().context.clone(),
+            cursor: page.next_cursor.clone(),
+        };
+        page = client
+            .continue_annotation_frontier(request(next.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        last_advance = Some(next);
+        advances += 1;
+        assert!(advances < 200);
     }
-    assert!(advances>10);
-    let blamed=page.blame.as_ref().unwrap();
-    assert_eq!(blamed.coverage,q::HistoryCoverage::HistoryComplete as i32);
-    assert_eq!(blamed.target_bytes,b"selected\n");assert_eq!(blamed.scanned_commits,300);
-    assert_eq!(expanded_origins(blamed),vec![Some((base.unwrap().id.0.to_vec(),0))]);
-    assert_eq!(client.continue_annotation_frontier(request(last_advance.unwrap(),ALPHA)).await.unwrap().into_inner(),page);
-    assert_eq!(client.read_annotation_input(request(q::ReadAnnotationInputRequest{
-        scope:attributed_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),revision:Some(query_id(head)),expected:None,
-    },ALPHA)).await.unwrap_err().code(),Code::FailedPrecondition);
-    let oracle_scope=query_ready(&mut client,&[head],185).await;
-    let mut oracle_request=blame_request(&oracle_scope,short_head.unwrap(),4);
-    oracle_request.policy=q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
-    let oracle=client.blame(request(oracle_request,ALPHA)).await.unwrap().into_inner();
-    let mut short=attributed.clone();
-    short.input.as_mut().unwrap().scope=oracle_scope.key.clone();
-    short.input.as_mut().unwrap().anchors=vec![query_id(short_head.unwrap())];
-    short.input.as_mut().unwrap().max_commits=4;
-    let mut page=client.open_annotation_frontier_paged(request(short,ALPHA)).await.unwrap().into_inner();
+    assert!(advances > 10);
+    let blamed = page.blame.as_ref().unwrap();
+    assert_eq!(blamed.coverage, q::HistoryCoverage::HistoryComplete as i32);
+    assert_eq!(blamed.target_bytes, b"selected\n");
+    assert_eq!(blamed.scanned_commits, 300);
+    assert_eq!(
+        expanded_origins(blamed),
+        vec![Some((base.unwrap().id.0.to_vec(), 0))]
+    );
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(last_advance.unwrap(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        page
+    );
+    assert_eq!(
+        client
+            .read_annotation_input(request(
+                q::ReadAnnotationInputRequest {
+                    scope: attributed_scope.key.clone(),
+                    context: page.frontier.as_ref().unwrap().context.clone(),
+                    revision: Some(query_id(head)),
+                    expected: None,
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let oracle_scope = query_ready(&mut client, &[head], 185).await;
+    let mut oracle_request = blame_request(&oracle_scope, short_head.unwrap(), 4);
+    oracle_request.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
+    let oracle = client
+        .blame(request(oracle_request, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut short = attributed.clone();
+    short.input.as_mut().unwrap().scope = oracle_scope.key.clone();
+    short.input.as_mut().unwrap().anchors = vec![query_id(short_head.unwrap())];
+    short.input.as_mut().unwrap().max_commits = 4;
+    let mut page = client
+        .open_annotation_frontier_paged(request(short, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
     while page.has_more {
-        page=client.continue_annotation_frontier(request(q::ContinueAnnotationFrontierRequest{
-            scope:oracle_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone(),
-        },ALPHA)).await.unwrap().into_inner();
+        page = client
+            .continue_annotation_frontier(request(
+                q::ContinueAnnotationFrontierRequest {
+                    scope: oracle_scope.key.clone(),
+                    context: page.frontier.as_ref().unwrap().context.clone(),
+                    cursor: page.next_cursor.clone(),
+                },
+                ALPHA,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
     }
-    assert_eq!(page.blame.as_ref().unwrap(),&oracle,"paged attribution shares the one-shot resolved policy");
+    assert_eq!(
+        page.blame.as_ref().unwrap(),
+        &oracle,
+        "paged attribution shares the one-shot resolved policy"
+    );
 
     // Target validation precedes ancestry even when its configured scan cap
     // cannot cover this deep chain. Empty targets complete without a graph.
-    for (name,revision,expected,replay) in [
-        ("empty",empty,None,186),
-        ("missing",absent,Some(Code::NotFound),187),
-        ("directory",directory,Some(Code::FailedPrecondition),188),
+    for (name, revision, expected, replay) in [
+        ("empty", empty, None, 186),
+        ("missing", absent, Some(Code::NotFound), 187),
+        ("directory", directory, Some(Code::FailedPrecondition), 188),
     ] {
-        let target_scope=query_ready(&mut client,&[revision],replay).await;
-        let mut input=attributed.clone();
-        input.input.as_mut().unwrap().scope=target_scope.key.clone();
-        input.input.as_mut().unwrap().anchors=vec![query_id(revision)];
-        input.input.as_mut().unwrap().max_commits=1;
-        let result=client.open_annotation_frontier_paged(request(input,ALPHA)).await;
-        if let Some(expected)=expected { assert_eq!(result.unwrap_err().code(),expected,"{name}"); }
-        else {
-            let result=result.unwrap().into_inner();assert!(!result.has_more);assert_eq!(result.operations,0);
+        let target_scope = query_ready(&mut client, &[revision], replay).await;
+        let mut input = attributed.clone();
+        input.input.as_mut().unwrap().scope = target_scope.key.clone();
+        input.input.as_mut().unwrap().anchors = vec![query_id(revision)];
+        input.input.as_mut().unwrap().max_commits = 1;
+        let result = client
+            .open_annotation_frontier_paged(request(input, ALPHA))
+            .await;
+        if let Some(expected) = expected {
+            assert_eq!(result.unwrap_err().code(), expected, "{name}");
+        } else {
+            let result = result.unwrap().into_inner();
+            assert!(!result.has_more);
+            assert_eq!(result.operations, 0);
             assert!(result.frontier.as_ref().unwrap().nodes.is_empty());
-            let blame=result.blame.unwrap();assert_eq!(blame.scanned_commits,0);
-            assert!(blame.target_bytes.is_empty()&&blame.ranges.is_empty());assert!(blame.target.is_some());
+            let blame = result.blame.unwrap();
+            assert_eq!(blame.scanned_commits, 0);
+            assert!(blame.target_bytes.is_empty() && blame.ranges.is_empty());
+            assert!(blame.target.is_some());
         }
     }
 
     // A finite allowance is cumulative across advances, not a per-page reset.
     let limited_scope = query_ready(&mut client, &[head], 182).await;
     let mut limited = open.clone();
-    limited.input.as_mut().unwrap().scope=limited_scope.key.clone();
-    limited.input.as_mut().unwrap().limits.as_mut().unwrap().work_nodes=100;
-    limited.scan_quantum=1;
-    limited.server_attribution=true;
-    let initial = client.open_annotation_frontier_paged(request(limited.clone(),ALPHA)).await.unwrap().into_inner();
-    let mut page=initial.clone(); let mut advances=0;
+    limited.input.as_mut().unwrap().scope = limited_scope.key.clone();
+    limited
+        .input
+        .as_mut()
+        .unwrap()
+        .limits
+        .as_mut()
+        .unwrap()
+        .work_nodes = 100;
+    limited.scan_quantum = 1;
+    limited.server_attribution = true;
+    let initial = client
+        .open_annotation_frontier_paged(request(limited.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut page = initial.clone();
+    let mut advances = 0;
     let failed_request = loop {
         assert!(page.has_more);
-        assert!(page.blame.is_none()&&page.frontier.as_ref().unwrap().nodes.is_empty());
-        let next=q::ContinueAnnotationFrontierRequest {scope:limited_scope.key.clone(),context:page.frontier.as_ref().unwrap().context.clone(),cursor:page.next_cursor.clone()};
-        match client.continue_annotation_frontier(request(next.clone(),ALPHA)).await {
-            Ok(reply)=>{page=reply.into_inner();advances+=1;assert!(advances<100);},
-            Err(error)=>{assert_eq!(error.code(),Code::ResourceExhausted);break next;},
+        assert!(page.blame.is_none() && page.frontier.as_ref().unwrap().nodes.is_empty());
+        let next = q::ContinueAnnotationFrontierRequest {
+            scope: limited_scope.key.clone(),
+            context: page.frontier.as_ref().unwrap().context.clone(),
+            cursor: page.next_cursor.clone(),
+        };
+        match client
+            .continue_annotation_frontier(request(next.clone(), ALPHA))
+            .await
+        {
+            Ok(reply) => {
+                page = reply.into_inner();
+                advances += 1;
+                assert!(advances < 100);
+            }
+            Err(error) => {
+                assert_eq!(error.code(), Code::ResourceExhausted);
+                break next;
+            }
         }
     };
-    assert!(advances>1);
-    assert_eq!(client.continue_annotation_frontier(request(failed_request,ALPHA)).await.unwrap_err().code(),Code::ResourceExhausted);
-    assert_eq!(client.open_annotation_frontier_paged(request(limited,ALPHA)).await.unwrap().into_inner(),initial,"reopening replays first result, never grants new work");
+    assert!(advances > 1);
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(failed_request, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .open_annotation_frontier_paged(request(limited, ALPHA))
+            .await
+            .unwrap()
+            .into_inner(),
+        initial,
+        "reopening replays first result, never grants new work"
+    );
 
-    let expiring_scope=query_ready(&mut client,&[head],183).await;
-    let mut expiring=open;expiring.input.as_mut().unwrap().scope=expiring_scope.key.clone();
-    let mut short=request(expiring,ALPHA);short.set_timeout(Duration::from_secs(1));
-    let opened=client.open_annotation_frontier_paged(short).await.unwrap().into_inner();
+    let expiring_scope = query_ready(&mut client, &[head], 183).await;
+    let mut expiring = open;
+    expiring.input.as_mut().unwrap().scope = expiring_scope.key.clone();
+    let mut short = request(expiring, ALPHA);
+    short.set_timeout(Duration::from_secs(1));
+    let opened = client
+        .open_annotation_frontier_paged(short)
+        .await
+        .unwrap()
+        .into_inner();
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(client.continue_annotation_frontier(request(q::ContinueAnnotationFrontierRequest {
-        scope:expiring_scope.key,context:opened.frontier.unwrap().context,cursor:opened.next_cursor,
-    },ALPHA)).await.unwrap_err().code(),Code::DeadlineExceeded);
-    drop(client);server.stop().await;
+    assert_eq!(
+        client
+            .continue_annotation_frontier(request(
+                q::ContinueAnnotationFrontierRequest {
+                    scope: expiring_scope.key,
+                    context: opened.frontier.unwrap().context,
+                    cursor: opened.next_cursor,
+                },
+                ALPHA
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DeadlineExceeded
+    );
+    drop(client);
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7660,79 +8436,119 @@ async fn dag_blame_uses_filtered_edges_merge_lines_and_aggregate_graph_bounds() 
     let cases = [
         Case {
             name: "unchanged parent bypass and transitive edge removal",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"x\n")),
-                (vec![0], None), (vec![2], Some(b"x\n")), (vec![1, 3], Some(b"x\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], Some(b"x\n")),
+                (vec![0], None),
+                (vec![2], Some(b"x\n")),
+                (vec![1, 3], Some(b"x\n")),
+            ],
             origins: vec![(3, 0)],
         },
         Case {
             name: "automerged intermediate is filtered out",
-            commits: vec![(vec![], Some(b"base\n")), (vec![0], Some(b"left\nbase\n")),
-                (vec![0], Some(b"base\nright\n")), (vec![1, 2], Some(b"left\nbase\nright\n")),
-                (vec![3], Some(b"left\nbase\nright\n"))],
+            commits: vec![
+                (vec![], Some(b"base\n")),
+                (vec![0], Some(b"left\nbase\n")),
+                (vec![0], Some(b"base\nright\n")),
+                (vec![1, 2], Some(b"left\nbase\nright\n")),
+                (vec![3], Some(b"left\nbase\nright\n")),
+            ],
             origins: vec![(1, 0), (0, 0), (2, 1)],
         },
         Case {
             name: "repeated lines cross an unchanged merge in one filtered graph",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"a\nx\n")),
-                (vec![0], Some(b"x\na\n")), (vec![1, 2], Some(b"a\nx\na\n")),
-                (vec![3], Some(b"x\na\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], Some(b"a\nx\n")),
+                (vec![0], Some(b"x\na\n")),
+                (vec![1, 2], Some(b"a\nx\na\n")),
+                (vec![3], Some(b"x\na\n")),
+            ],
             origins: vec![(0, 0), (1, 0)],
         },
         Case {
             name: "unchanged layer does not force a repeated-line boundary head",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"a\nx\n")),
-                (vec![0], Some(b"x\na\n")), (vec![1, 2], Some(b"a\nx\na\n")),
-                (vec![3], Some(b"a\nx\na\n")), (vec![4], Some(b"x\na\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], Some(b"a\nx\n")),
+                (vec![0], Some(b"x\na\n")),
+                (vec![1, 2], Some(b"a\nx\na\n")),
+                (vec![3], Some(b"a\nx\na\n")),
+                (vec![4], Some(b"x\na\n")),
+            ],
             origins: vec![(0, 0), (1, 0)],
         },
         Case {
             name: "filtered merge boundary cannot invent a locally introduced line",
-            commits: vec![(vec![], Some(b"x\nkeep\nend\n")),
+            commits: vec![
+                (vec![], Some(b"x\nkeep\nend\n")),
                 (vec![0], Some(b"x\nkeep\nP\nend\n")),
                 (vec![0], Some(b"keep\nend\n")),
                 (vec![1, 2], Some(b"keep\nP\nend\n")),
-                (vec![3], Some(b"x\n"))],
+                (vec![3], Some(b"x\n")),
+            ],
             origins: vec![(0, 0)],
         },
         Case {
             name: "two selected occurrences converge on one ancestor line",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], Some(b"x\nleft\n")),
-                (vec![0], Some(b"right\nx\n")), (vec![1, 2], Some(b"x\nleft\nright\nx\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], Some(b"x\nleft\n")),
+                (vec![0], Some(b"right\nx\n")),
+                (vec![1, 2], Some(b"x\nleft\nright\nx\n")),
+            ],
             origins: vec![(0, 0), (1, 1), (2, 0), (0, 0)],
         },
         Case {
             name: "redundant direct parents retain first parent priority",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], None),
-                (vec![1], Some(b"x\n")), (vec![0, 2], Some(b"x\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], None),
+                (vec![1], Some(b"x\n")),
+                (vec![0, 2], Some(b"x\n")),
+            ],
             origins: vec![(0, 0)],
         },
         Case {
             name: "reversed direct parents retain canonical order",
-            commits: vec![(vec![], Some(b"x\n")), (vec![0], None),
-                (vec![1], Some(b"x\n")), (vec![2, 0], Some(b"x\n"))],
+            commits: vec![
+                (vec![], Some(b"x\n")),
+                (vec![0], None),
+                (vec![1], Some(b"x\n")),
+                (vec![2, 0], Some(b"x\n")),
+            ],
             origins: vec![(2, 0)],
         },
         Case {
             name: "recursive criss-cross common ancestors",
-            commits: vec![(vec![], Some(b"a\nstable\nb\n")),
-                (vec![0], Some(b"A\nstable\nb\n")), (vec![0], Some(b"a\nstable\nB\n")),
-                (vec![1, 2], Some(b"A\nstable\nB\n")), (vec![2, 1], Some(b"A\nstable\nB\n")),
-                (vec![3, 4], Some(b"A\nstable\nB\n")), (vec![5], Some(b"A\nstable\nB\n"))],
+            commits: vec![
+                (vec![], Some(b"a\nstable\nb\n")),
+                (vec![0], Some(b"A\nstable\nb\n")),
+                (vec![0], Some(b"a\nstable\nB\n")),
+                (vec![1, 2], Some(b"A\nstable\nB\n")),
+                (vec![2, 1], Some(b"A\nstable\nB\n")),
+                (vec![3, 4], Some(b"A\nstable\nB\n")),
+                (vec![5], Some(b"A\nstable\nB\n")),
+            ],
             origins: vec![(1, 0), (0, 1), (2, 2)],
         },
         Case {
             name: "ordered three-parent automatic file merge",
-            commits: vec![(vec![], Some(b"a\nanchor-a\nb\nanchor-b\nc\n")),
+            commits: vec![
+                (vec![], Some(b"a\nanchor-a\nb\nanchor-b\nc\n")),
                 (vec![0], Some(b"A\nanchor-a\nb\nanchor-b\nc\n")),
                 (vec![0], Some(b"a\nanchor-a\nB\nanchor-b\nc\n")),
                 (vec![0], Some(b"a\nanchor-a\nb\nanchor-b\nC\n")),
                 (vec![1, 2, 3], Some(b"A\nanchor-a\nB\nanchor-b\nC\n")),
-                (vec![4], Some(b"A\nanchor-a\nB\nanchor-b\nC\n"))],
+                (vec![4], Some(b"A\nanchor-a\nB\nanchor-b\nC\n")),
+            ],
             origins: vec![(1, 0), (0, 1), (2, 2), (0, 3), (3, 4)],
         },
     ];
     let (temporary, store) = setup();
-    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
     let mut fixtures = Vec::new();
     let mut change = 1;
     for case in &cases {
@@ -7740,7 +8556,11 @@ async fn dag_blame_uses_filtered_edges_merge_lines_and_aggregate_graph_bounds() 
         for (parents, body) in &case.commits {
             let parents = parents.iter().map(|&i| commits[i]).collect::<Vec<_>>();
             let value = body.map(|body| history_file(&store, body, false));
-            commits.push(history_commit(&store, &index, &parents, value, change).descriptor.key);
+            commits.push(
+                history_commit(&store, &index, &parents, value, change)
+                    .descriptor
+                    .key,
+            );
             change += 1;
         }
         fixtures.push(commits);
@@ -7752,13 +8572,44 @@ async fn dag_blame_uses_filtered_edges_merge_lines_and_aggregate_graph_bounds() 
         let scope = query_ready(&mut client, &[head], 180 + case_index as u8).await;
         let mut input = blame_request(&scope, head, 0);
         input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
-        let result = client.blame(request(input.clone(), ALPHA)).await.unwrap().into_inner();
-        assert_eq!(result.coverage, q::HistoryCoverage::HistoryComplete as i32, "{}", case.name);
-        assert_eq!(result.scanned_commits, commits.len() as u32, "{}", case.name);
-        assert_eq!(expanded_origins(&result), case.origins.iter().map(|&(index, line)| Some((commits[index].id.0.to_vec(), line))).collect::<Vec<_>>(), "{}", case.name);
+        let result = client
+            .blame(request(input.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            result.coverage,
+            q::HistoryCoverage::HistoryComplete as i32,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            result.scanned_commits,
+            commits.len() as u32,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            expanded_origins(&result),
+            case.origins
+                .iter()
+                .map(|&(index, line)| Some((commits[index].id.0.to_vec(), line)))
+                .collect::<Vec<_>>(),
+            "{}",
+            case.name
+        );
         input.max_commits = 2;
-        let partial = client.blame(request(input, ALPHA)).await.unwrap().into_inner();
-        assert_eq!(partial.coverage, q::HistoryCoverage::HistoryScanLimit as i32, "{}", case.name);
+        let partial = client
+            .blame(request(input, ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            partial.coverage,
+            q::HistoryCoverage::HistoryScanLimit as i32,
+            "{}",
+            case.name
+        );
         assert_eq!(partial.scanned_commits, 2);
         assert!(expanded_origins(&partial).iter().all(Option::is_none));
         assert_eq!(partial.target_bytes, result.target_bytes);
@@ -8223,7 +9074,14 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                     .code(),
                 Code::InvalidArgument
             );
-            assert_eq!(client.blame(request(dag_input, ALPHA)).await.unwrap_err().code(), Code::InvalidArgument);
+            assert_eq!(
+                client
+                    .blame(request(dag_input, ALPHA))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
         } else {
             let response = client
                 .blame(request(input, ALPHA))
@@ -8235,15 +9093,45 @@ async fn history_canonical_source_excludes_private_metadata_only_overlays() {
                 q::HistoryCoverage::HistoryPrivateOverlay as i32
             );
             assert!(response.target.is_none());
-            let dag_response = client.blame(request(dag_input, ALPHA)).await.unwrap().into_inner();
-            assert_eq!(dag_response.coverage, q::HistoryCoverage::HistoryPrivateOverlay as i32);
-            assert!(dag_response.target.is_none() && dag_response.target_bytes.is_empty() && dag_response.ranges.is_empty());
-            let frontier = client.open_annotation_frontier(request(q::OpenAnnotationFrontierRequest {
-            limits: None,
-                scope: overlay.key.clone(), version: 1, anchors: vec![q::CommitId { value: draft.descriptor.key.id.0.to_vec() }], path: "file".into(), max_commits: 0,
-            }, ALPHA)).await.unwrap().into_inner();
-            assert_eq!(frontier.coverage, q::HistoryCoverage::HistoryPrivateOverlay as i32);
-            assert!(frontier.nodes.is_empty(), "COMMIT-only overlay cannot mint canonical path/input authority");
+            let dag_response = client
+                .blame(request(dag_input, ALPHA))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                dag_response.coverage,
+                q::HistoryCoverage::HistoryPrivateOverlay as i32
+            );
+            assert!(
+                dag_response.target.is_none()
+                    && dag_response.target_bytes.is_empty()
+                    && dag_response.ranges.is_empty()
+            );
+            let frontier = client
+                .open_annotation_frontier(request(
+                    q::OpenAnnotationFrontierRequest {
+                        limits: None,
+                        scope: overlay.key.clone(),
+                        version: 1,
+                        anchors: vec![q::CommitId {
+                            value: draft.descriptor.key.id.0.to_vec(),
+                        }],
+                        path: "file".into(),
+                        max_commits: 0,
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                frontier.coverage,
+                q::HistoryCoverage::HistoryPrivateOverlay as i32
+            );
+            assert!(
+                frontier.nodes.is_empty(),
+                "COMMIT-only overlay cannot mint canonical path/input authority"
+            );
             let search = client
                 .search(request(
                     search_input(&overlay, draft.descriptor.key, b"selected", 1),
@@ -8391,13 +9279,20 @@ async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
         }
         let mut dag_input = blame_request(&scope, b, u32::MAX);
         dag_input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
-        let dag = client.blame(request(dag_input, ALPHA)).await.unwrap().into_inner();
+        let dag = client
+            .blame(request(dag_input, ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(dag.coverage, expected as i32, "DAG {name}");
         assert!(dag.boundary.is_some(), "DAG {name}");
         assert_eq!(dag.target.is_some(), has_target, "DAG {name}");
         if has_target {
             assert_eq!(expanded_origins(&dag).len(), 2);
-            assert!(expanded_origins(&dag).iter().all(Option::is_none), "DAG {name}: no guessed origins");
+            assert!(
+                expanded_origins(&dag).iter().all(Option::is_none),
+                "DAG {name}: no guessed origins"
+            );
         } else {
             assert!(dag.target_bytes.is_empty() && dag.ranges.is_empty());
         }
@@ -8549,10 +9444,21 @@ async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
     }
     let mut conflict_input = blame_request(&scope, conflict.descriptor.key, 0);
     conflict_input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
-    let conflict_result = client.blame(request(conflict_input, ALPHA)).await.unwrap().into_inner();
-    assert_eq!(conflict_result.coverage, q::HistoryCoverage::HistoryConflictBoundary as i32);
+    let conflict_result = client
+        .blame(request(conflict_input, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        conflict_result.coverage,
+        q::HistoryCoverage::HistoryConflictBoundary as i32
+    );
     assert!(conflict_result.boundary.is_some());
-    assert!(conflict_result.target.is_none() && conflict_result.target_bytes.is_empty() && conflict_result.ranges.is_empty());
+    assert!(
+        conflict_result.target.is_none()
+            && conflict_result.target_bytes.is_empty()
+            && conflict_result.ranges.is_empty()
+    );
     drop(client);
     server.stop().await;
 }
@@ -8560,8 +9466,17 @@ async fn history_limits_and_unsupported_graphs_never_claim_complete_blame() {
 #[tokio::test]
 async fn dag_memory_refusal_does_not_raise_linear_history_admission_cost() {
     let (temporary, store) = setup();
-    let index = tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
-    let head = history_commit(&store, &index, &[], Some(history_file(&store, b"selected\n", false)), 171).descriptor.key;
+    let index =
+        tinytree_index::Index::open(temporary.path().join("derived"), &Default::default()).unwrap();
+    let head = history_commit(
+        &store,
+        &index,
+        &[],
+        Some(history_file(&store, b"selected\n", false)),
+        171,
+    )
+    .descriptor
+    .key;
     let mut config = ServiceConfig::default();
     // A valid operator policy may allow large aggregate reads without enlarging
     // its global residency pool. Only the new DAG policy needs the extra cache.
@@ -8571,8 +9486,19 @@ async fn dag_memory_refusal_does_not_raise_linear_history_admission_cost() {
     let scope = query_ready(&mut client, &[head], 200).await;
     let mut input = blame_request(&scope, head, 0);
     input.policy = q::HistoryPolicy::JjResolvedFixedPathV1 as i32;
-    assert_eq!(client.blame(request(input, ALPHA)).await.unwrap_err().code(), Code::ResourceExhausted);
-    let linear = client.blame(request(blame_request(&scope, head, 0), ALPHA)).await.unwrap().into_inner();
+    assert_eq!(
+        client
+            .blame(request(input, ALPHA))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    let linear = client
+        .blame(request(blame_request(&scope, head, 0), ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(linear.coverage, q::HistoryCoverage::HistoryComplete as i32);
     assert_eq!(linear.target_bytes, b"selected\n");
     drop(client);
@@ -11304,24 +12230,60 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     let noise_right = history_file(&store, &vec![b'c'; 4096], false);
     let unchanged = history_file(&store, b"unchanged\n", false);
     let entries = |file, noise| {
-        let mut leaves = vec![tinytree_model::TreeEntry { name: "file".into(), value:file }, tinytree_model::TreeEntry { name:"noise".into(), value:noise }];
-        leaves.extend((0..48).map(|n| tinytree_model::TreeEntry { name:format!("unchanged-{n:03}"), value:unchanged.clone() }));
-        let put_tree = |mut entries:Vec<tinytree_model::TreeEntry>| {
-            entries.sort_by(|a,b|a.name.cmp(&b.name));
-            let object=tinytree_model::encode(&Object::Tree(tinytree_model::Tree{entries}),Limits::default()).unwrap();
-            store.put("alpha",object.descriptor,&object.bytes,0).unwrap();
+        let mut leaves = vec![
+            tinytree_model::TreeEntry {
+                name: "file".into(),
+                value: file,
+            },
+            tinytree_model::TreeEntry {
+                name: "noise".into(),
+                value: noise,
+            },
+        ];
+        leaves.extend((0..48).map(|n| tinytree_model::TreeEntry {
+            name: format!("unchanged-{n:03}"),
+            value: unchanged.clone(),
+        }));
+        let put_tree = |mut entries: Vec<tinytree_model::TreeEntry>| {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let object = tinytree_model::encode(
+                &Object::Tree(tinytree_model::Tree { entries }),
+                Limits::default(),
+            )
+            .unwrap();
+            store
+                .put("alpha", object.descriptor, &object.bytes, 0)
+                .unwrap();
             tinytree_model::TreeValue::Tree(TreeId(object.descriptor.key.id.0))
         };
-        let src=put_tree(leaves);
-        let mut project=vec![tinytree_model::TreeEntry{name:"src".into(),value:src}];
-        project.extend((0..49).map(|n|tinytree_model::TreeEntry{name:format!("other-{n:03}"),value:unchanged.clone()}));
-        let project=put_tree(project);
-        let mut crates=vec![tinytree_model::TreeEntry{name:"project".into(),value:project}];
-        crates.extend((0..49).map(|n|tinytree_model::TreeEntry{name:format!("package-{n:03}"),value:unchanged.clone()}));
-        let crates=put_tree(crates);
-        let mut root=vec![tinytree_model::TreeEntry{name:"crates".into(),value:crates}];
-        root.extend((0..29).map(|n|tinytree_model::TreeEntry{name:format!("root-{n:03}"),value:unchanged.clone()}));
-        root.sort_by(|a,b|a.name.cmp(&b.name));
+        let src = put_tree(leaves);
+        let mut project = vec![tinytree_model::TreeEntry {
+            name: "src".into(),
+            value: src,
+        }];
+        project.extend((0..49).map(|n| tinytree_model::TreeEntry {
+            name: format!("other-{n:03}"),
+            value: unchanged.clone(),
+        }));
+        let project = put_tree(project);
+        let mut crates = vec![tinytree_model::TreeEntry {
+            name: "project".into(),
+            value: project,
+        }];
+        crates.extend((0..49).map(|n| tinytree_model::TreeEntry {
+            name: format!("package-{n:03}"),
+            value: unchanged.clone(),
+        }));
+        let crates = put_tree(crates);
+        let mut root = vec![tinytree_model::TreeEntry {
+            name: "crates".into(),
+            value: crates,
+        }];
+        root.extend((0..29).map(|n| tinytree_model::TreeEntry {
+            name: format!("root-{n:03}"),
+            value: unchanged.clone(),
+        }));
+        root.sort_by(|a, b| a.name.cmp(&b.name));
         root
     };
     let base = history_tree_commit(&store, &index, &[], entries(base_file, noise_base), 141)
@@ -11367,10 +12329,18 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     // jj merged-entry maps at every unchanged FILE candidate.
     let mut broad_head = edited;
     for change in 160..200 {
-        let mut bytes = vec![b'n';4096];
+        let mut bytes = vec![b'n'; 4096];
         bytes[..1].copy_from_slice(&[change]);
         let noise = history_file(&store, &bytes, false);
-        broad_head = history_tree_commit(&store, &index, &[broad_head], entries(edited_file.clone(), noise), change).descriptor.key;
+        broad_head = history_tree_commit(
+            &store,
+            &index,
+            &[broad_head],
+            entries(edited_file.clone(), noise),
+            change,
+        )
+        .descriptor
+        .key;
     }
     let mut config = ServiceConfig::default();
     config.query.max_blame_file_bytes = 128; // Unrelated conflict bodies cannot fit.
@@ -11504,8 +12474,13 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
             .unwrap();
     }
     let mut point_selection = selection.clone();
-    let Some(q::graph_expr::Expression::ChangedPath(filter)) = point_selection.expression.as_mut() else { unreachable!() };
-    filter.candidates = ids_evaluation(&scope, 0, &[clean, edited]).expression.map(Box::new);
+    let Some(q::graph_expr::Expression::ChangedPath(filter)) = point_selection.expression.as_mut()
+    else {
+        unreachable!()
+    };
+    filter.candidates = ids_evaluation(&scope, 0, &[clean, edited])
+        .expression
+        .map(Box::new);
     let facts = q::QueryFactsRequest {
         scope: scope.key.clone(),
         facts: [clean, edited]
@@ -11565,8 +12540,20 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
             .result,
         Some(q::commit_prefix_result::Result::Single(_))
     ));
-    let clean_prefix = q::ResolveCommitPrefixRequest { scope: scope.key.clone(), hex_prefix: hex(&clean.id.0), selection: Some(selection.clone()) };
-    assert!(matches!(client.resolve_commit_prefix(merged_request(clean_prefix, ALPHA)).await.unwrap().into_inner().result, Some(q::commit_prefix_result::Result::NoMatch(_))));
+    let clean_prefix = q::ResolveCommitPrefixRequest {
+        scope: scope.key.clone(),
+        hex_prefix: hex(&clean.id.0),
+        selection: Some(selection.clone()),
+    };
+    assert!(matches!(
+        client
+            .resolve_commit_prefix(merged_request(clean_prefix, ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .result,
+        Some(q::commit_prefix_result::Result::NoMatch(_))
+    ));
     let change = q::ResolveChangePrefixRequest {
         scope: scope.key.clone(),
         visible_heads: Vec::new(),
@@ -11608,8 +12595,17 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
         .shortest_prefix(merged_request(shortest, ALPHA))
         .await
         .unwrap();
-    let clean_shortest = q::ShortestPrefixRequest { scope: scope.key.clone(), target: Some(q::shortest_prefix_request::Target::Commit(query_id(clean))), visible_heads: Vec::new(), selection: Some(selection.clone()) };
-    let clean_shortest = client.shortest_prefix(merged_request(clean_shortest, ALPHA)).await.unwrap().into_inner();
+    let clean_shortest = q::ShortestPrefixRequest {
+        scope: scope.key.clone(),
+        target: Some(q::shortest_prefix_request::Target::Commit(query_id(clean))),
+        visible_heads: Vec::new(),
+        selection: Some(selection.clone()),
+    };
+    let clean_shortest = client
+        .shortest_prefix(merged_request(clean_shortest, ALPHA))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(clean_shortest.in_selection, Some(false));
     assert_eq!(clean_shortest.hex_length, 0);
     // Policy 3 applies ONE stock matcher to paths, not boolean combinations
@@ -11720,19 +12716,50 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
     let ancestors = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Ancestors(Box::new(q::AncestorsExpr { heads:Some(Box::new(heads)), generations:None, parents:None }))) };
     let changed = q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::ChangedPath(Box::new(q::ChangedPathExpr { matcher: None, policy_version:2, candidates:Some(Box::new(ancestors)), path:"crates/project/src/file".into(), exact_file:true }))) };
     let mut broad = ids_evaluation(&broad_scope, 225, &[]);
-    broad.expression = Some(q::GraphExpr { version:1, expression:Some(q::graph_expr::Expression::Latest(Box::new(q::LatestExpr { candidates:Some(Box::new(changed)),count:3 }))) });
+    broad.expression = Some(q::GraphExpr {
+        version: 1,
+        expression: Some(q::graph_expr::Expression::Latest(Box::new(q::LatestExpr {
+            candidates: Some(Box::new(changed)),
+            count: 3,
+        }))),
+    });
     broad.projection = q::Projection::Graph as i32;
     broad.page_size = 1;
-    let mut broad_rows=Vec::new();let mut broad_done=false;
+    let mut broad_rows = Vec::new();
+    let mut broad_done = false;
     for _ in 0..1024 {
-        let page=client.evaluate(merged_request(broad.clone(),ALPHA)).await.unwrap().into_inner();
+        let page = client
+            .evaluate(merged_request(broad.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner();
         broad_rows.extend(page.rows);
-        if page.exhausted==Some(true){broad_done=true;break;}
-        broad.cursor=page.cursor;
+        if page.exhausted == Some(true) {
+            broad_done = true;
+            break;
+        }
+        broad.cursor = page.cursor;
     }
-    assert!(broad_done,"broad default-budget FILE query must finish");
-    assert_eq!(broad_rows.iter().map(|r|r.commit.as_ref().unwrap().value.clone()).collect::<std::collections::BTreeSet<_>>(),[edited,right,left].iter().map(|id|id.id.0.to_vec()).collect());
-    client.close_scope(request(q::CloseScopeRequest{scope:broad_scope.key},ALPHA)).await.unwrap();
+    assert!(broad_done, "broad default-budget FILE query must finish");
+    assert_eq!(
+        broad_rows
+            .iter()
+            .map(|r| r.commit.as_ref().unwrap().value.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [edited, right, left]
+            .iter()
+            .map(|id| id.id.0.to_vec())
+            .collect()
+    );
+    client
+        .close_scope(request(
+            q::CloseScopeRequest {
+                scope: broad_scope.key,
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
     // A peer cannot refresh the original query deadline using a new RPC budget.
     let mut expiry = ids_evaluation(&scope, 223, &[]);
     expiry.expression = Some(fileset_expression);

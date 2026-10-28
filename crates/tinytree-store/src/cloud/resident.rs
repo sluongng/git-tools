@@ -43,7 +43,7 @@ impl Catalog {
         // Precharge one complete operation arena, not a row-at-a-time live-len
         // counter. Unique rows dominate every retained catalog container:
         //
-        // * version/current/manifest and three work maps retain bounded copies
+        // * version/current/manifest and work/descriptor maps retain bounded copies
         //   of each version key/record, never every repeated validation read;
         // * native/cloud/variant/artifact/blob sets deduplicate catalog IDs;
         //   native-by-repository and quota unions add simultaneous set copies;
@@ -130,6 +130,9 @@ pub(crate) fn preflight(root: &Path, config: &Config) -> Result<Catalog> {
                 }
             {
                 return Err(Error::Corrupt("cloud metadata row size"));
+            }
+            if slot == 13 && bytes.len() > 4096 {
+                return Err(Error::Corrupt("cloud resident lifecycle row"));
             }
             if slot == 8 {
                 // Normal writes encode Accounting's fixed u64 scalar fields;

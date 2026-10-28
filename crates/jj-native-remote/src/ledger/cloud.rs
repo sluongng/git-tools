@@ -150,6 +150,15 @@ impl Ledger {
             .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        if let Some(pin) =
+            self.get::<super::offload::SourcePin>(&self.source_pins, authority.id.as_bytes())?
+        {
+            ensure!(
+                pin.authority == super::offload::SourcePinAuthority::File(authority.clone())
+                    && pin.phase != super::offload::SourcePinPhase::ReleasePending,
+                "retained source release must finish before generic readmission"
+            );
+        }
         if let Some(existing) = self.cloud_authority(&authority.id)? {
             ensure!(
                 existing == authority,

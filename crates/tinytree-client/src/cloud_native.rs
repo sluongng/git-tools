@@ -1,4 +1,4 @@
-//! Retained-version authority originates only in an authenticated GetVersion.
+//! Retained-version authority originates only in an authenticated checked Version reply.
 //! It is distinct from independent canonical manifest/artifact coverage proof.
 use super::*;
 
@@ -153,7 +153,7 @@ impl NativeClient {
         }
         self.checked_retained_version(version)
     }
-    fn checked_retained_version(
+    pub(super) fn checked_retained_version(
         &self,
         version: CloudVersion,
     ) -> Result<VerifiedRetainedVersion, Status> {

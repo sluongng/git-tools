@@ -182,6 +182,7 @@ enum Mode {
     CapabilitiesNoFileset,
     CapabilitiesDenied,
     CapabilitiesLimited,
+    CapabilitiesOutOfRange,
     CapabilitiesTransport,
     CapabilitiesSlow,
     Normal,
@@ -207,6 +208,62 @@ enum Mode {
     EmptyGraphEntries,
     EmptyMissingKeys,
 }
+#[tokio::test]
+async fn structured_publication_requires_its_exact_capability_without_legacy_fallback() {
+    for (mode, expected) in [
+        (Mode::CapabilitiesAbsent, Code::Unimplemented),
+        (Mode::CapabilitiesLegacyFeature, Code::Unimplemented),
+        (Mode::CapabilitiesDenied, Code::PermissionDenied),
+        (Mode::CapabilitiesLimited, Code::ResourceExhausted),
+    ] {
+        let (_directory, _store, service) = setup();
+        let running = Running::start(service, mode).await;
+        let client = running.client().await;
+        let identity = tinytree_client::CloudPublicationIdentity {
+            workspace_id: [71; 32],
+            generation: 1,
+            nonce: [19; 16],
+        };
+        assert_eq!(
+            client
+                .cloud_publication_v2(identity)
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(running.capabilities.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client
+                .acquire_cloud_version_pin(
+                    [71; 32],
+                    tinytree_client::CloudVersionPinIdentity {
+                        pin_id: [19; 16],
+                        acquire_not_after_unix_seconds: 120,
+                    },
+                    tinytree_client::CloudPinSelection::LatestCaptured
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        assert_eq!(running.capabilities.load(Ordering::SeqCst), 2);
+        running.stop().await;
+    }
+    // A capability error cannot prove that an accepted pin identity is terminal.
+    let (_directory, _store, service) = setup();
+    let running = Running::start(service, Mode::CapabilitiesOutOfRange).await;
+    assert_eq!(running.client().await.acquire_cloud_version_pin(
+        [71; 32], tinytree_client::CloudVersionPinIdentity {
+            pin_id: [19; 16], acquire_not_after_unix_seconds: 120,
+        }, tinytree_client::CloudPinSelection::LatestCaptured,
+    ).await.unwrap_err().code(), Code::FailedPrecondition);
+    assert_eq!(running.capabilities.load(Ordering::SeqCst), 1);
+    running.stop().await;
+
+}
+
 #[tokio::test]
 async fn capabilities_are_exact_checked_configuration_not_implicit_root_readiness_or_fallback() {
     use tinytree_client::{CapabilityFeature as F, RootReadiness};
@@ -393,7 +450,10 @@ impl Repository for Faults {
             ));
         }
         if self.mode == Mode::CapabilitiesLegacyFeature
-            && matches!(request.get_ref().features.as_slice(), [11] | [13] | [15])
+            && matches!(
+                request.get_ref().features.as_slice(),
+                [11] | [13] | [15] | [16] | [17]
+            )
         {
             return Err(Status::invalid_argument(
                 "legacy capability vocabulary ends at10",
@@ -404,6 +464,9 @@ impl Repository for Faults {
         }
         if self.mode == Mode::CapabilitiesLimited {
             return Err(Status::resource_exhausted("capability busy"));
+        }
+        if self.mode == Mode::CapabilitiesOutOfRange {
+            return Err(Status::out_of_range("capability fixture unavailable"));
         }
         if self.mode == Mode::CapabilitiesTransport {
             return Err(Status::unavailable("capability transport unavailable"));
@@ -6387,6 +6450,23 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
     .unwrap();
     store.create_repository("alpha").unwrap();
     store.create_repository("beta").unwrap();
+    let native = fixture();
+    for object in native.objects() {
+        store
+            .put("alpha", object.descriptor, &object.bytes, 0)
+            .unwrap();
+    }
+    let native_commit = native
+        .objects()
+        .iter()
+        .filter(|object| object.descriptor.key.kind == Kind::Commit)
+        .find_map(|object| {
+            match tinytree_model::decode(&object.bytes, Default::default()).unwrap() {
+                tinytree_model::Object::Commit(commit) => Some((object.descriptor.key, commit)),
+                _ => None,
+            }
+        })
+        .unwrap();
     let source_directory = tempfile::tempdir().unwrap();
     use jj_lib::{
         backend::{MillisSinceEpoch, Timestamp},
@@ -6403,10 +6483,10 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
         },
     )
     .unwrap();
-    let mut view = View::make_root(jj_lib::backend::CommitId::from_bytes(&[0; 32]));
+    let mut view = View::make_root(jj_lib::backend::CommitId::from_bytes(&native_commit.0.id.0));
     view.wc_commit_ids.insert(
         "task".into(),
-        jj_lib::backend::CommitId::from_bytes(&[0; 32]),
+        jj_lib::backend::CommitId::from_bytes(&native_commit.0.id.0),
     );
     let view_id = source.write_view(&view).await.unwrap();
     let time = Timestamp {
@@ -6493,11 +6573,21 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
         .capabilities(&[
             F::ExactCloudRepresentationRead,
             F::ExactCloudRepresentationWrite,
+            F::StructuredCloudPublicationV2,
         ])
         .await
         .unwrap();
     assert!(caps.features.iter().all(|f| f.supported && f.authorized));
     assert_eq!(F::ALL.len(), 5);
+    let mut members = objects
+        .iter()
+        .map(|object| tinytree_cloud::Member {
+            id: object.id(),
+            selected: object.digest().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by_key(|member| member.id);
+    let mut publication_leases = Vec::new();
     let mut changed = [false; 2];
     for object in objects {
         let raw = object.payload().unwrap();
@@ -6506,6 +6596,7 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
             tinytree_cloud::ObjectId::View(id) => CloudObjectId::View(id),
         };
         let primary = sdk.cloud_put_object(id, raw).await.unwrap();
+        publication_leases.push(primary.staging_lease.clone());
         // Unknown protobuf fields are preserved raw but ignored by semantic ID.
         let mut alternate = raw.to_vec();
         alternate.extend_from_slice(&[0xa0, 0x06, 0x01]);
@@ -6594,6 +6685,112 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
         }
     }
     assert_eq!(changed, [true, true]);
+    let identity = tinytree_client::CloudPublicationIdentity {
+        workspace_id: [71; 32],
+        generation: 1,
+        nonce: [19; 16],
+    };
+    assert_eq!(identity.token().len(), 117);
+    let mut roots = vec![native_commit.0];
+    roots.extend(
+        native_commit
+            .1
+            .root_tree
+            .terms
+            .iter()
+            .map(|tree| ObjectKey {
+                kind: Kind::Tree,
+                id: ObjectId(tree.0),
+            }),
+    );
+    roots.sort_by_key(|key| (key.kind as u8, key.id.0));
+    roots.dedup();
+    let operation: [u8; 64] = op_id.as_bytes().try_into().unwrap();
+    let manifest = tinytree_cloud::Manifest {
+        workspace: identity.workspace_id,
+        exporter: [72; 16],
+        sequence: 1,
+        operation_heads: vec![operation],
+        undo_operations: vec![],
+        intent_operations: vec![],
+        working_copy: tinytree_cloud::WorkingCopy {
+            workspace_name: "task".into(),
+            wc_operation: operation,
+            snapshot_operation: operation,
+            snapshot_commit: native_commit.0.id.0,
+            tree: native_commit.1.root_tree,
+        },
+        parents: vec![],
+        members,
+        intent_roots: vec![],
+        native_roots: roots,
+        coverage: tinytree_cloud::Coverage::FullRequired,
+        detached: vec![],
+    };
+    let intent = tinytree_client::CloudPublishIntent {
+        workspace_id: identity.workspace_id,
+        expected_generation: 0,
+        idempotency_key: identity.token(),
+        manifest: tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap(),
+        staging_leases: publication_leases,
+    };
+    assert!(sdk.cloud_publication_v2(identity).await.unwrap().is_none());
+    let published = sdk
+        .cloud_publish_version_v2(&intent, identity)
+        .await
+        .unwrap();
+    assert_eq!(
+        sdk.cloud_publish_version_v2(&intent, identity)
+            .await
+            .unwrap(),
+        published
+    );
+    assert_eq!(
+        sdk.cloud_publication_v2(identity).await.unwrap(),
+        Some(published)
+    );
+    assert!(
+        sdk.cloud_publication(&identity.token())
+            .await
+            .unwrap()
+            .is_none(),
+        "structured receipt must not occupy the opaque legacy namespace"
+    );
+    let mut malformed = tinytree_client::CloudPublishIntent {
+        workspace_id: intent.workspace_id,
+        expected_generation: intent.expected_generation,
+        idempotency_key: intent.idempotency_key.clone(),
+        manifest: intent.manifest.clone(),
+        staging_leases: intent.staging_leases.clone(),
+    };
+    malformed.idempotency_key.push('x');
+    assert_eq!(
+        sdk.cloud_publish_version_v2(&malformed, identity)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let wrong_generation = tinytree_client::CloudPublicationIdentity {
+        generation: 2,
+        ..identity
+    };
+    malformed.idempotency_key = wrong_generation.token();
+    assert_eq!(
+        sdk.cloud_publish_version_v2(&malformed, wrong_generation)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let peer = NativeClient::connect(Config {
+        token_env: Some("TINYTREE_EXACT_TEST_PEER".into()),
+        ..base.clone()
+    })
+    .await
+    .unwrap();
+    assert!(peer.cloud_publication_v2(identity).await.unwrap().is_none());
+
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
@@ -6621,6 +6818,9 @@ fn discovery_fixture_cursor(domain: u8, after: [u8; 32], ceiling: u64) -> Vec<u8
     token.extend_from_slice(&[7; 32]);
     token.extend_from_slice(&after);
     token.extend_from_slice(&ceiling.to_be_bytes());
+    if domain == 2 {
+        token.extend_from_slice(&0u64.to_be_bytes());
+    }
     token
 }
 #[derive(Clone, Default)]
@@ -6631,9 +6831,58 @@ struct CloudFaults {
     index_entered: Arc<tokio::sync::Notify>,
     index_release: Arc<tokio::sync::Notify>,
     native_snapshot_calls: Arc<AtomicUsize>,
+    pin_requests: Arc<std::sync::Mutex<Vec<tinytree_client::CloudVersionPinIdentity>>>,
 }
 #[tonic::async_trait]
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for CloudFaults {
+    async fn acquire_version_pin(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::AcquireVersionPinRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::VersionPin>, Status> {
+        let input = request.into_inner();
+        self.pin_requests.lock().unwrap().push(tinytree_client::CloudVersionPinIdentity {
+            pin_id: input.pin_id.as_slice().try_into().unwrap(),
+            acquire_not_after_unix_seconds: input.acquire_not_after_unix_seconds,
+        });
+        match self.mode.load(Ordering::SeqCst) {
+            63 => return Err(Status::failed_precondition("cloud pin source version expired")),
+            64 => return Err(Status::out_of_range("cloud pin admission closed")),
+            _ => {}
+        }
+        let version = self
+            .get_version(Request::new(
+                tinytree_client::cloud_protocol::GetVersionRequest {
+                    repository_id: input.repository_id,
+                    workspace_id: input.workspace_id,
+                    generation: 1,
+                },
+            ))
+            .await?
+            .into_inner();
+        let mut pin_id = input.pin_id;
+        if self.mode.load(Ordering::SeqCst) == 56 {
+            pin_id[0] ^= 1;
+        }
+        Ok(Response::new(tinytree_client::cloud_protocol::VersionPin {
+            pin_id,
+            version: Some(version),
+            acquire_not_after_unix_seconds: input.acquire_not_after_unix_seconds
+                + i64::from(self.mode.load(Ordering::SeqCst) == 61),
+        }))
+    }
+    async fn release_version_pin(
+        &self,
+        request: Request<tinytree_client::cloud_protocol::ReleaseVersionPinRequest>,
+    ) -> Result<Response<tinytree_client::cloud_protocol::VersionPinReleased>, Status> {
+        let input = request.into_inner();
+        Ok(Response::new(
+            tinytree_client::cloud_protocol::VersionPinReleased {
+                pin_id: input.pin_id,
+                acquire_not_after_unix_seconds: input.acquire_not_after_unix_seconds
+                    + i64::from(self.mode.load(Ordering::SeqCst) == 62),
+            },
+        ))
+    }
     async fn put_object_representation(
         &self,
         _: tonic::Request<tinytree_client::cloud_protocol::PutObjectRequest>,
@@ -6737,6 +6986,7 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             manifest_id: Some(vec![4; 32]),
         };
         let mut ceiling = 2;
+        let (mut floor, mut revision) = (0u64, 0u64);
         match mode {
             90 => rows[0].workspace_id = vec![9; 32],
             91 => rows[0].generation = 2,
@@ -6748,6 +6998,51 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             95 => ceiling = 1,
             96 => continuation = vec![0; 74],
             97 => current.manifest_id = Some(vec![9; 32]),
+            100 | 101 | 102 | 103 | 104 => {
+                floor = 1;
+                revision = 1;
+                rows.retain(|row| row.generation > floor);
+                continuation.clear();
+                if mode == 102 {
+                    floor = 2;
+                }
+                if mode == 103 {
+                    rows[0].generation = 1;
+                }
+            }
+            105 => {
+                floor = 1;
+                revision = 1;
+                ceiling = 3;
+                current.generation = 3;
+                current.manifest_id = Some(vec![5; 32]);
+                let first = input.continuation.is_empty();
+                rows = vec![c::VersionSummary {
+                    workspace_id: current.workspace_id.clone(),
+                    generation: if first { 2 } else { 3 },
+                    manifest_id: vec![if first { 4 } else { 5 }; 32],
+                    previous_manifest_id: Some(vec![if first { 3 } else { 4 }; 32]),
+                }];
+                continuation = if first {
+                    let mut position = [0; 32];
+                    position[..8].copy_from_slice(&2u64.to_be_bytes());
+                    position[8..16].copy_from_slice(&floor.to_be_bytes());
+                    let mut cursor = discovery_fixture_cursor(2, position, ceiling);
+                    cursor[74..82].copy_from_slice(&revision.to_be_bytes());
+                    cursor
+                } else {
+                    vec![]
+                };
+            }
+            99 => {
+                current.generation = 3;
+                current.manifest_id = Some(vec![5; 32]);
+                ceiling = 3;
+                let mut position = [0; 32];
+                position[..8].copy_from_slice(&2u64.to_be_bytes());
+                continuation = discovery_fixture_cursor(2, position, 3);
+                continuation[74..82].copy_from_slice(&1u64.to_be_bytes());
+            }
             98 => {
                 current.generation = u64::MAX;
                 ceiling = u64::MAX;
@@ -6763,6 +7058,8 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
             versions: rows,
             continuation,
             through_generation: ceiling,
+            retired_through: floor,
+            retention_revision: revision,
         }))
     }
 
@@ -7355,7 +7652,91 @@ async fn cloud_discovery_checks_pages_scopes_chains_and_malformed_replies() {
         Code::DataLoss,
         "generation overflow is a corrupt page, not a panic"
     );
+    faults.mode.store(99, Ordering::SeqCst);
+    position[..8].copy_from_slice(&1u64.to_be_bytes());
+    let frozen = discovery_fixture_cursor(2, position, 3);
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 1, &frozen)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "retention revision cannot change within a paged discovery"
+    );
+    faults.mode.store(100, Ordering::SeqCst);
+    let retained = client.cloud_versions([2; 32], 2, &[]).await.unwrap();
+    assert_eq!(retained.retired_through, 1);
+    assert_eq!(retained.retention_revision, 1);
+    assert_eq!(
+        retained
+            .versions
+            .iter()
+            .map(|row| row.generation)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    faults.mode.store(101, Ordering::SeqCst);
+    position[..8].copy_from_slice(&1u64.to_be_bytes());
+    let obsolete = discovery_fixture_cursor(2, position, 2);
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 1, &obsolete)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "a response cannot change a cursor's retention revision"
+    );
+    faults.mode.store(104, Ordering::SeqCst);
+    let mut wrong_floor = obsolete.clone();
+    wrong_floor[74..82].copy_from_slice(&1u64.to_be_bytes());
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 1, &wrong_floor)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss,
+        "a response cannot change a cursor's retained floor"
+    );
+    faults.mode.store(105, Ordering::SeqCst);
+    let first_retained = client.cloud_versions([2; 32], 1, &[]).await.unwrap();
+    assert_eq!(first_retained.versions[0].generation, 2);
+    assert_eq!(first_retained.retired_through, 1);
+    let last_retained = client
+        .cloud_versions([2; 32], 1, &first_retained.continuation)
+        .await
+        .unwrap();
+    assert_eq!(last_retained.versions[0].generation, 3);
+    assert_eq!(last_retained.retired_through, 1);
+    assert_eq!(
+        last_retained.retention_revision,
+        first_retained.retention_revision
+    );
+    assert!(last_retained.continuation.is_empty());
+    for mode in [102, 103] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .cloud_versions([2; 32], 2, &[])
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss,
+            "invalid retained floor or first retained generation"
+        );
+    }
     let before = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .cloud_versions([2; 32], 1, &[0; 74])
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument,
+        "legacy-size version cursors cannot omit the retention revision"
+    );
     assert_eq!(
         client.cloud_workspaces(0, &[]).await.unwrap_err().code(),
         Code::InvalidArgument
@@ -9161,15 +9542,45 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     let service = WorkspaceCloudServer::new(faults.clone())
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+    // Real authenticated capability negotiation alongside an explicitly
+    // synthetic peer for malformed Version/pin wire-response validation.
+    let pin_directory = private_tempdir();
+    let mut pin_profile: tinytree_server::Config =
+        toml::from_str(include_str!("../../tinytree-server/examples/cloud.toml")).unwrap();
+    pin_profile.service.cloud.indexed_versions = true;
+    pin_profile.service.cloud.captured_versions = true;
+    pin_profile.service.cloud.max_capture_bytes = 128 * 1024;
+    let pin_store = Store::open(
+        pin_directory.path(),
+        pin_profile
+            .store
+            .materialize(pin_profile.service.max_metadata_bytes),
+    )
+    .unwrap();
+    pin_store.create_repository("example").unwrap();
+    let capability_service = RepositoryService::new(
+        pin_store,
+        pin_profile.service,
+        vec!["example".into()],
+        vec![
+            Principal::new("test", TOKEN, vec!["example".into()], true)
+                .unwrap()
+                .with_cloud(true),
+        ],
+    )
+    .unwrap();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(service)
+            .add_service(capability_service.grpc_service())
             .serve_with_incoming(incoming)
             .await
             .unwrap()
     });
     let mut config = Config::default();
     config.endpoint = format!("http://{address}");
+    config.repository_id = "example".into();
+    config.token_env = Some("TINYTREE_CLIENT_TEST_TOKEN".into());
     config.limits.max_inflight = 1;
     config.rpc.retry.max_attempts = 1;
     assert!(!toml::to_string(&config).unwrap().contains("[cloud]"));
@@ -9361,6 +9772,148 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
         Some(selector.manifest_id)
     );
     assert_eq!(intent.capture_data(), data);
+    faults.mode.store(40, Ordering::SeqCst);
+    let pin_identity = tinytree_client::CloudVersionPinIdentity {
+        pin_id: [21; 16],
+        acquire_not_after_unix_seconds: i64::try_from(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()).unwrap() + 120,
+    };
+    let pin = client
+        .acquire_cloud_version_pin(
+            [1; 32],
+            pin_identity,
+            tinytree_client::CloudPinSelection::LatestCaptured,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pin.identity, pin_identity);
+    assert_eq!(pin.version.selector(), selector);
+    assert_eq!(pin.version.manifest_selected(), selected);
+    assert_eq!(pin.version.manifest(), manifest);
+    client.cloud_workspace([1; 32]).await.unwrap();
+    let exact_pin = client.acquire_cloud_version_pin(
+        [1; 32], pin_identity,
+        tinytree_client::CloudPinSelection::Exact { selector, selected },
+    ).await.unwrap();
+    assert_eq!(exact_pin.identity, pin_identity);
+    assert_eq!(exact_pin.version.selector(), pin.version.selector());
+    drop(exact_pin);
+    // A real retained capture authority consumes this conservative pool. Exact
+    // reattachment must reserve its selected bytes, not the unknown-size
+    // discovery maximum that would exhaust the remaining physical capacity.
+    let mut bounded_config = config.clone();
+    bounded_config.limits.max_metadata_bytes = 4 * 1024 * 1024;
+    bounded_config.limits.max_batch_bytes = 4 * 1024 * 1024;
+    bounded_config.limits.max_graph_bytes = 8 * 1024 * 1024;
+    bounded_config.limits.max_buffered_bytes = 32 * 1024 * 1024;
+    let bounded = NativeClient::connect(bounded_config).await.unwrap();
+    let retained = bounded.cloud_retained_version_selected(selector, selected).await.unwrap();
+    let retained = bounded.cloud_captured_version(retained).unwrap();
+    let capture = bounded.cloud_read_capture(&retained).await.unwrap();
+    let bounded_pin = bounded.acquire_cloud_version_pin(
+        [1; 32], pin_identity,
+        tinytree_client::CloudPinSelection::Exact { selector, selected },
+    ).await.unwrap();
+    assert_eq!(bounded_pin.version.selector(), selector);
+    assert_eq!(bounded_pin.version.manifest_selected(), selected);
+    assert_eq!(capture.payload(), data);
+    assert_eq!(bounded.acquire_cloud_version_pin(
+        [1; 32], pin_identity, tinytree_client::CloudPinSelection::LatestCaptured,
+    ).await.unwrap_err().code(), Code::ResourceExhausted,
+        "discovery retains its static maximum instead of borrowing available permits");
+    let before = faults.calls.load(Ordering::SeqCst);
+    let mut oversized = selected;
+    oversized.size_bytes = u64::MAX;
+    assert_eq!(bounded.acquire_cloud_version_pin(
+        [1; 32], pin_identity,
+        tinytree_client::CloudPinSelection::Exact { selector, selected: oversized },
+    ).await.unwrap_err().code(), Code::ResourceExhausted);
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before,
+        "an oversized exact bound is rejected before any RPC");
+    drop((bounded_pin, capture, retained));
+    faults.mode.store(62, Ordering::SeqCst);
+    assert_eq!(client.release_cloud_version_pin(pin.identity, selector, selected)
+        .await.unwrap_err().code(), Code::DataLoss);
+    faults.mode.store(40, Ordering::SeqCst);
+    client
+        .release_cloud_version_pin(
+            pin.identity,
+            pin.version.selector(),
+            pin.version.manifest_selected(),
+        )
+        .await
+        .unwrap();
+    client
+        .release_cloud_version_pin(
+            pin.identity,
+            pin.version.selector(),
+            pin.version.manifest_selected(),
+        )
+        .await
+        .unwrap();
+    drop(pin);
+    for mode in [56, 61] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(client.acquire_cloud_version_pin(
+            [1; 32], pin_identity, tinytree_client::CloudPinSelection::LatestCaptured,
+        ).await.unwrap_err().code(), Code::DataLoss);
+    }
+    for (mode, expected) in [(63, Code::FailedPrecondition), (64, Code::OutOfRange)] {
+        faults.mode.store(mode, Ordering::SeqCst);
+        assert_eq!(client.acquire_cloud_version_pin(
+            [1; 32], pin_identity, tinytree_client::CloudPinSelection::Exact { selector, selected },
+        ).await.unwrap_err().code(), expected,
+        "source expiry is not terminal admission proof");
+    }
+    faults.mode.store(40, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .acquire_cloud_version_pin(
+                [1; 32],
+                pin_identity,
+                tinytree_client::CloudPinSelection::Generation(2)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    let mut wrong = selector;
+    wrong.manifest_id.0[0] ^= 1;
+    assert_eq!(
+        client
+            .acquire_cloud_version_pin(
+                [1; 32],
+                pin_identity,
+                tinytree_client::CloudPinSelection::Exact {
+                    selector: wrong,
+                    selected
+                }
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    let before_pin = faults.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        client
+            .acquire_cloud_version_pin(
+                [2; 32],
+                pin_identity,
+                tinytree_client::CloudPinSelection::Exact { selector, selected }
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(faults.calls.load(Ordering::SeqCst), before_pin);
+
+    assert!(faults.pin_requests.lock().unwrap().iter()
+        .all(|identity| *identity == pin_identity),
+        "latest/exact retry and proof failures never renew the admission identity");
+
     use tinytree_client::PublicationFailureReason as Reason;
     let mut manifest_config = config.clone();
     manifest_config.cloud.max_manifest_bytes = 1;

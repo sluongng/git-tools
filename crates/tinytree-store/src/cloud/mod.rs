@@ -40,10 +40,30 @@ pub struct CloudWriteReceipt {
     pub staging_lease: String,
     pub expires_at: i64,
 }
+/// One bounded admission identity. Its deadline fences creation, not the
+/// lifetime of a successfully acquired source hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloudVersionPinIdentity {
+    pub pin_id: [u8; 16],
+    pub acquire_not_after_unix_seconds: i64,
+}
+impl CloudVersionPinIdentity {
+    fn validate(self) -> Result<()> {
+        if self.pin_id == [0; 16] || self.acquire_not_after_unix_seconds <= 0 {
+            return Err(Error::Invalid("cloud pin identity"));
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug)]
 pub struct CloudConfig {
     /// Optional owned-memory bound, independent of cumulative validation work.
     pub resident: Option<CloudResidentLimits>,
+    /// Explicit opt-in to owner-scoped version retirement.
+    pub retirement_enabled: bool,
+    /// Roll the discovery window atomically with typed captured publication.
+    /// Durable source pins and verified readers remain hidden exceptions.
+    pub rolling_retention_enabled: bool,
     pub max_object_bytes: usize,
     pub index_artifacts: tinytree_cloud::IndexArtifactLimits,
     pub manifest_limits: tinytree_cloud::ManifestLimits,
@@ -59,12 +79,17 @@ pub struct CloudConfig {
     pub max_staging_bytes_per_owner: u64,
     pub max_workspaces_per_owner: u64,
     pub max_versions_per_workspace: u64,
+    /// Active holds and unreclaimed release fences, independent of the window.
+    pub max_pin_lifecycle_records_per_workspace: u64,
+    pub max_pin_acquisition_seconds: i64,
     pub max_receipts_per_owner: u64,
 }
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             resident: None,
+            retirement_enabled: false,
+            rolling_retention_enabled: false,
             max_object_bytes: 4 * 1024 * 1024,
             index_artifacts: Default::default(),
             manifest_limits: tinytree_cloud::ManifestLimits::default(),
@@ -80,12 +105,17 @@ impl Default for CloudConfig {
             max_staging_bytes_per_owner: 128 * 1024 * 1024,
             max_workspaces_per_owner: 1024,
             max_versions_per_workspace: 1024,
+            max_pin_lifecycle_records_per_workspace: 1024,
+            max_pin_acquisition_seconds: 300,
             max_receipts_per_owner: 100_000,
         }
     }
 }
 impl CloudConfig {
     pub(super) fn validate(&self) -> Result<()> {
+        if self.rolling_retention_enabled && !self.retirement_enabled {
+            return Err(Error::Invalid("rolling retention requires retirement"));
+        }
         if let Some(limits) = self.resident {
             limits.validate()?;
         }
@@ -110,6 +140,8 @@ impl CloudConfig {
             || self.max_staging_bytes_per_owner == 0
             || !(1..=1_000_000).contains(&self.max_workspaces_per_owner)
             || !(1..=1_000_000).contains(&self.max_versions_per_workspace)
+            || !(1..=1_000_000).contains(&self.max_pin_lifecycle_records_per_workspace)
+            || !(1..=86_400).contains(&self.max_pin_acquisition_seconds)
             || !(1..=10_000_000).contains(&self.max_receipts_per_owner)
         {
             return Err(Error::Invalid("cloud storage bounds"));
@@ -133,7 +165,8 @@ mod captures;
 pub use captures::{CloudCaptureReadLease, PublishCapturedCloudRequest};
 mod versions;
 pub use versions::{
-    CloudPublication, CloudPublicationLimits, CloudSnapshotCommit, CloudSnapshotReadGuard,
+    CloudPublication, CloudPublicationIdentity, CloudPublicationLimits, CloudRetentionState,
+    CloudRetirementReceipt, CloudRetirementRequest, CloudSnapshotCommit, CloudSnapshotReadGuard,
     CloudVersion, CloudVersionPage, CloudVersionReadGuard, CloudWorkspace, CloudWorkspacePage,
     PublishCloudRequest,
 };
@@ -143,7 +176,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
     serde_json::from_slice(bytes).map_err(|_| Error::Corrupt("cloud metadata encoding"))
 }
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 14] = [
     "cloud-objects-v1",
     "cloud-blobs-v1",
     "cloud-staging-v1",
@@ -157,6 +190,7 @@ const TABLES: [&str; 13] = [
     "cloud-index-staging-v1",
     "cloud-captures-v1",
     "cloud-opview-variants-v1",
+    "cloud-version-lifecycle-v1",
 ];
 pub(super) struct Spaces {
     objects: SingleWriterTxKeyspace,
@@ -172,6 +206,7 @@ pub(super) struct Spaces {
     index_staging: SingleWriterTxKeyspace,
     captures: SingleWriterTxKeyspace,
     variants: SingleWriterTxKeyspace,
+    lifecycle: SingleWriterTxKeyspace,
 }
 impl Spaces {
     pub(super) fn open(db: &SingleWriterTxDatabase, feature: u8) -> Result<Self> {
@@ -187,6 +222,9 @@ impl Spaces {
         if feature >= 11 && !db.keyspace_exists(TABLES[12]) {
             return Err(Error::Corrupt("cloud variant keyspace missing"));
         }
+        if feature >= 12 && !db.keyspace_exists(TABLES[13]) {
+            return Err(Error::Corrupt("cloud lifecycle keyspace missing"));
+        }
         Ok(Self {
             objects: db.keyspace(TABLES[0], KeyspaceCreateOptions::default)?,
             blobs: db.keyspace(TABLES[1], KeyspaceCreateOptions::default)?,
@@ -201,9 +239,10 @@ impl Spaces {
             index_staging: db.keyspace(TABLES[10], KeyspaceCreateOptions::default)?,
             captures: db.keyspace(TABLES[11], KeyspaceCreateOptions::default)?,
             variants: db.keyspace(TABLES[12], KeyspaceCreateOptions::default)?,
+            lifecycle: db.keyspace(TABLES[13], KeyspaceCreateOptions::default)?,
         })
     }
-    fn all(&self) -> [&SingleWriterTxKeyspace; 13] {
+    fn all(&self) -> [&SingleWriterTxKeyspace; 14] {
         [
             &self.objects,
             &self.blobs,
@@ -218,6 +257,7 @@ impl Spaces {
             &self.index_staging,
             &self.captures,
             &self.variants,
+            &self.lifecycle,
         ]
     }
 }
@@ -1473,6 +1513,9 @@ impl Inner {
         if feature < 11 && view.iter(&self.spaces.cloud.variants).next().is_some() {
             return Err(Error::Corrupt("cloud variants precede feature"));
         }
+        if feature < 12 && view.iter(&self.spaces.cloud.lifecycle).next().is_some() {
+            return Err(Error::Corrupt("cloud lifecycle precedes feature"));
+        }
         for (space, variant) in [
             (&self.spaces.cloud.objects, false),
             (&self.spaces.cloud.variants, true),
@@ -2007,6 +2050,12 @@ impl Store {
     /// whole contract; a VersionRecord alone is insufficient. This is a storage
     /// contract, not current source authorization, availability or infinite quota.
     pub fn supports_durable_retained_offload(&self) -> bool {
-        true
+        !self.inner.config.cloud.retirement_enabled
+            && self
+                .inner
+                .db
+                .read_tx()
+                .get(&self.inner.spaces.meta, b"cloud-retirement-activated")
+                .is_ok_and(|marker| marker.is_none())
     }
 }

@@ -12,6 +12,9 @@ use std::{
 use tinytree_client::{CloudRawDigest, RetainedVersionSelector, VerifiedRetainedVersion};
 use tinytree_model as m;
 
+pub(crate) fn captured_manifest(bytes: &[u8]) -> bool {
+    bytes.get(..8) == Some(b"TTCLOUD\0".as_slice()) && bytes.get(8..10) == Some([3u8, 0].as_slice())
+}
 pub(crate) fn retained_native_roots(
     config: &crate::Config,
     selector: RetainedVersionSelector,
@@ -140,11 +143,26 @@ impl RemoteRepositoryControl {
                 );
                 let inner = job.inner.clone();
                 let held = proof.clone();
-                let authority = io::blocking_owned(job.clone(), move || {
-                    let roots = retained_native_roots(&inner.config, selector, held.manifest())?;
-                    inner.ledger.install_cloud_authority(&held, &roots)
+                let roots = io::blocking_owned(job.clone(), move || {
+                    retained_native_roots(&inner.config, selector, held.manifest())
                 })
                 .await?;
+                let authority = if captured_manifest(proof.manifest()) {
+                    crate::retained_offload::adopt_file_source_pin(
+                        &job.inner,
+                        job.clone(),
+                        &client,
+                        proof,
+                        roots,
+                    )
+                    .await?
+                } else {
+                    let inner = job.inner.clone();
+                    io::blocking_owned(job.clone(), move || {
+                        inner.ledger.install_cloud_authority(&proof, &roots)
+                    })
+                    .await?
+                };
                 Ok(AdmittedCloudVersion {
                     selector,
                     selected,
@@ -211,7 +229,7 @@ impl RemoteObjectIo {
             .connector
             .get()
             .await?
-            .with_lifetime_guard(Arc::new(owner));
+            .with_lifetime_guard(Arc::new(owner.clone()));
         let client = match io::scope() {
             Some(scope) => client.with_operation_deadline(scope.deadline),
             None => client,
@@ -224,6 +242,15 @@ impl RemoteObjectIo {
             authority.agrees(&proof),
             "cloud version owner or selected binding changed"
         );
+        if captured_manifest(proof.manifest()) {
+            crate::retained_offload::ensure_file_source_pin(
+                &self.inner,
+                owner,
+                &client,
+                authority.clone(),
+            )
+            .await?;
+        }
         Ok((client, proof))
     }
     pub(crate) async fn cloud_metadata(

@@ -917,8 +917,8 @@ max_manifest_members=1024
         assert_eq!(restored.projection_seed(), &data.working_copy);
         assert_eq!(
             capability_calls.load(Ordering::SeqCst),
-            1,
-            "exact representation support is negotiated by one read-only capability RPC"
+            3,
+            "exact representation and durable source-pin support use read-only capability RPCs"
         );
         assert_eq!(
             native_calls.load(Ordering::SeqCst),

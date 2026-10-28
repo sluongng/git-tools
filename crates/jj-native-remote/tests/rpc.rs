@@ -416,8 +416,11 @@ impl Server {
             move |request: Request<()>| {
                 query_requests.fetch_add(1, Ordering::SeqCst);
                 query_work_classes.lock().unwrap().push(
-                    request.metadata().get("x-tinytree-query-work-class")
-                        .and_then(|value| value.to_str().ok()).map(str::to_owned),
+                    request
+                        .metadata()
+                        .get("x-tinytree-query-work-class")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
                 );
                 if capture_timeouts.load(Ordering::SeqCst) {
                     query_timeouts.lock().unwrap().push(
@@ -7827,6 +7830,11 @@ max_closure_edges=16384
 max_path_contexts=4096
 max_path_context_bytes=4194304
 [store.cloud]
+# Keep this fixture's three legacy/query versions, while the independent
+# offload workspace rotates beyond 64 genuine captures using real pin exceptions.
+retirement_enabled=true
+rolling_retention_enabled=true
+max_versions_per_workspace=3
 max_object_bytes=4194304
 max_decode_bytes=16777216
 max_version_decode_bytes=134217728
@@ -8186,9 +8194,8 @@ max_manifest_members=1024
     exercise_retained_offload_core(
         &store,
         &client,
-        &manifest,
-        selector,
-        selected,
+        &query_rotation.captured_template,
+        &query_rotation.capture_data,
         configuration.clone(),
         head,
         tree_key,
@@ -8463,6 +8470,8 @@ struct QueryRotationFixture {
     configuration: Config,
     file: m::FileId,
     bytes: Vec<u8>,
+    captured_template: tinytree_cloud::ManifestV3,
+    capture_data: Vec<u8>,
 }
 // Extend the retained-version fixture with an independent local provider. This
 // keeps its V1 residency assertions intact while exercising V2 import and the
@@ -8470,9 +8479,8 @@ struct QueryRotationFixture {
 async fn exercise_retained_offload_core(
     store: &Store,
     client: &tinytree_client::NativeClient,
-    base: &tinytree_cloud::Manifest,
-    _selector: tinytree_client::RetainedVersionSelector,
-    _selected: tinytree_client::CloudRawDigest,
+    captured_template: &tinytree_cloud::ManifestV3,
+    capture_data: &[u8],
     mut configuration: Config,
     head: m::ObjectKey,
     tree: m::ObjectKey,
@@ -8483,25 +8491,45 @@ async fn exercise_retained_offload_core(
     use jj_native_remote::DurableRetainedOffloadContract::ExplicitlyVerifiedV1 as Contract;
     // An independent workspace keeps this source lifecycle case separate from
     // the selected-snapshot query fixture's own publication sequence.
-    let mut owned_manifest = base.clone();
-    owned_manifest.workspace = [88; 32];
-    owned_manifest.sequence = 1;
-    let base = &owned_manifest;
-    let first_payload = tinytree_cloud::encode_manifest(base, Default::default()).unwrap();
+    let mut captured = captured_template.clone();
+    captured.history.recovery.workspace = [88; 32];
+    captured.history.recovery.sequence = 1;
+    captured.history.recovery.parents.clear();
+    let base = &captured.history.recovery;
+    let first_payload = tinytree_cloud::encode_manifest_v3(&captured, Default::default()).unwrap();
     let selected = tinytree_client::CloudRawDigest::of(&first_payload);
     let selector = tinytree_client::RetainedVersionSelector {
         workspace_id: base.workspace,
         generation: 1,
         manifest_id: tinytree_client::CloudManifestId::of(&first_payload),
     };
+    // Match the native producer: only structured V2 publication identities
+    // authorize the automatic rolling-retention transition for captured V3.
+    let publication_id = |generation: u64| {
+        let mut nonce = [88; 16];
+        nonce[..8].copy_from_slice(&generation.to_le_bytes());
+        tinytree_client::CloudPublicationIdentity {
+            workspace_id: [88; 32],
+            generation,
+            nonce,
+        }
+    };
+    let identity = publication_id(1);
     client
-        .cloud_publish_version(&tinytree_client::CloudPublishIntent {
-            workspace_id: base.workspace,
-            expected_generation: 0,
-            idempotency_key: "retained-offload-first".into(),
-            manifest: first_payload,
-            staging_leases: Vec::new(),
-        })
+        .cloud_publish_captured_version_v2(
+            &tinytree_client::CloudCapturedPublishIntent::new(
+                tinytree_client::CloudPublishIntent {
+                    workspace_id: base.workspace,
+                    expected_generation: 0,
+                    idempotency_key: identity.token(),
+                    manifest: first_payload,
+                    staging_leases: Vec::new(),
+                },
+                capture_data.to_vec(),
+            )
+            .unwrap(),
+            identity,
+        )
         .await
         .unwrap();
     let directory = private_dir();
@@ -8514,6 +8542,12 @@ async fn exercise_retained_offload_core(
         true,
     );
     let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
+    // A previously admitted source has no backend-pin row yet. Offload must
+    // adopt its exact source before claiming durable cleanup protection.
+    repo.control
+        .admit_retained_version(selector, selected, Arc::new(()))
+        .await
+        .unwrap();
     let first = repo
         .control
         .admit_retained_offload_until(
@@ -8553,40 +8587,30 @@ async fn exercise_retained_offload_core(
             .unwrap()
     );
     // The live FILE reader still protects this authority even without a cleanup pin.
-    let mut extra = Vec::new();
-    for value in [
-        b"offload extra root one".as_slice(),
-        b"offload extra root two".as_slice(),
-    ] {
-        let descriptor = m::describe_file(value);
-        store.put("example", descriptor, value, 0).unwrap();
-        extra.push(descriptor.key);
-    }
     let mut generations = Vec::new();
-    for (sequence, roots) in [(2u64, vec![extra[0]]), (3, extra.clone())] {
-        let mut manifest = base.clone();
-        manifest.sequence = sequence;
-        manifest.intent_roots[0].roots.extend(roots.iter().copied());
-        manifest.intent_roots[0]
-            .roots
-            .sort_by_key(|r| (r.kind as u8, r.id.0));
-        manifest.intent_roots[0].roots.dedup();
-        manifest.native_roots.extend(roots);
-        manifest
-            .native_roots
-            .sort_by_key(|r| (r.kind as u8, r.id.0));
-        manifest.native_roots.dedup();
-        let payload = tinytree_cloud::encode_manifest(&manifest, Default::default()).unwrap();
+    for sequence in [2u64, 3] {
+        let mut version = captured.clone();
+        version.history.recovery.sequence = sequence;
+        let manifest = &version.history.recovery;
+        let payload = tinytree_cloud::encode_manifest_v3(&version, Default::default()).unwrap();
         let raw = tinytree_client::CloudRawDigest::of(&payload);
         let id = tinytree_client::CloudManifestId::of(&payload);
+        let identity = publication_id(sequence);
         let publication = client
-            .cloud_publish_version(&tinytree_client::CloudPublishIntent {
-                workspace_id: manifest.workspace,
-                expected_generation: sequence - 1,
-                idempotency_key: format!("retained-offload-source-{sequence}"),
-                manifest: payload,
-                staging_leases: Vec::new(),
-            })
+            .cloud_publish_captured_version_v2(
+                &tinytree_client::CloudCapturedPublishIntent::new(
+                    tinytree_client::CloudPublishIntent {
+                        workspace_id: manifest.workspace,
+                        expected_generation: sequence - 1,
+                        idempotency_key: identity.token(),
+                        manifest: payload,
+                        staging_leases: Vec::new(),
+                    },
+                    capture_data.to_vec(),
+                )
+                .unwrap(),
+                identity,
+            )
             .await
             .unwrap();
         assert_eq!(publication.workspace.generation, sequence);
@@ -8597,7 +8621,7 @@ async fn exercise_retained_offload_core(
                 manifest_id: id,
             },
             raw,
-            manifest.native_roots,
+            manifest.native_roots.clone(),
         ));
     }
     let (second_selector, second_raw, second_roots) = &generations[0];
@@ -8665,8 +8689,13 @@ async fn exercise_retained_offload_core(
     drop(repo);
     drop(direct);
     drop(shared);
-    let (direct, repo) = local(directory.path(), cold, configuration.clone(), false);
-    let resumed = repo
+    // Reopen with cold storage; the durable outbox is reconciled independently.
+    let (mut direct, mut repo) = local(directory.path(), cold, configuration.clone(), false);
+    repo.control
+        .reconcile_retained_source_pins_until(Arc::new(()), deadline())
+        .await
+        .unwrap();
+    let mut resumed = repo
         .control
         .resume_retained_offload_until(Contract, third_witness.clone(), Arc::new(()), deadline())
         .await
@@ -8677,39 +8706,38 @@ async fn exercise_retained_offload_core(
         expected_file,
         "cold reopen reads the retained canonical closure"
     );
-    // More than 64 NON-equivalent retained selections, with two alternating
-    // agent identities, must make progress at a two-source authority ceiling.
-    // Each selection adds a real direct root; predecessor pins are released
-    // only after its cleanup obligation completes, enabling safe compaction.
-    let mut evolving = base.clone();
-    evolving.native_roots = third_roots.clone();
-    evolving.intent_roots[0].roots = third_roots.clone();
+    // More than 64 captured equal-root versions must rotate to the newly
+    // requested source at the unchanged two-authority ceiling. The server keeps
+    // only its recent three plus real protected exceptions, including the held
+    // generation-three cleanup witness. DATA and index roots are genuine V3
+    // capture data, not synthetic extra manifest roots.
+    let mut evolving = captured.clone();
     let mut identities = std::collections::BTreeSet::new();
     for n in 1u8..=80 {
-        let payload = format!("retained agent {} edit {n}", n % 2).into_bytes();
-        let descriptor = m::describe_file(&payload);
-        store.put("example", descriptor, &payload, 0).unwrap();
-        evolving.native_roots.push(descriptor.key);
-        evolving
-            .native_roots
-            .sort_by_key(|r| (r.kind as u8, r.id.0));
-        evolving.intent_roots[0].roots = evolving.native_roots.clone();
-        evolving.sequence = u64::from(n) + 3;
-        let encoded = tinytree_cloud::encode_manifest(&evolving, Default::default()).unwrap();
+        evolving.history.recovery.sequence = u64::from(n) + 3;
+        let encoded = tinytree_cloud::encode_manifest_v3(&evolving, Default::default()).unwrap();
         let selected = tinytree_client::CloudRawDigest::of(&encoded);
         let selector = tinytree_client::RetainedVersionSelector {
-            workspace_id: evolving.workspace,
-            generation: evolving.sequence,
+            workspace_id: evolving.history.recovery.workspace,
+            generation: evolving.history.recovery.sequence,
             manifest_id: tinytree_client::CloudManifestId::of(&encoded),
         };
+        let identity = publication_id(evolving.history.recovery.sequence);
         client
-            .cloud_publish_version(&tinytree_client::CloudPublishIntent {
-                workspace_id: evolving.workspace,
-                expected_generation: evolving.sequence - 1,
-                idempotency_key: format!("retained-alternating-agent-edit-{n}"),
-                manifest: encoded,
-                staging_leases: Vec::new(),
-            })
+            .cloud_publish_captured_version_v2(
+                &tinytree_client::CloudCapturedPublishIntent::new(
+                    tinytree_client::CloudPublishIntent {
+                        workspace_id: evolving.history.recovery.workspace,
+                        expected_generation: evolving.history.recovery.sequence - 1,
+                        idempotency_key: identity.token(),
+                        manifest: encoded,
+                        staging_leases: Vec::new(),
+                    },
+                    capture_data.to_vec(),
+                )
+                .unwrap(),
+                identity,
+            )
             .await
             .unwrap();
         let pin = repo
@@ -8719,7 +8747,7 @@ async fn exercise_retained_offload_core(
                 selector,
                 selected,
                 [n; 32],
-                evolving.native_roots.clone(),
+                evolving.history.recovery.native_roots.clone(),
                 Arc::new(()),
                 deadline(),
             )
@@ -8747,8 +8775,75 @@ async fn exercise_retained_offload_core(
     assert_eq!(
         identities.len(),
         80,
-        "non-equivalent sources compact within the unchanged two-authority ceiling"
+        "fresh sources, including equal-root generations, rotate within the unchanged ceiling"
     );
+    // The final successful rotation leaves an actual ReleasePending predecessor.
+    // Apply its exact release, lose the local ACK, then reopen and replay it.
+    drop(resumed);
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    let (lost_identity, lost_selector, lost_selected) = {
+        use fjall::Readable;
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let pins = db
+            .keyspace(
+                "retained-source-pins-v8",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let row = db
+            .read_tx()
+            .iter(&pins)
+            .find_map(|entry| {
+                let (_, raw) = entry.into_inner().unwrap();
+                let row: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                (row["phase"] == "ReleasePending").then_some(row)
+            })
+            .expect("final compaction leaves release work");
+        let source = &row["authority"]["File"];
+        (
+            tinytree_client::CloudVersionPinIdentity {
+                pin_id: serde_json::from_value(row["nonce"].clone()).unwrap(),
+                acquire_not_after_unix_seconds: row["acquire_not_after_unix_seconds"]
+                    .as_i64()
+                    .unwrap(),
+            },
+            tinytree_client::RetainedVersionSelector {
+                workspace_id: serde_json::from_value(source["workspace"].clone()).unwrap(),
+                generation: source["generation"].as_u64().unwrap(),
+                manifest_id: tinytree_client::CloudManifestId(
+                    serde_json::from_value(source["manifest"].clone()).unwrap(),
+                ),
+            },
+            tinytree_client::CloudRawDigest {
+                blake3: serde_json::from_value(source["manifest_raw"].clone()).unwrap(),
+                size_bytes: source["manifest_size"].as_u64().unwrap(),
+            },
+        )
+    };
+    client
+        .release_cloud_version_pin(lost_identity, lost_selector, lost_selected)
+        .await
+        .unwrap();
+    let reopened_cache = private_dir();
+    (direct, repo) = local(
+        directory.path(),
+        cache(reopened_cache.path()),
+        configuration.clone(),
+        false,
+    );
+    repo.control
+        .reconcile_retained_source_pins_until(Arc::new(()), deadline())
+        .await
+        .unwrap();
+    resumed = repo
+        .control
+        .resume_retained_offload_until(Contract, third_witness.clone(), Arc::new(()), deadline())
+        .await
+        .unwrap();
     let mut wrong = third_witness.clone();
     wrong.binding[0] ^= 1;
     assert!(
@@ -8770,14 +8865,36 @@ async fn exercise_retained_offload_core(
         0,
         "retained-only delivery never uses generic repository reads"
     );
+    repo.control
+        .reconcile_retained_source_pins_until(Arc::new(()), deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .cloud_retained_version_selected(selector, selected)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::OutOfRange,
+        "initial unprotected generation expires instead of being reselected"
+    );
+    // Encoding fences need an extant cleanup obligation, not an expired initial
+    // selection. Bind it to the final exact source that remains in the window.
+    let final_payload = tinytree_cloud::encode_manifest_v3(&evolving, Default::default()).unwrap();
+    let final_selector = tinytree_client::RetainedVersionSelector {
+        workspace_id: evolving.history.recovery.workspace,
+        generation: evolving.history.recovery.sequence,
+        manifest_id: tinytree_client::CloudManifestId::of(&final_payload),
+    };
+    let final_selected = tinytree_client::CloudRawDigest::of(&final_payload);
     let preserved = repo
         .control
         .admit_retained_offload_until(
             Contract,
-            selector,
-            selected,
+            final_selector,
+            final_selected,
             [250; 32],
-            base.native_roots.clone(),
+            evolving.history.recovery.native_roots.clone(),
             Arc::new(()),
             deadline(),
         )
@@ -8797,6 +8914,31 @@ async fn exercise_retained_offload_core(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+    {
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let pins = db
+            .keyspace(
+                "retained-source-pins-v8",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let rows = db
+            .read_tx()
+            .iter(&pins)
+            .map(|item| {
+                let (_, value) = item.into_inner().unwrap();
+                serde_json::from_slice::<serde_json::Value>(&value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.len()
+                <= configuration.query.max_authorities + configuration.max_pending_operations
+        );
+        assert!(rows.iter().filter(|r| r["phase"] == "Active").count() <= 2);
+        assert!(rows.iter().all(|r| r["ordinal"].as_u64().unwrap() > 0));
+    }
     let saved_pin = {
         let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
             .open()
@@ -8880,6 +9022,193 @@ async fn exercise_retained_offload_core(
             tx.commit().unwrap();
         }
     }
+    // Simulate the main15 legacy-adoption crash window: the installed exact
+    // authority and its cleanup/FILE provenance exist, but the new admission
+    // intent never reached the server before its immutable deadline elapsed.
+    // Synthetic fixture editing changes only that intent, with exact accounting.
+    let source_key = preserved_witness
+        .authority
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    fn adoption_state(
+        path: &Path,
+        source_key: &str,
+    ) -> (serde_json::Value, Vec<(String, Vec<u8>, Vec<u8>)>) {
+        let db = fjall::SingleWriterTxDatabase::builder(path.join("ledger/data"))
+            .open()
+            .unwrap();
+        let pins = db
+            .keyspace(
+                "retained-source-pins-v8",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let raw = db
+            .read_tx()
+            .get(&pins, source_key.as_bytes())
+            .unwrap()
+            .unwrap();
+        let mut preserved = Vec::new();
+        for name in [
+            "cloud-authorities-v4",
+            "cloud-query-authorities-v5",
+            "retained-offload-pins-v6",
+            "derived_files",
+            "admissions",
+            "known-references-v2",
+            "verified-progress-v2",
+            "query-grants-v3",
+        ] {
+            let space = db
+                .keyspace(name, fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            for entry in db.read_tx().iter(&space) {
+                let (key, value) = entry.into_inner().unwrap();
+                preserved.push((name.to_owned(), key.to_vec(), value.to_vec()));
+            }
+        }
+        (serde_json::from_slice(&raw).unwrap(), preserved)
+    }
+    let (original, provenance) = adoption_state(directory.path(), &source_key);
+    let original_identity = tinytree_client::CloudVersionPinIdentity {
+        pin_id: serde_json::from_value(original["nonce"].clone()).unwrap(),
+        acquire_not_after_unix_seconds: original["acquire_not_after_unix_seconds"]
+            .as_i64()
+            .unwrap(),
+    };
+    client
+        .release_cloud_version_pin(original_identity, final_selector, final_selected)
+        .await
+        .unwrap();
+    let mut stalled = original.clone();
+    stalled["phase"] = "AcquirePending".into();
+    stalled["nonce"] = serde_json::to_value([252u8; 16]).unwrap();
+    stalled["acquire_not_after_unix_seconds"] = 1.into();
+    {
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let pins = db
+            .keyspace(
+                "retained-source-pins-v8",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let meta = db
+            .keyspace("meta", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
+        let old = tx.get(&pins, source_key.as_bytes()).unwrap().unwrap();
+        let raw = serde_json::to_vec(&stalled).unwrap();
+        let charged: u64 =
+            serde_json::from_slice(&tx.get(&meta, b"bytes").unwrap().unwrap()).unwrap();
+        let charged = charged
+            .checked_sub(old.len() as u64)
+            .unwrap()
+            .checked_add(raw.len() as u64)
+            .unwrap();
+        tx.insert(&pins, source_key.as_bytes(), raw);
+        tx.insert(&meta, b"bytes", serde_json::to_vec(&charged).unwrap());
+        tx.commit().unwrap();
+    }
+    (direct, repo) = local(
+        directory.path(),
+        cache(cold_cache.path()),
+        configuration.clone(),
+        false,
+    );
+    let foreign_before = counts.cloud_rpcs.load(Ordering::SeqCst);
+    assert_eq!(
+        repo.control
+            .reconcile_retained_source_pins_before_publish_until([89; 32], Arc::new(()), deadline())
+            .await
+            .unwrap(),
+        0,
+        "an expired adoption from another workspace cannot block publication"
+    );
+    assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), foreign_before);
+    let error = repo
+        .control
+        .reconcile_retained_source_pins_before_publish_until(
+            final_selector.workspace_id,
+            Arc::new(()),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<tonic::Status>().unwrap().code(),
+        tonic::Code::OutOfRange
+    );
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    let (renewed, after_terminal) = adoption_state(directory.path(), &source_key);
+    assert_eq!(
+        renewed["phase"], "AcquirePending",
+        "current request must not acquire its replacement identity"
+    );
+    assert_ne!(renewed["nonce"], stalled["nonce"]);
+    assert!(renewed["acquire_not_after_unix_seconds"].as_i64().unwrap() > 1);
+    assert_eq!(renewed["authority"], original["authority"]);
+    assert_eq!(renewed["ordinal"], original["ordinal"]);
+    assert_eq!(
+        after_terminal, provenance,
+        "terminal adoption recovery preserves all installed provenance and cleanup obligations"
+    );
+    (direct, repo) = local(
+        directory.path(),
+        cache(cold_cache.path()),
+        configuration.clone(),
+        false,
+    );
+    repo.control
+        .reconcile_retained_source_pins_before_publish_until(
+            final_selector.workspace_id,
+            Arc::new(()),
+            deadline(),
+        )
+        .await
+        .unwrap();
+    let active_before = counts.cloud_rpcs.load(Ordering::SeqCst);
+    assert_eq!(
+        repo.control
+            .reconcile_retained_source_pins_before_publish_until(
+                final_selector.workspace_id,
+                Arc::new(()),
+                deadline()
+            )
+            .await
+            .unwrap(),
+        0,
+        "confirmed sources must not be replayed or renewed by publication"
+    );
+    assert_eq!(counts.cloud_rpcs.load(Ordering::SeqCst), active_before);
+    let recovered = repo
+        .control
+        .resume_retained_offload_until(
+            Contract,
+            preserved_witness.clone(),
+            Arc::new(()),
+            deadline(),
+        )
+        .await
+        .unwrap();
+    recovered.validate(&preserved_witness).unwrap();
+    drop(recovered);
+    repo.wait_for_idle().await;
+    drop(repo);
+    drop(direct);
+    let (active, after_recovery) = adoption_state(directory.path(), &source_key);
+    assert_eq!(active["phase"], "Active");
+    assert_eq!(active["nonce"], renewed["nonce"]);
+    assert_eq!(
+        active["acquire_not_after_unix_seconds"],
+        renewed["acquire_not_after_unix_seconds"]
+    );
+    assert_eq!(active["authority"], original["authority"]);
+    assert_eq!(after_recovery, provenance);
 }
 
 async fn exercise_retained_query_facade(
@@ -9146,6 +9475,8 @@ async fn exercise_retained_query_facade(
         capture: tinytree_cloud::CaptureDescriptor::of(&capture_bytes),
     };
     let captured_bytes = tinytree_cloud::encode_manifest_v3(&captured, Default::default()).unwrap();
+    let captured_template = captured.clone();
+    let capture_data = capture_bytes.clone();
     let intent = tinytree_client::CloudCapturedPublishIntent::new(
         tinytree_client::CloudPublishIntent {
             workspace_id: recovery.workspace,
@@ -9216,7 +9547,7 @@ async fn exercise_retained_query_facade(
     );
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-4\n"
+        b"tinytree-native-admission-8\n"
     );
     let mut broker_config = native_broker::Config::default();
     broker_config.max_inflight = 1;
@@ -9307,9 +9638,23 @@ async fn exercise_retained_query_facade(
     );
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-4\n",
-        "failed source check cannot enable or install snapshot grants"
+        b"tinytree-native-admission-8\n",
+        "durable FILE adoption already enabled the source-pin feature gate"
     );
+    // A rejected client-side anchor check may already have reserved the
+    // server replay identity. Its inputs remain immutable despite that failure.
+    let mut corrected = input.clone();
+    corrected.replay_key = [109; 32];
+    assert_eq!(
+        query
+            .open_cloud_scope(corrected.clone(), Arc::new(()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    // The existing valid-source opens below also verify that this rejected
+    // selection does not poison independent query requests.
     // A pass fetches exactly one SDK proof while every selected root still
     // obtains its own authenticated server scope. A second pass must refetch.
     let common = source.authorization_source();
@@ -9339,6 +9684,7 @@ async fn exercise_retained_query_facade(
         let mut selected_source = source.clone();
         selected_source.index_root_ids = vec![root];
         selected_source.expected_anchors = vec![anchor];
+        let before_open = counts.cloud_rpcs.load(Ordering::SeqCst);
         let scope = prepared
             .value
             .open_cloud_scope(
@@ -9354,6 +9700,12 @@ async fn exercise_retained_query_facade(
         assert_eq!(
             scope.value.cloud_source_digest,
             Some(selected_source.digest())
+        );
+        let after_open = counts.cloud_rpcs.load(Ordering::SeqCst);
+        assert_eq!(
+            after_open,
+            before_open + 1,
+            "each new exact query authority acquires one durable source pin"
         );
         let facts = prepared
             .value
@@ -9381,12 +9733,17 @@ async fn exercise_retained_query_facade(
             .close_scope(scope.value.handle, prepared.owner.clone())
             .await
             .unwrap();
+        assert_eq!(
+            counts.cloud_rpcs.load(Ordering::SeqCst),
+            after_open,
+            "facts and ACK close must not refetch the prepared proof or repin the source"
+        );
     }
     assert!(counts.query_rpcs.load(Ordering::SeqCst) > queries_before);
     assert_eq!(
         counts.cloud_rpcs.load(Ordering::SeqCst),
-        cloud_before + 1,
-        "per-root scope/facts/ACK closes must not refetch the common proof"
+        cloud_before + 3,
+        "one prepared proof plus two distinct query-source acquisitions"
     );
     let next = prepared
         .value
@@ -9396,7 +9753,7 @@ async fn exercise_retained_query_facade(
         .unwrap();
     assert_eq!(
         counts.cloud_rpcs.load(Ordering::SeqCst),
-        cloud_before + 2,
+        cloud_before + 4,
         "even preparing from a pass view must freshly authenticate the next pass"
     );
     drop(next);
@@ -9566,7 +9923,7 @@ async fn exercise_retained_query_facade(
     );
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-5\n"
+        b"tinytree-native-admission-8\n"
     );
     assert!(
         direct
@@ -10308,6 +10665,48 @@ async fn exercise_retained_query_facade(
     remote.wait_for_idle().await;
     drop(remote);
     drop(direct);
+    // Closing scopes does not release durable selected-query authority. The
+    // exact admission identity survives provider restart unchanged.
+    let query_identity = {
+        use fjall::Readable;
+        let db = fjall::SingleWriterTxDatabase::builder(directory.path().join("ledger/data"))
+            .open()
+            .unwrap();
+        let pins = db
+            .keyspace(
+                "retained-source-pins-v8",
+                fjall::KeyspaceCreateOptions::default,
+            )
+            .unwrap();
+        let rows = db
+            .read_tx()
+            .iter(&pins)
+            .map(|entry| {
+                let (_, raw) = entry.into_inner().unwrap();
+                serde_json::from_slice::<serde_json::Value>(&raw).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let row = rows
+            .iter()
+            .find(|row| row["authority"].get("Query").is_some())
+            .expect("selected query authority has a durable backend pin");
+        assert_eq!(row["phase"], "Active");
+        assert!(row["acquire_not_after_unix_seconds"].as_i64().unwrap() > 0);
+        tinytree_client::CloudVersionPinIdentity {
+            pin_id: serde_json::from_value(row["nonce"].clone()).unwrap(),
+            acquire_not_after_unix_seconds: row["acquire_not_after_unix_seconds"].as_i64().unwrap(),
+        }
+    };
+    let replayed_pin = publisher
+        .acquire_cloud_version_pin(
+            selector.workspace_id,
+            query_identity,
+            tinytree_client::CloudPinSelection::Exact { selector, selected },
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed_pin.identity, query_identity);
+    drop(replayed_pin);
     // Move live references independently and collect expired staging leases.
     // Refetch must reauthorize through the exact V3 selector, not the current
     // ref. Older retained history also pins this shared closure, so this is an
@@ -10363,7 +10762,7 @@ async fn exercise_retained_query_facade(
                 .is_none()
         );
     }
-    // Simulate the safe feature-gate crash window: DB5 is already SyncAll while
+    // Simulate the safe feature-gate crash window: DB8 is already SyncAll while
     // marker replacement was interrupted. A legacy reader rejects the DB gate.
     std::fs::write(
         directory.path().join("ledger/admission.format"),
@@ -10382,7 +10781,7 @@ async fn exercise_retained_query_facade(
     );
     assert_eq!(
         std::fs::read(directory.path().join("ledger/admission.format")).unwrap(),
-        b"tinytree-native-admission-5\n"
+        b"tinytree-native-admission-8\n"
     );
     assert!(
         direct
@@ -10483,6 +10882,8 @@ async fn exercise_retained_query_facade(
         configuration,
         file,
         bytes: expected_file,
+        captured_template,
+        capture_data,
     }
 }
 

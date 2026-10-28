@@ -18,6 +18,12 @@ pub(crate) struct CloudQueryAuthority {
     native_binding: [u8; 32],
 }
 impl CloudQueryAuthority {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(super) fn binding(&self) -> &str {
+        &self.binding
+    }
     pub fn key(&self) -> String {
         format!("cq/{}", self.id)
     }
@@ -58,7 +64,7 @@ impl CloudQueryAuthority {
             && proof.owner_binding() == self.owner
             && proof.binding_digest() == self.native_binding
     }
-    fn identity(&self) -> Result<String> {
+    pub(super) fn identity(&self) -> Result<String> {
         let mut hash = blake3::Hasher::new();
         hash.update(b"native-cloud-query-authority-v1\0");
         hash.update(&serde_json::to_vec(&(
@@ -107,6 +113,82 @@ impl Ledger {
         );
         self.enable_cloud_queries()?;
         Ok(authority)
+    }
+    pub(crate) fn install_pinned_query_authority(
+        &self,
+        authority: &CloudQueryAuthority,
+        pin: &super::offload::SourcePin,
+    ) -> Result<()> {
+        use super::offload::{SourcePin, SourcePinAuthority, SourcePinPhase};
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.check()?;
+        ensure!(
+            self.valid_cloud_query(authority)?,
+            "cloud query pin source changed"
+        );
+        let expected = SourcePinAuthority::Query(authority.clone());
+        ensure!(
+            pin.authority == expected && pin.phase != SourcePinPhase::ReleasePending,
+            "cloud query pin selection changed"
+        );
+        let saved = self
+            .get::<SourcePin>(&self.source_pins, expected.id().as_bytes())?
+            .context("cloud query acquisition intent missing")?;
+        ensure!(&saved == pin, "cloud query acquisition intent changed");
+        let existing = self.cloud_query(authority.id())?;
+        if let Some(existing) = &existing {
+            ensure!(existing == authority, "cloud query identity changed");
+            if pin.phase == SourcePinPhase::Active {
+                return Ok(());
+            }
+        } else {
+            ensure!(
+                self.authority_count()? < self.config.query.max_authorities,
+                "query authority count exceeded"
+            );
+        }
+        let mut active = pin.clone();
+        active.phase = SourcePinPhase::Active;
+        self.write_locked(vec![
+            (
+                &self.cloud_queries,
+                authority.id().as_bytes().to_vec(),
+                Some(serde_json::to_vec(authority)?),
+            ),
+            (
+                &self.source_pins,
+                expected.id().as_bytes().to_vec(),
+                Some(serde_json::to_vec(&active)?),
+            ),
+        ])
+    }
+    /// Query roots remain selected even after their ephemeral server scope ends.
+    /// Physical source users additionally prevent authority retirement while live.
+    pub(crate) fn retain_cloud_query_read(
+        self: &std::sync::Arc<Self>,
+        authority: &CloudQueryAuthority,
+    ) -> Result<std::sync::Arc<super::offload::CloudReadLease>> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        ensure!(
+            self.valid_cloud_query(authority)?,
+            "cloud query read source changed"
+        );
+        if let Some(pin) =
+            self.get::<super::offload::SourcePin>(&self.source_pins, authority.key().as_bytes())?
+        {
+            ensure!(
+                pin.authority == super::offload::SourcePinAuthority::Query(authority.clone())
+                    && pin.phase == super::offload::SourcePinPhase::Active,
+                "cloud query source pin is not active"
+            );
+        }
+        self.retain_source_read_locked(authority.key())
     }
     pub(super) fn valid_cloud_query(&self, authority: &CloudQueryAuthority) -> Result<bool> {
         self.check()?;

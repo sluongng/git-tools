@@ -27,10 +27,12 @@ mod cloud;
 pub use cloud::{
     CloudCaptureReadLease, CloudCatalogBudgetSummary, CloudConfig, CloudIndexReadLease,
     CloudIndexWriteReceipt, CloudNativeReadLease, CloudNativeReadLimits, CloudObjectDescriptor,
-    CloudOwner, CloudPublication, CloudPublicationLimits, CloudReadLease, CloudResidentLimits,
-    CloudResourceProfile, CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion,
-    CloudVersionPage, CloudVersionReadGuard, CloudVersionSelector, CloudWorkspace,
-    CloudWorkspacePage, CloudWriteReceipt, PublishCapturedCloudRequest, PublishCloudRequest,
+    CloudOwner, CloudPublication, CloudPublicationIdentity, CloudPublicationLimits, CloudReadLease,
+    CloudResidentLimits, CloudResourceProfile, CloudRetentionState, CloudRetirementReceipt,
+    CloudRetirementRequest, CloudSnapshotCommit, CloudSnapshotReadGuard, CloudVersion,
+    CloudVersionPage, CloudVersionPinIdentity, CloudVersionReadGuard, CloudVersionSelector,
+    CloudWorkspace, CloudWorkspacePage, CloudWriteReceipt, PublishCapturedCloudRequest,
+    PublishCloudRequest,
 };
 mod external_checks;
 mod landing;
@@ -67,6 +69,9 @@ pub enum Error {
     StaleReference(Reference),
     IdempotencyConflict,
     StaleCloudWorkspace(cloud::CloudWorkspace),
+    CloudVersionExpired,
+    CloudReplayExpired,
+    CloudRetentionChanged,
     Limit(&'static str),
     Poisoned,
 }
@@ -82,6 +87,9 @@ impl fmt::Display for Error {
             Self::MissingObject(_) => f.write_str("native object is unavailable"),
             Self::StaleReference(_) => f.write_str("native reference generation changed"),
             Self::StaleCloudWorkspace(_) => f.write_str("cloud workspace generation changed"),
+            Self::CloudVersionExpired => f.write_str("exact cloud version expired"),
+            Self::CloudReplayExpired => f.write_str("cloud publication replay expired"),
+            Self::CloudRetentionChanged => f.write_str("cloud retention changed"),
             Self::IdempotencyConflict => f.write_str("idempotency key has a different request"),
             Self::Limit(why) => write!(f, "native store limit: {why}"),
             Self::Poisoned => f.write_str("native store publication gate is poisoned"),
@@ -478,6 +486,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-9") => Ok(9),
         Some(b"tinytree-store-10") => Ok(10),
         Some(b"tinytree-store-11") => Ok(11),
+        Some(b"tinytree-store-12") => Ok(12),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -499,6 +508,7 @@ fn advance_feature(
             9 => b"tinytree-store-9".as_slice(),
             10 => b"tinytree-store-10".as_slice(),
             11 => b"tinytree-store-11".as_slice(),
+            12 => b"tinytree-store-12".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         tx.insert(meta, b"format", value);
@@ -815,6 +825,12 @@ impl Store {
             store.inner.validate_packs_on_reopen()?;
             store.inner.validate_cloud_on_reopen()?;
             store.inner.validate_landing_on_reopen()?;
+        }
+        if !planned.fresh {
+            // Strict reopen validation above must see stale packages before
+            // cleanup; malformed exception metadata cannot be erased as repair.
+            let gate = store.inner.lock()?;
+            store.inner.reap_cloud_version_exceptions(None, &gate)?;
         }
         Ok(store)
     }
@@ -1677,6 +1693,8 @@ impl Store {
     pub fn gc(&self, repo: &str, now: i64) -> Result<GcReport> {
         let gate = self.inner.lock()?;
         self.inner.repository(repo)?;
+        self.inner
+            .reap_cloud_version_exceptions(Some(repo), &gate)?;
         let cloud = self.inner.cloud_gc_plan(repo, now, &gate)?;
         let prefix = key(repo, b"");
         let view = self.inner.db.read_tx();

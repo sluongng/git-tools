@@ -146,11 +146,16 @@ pub(crate) fn run(ui: &Ui, command: &CommandHelper, args: CloudArgs) -> Result<(
                             version.manifest_id
                         )?;
                     }
-                    writeln!(
-                        ui.stdout(),
-                        "Selected history through generation {}; restore verifies the chosen capsule.",
-                        page.through_generation
-                    )?;
+                    if page.through_generation > page.retired_through {
+                        writeln!(
+                            ui.stdout(),
+                            "Retained generations {} through {}; restore verifies the chosen capsule.",
+                            page.retired_through + 1,
+                            page.through_generation
+                        )?;
+                    } else {
+                        writeln!(ui.stdout(), "No retained cloud versions.")?;
+                    }
                     if !page.continuation.is_empty() {
                         writeln!(ui.stdout(), "Next page: --cursor {}", page.continuation)?;
                     }

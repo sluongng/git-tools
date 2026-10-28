@@ -81,6 +81,23 @@ impl Requested {
         requested.validate(binding)?;
         Ok(requested)
     }
+    /// Seal the policy saved before source selection without consulting mutable
+    /// host configuration again. The pending placeholder is never authority.
+    pub fn rebind(&self, pending: &Binding<'_>, selected: &Binding<'_>) -> Result<Self> {
+        self.validate(pending)?;
+        ensure!(
+            pending.root == selected.root
+                && pending.store == selected.store
+                && pending.workspace_id == selected.workspace_id
+                && pending.provider_identity == selected.provider_identity
+                && pending.source.workspace_id == selected.source.workspace_id,
+            "automatic restore pending binding differs"
+        );
+        let mut requested = self.clone();
+        requested.binding = requested.bound_digest(selected)?;
+        requested.validate(selected)?;
+        Ok(requested)
+    }
     pub fn policy(&self) -> Result<native_broker::CreationPolicy> {
         native_broker::CreationPolicy::checked(
             native_broker::CreationPolicy {

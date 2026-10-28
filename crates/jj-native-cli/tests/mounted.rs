@@ -1662,6 +1662,45 @@ max_manifest_members=1024
         history_scan_limit: Option<usize>,
         cloud_proof_profile: Option<GrowingCloudProofProfile>,
     ) -> Self {
+        Self::start_retention_profile_configured(
+            history,
+            cloud_enabled,
+            blame_bytes,
+            search_seed,
+            landing_enabled,
+            cloud_catalog,
+            cloud_landing_recovery,
+            history_scan_limit,
+            cloud_proof_profile,
+            None,
+        )
+    }
+    fn start_with_rolling_cloud_window(window: u64) -> Self {
+        Self::start_retention_profile_configured(
+            8,
+            true,
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+            None,
+            Some(window),
+        )
+    }
+    fn start_retention_profile_configured(
+        history: usize,
+        cloud_enabled: bool,
+        blame_bytes: Option<usize>,
+        search_seed: bool,
+        landing_enabled: bool,
+        cloud_catalog: Option<(usize, u64, u64)>,
+        cloud_landing_recovery: bool,
+        history_scan_limit: Option<usize>,
+        cloud_proof_profile: Option<GrowingCloudProofProfile>,
+        rolling_window: Option<u64>,
+    ) -> Self {
         assert!((1..=1024).contains(&history));
         assert!(
             !cloud_landing_recovery
@@ -1695,6 +1734,11 @@ max_manifest_members=1024
                     profile.service.query.max_scope_replays;
                 profile.service.query.max_scope_replays_per_repository =
                     profile.service.query.max_scope_replays;
+            }
+            if let Some(window) = rolling_window {
+                profile.store.cloud.retirement_enabled = true;
+                profile.store.cloud.rolling_retention_enabled = true;
+                profile.store.cloud.max_versions_per_workspace = window;
             }
             profile.validate().unwrap();
             let store = profile
@@ -6806,6 +6850,64 @@ fn published_capture_retirement_continues_distinct_edits_and_restores_old_versio
     assert_eq!(local_capture_bundles(&fixture).len(), 1);
     let versions =
         retained_capture_versions(&upstream, binding.workspace_id, expected_publications);
+    // Local capsule retirement can be justified by the old remote version alone.
+    // Independently require the real newest export to carry the former snapshot
+    // and its exact undo/index/raw associations before server retirement is added.
+    let oldest = versions
+        .iter()
+        .find(|(_, _, _, manifest, _)| {
+            capture_identity(&manifest.history.recovery.working_copy.wc_operation)
+                == captures.first().unwrap().0
+        })
+        .unwrap();
+    let newest = versions
+        .iter()
+        .find(|(_, _, _, manifest, _)| {
+            capture_identity(&manifest.history.recovery.working_copy.wc_operation)
+                == captures.last().unwrap().0
+        })
+        .unwrap();
+    let decode = |version: &RetainedCaptureVersion| {
+        tinytree_cloud::decode_data(
+            &version.4,
+            tinytree_cloud::CaptureDataId::of(&version.4).0,
+            &Default::default(),
+        )
+        .unwrap()
+    };
+    let old_data = decode(oldest);
+    let new_data = decode(newest);
+    assert_eq!(new_data.working_copy.wc_operation, captures.last().unwrap().0);
+    for operation in &old_data.operations {
+        assert!(
+            new_data.operations.contains(operation),
+            "newest real export must preserve the older exact operation and view"
+        );
+    }
+    for index in &old_data.indexes {
+        assert!(
+            new_data.indexes.contains(index),
+            "newest real export must preserve every older operation/index association"
+        );
+    }
+    for blob in &old_data.blobs {
+        assert!(
+            new_data.blobs.contains(blob),
+            "newest real export must preserve older selected raw OP/VIEW representations"
+        );
+    }
+    for member in &oldest.3.history.recovery.members {
+        assert!(
+            newest.3.history.recovery.members.contains(member),
+            "newest remote manifest must retain the older exact raw selection"
+        );
+    }
+    assert!(
+        new_data.operations.iter().any(|operation| {
+            operation.operation == old_data.working_copy.snapshot_operation
+        }),
+        "the original snapshot operation must remain usable from newest capture alone"
+    );
     fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
     let oldest_snapshot = versions
         .iter()
@@ -6869,6 +6971,219 @@ fn published_capture_retirement_continues_distinct_edits_and_restores_old_versio
         };
         restore_retired_capture(&upstream, &selection, &data, &selected.1, use_latest);
     }
+}
+
+#[test]
+#[ignore = "requires usable /dev/fuse and fusermount3; run mounted_tests locally"]
+fn rolling_cloud_window_preserves_a_cold_host_pinned_restore_after_restart() {
+    fn default_workspace(fixture: &mut Fixture, endpoint: &str) {
+        fixture.configure_remote(endpoint);
+        fixture.automatic_policies();
+        let mut config: toml::Value =
+            toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+        // Only shorten the fixture scheduler tick; capture/upload policy stays Auto.
+        config["native"]["workspaces"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "upload".into(),
+                toml::Value::Table(toml::map::Map::from_iter([("poll_ms".into(), 250.into())])),
+            );
+        fs::write(&fixture.daemon_config, toml::to_string(&config).unwrap()).unwrap();
+    }
+    let upstream = RemoteServer::start_with_rolling_cloud_window(2);
+    let mut producer = Fixture::new();
+    default_workspace(&mut producer, &upstream.endpoint);
+    producer.start();
+    let producer_base = producer.base().to_owned();
+    let source = producer_base.join("rolling-source");
+    producer.clone_remote(&source);
+    let binding = producer.binding(&source);
+    let public = upstream.public();
+    let first_bytes = b"first pinned private snapshot\n";
+    fs::write(source.join("capture-only.txt"), first_bytes).unwrap();
+    producer.success(&source, &["status"]);
+    let first_count = local_capture_status(&producer)["queued"].as_u64().unwrap();
+    assert!((1..=2).contains(&first_count));
+    // GetWorkspace is legitimately absent before the first background publication.
+    wait_for_capture_publications(&producer, 1);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while cloud_generation(&upstream, binding.workspace_id) < first_count {
+        assert!(
+            Instant::now() < deadline,
+            "initial default backup did not publish"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let initial = retained_capture_versions(&upstream, binding.workspace_id, first_count);
+    let selected = initial.last().unwrap();
+    let selection = workspace_daemon::control::NativeRestoreSelection {
+        workspace_id: binding.workspace_id,
+        generation: selected.0,
+        manifest_id: selected.1.0,
+        manifest_blake3: selected.2.blake3,
+        manifest_size_bytes: selected.2.size_bytes,
+    };
+    let workspace = capture_identity(&binding.workspace_id);
+    let generation = selection.generation.to_string();
+    let mut restored = Fixture::new();
+    default_workspace(&mut restored, &upstream.endpoint);
+    restored.start();
+    let restored_base = restored.base().to_owned();
+    let destination = restored_base.join("pinned-restore");
+    let file_reads = upstream.file_reads();
+    let report: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&restored.cloud(
+            &restored_base,
+            &[
+                "restore",
+                &workspace,
+                destination.to_str().unwrap(),
+                "--generation",
+                &generation,
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(report.source, selection);
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads,
+        "restore must remain metadata-only"
+    );
+    // No restored FILE or query is read before shutdown: the durable host pin,
+    // not a prewarmed cache or a surviving reader, must protect this source.
+    restored.success(
+        &restored_base,
+        &["tinytree", "unmount", destination.to_str().unwrap()],
+    );
+    restored.stop_daemon();
+
+    let mut latest = first_count;
+    for edit in 1..=6 {
+        fs::write(
+            source.join("capture-only.txt"),
+            format!("later snapshot {edit}\n"),
+        )
+        .unwrap();
+        producer.success(&source, &["status"]);
+        let queued = local_capture_status(&producer)["queued"].as_u64().unwrap();
+        assert!(queued > latest, "distinct default capture did not advance");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while cloud_generation(&upstream, binding.workspace_id) < queued {
+            assert!(
+                Instant::now() < deadline,
+                "default backup stalled beyond rolling window"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        latest = queued;
+    }
+    assert!(latest >= selection.generation + 6);
+    assert_eq!(
+        upstream.public(),
+        public,
+        "backup cannot publish private roots"
+    );
+    restored.start();
+    let page: workspace_daemon::control::NativeCloudVersions =
+        serde_json::from_str(&restored.cloud(
+            &restored_base,
+            &["versions", &workspace, "--limit", "10", "--json"],
+        ))
+        .unwrap();
+    assert_eq!(
+        page.versions
+            .iter()
+            .map(|v| v.generation)
+            .collect::<Vec<_>>(),
+        vec![latest - 1, latest]
+    );
+    assert!(page.continuation.is_empty());
+    let expired_destination = restored_base.join("expired-restore");
+    let configuration = restored.daemon_config.to_str().unwrap().to_owned();
+    let expired_generation = (selection.generation + 1).to_string();
+    let expired = restored.run(
+        &restored_base,
+        &[
+            "tinytree",
+            "cloud",
+            "--daemon-config",
+            &configuration,
+            "--store",
+            "example",
+            "restore",
+            &workspace,
+            expired_destination.to_str().unwrap(),
+            "--generation",
+            &expired_generation,
+            "--json",
+        ],
+    );
+    assert!(
+        !expired.status.success(),
+        "expired source must not fall back to latest"
+    );
+    assert!(!expired_destination.exists());
+    let resumed: workspace_daemon::control::NativeCloudRestored =
+        serde_json::from_str(&restored.cloud(
+            &restored_base,
+            &[
+                "restore",
+                &workspace,
+                destination.to_str().unwrap(),
+                "--json",
+            ],
+        ))
+        .unwrap();
+    assert!(resumed.reused_destination);
+    assert_eq!(resumed.source, selection, "retry must not reselect latest");
+    assert_eq!(
+        upstream.file_reads(),
+        file_reads,
+        "resume cannot eagerly hydrate source FILEs"
+    );
+    assert_eq!(
+        fs::read(destination.join("capture-only.txt")).unwrap(),
+        first_bytes
+    );
+    let log = restored.success(
+        &destination,
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@",
+            "-T",
+            "commit_id",
+        ],
+    );
+    assert_eq!(
+        log.trim(),
+        capture_identity(&selected.3.history.recovery.working_copy.snapshot_commit)
+    );
+    let blame = restored.success(
+        &destination,
+        &[
+            "--ignore-working-copy",
+            "file",
+            "annotate",
+            "capture-only.txt",
+        ],
+    );
+    assert!(blame.contains("first pinned private snapshot"));
+    assert_eq!(upstream.public(), public);
+    restored.success(
+        &restored_base,
+        &["tinytree", "unmount", destination.to_str().unwrap()],
+    );
+    restored.stop_daemon();
+    producer.success(
+        &producer_base,
+        &["tinytree", "unmount", source.to_str().unwrap()],
+    );
+    producer.stop_daemon();
 }
 
 fn cloud_generation(upstream: &RemoteServer, workspace: [u8; 32]) -> u64 {

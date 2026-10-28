@@ -97,6 +97,7 @@ struct CapturedScope {
     authority: Authority,
     overlays: BTreeMap<m::CommitId, Arc<Vec<u8>>>,
     _parent: Option<Arc<CapturedScope>>,
+    _source_read: Option<Arc<crate::ledger::offload::CloudReadLease>>,
     _memory: OwnedSemaphorePermit,
 }
 impl CapturedScope {
@@ -1110,12 +1111,9 @@ impl RemoteQueryIo {
                             <= self.inner.config.remote.limits.max_request_bytes,
                         tonic::Status::resource_exhausted("native query literals exceeded")
                     );
-                    let candidates = v
-                        .candidates
-                        .as_deref()
-                        .ok_or_else(|| {
-                            tonic::Status::invalid_argument("native changed-path candidates missing")
-                        })?;
+                    let candidates = v.candidates.as_deref().ok_or_else(|| {
+                        tonic::Status::invalid_argument("native changed-path candidates missing")
+                    })?;
                     pending.push((candidates, depth + 1));
                 }
                 E::Heads(v) | E::Roots(v) | E::HasConflict(v) => {
@@ -1466,6 +1464,21 @@ impl NativeQueryIo for RemoteQueryIo {
                     ledger.cloud_query_authority(input.source, &captured)
                 })
                 .await?;
+                if crate::cloud::captured_manifest(proof.manifest()) {
+                    crate::retained_offload::adopt_query_source_pin(
+                        &this.inner,
+                        operation.clone(),
+                        &rpc,
+                        authority.clone(),
+                    )
+                    .await?;
+                }
+                let ledger = this.inner.ledger.clone();
+                let selected = authority.clone();
+                let source_read = io::blocking_owned(operation.clone(), move || {
+                    ledger.retain_cloud_query_read(&selected)
+                })
+                .await?;
                 Ok(Arc::new(CapturedScope {
                     annotation: Mutex::new(AnnotationRecord::default()),
                     client,
@@ -1473,6 +1486,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     authority: Authority::CloudQuery(authority),
                     overlays,
                     _parent: None,
+                    _source_read: Some(source_read),
                     _memory: charge,
                 }))
             }
@@ -1599,6 +1613,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     authority: Authority::Query(authority),
                     overlays,
                     _parent: None,
+                    _source_read: None,
                     _memory: charge,
                 }))
             }
@@ -1738,6 +1753,7 @@ impl NativeQueryIo for RemoteQueryIo {
                     authority: parent.authority.clone(),
                     overlays,
                     _parent: Some(parent),
+                    _source_read: None,
                     _memory: charge,
                 }))
             }

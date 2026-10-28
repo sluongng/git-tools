@@ -41,8 +41,8 @@ impl OffloadPinLease {
     }
 }
 pub(crate) struct CloudReadLease {
-    _ledger: Arc<Ledger>,
-    _authority: String,
+    pub(super) _ledger: Arc<Ledger>,
+    pub(super) _authority: String,
 }
 pub(crate) fn root_digest(roots: &[ObjectKey]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
@@ -117,6 +117,181 @@ pub(super) fn validate_saved_pins(
     }
     Ok(())
 }
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum SourcePinPhase {
+    AcquirePending,
+    Active,
+    ReleasePending,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum SourcePinAuthority {
+    File(CloudVersionAuthority),
+    Query(CloudQueryAuthority),
+}
+impl SourcePinAuthority {
+    pub(crate) fn id(&self) -> String {
+        match self {
+            Self::File(a) => a.id().into(),
+            Self::Query(a) => a.key(),
+        }
+    }
+    fn identity(&self) -> Result<String> {
+        match self {
+            Self::File(a) => a.identity(),
+            Self::Query(a) => Ok(format!("cq/{}", a.identity()?)),
+        }
+    }
+    fn binding(&self) -> &str {
+        match self {
+            Self::File(a) => &a.binding,
+            Self::Query(a) => a.binding(),
+        }
+    }
+    pub(crate) fn selector(&self) -> tinytree_client::RetainedVersionSelector {
+        match self {
+            Self::File(a) => a.selector(),
+            Self::Query(a) => a.selector(),
+        }
+    }
+    pub(crate) fn selected(&self) -> tinytree_client::CloudRawDigest {
+        match self {
+            Self::File(a) => a.selected(),
+            Self::Query(a) => a.selected_raw(),
+        }
+    }
+    pub(crate) fn agrees(&self, proof: &tinytree_client::VerifiedRetainedVersion) -> bool {
+        match self {
+            Self::File(a) => a.agrees(proof),
+            Self::Query(a) => a.agrees(proof),
+        }
+    }
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourcePin {
+    version: u8,
+    pub authority: SourcePinAuthority,
+    pub nonce: [u8; 16],
+    pub acquire_not_after_unix_seconds: i64,
+    pub ordinal: u64,
+    pub phase: SourcePinPhase,
+}
+impl SourcePin {
+    pub(crate) fn identity(&self) -> tinytree_client::CloudVersionPinIdentity {
+        tinytree_client::CloudVersionPinIdentity {
+            pin_id: self.nonce,
+            acquire_not_after_unix_seconds: self.acquire_not_after_unix_seconds,
+        }
+    }
+}
+fn source_pin_admission_deadline() -> Result<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .try_into()
+        .ok()
+        .and_then(|now: i64| now.checked_add(120))
+        .context("retained source pin admission clock invalid")
+}
+fn source_pin_limit(config: &Config) -> usize {
+    config
+        .query
+        .max_authorities
+        .saturating_add(config.max_pending_operations)
+}
+pub(super) fn validate_saved_source_pins(
+    db: &fjall::SingleWriterTxDatabase,
+    meta: &fjall::SingleWriterTxKeyspace,
+    pins: &fjall::SingleWriterTxKeyspace,
+    authorities: &fjall::SingleWriterTxKeyspace,
+    query_authorities: &fjall::SingleWriterTxKeyspace,
+    config: &Config,
+) -> Result<()> {
+    let sequence: u64 = db
+        .read_tx()
+        .get(meta, b"source-pin-sequence")?
+        .map(|v| serde_json::from_slice(&v))
+        .transpose()?
+        .unwrap_or(0);
+    let mut nonces = HashSet::new();
+    let mut ordinals = HashSet::new();
+    let mut pending = 0usize;
+    let mut active = 0usize;
+    for entry in db.read_tx().iter(pins) {
+        ensure!(
+            nonces.len() < source_pin_limit(config),
+            "retained source pin count exceeded"
+        );
+        let (key, raw) = entry.into_inner()?;
+        ensure!(
+            raw.len()
+                <= config
+                    .max_admitted_roots
+                    .saturating_add(256)
+                    .saturating_mul(256)
+                    .saturating_add(16_384),
+            "retained source pin encoding exceeds bound"
+        );
+        let pin: SourcePin = serde_json::from_slice(&raw)?;
+        ensure!(
+            pin.version == 2
+                && pin.acquire_not_after_unix_seconds > 0
+                && pin.nonce != [0; 16]
+                && nonces.insert(pin.nonce)
+                && pin.ordinal > 0
+                && pin.ordinal <= sequence
+                && ordinals.insert(pin.ordinal)
+                && pin.authority.id() == pin.authority.identity()?
+                && key.as_ref() == pin.authority.id().as_bytes(),
+            "retained source pin corrupt"
+        );
+        if pin.phase == SourcePinPhase::Active {
+            active += 1;
+            let space = match &pin.authority {
+                SourcePinAuthority::File(_) => authorities,
+                SourcePinAuthority::Query(_) => query_authorities,
+            };
+            let authority_key = match &pin.authority {
+                SourcePinAuthority::File(a) => a.id(),
+                SourcePinAuthority::Query(a) => a.id(),
+            };
+            let authority = db
+                .read_tx()
+                .get(space, authority_key.as_bytes())?
+                .context("active source authority missing")?;
+            ensure!(
+                authority.as_ref()
+                    == match &pin.authority {
+                        SourcePinAuthority::File(a) => serde_json::to_vec(a)?,
+                        SourcePinAuthority::Query(a) => serde_json::to_vec(a)?,
+                    }
+                    .as_slice(),
+                "active source authority changed"
+            );
+        } else {
+            pending += 1;
+            if pin.phase == SourcePinPhase::ReleasePending {
+                ensure!(
+                    match &pin.authority {
+                        SourcePinAuthority::File(a) =>
+                            db.read_tx().get(authorities, a.id().as_bytes())?,
+                        SourcePinAuthority::Query(a) =>
+                            db.read_tx().get(query_authorities, a.id().as_bytes())?,
+                    }
+                    .is_none(),
+                    "released source authority remains installed"
+                );
+            }
+        }
+        ensure!(
+            active <= config.query.max_authorities && pending <= config.max_pending_operations,
+            "retained source pin state count exceeded"
+        );
+    }
+    Ok(())
+}
+
 impl Ledger {
     fn enable_offload_locked(&self) -> Result<()> {
         self.check()?;
@@ -125,7 +300,7 @@ impl Ledger {
             .read_tx()
             .get(&self.meta, b"format")?
             .context("native feature gate missing")?;
-        if format.as_ref() == OFFLOAD_FORMAT {
+        if format.as_ref() == OFFLOAD_FORMAT || format.as_ref() == SOURCE_PIN_FORMAT {
             return Ok(());
         }
         ensure!(
@@ -153,6 +328,271 @@ impl Ledger {
         }
         Ok(())
     }
+    pub(crate) fn source_pins(&self) -> Result<Vec<SourcePin>> {
+        let rows = self.list::<SourcePin>(&self.source_pins, source_pin_limit(&self.config))?;
+        for pin in &rows {
+            ensure!(
+                pin.version == 2
+                    && pin.acquire_not_after_unix_seconds > 0
+                    && pin.nonce != [0; 16]
+                    && pin.ordinal > 0
+                    && pin.authority.identity()? == pin.authority.id()
+                    && pin.authority.binding() == self.binding.scope,
+                "retained source pin binding changed"
+            );
+        }
+        Ok(rows)
+    }
+    /// Snapshot only installed sources in this publication workspace. The final
+    /// pass rechecks all still-installed authorities under the same ledger gate;
+    /// a changed acquisition row is not an acknowledgement of protection.
+    pub(crate) fn source_pins_before_publish(
+        &self,
+        workspace: [u8; 32],
+        require_active: bool,
+    ) -> Result<Vec<SourcePin>> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.check()?;
+        let authorities = self
+            .cloud_authorities()?
+            .into_iter()
+            .map(SourcePinAuthority::File)
+            .chain(
+                self.cloud_query_authorities()?
+                    .into_iter()
+                    .map(SourcePinAuthority::Query),
+            );
+        let mut pending = Vec::new();
+        for authority in authorities {
+            if authority.selector().workspace_id != workspace {
+                continue;
+            }
+            let saved = self.get::<SourcePin>(&self.source_pins, authority.id().as_bytes())?;
+            if require_active {
+                ensure!(
+                    saved.as_ref().is_some_and(|pin| {
+                        pin.authority == authority && pin.phase == SourcePinPhase::Active
+                    }),
+                    "publication source authority has no confirmed backend pin"
+                );
+            } else if let Some(pin) = saved {
+                ensure!(pin.authority == authority, "publication source pin changed");
+                if pin.phase == SourcePinPhase::AcquirePending {
+                    pending.push(pin);
+                }
+            }
+        }
+        pending.sort_by_key(|pin| std::cmp::Reverse(pin.ordinal));
+        Ok(pending)
+    }
+    pub(crate) fn prepare_offload_source_pin(
+        &self,
+        proof: &tinytree_client::VerifiedRetainedVersion,
+        roots: &[ObjectKey],
+    ) -> Result<SourcePin> {
+        self.prepare_source_pin(&SourcePinAuthority::File(
+            self.make_cloud_authority(proof, roots)?,
+        ))
+    }
+    pub(crate) fn source_pin_unchanged(&self, expected: &SourcePin) -> Result<bool> {
+        self.check()?;
+        Ok(self
+            .get::<SourcePin>(&self.source_pins, expected.authority.id().as_bytes())?
+            .as_ref()
+            == Some(expected))
+    }
+    pub(crate) fn prepare_source_pin(&self, authority: &SourcePinAuthority) -> Result<SourcePin> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.enable_offload_locked()?;
+        ensure!(
+            authority.identity()? == authority.id() && authority.binding() == self.binding.scope,
+            "retained source authority binding changed"
+        );
+        if let Some(saved) = self.get::<SourcePin>(&self.source_pins, authority.id().as_bytes())? {
+            ensure!(
+                saved.authority == *authority && saved.phase != SourcePinPhase::ReleasePending,
+                "retained source release must finish before reacquisition"
+            );
+            return Ok(saved);
+        }
+        let rows = self.source_pins()?;
+        ensure!(
+            rows.len() < source_pin_limit(&self.config)
+                && rows
+                    .iter()
+                    .filter(|p| p.phase != SourcePinPhase::Active)
+                    .count()
+                    < self.config.max_pending_operations,
+            "retained source pin outbox full"
+        );
+        let sequence: u64 = self.get(&self.meta, b"source-pin-sequence")?.unwrap_or(0);
+        let ordinal = sequence
+            .checked_add(1)
+            .context("retained source pin sequence exhausted")?;
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
+        ensure!(
+            nonce != [0; 16] && rows.iter().all(|p| p.nonce != nonce),
+            "retained source nonce collision"
+        );
+        let pin = SourcePin {
+            version: 2,
+            authority: authority.clone(),
+            nonce,
+            acquire_not_after_unix_seconds: source_pin_admission_deadline()?,
+            ordinal,
+            phase: SourcePinPhase::AcquirePending,
+        };
+        self.write_locked_with_format(
+            vec![
+                (
+                    &self.meta,
+                    b"source-pin-sequence".to_vec(),
+                    Some(serde_json::to_vec(&ordinal)?),
+                ),
+                (
+                    &self.source_pins,
+                    authority.id().as_bytes().to_vec(),
+                    Some(serde_json::to_vec(&pin)?),
+                ),
+            ],
+            Some(SOURCE_PIN_FORMAT),
+        )?;
+        if let Err(error) = self._directory.replace(MARKER, SOURCE_PIN_FORMAT) {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(pin)
+    }
+    /// Called only after Acquire proves the old identity durably terminal. An
+    /// installed legacy authority keeps all provenance and gets a new pending
+    /// intent for a later request; an unreferenced intent may instead be cleared.
+    /// Active pins and uncertain identities are never renewed here.
+    pub(crate) fn acknowledge_expired_acquisition(&self, expected: &SourcePin) -> Result<bool> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.check()?;
+        if expected.phase != SourcePinPhase::AcquirePending {
+            return Ok(false);
+        }
+        let key = expected.authority.id();
+        if self
+            .get::<SourcePin>(&self.source_pins, key.as_bytes())?
+            .as_ref()
+            != Some(expected)
+        {
+            return Ok(false);
+        }
+        let installed = match &expected.authority {
+            SourcePinAuthority::File(authority) => self
+                .cloud_authority(authority.id())?
+                .map(|saved| SourcePinAuthority::File(saved)),
+            SourcePinAuthority::Query(authority) => self
+                .cloud_query(authority.id())?
+                .map(|saved| SourcePinAuthority::Query(saved)),
+        };
+        if let Some(installed) = installed {
+            ensure!(
+                installed == expected.authority,
+                "terminal acquisition authority changed"
+            );
+            let mut next = expected.clone();
+            next.nonce = *uuid::Uuid::new_v4().as_bytes();
+            ensure!(
+                next.nonce != [0; 16]
+                    && self
+                        .source_pins()?
+                        .iter()
+                        .all(|pin| pin.nonce != next.nonce),
+                "retained source nonce collision"
+            );
+            next.acquire_not_after_unix_seconds = source_pin_admission_deadline()?;
+            // Retain the original source ordinal: retrying an old adoption does
+            // not make it a newer source eligible to supersede later captures.
+            self.write_locked(vec![(
+                &self.source_pins,
+                key.into_bytes(),
+                Some(serde_json::to_vec(&next)?),
+            )])?;
+            return Ok(true);
+        }
+        let (id, name) = match &expected.authority {
+            SourcePinAuthority::File(a) => (a.id(), a.key()),
+            SourcePinAuthority::Query(a) => (a.id(), a.key()),
+        };
+        if self.cloud_authority(id)?.is_some()
+            || self.cloud_query(id)?.is_some()
+            || self
+                .offload_pins()?
+                .iter()
+                .any(|pin| hex(&pin.witness.authority) == id)
+            || self
+                .db
+                .read_tx()
+                .get(&self.progress, name.as_bytes())?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let reads = self
+            .cloud_read_owners
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("retained read ownership busy"))?;
+        if reads.get(&key).and_then(Weak::upgrade).is_some() {
+            return Ok(false);
+        }
+        let prefix = format!("{name}/");
+        for space in [&self.members, &self.references, &self.query_grants] {
+            if let Some(entry) = self.db.read_tx().prefix(space, prefix.as_bytes()).next() {
+                entry.into_inner()?;
+                return Ok(false);
+            }
+        }
+        for (count, entry) in self.db.read_tx().iter(&self.files).enumerate() {
+            ensure!(
+                count < self.config.max_file_index_entries,
+                "retained FILE claim count exceeded"
+            );
+            let (_, raw) = entry.into_inner()?;
+            let claim: FileClaim = serde_json::from_slice(&raw)?;
+            if claim.root == name {
+                return Ok(false);
+            }
+        }
+        self.write_locked(vec![(&self.source_pins, key.into_bytes(), None)])?;
+        drop(reads);
+        Ok(true)
+    }
+    pub(crate) fn acknowledge_source_release(&self, expected: &SourcePin) -> Result<bool> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        ensure!(
+            expected.phase == SourcePinPhase::ReleasePending
+                && expected.authority.binding() == self.binding.scope,
+            "retained source release binding changed"
+        );
+        let current =
+            self.get::<SourcePin>(&self.source_pins, expected.authority.id().as_bytes())?;
+        if current.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        self.write_locked(vec![(
+            &self.source_pins,
+            expected.authority.id().as_bytes().to_vec(),
+            None,
+        )])?;
+        Ok(true)
+    }
     pub(crate) fn pinned_cloud_authority(
         &self,
         capture: [u8; 32],
@@ -169,24 +609,6 @@ impl Ledger {
         }
         Ok(None)
     }
-    pub(crate) fn reusable_cloud_authority(
-        &self,
-        roots: &[ObjectKey],
-    ) -> Result<Option<CloudVersionAuthority>> {
-        for authority in self.cloud_authorities()? {
-            if !self.valid_cloud_authority(&authority)? {
-                continue;
-            }
-            let mut covers = true;
-            for root in roots {
-                covers &= intrinsic(*root) || authority.terminal(*root)?;
-            }
-            if covers {
-                return Ok(Some(authority));
-            }
-        }
-        Ok(None)
-    }
     pub(crate) fn retain_cloud_read(
         self: &Arc<Self>,
         authority: &CloudVersionAuthority,
@@ -199,19 +621,25 @@ impl Ledger {
             self.valid_cloud_authority(authority)?,
             "retained read source changed"
         );
+        self.retain_source_read_locked(authority.id().into())
+    }
+    pub(super) fn retain_source_read_locked(
+        self: &Arc<Self>,
+        key: String,
+    ) -> Result<Arc<CloudReadLease>> {
         let mut owners = self
             .cloud_read_owners
             .try_lock()
             .map_err(|_| anyhow::anyhow!("retained read ownership busy"))?;
         owners.retain(|_, owner| owner.strong_count() != 0);
-        if let Some(owner) = owners.get(authority.id()).and_then(Weak::upgrade) {
+        if let Some(owner) = owners.get(&key).and_then(Weak::upgrade) {
             return Ok(owner);
         }
         let owner = Arc::new(CloudReadLease {
             _ledger: self.clone(),
-            _authority: authority.id().into(),
+            _authority: key.clone(),
         });
-        owners.insert(authority.id().into(), Arc::downgrade(&owner));
+        owners.insert(key, Arc::downgrade(&owner));
         Ok(owner)
     }
     fn offload_pins(&self) -> Result<Vec<OffloadPin>> {
@@ -240,6 +668,7 @@ impl Ledger {
         &self,
         proof: &tinytree_client::VerifiedRetainedVersion,
         roots: &[ObjectKey],
+        pin: &SourcePin,
     ) -> Result<CloudVersionAuthority> {
         let authority = self.make_cloud_authority(proof, roots)?;
         let _gate = self
@@ -247,10 +676,21 @@ impl Ledger {
             .lock()
             .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
         self.enable_offload_locked()?;
-        if let Some(existing) = self.cloud_authority(authority.id())? {
-            ensure!(existing == authority, "retained authority identity changed");
-            return Ok(existing);
-        }
+        let existing = self.cloud_authority(authority.id())?;
+        ensure!(
+            existing.as_ref().is_none_or(|a| *a == authority),
+            "retained authority identity changed"
+        );
+        let saved = self
+            .get::<SourcePin>(&self.source_pins, authority.id().as_bytes())?
+            .context("retained source acquisition intent missing")?;
+        ensure!(
+            &saved == pin
+                && pin.authority == SourcePinAuthority::File(authority.clone())
+                && pin.phase != SourcePinPhase::ReleasePending,
+            "retained source acquisition intent changed"
+        );
+        let source_pins = self.source_pins()?;
         let pins = self.offload_pins()?;
         let reads = self
             .cloud_read_owners
@@ -258,7 +698,15 @@ impl Ledger {
             .map_err(|_| anyhow::anyhow!("retained read ownership busy"))?;
         let mut victims = Vec::new();
         for old in self.cloud_authorities()? {
-            if !self.valid_cloud_authority(&old)?
+            let Some(_) = source_pins.iter().find(|p| {
+                p.authority == SourcePinAuthority::File(old.clone())
+                    && p.phase == SourcePinPhase::Active
+                    && p.ordinal < pin.ordinal
+            }) else {
+                continue;
+            };
+            if old.id() == authority.id()
+                || !self.valid_cloud_authority(&old)?
                 || pins.iter().any(|p| hex(&p.witness.authority) == old.id())
                 || reads.get(old.id()).and_then(Weak::upgrade).is_some()
             {
@@ -274,16 +722,31 @@ impl Ledger {
             }
         }
         ensure!(
-            self.authority_count()?.saturating_sub(victims.len())
-                < self.config.query.max_authorities,
+            self.authority_count()?
+                .saturating_sub(victims.len())
+                .saturating_add(usize::from(existing.is_none()))
+                <= self.config.query.max_authorities,
             "native authority count exceeded"
+        );
+        let pending = source_pins
+            .iter()
+            .filter(|p| p.phase != SourcePinPhase::Active)
+            .count();
+        ensure!(
+            pending
+                .saturating_sub(usize::from(pin.phase == SourcePinPhase::AcquirePending))
+                .saturating_add(victims.len())
+                <= self.config.max_pending_operations,
+            "retained source release outbox full"
         );
         let name = authority.key();
         let mut changes = Vec::new();
         let mut copied: BTreeMap<(u8, Vec<u8>), Vec<u8>> = BTreeMap::new();
         let mut charged = 0usize;
         let mut rows = 0usize;
-        let mut progress = Progress::default();
+        let mut progress = self
+            .get::<Progress>(&self.progress, name.as_bytes())?
+            .unwrap_or_default();
         let mut sum = |value: Progress| -> Result<()> {
             progress.objects = progress
                 .objects
@@ -337,11 +800,16 @@ impl Ledger {
                     );
                     let mut new_key = format!("{name}/").into_bytes();
                     new_key.extend_from_slice(&key[prefix.len()..]);
-                    if let Some(previous) = copied.get(&(number, new_key.clone())) {
+                    let destination = self.db.read_tx().get(space, &new_key)?;
+                    if let Some(previous) = destination
+                        .as_ref()
+                        .map(|v| v.as_ref())
+                        .or_else(|| copied.get(&(number, new_key.clone())).map(Vec::as_slice))
+                    {
                         // Two real canonical paths can name different parents.
                         // Keep the first path; descriptors/grants must agree.
                         ensure!(
-                            number == 1 || previous.as_slice() == value.as_ref(),
+                            number == 1 || previous == value.as_ref(),
                             "retained compaction descriptor mismatch"
                         );
                     } else {
@@ -355,6 +823,17 @@ impl Ledger {
                 changes.push((&self.progress, old_name.as_bytes().to_vec(), None));
             }
             changes.push((&self.cloud_authorities, old.id().as_bytes().to_vec(), None));
+            let mut released = source_pins
+                .iter()
+                .find(|p| p.authority == SourcePinAuthority::File(old.clone()))
+                .context("retained victim pin missing")?
+                .clone();
+            released.phase = SourcePinPhase::ReleasePending;
+            changes.push((
+                &self.source_pins,
+                old.id().as_bytes().to_vec(),
+                Some(serde_json::to_vec(&released)?),
+            ));
         }
         drop(sum);
         changes.push((
@@ -405,6 +884,13 @@ impl Ledger {
                 changes.push((&self.files, key.to_vec(), Some(serde_json::to_vec(&claim)?)));
             }
         }
+        let mut active = pin.clone();
+        active.phase = SourcePinPhase::Active;
+        changes.push((
+            &self.source_pins,
+            authority.id().as_bytes().to_vec(),
+            Some(serde_json::to_vec(&active)?),
+        ));
         self.write_locked(changes)?;
         drop(reads);
         Ok(authority)

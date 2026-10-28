@@ -20,6 +20,104 @@ pub use native::{RetainedVersionSelector, VerifiedRetainedVersion};
 use serde::{Deserialize, Serialize};
 use tinytree_proto::cloud_v1 as c;
 
+/// Persist this complete identity before the first request. Its admission fence
+/// must not be renewed when retrying an uncertain operation; active pins do not
+/// expire when this time passes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudVersionPinIdentity {
+    pub pin_id: [u8; 16],
+    pub acquire_not_after_unix_seconds: i64,
+}
+impl CloudVersionPinIdentity {
+    fn check(self) -> Result<(), Status> {
+        if self.pin_id == [0; 16] || self.acquire_not_after_unix_seconds <= 0 {
+            return Err(Status::invalid_argument("invalid cloud pin identity"));
+        }
+        Ok(())
+    }
+}
+/// Durable job pin. No Drop path releases server retention; release is explicit.
+#[derive(Debug)]
+pub struct CloudVersionPin {
+    pub identity: CloudVersionPinIdentity,
+    pub version: VerifiedRetainedVersion,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudPinSelection {
+    LatestCaptured,
+    Generation(u64),
+    Exact {
+        selector: RetainedVersionSelector,
+        selected: CloudRawDigest,
+    },
+}
+fn exact_pin_wire(
+    selector: RetainedVersionSelector,
+    selected: CloudRawDigest,
+) -> Result<c::ExactVersionSelection, Status> {
+    if selector.generation == 0 || selected.size_bytes == 0 {
+        return Err(Status::invalid_argument("invalid cloud pin selector"));
+    }
+    Ok(c::ExactVersionSelection {
+        version: Some(c::RetainedVersionSelector {
+            workspace_id: selector.workspace_id.to_vec(),
+            generation: selector.generation,
+            manifest_id: selector.manifest_id.0.to_vec(),
+        }),
+        manifest_selected: Some(c::RawDigest {
+            blake3: selected.blake3.to_vec(),
+            size_bytes: selected.size_bytes,
+        }),
+    })
+}
+
+/// Explicit structured replay identity. Its display token is not authority and
+/// never changes a legacy publication's namespace by textual resemblance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloudPublicationIdentity {
+    pub workspace_id: [u8; 32],
+    pub generation: u64,
+    pub nonce: [u8; 16],
+}
+impl CloudPublicationIdentity {
+    pub fn token(self) -> String {
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        format!(
+            "r2-{}-{:016x}-{}",
+            hex(&self.workspace_id),
+            self.generation,
+            hex(&self.nonce)
+        )
+    }
+    fn wire(self) -> c::PublicationIdentity {
+        c::PublicationIdentity {
+            workspace_id: self.workspace_id.to_vec(),
+            target_generation: self.generation,
+            nonce: self.nonce.to_vec(),
+        }
+    }
+    fn check_intent(self, intent: &CloudPublishIntent) -> Result<(), Status> {
+        self.check(&intent.idempotency_key)?;
+        if self.workspace_id != intent.workspace_id
+            || Some(self.generation) != intent.expected_generation.checked_add(1)
+        {
+            return Err(Status::invalid_argument(
+                "invalid structured cloud publication binding",
+            ));
+        }
+        Ok(())
+    }
+    fn check(self, token: &str) -> Result<(), Status> {
+        if self.generation == 0 || token != self.token() {
+            return Err(Status::invalid_argument(
+                "invalid structured cloud publication binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudLimits {
@@ -254,6 +352,8 @@ pub struct CloudVersionPage {
     pub workspace: CloudWorkspace,
     pub versions: Vec<CloudVersionSummary>,
     pub through_generation: u64,
+    pub retired_through: u64,
+    pub retention_revision: u64,
     pub continuation: Vec<u8>,
 }
 fn discovery_cursor(
@@ -267,14 +367,17 @@ fn discovery_cursor(
     if cursor.is_empty() {
         return Ok(None);
     }
-    if cursor.len() != 74 || cursor[..2] != [1, domain] {
+    let cursor_bytes = if domain == 2 { 82 } else { 74 };
+    if cursor.len() != cursor_bytes || cursor[..2] != [1, domain] {
         return Err(Status::invalid_argument("cloud discovery continuation"));
     }
     let id: [u8; 32] = cursor[34..66].try_into().unwrap();
-    let ceiling = u64::from_be_bytes(cursor[66..].try_into().unwrap());
+    let ceiling = u64::from_be_bytes(cursor[66..74].try_into().unwrap());
     if (domain == 1 && ceiling != 0)
         || (domain == 2
-            && (id[8..] != [0; 24]
+            && (id[16..] != [0; 16]
+                || u64::from_be_bytes(id[8..16].try_into().unwrap())
+                    > u64::from_be_bytes(id[..8].try_into().unwrap())
                 || ceiling == 0
                 || u64::from_be_bytes(id[..8].try_into().unwrap()) == 0
                 || u64::from_be_bytes(id[..8].try_into().unwrap()) >= ceiling))
@@ -302,6 +405,7 @@ fn check_discovery_next(
         || Some(position) != last
         || c != ceiling
         || (!before.is_empty() && next[2..34] != before[2..34])
+        || (domain == 2 && !before.is_empty() && next[74..82] != before[74..82])
     {
         return Err(corrupt());
     }
@@ -787,9 +891,23 @@ impl NativeClient {
         let current = workspace(value.workspace.ok_or_else(corrupt)?, id)?;
         let (old, ceiling) = after
             .map(|(id, c)| (u64::from_be_bytes(id[..8].try_into().unwrap()), c))
-            .unwrap_or((0, current.generation));
+            .unwrap_or((value.retired_through, current.generation));
         if value.through_generation != ceiling
             || ceiling > current.generation
+            || value.retired_through > old
+            || after.is_some_and(|(position, _)| {
+                u64::from_be_bytes(position[8..16].try_into().unwrap()) != value.retired_through
+            })
+            || value.retired_through > ceiling
+            || (ceiling > 0 && value.retired_through == ceiling)
+            || (!continuation.is_empty()
+                && u64::from_be_bytes(continuation[74..82].try_into().unwrap())
+                    != value.retention_revision)
+            || (!value.continuation.is_empty()
+                && discovery_cursor(&value.continuation, 2, page_size).is_err())
+            || (!value.continuation.is_empty()
+                && u64::from_be_bytes(value.continuation[74..82].try_into().unwrap())
+                    != value.retention_revision)
             || value.versions.len() > page_size
         {
             return Err(corrupt());
@@ -838,6 +956,7 @@ impl NativeClient {
         }
         let mut position = [0; 32];
         position[..8].copy_from_slice(&last.to_be_bytes());
+        position[8..16].copy_from_slice(&value.retired_through.to_be_bytes());
         check_discovery_next(
             &value.continuation,
             continuation,
@@ -851,6 +970,8 @@ impl NativeClient {
             workspace: current,
             versions,
             through_generation: ceiling,
+            retired_through: value.retired_through,
+            retention_revision: value.retention_revision,
             continuation: value.continuation,
         })
     }
@@ -858,8 +979,12 @@ impl NativeClient {
         &self,
         key_value: &str,
         deadline: Instant,
+        identity: Option<CloudPublicationIdentity>,
     ) -> Result<Option<CloudPublication>, Status> {
         key(key_value)?;
+        if let Some(identity) = identity {
+            identity.check(key_value)?;
+        }
         let (value, _budget) = self
             .cloud_call(
                 deadline,
@@ -870,6 +995,7 @@ impl NativeClient {
                 || c::GetPublicationRequest {
                     repository_id: self.inner.config.repository_id.clone(),
                     idempotency_key: key_value.into(),
+                    publication_identity: identity.map(CloudPublicationIdentity::wire),
                 },
             )
             .await?;
@@ -882,6 +1008,11 @@ impl NativeClient {
                 }
                 let state = value.workspace.ok_or_else(corrupt)?;
                 let id = array(&state.workspace_id)?;
+                if identity.is_some_and(|identity| {
+                    identity.workspace_id != id || identity.generation != state.generation
+                }) {
+                    return Err(corrupt());
+                }
                 Ok(CloudPublication {
                     idempotency_key: value.idempotency_key,
                     workspace: workspace(state, id)?,
@@ -893,7 +1024,220 @@ impl NativeClient {
         &self,
         key_value: &str,
     ) -> Result<Option<CloudPublication>, Status> {
-        self.cloud_publication_at(key_value, self.deadline()).await
+        self.cloud_publication_at(key_value, self.deadline(), None)
+            .await
+    }
+    async fn require_structured_publication(&self, deadline: Instant) -> Result<(), Status> {
+        let capabilities = self
+            .clone()
+            .with_operation_deadline(deadline)
+            .capabilities(&[crate::CapabilityFeature::StructuredCloudPublicationV2])
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) {
+                    Status::unimplemented("structured cloud publication is not supported")
+                } else {
+                    error
+                }
+            })?;
+        let feature = capabilities.features[0];
+        if !feature.authorized {
+            return Err(Status::permission_denied(
+                "structured cloud publication is not authorized",
+            ));
+        }
+        if !feature.supported {
+            return Err(Status::unimplemented(
+                "structured cloud publication is not supported",
+            ));
+        }
+        Ok(())
+    }
+    async fn require_version_pin(&self, deadline: Instant) -> Result<(), Status> {
+        let caps = self
+            .clone()
+            .with_operation_deadline(deadline)
+            .capabilities(&[crate::CapabilityFeature::DurableCloudVersionPinV1])
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) {
+                    Status::unimplemented("durable cloud version pins are not supported")
+                } else if error.code() == tonic::Code::OutOfRange {
+                    // A capability error says nothing about this pin identity.
+                    Status::failed_precondition("cloud pin capability negotiation unavailable")
+                } else {
+                    error
+                }
+            })?;
+        if !caps.features[0].authorized {
+            return Err(Status::permission_denied(
+                "durable cloud version pins are not authorized",
+            ));
+        }
+        if !caps.features[0].supported {
+            return Err(Status::unimplemented(
+                "durable cloud version pins are not supported",
+            ));
+        }
+        Ok(())
+    }
+    /// Acquire or replay one persisted admission identity. `OutOfRange` from
+    /// this method is reserved for the server's durable terminal identity fence
+    /// (released, or admission expired with no active pin). Source unavailability
+    /// uses other codes and does not establish that an older worker cannot commit.
+    /// A caller may retire an uncertain pending row only when that terminal
+    /// result is combined with absence of local authorities and physical claims.
+    pub async fn acquire_cloud_version_pin(
+        &self,
+        workspace_id: [u8; 32],
+        identity: CloudVersionPinIdentity,
+        selection: CloudPinSelection,
+    ) -> Result<CloudVersionPin, Status> {
+        identity.check()?;
+        let deadline = self.deadline();
+        use c::acquire_version_pin_request::Selection;
+        let (wire, maximum) = match selection {
+            CloudPinSelection::LatestCaptured => {
+                (Selection::LatestCaptured(true), self.cloud_version_maximum()?)
+            }
+            CloudPinSelection::Generation(generation) if generation > 0 => {
+                (Selection::Generation(generation), self.cloud_version_maximum()?)
+            }
+            CloudPinSelection::Exact { selector, selected }
+                if selector.workspace_id == workspace_id =>
+            {
+                let wire = exact_pin_wire(selector, selected)?;
+                // Exact selection already binds the response bytes. Reserve that
+                // checked bound rather than a discovery-sized arena, so retained
+                // capture/query authorities can coexist with reattachment.
+                let maximum = usize::try_from(selected.size_bytes).map_err(|_| limit())?;
+                if maximum > self.inner.config.cloud.max_manifest_bytes {
+                    return Err(limit());
+                }
+                (Selection::Exact(wire), maximum)
+            }
+            _ => return Err(Status::invalid_argument("invalid cloud pin selection")),
+        };
+        self.require_version_pin(deadline).await?;
+        self.cloud_payload_fits(maximum, self.cloud_memory(maximum + 4096)?)?;
+        let retained = self.cloud_retained(maximum)?;
+        let (value, budget): (c::VersionPin, _) = self
+            .cloud_call(
+                deadline,
+                "/tinytree.cloud.v1.WorkspaceCloud/AcquireVersionPin",
+                Shape::CloudVersionPin,
+                maximum + 4096,
+                4096,
+                || c::AcquireVersionPinRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    workspace_id: workspace_id.to_vec(),
+                    pin_id: identity.pin_id.to_vec(),
+                    acquire_not_after_unix_seconds: identity.acquire_not_after_unix_seconds,
+                    selection: Some(wire.clone()),
+                },
+            )
+            .await?;
+        if value.pin_id.as_slice() != identity.pin_id
+            || value.acquire_not_after_unix_seconds != identity.acquire_not_after_unix_seconds
+        {
+            return Err(corrupt());
+        }
+        let expected_generation = match selection {
+            CloudPinSelection::LatestCaptured => None,
+            CloudPinSelection::Generation(generation) => Some(generation),
+            CloudPinSelection::Exact { selector, .. } => Some(selector.generation),
+        };
+        let version = self
+            .finish_cloud_version(
+                value.version.ok_or_else(corrupt)?,
+                budget,
+                retained,
+                workspace_id,
+                expected_generation,
+                maximum,
+                deadline,
+            )
+            .await?;
+        if let CloudPinSelection::Exact { selector, selected } = selection {
+            if version.manifest_id != selector.manifest_id
+                || CloudRawDigest::of(version.manifest()) != selected
+            {
+                return Err(corrupt());
+            }
+        }
+        if !capture::is_v3(version.manifest()) {
+            return Err(corrupt());
+        }
+        Ok(CloudVersionPin {
+            identity,
+            version: self.checked_retained_version(version)?,
+        })
+    }
+    pub async fn release_cloud_version_pin(
+        &self,
+        identity: CloudVersionPinIdentity,
+        selector: RetainedVersionSelector,
+        selected: CloudRawDigest,
+    ) -> Result<(), Status> {
+        identity.check()?;
+        let deadline = self.deadline();
+        let exact = exact_pin_wire(selector, selected)?;
+        self.require_version_pin(deadline).await?;
+        let (value, _budget): (c::VersionPinReleased, _) = self
+            .cloud_call(
+                deadline,
+                "/tinytree.cloud.v1.WorkspaceCloud/ReleaseVersionPin",
+                Shape::CloudPinReleased,
+                1024,
+                4096,
+                || c::ReleaseVersionPinRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    pin_id: identity.pin_id.to_vec(),
+                    acquire_not_after_unix_seconds: identity.acquire_not_after_unix_seconds,
+                    exact: Some(exact.clone()),
+                },
+            )
+            .await?;
+        if value.pin_id.as_slice() != identity.pin_id
+            || value.acquire_not_after_unix_seconds != identity.acquire_not_after_unix_seconds
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+    pub async fn cloud_publication_v2(
+        &self,
+        identity: CloudPublicationIdentity,
+    ) -> Result<Option<CloudPublication>, Status> {
+        let deadline = self.deadline();
+        identity.check(&identity.token())?;
+        self.require_structured_publication(deadline).await?;
+        self.cloud_publication_at(&identity.token(), deadline, Some(identity))
+            .await
+    }
+    pub async fn cloud_publish_version_v2(
+        &self,
+        intent: &CloudPublishIntent,
+        identity: CloudPublicationIdentity,
+    ) -> Result<CloudPublication, Status> {
+        let deadline = self.deadline();
+        identity.check_intent(intent)?;
+        if capture::is_v3(&intent.manifest) {
+            return Err(Status::invalid_argument(
+                "captured manifest requires capture data",
+            ));
+        }
+        self.require_structured_publication(deadline).await?;
+        self.clone()
+            .with_operation_deadline(deadline)
+            .cloud_publish_at(intent, &[], true, Some(identity))
+            .await
     }
     pub async fn cloud_publish_version(
         &self,
@@ -904,15 +1248,26 @@ impl NativeClient {
                 "captured manifest requires capture data",
             ));
         }
-        self.cloud_publish_at(intent, &[], false).await
+        self.cloud_publish_at(intent, &[], false, None).await
     }
     async fn cloud_publish_at(
         &self,
         intent: &CloudPublishIntent,
         capture_data: &[u8],
         same_deadline_reconcile: bool,
+        identity: Option<CloudPublicationIdentity>,
     ) -> Result<CloudPublication, Status> {
         key(&intent.idempotency_key)?;
+        if let Some(identity) = identity {
+            identity.check(&intent.idempotency_key)?;
+            if identity.workspace_id != intent.workspace_id
+                || Some(identity.generation) != intent.expected_generation.checked_add(1)
+            {
+                return Err(Status::invalid_argument(
+                    "invalid structured cloud publication binding",
+                ));
+            }
+        }
         let l = &self.inner.config.cloud;
         use tinytree_proto::PublicationFailureReason as Reason;
         if intent.manifest.len() > l.max_manifest_bytes {
@@ -971,6 +1326,7 @@ impl NativeClient {
                     manifest: intent.manifest.clone(),
                     staging_leases: intent.staging_leases.clone(),
                     capture_data: capture_data.to_vec(),
+                    publication_identity: identity.map(CloudPublicationIdentity::wire),
                 },
             )
             .await;
@@ -1003,6 +1359,7 @@ impl NativeClient {
                         } else {
                             self.deadline()
                         },
+                        identity,
                     )
                     .await?
                 {
@@ -1125,6 +1482,19 @@ impl NativeClient {
             )
             .await?
         };
+        self.finish_cloud_version(value, budget, retained, id, generation, maximum, deadline)
+            .await
+    }
+    async fn finish_cloud_version(
+        &self,
+        value: c::Version,
+        budget: Arc<Budget>,
+        retained: Arc<RetainedCloud>,
+        id: [u8; 32],
+        generation: Option<u64>,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<CloudVersion, Status> {
         let value: c::Version = value;
         if array::<32>(&value.workspace_id)? != id
             || value.generation == 0

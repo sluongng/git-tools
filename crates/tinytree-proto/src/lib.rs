@@ -334,6 +334,42 @@ mod tests {
     use tonic::{codec::CompressionEncoding, transport::Channel};
 
     #[test]
+    fn durable_version_pins_have_explicit_unary_contracts() {
+        let descriptors = prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
+        let service = descriptors
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("tinytree.cloud.v1"))
+            .unwrap()
+            .service
+            .iter()
+            .find(|service| service.name.as_deref() == Some("WorkspaceCloud"))
+            .unwrap();
+        for (name, input, output) in [
+            (
+                "AcquireVersionPin",
+                ".tinytree.cloud.v1.AcquireVersionPinRequest",
+                ".tinytree.cloud.v1.VersionPin",
+            ),
+            (
+                "ReleaseVersionPin",
+                ".tinytree.cloud.v1.ReleaseVersionPinRequest",
+                ".tinytree.cloud.v1.VersionPinReleased",
+            ),
+        ] {
+            let method = service
+                .method
+                .iter()
+                .find(|method| method.name.as_deref() == Some(name))
+                .unwrap();
+            assert_eq!(method.input_type.as_deref(), Some(input));
+            assert_eq!(method.output_type.as_deref(), Some(output));
+            assert!(!method.client_streaming.unwrap_or(false));
+            assert!(!method.server_streaming.unwrap_or(false));
+        }
+    }
+
+    #[test]
     fn latest_captured_version_has_an_explicit_unary_contract() {
         let descriptors = prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).unwrap();
         let cloud = descriptors

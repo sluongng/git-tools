@@ -414,6 +414,15 @@ mod tests {
     fn config_rejects_unsafe_transport_and_unbounded_limits() {
         let mut config = Config::default();
         assert!(config.validate().is_ok());
+        config.store.cloud.rolling_retention_enabled = true;
+        assert!(config.validate().is_err(), "rolling policy requires retirement admission");
+        config.store.cloud.retirement_enabled = true;
+        config.store.cloud.max_versions_per_workspace = 0;
+        assert!(config.validate().is_err());
+        config.store.cloud.max_versions_per_workspace = 2;
+        assert!(config.validate().is_ok());
+        config.store.cloud.rolling_retention_enabled = false;
+        config.store.cloud.retirement_enabled = false;
         config.store.cloud.resident = Some(tinytree_store::CloudResidentLimits {
             max_bytes: 0,
             max_entries: 65_536,

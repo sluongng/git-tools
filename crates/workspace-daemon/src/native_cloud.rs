@@ -27,7 +27,7 @@ pub(crate) fn workspace(text: &str) -> Result<[u8; 32]> {
     ensure!(id != [0; 32], "cloud workspace identity must be nonzero");
     Ok(id)
 }
-fn page(page_size: u16, continuation: &str) -> Result<Vec<u8>> {
+fn page(page_size: u16, continuation: &str, cursor_bytes: usize) -> Result<Vec<u8>> {
     ensure!(
         (1..=128).contains(&page_size),
         "cloud page size must be 1..128"
@@ -35,7 +35,7 @@ fn page(page_size: u16, continuation: &str) -> Result<Vec<u8>> {
     if continuation.is_empty() {
         Ok(Vec::new())
     } else {
-        bytes(continuation, 74)
+        bytes(continuation, cursor_bytes)
     }
 }
 async fn client(source: &Arc<Source>, deadline: Instant) -> Result<NativeClient> {
@@ -58,7 +58,7 @@ pub(crate) async fn workspaces(
     continuation: &str,
     deadline: Instant,
 ) -> Result<NativeCloudWorkspaces> {
-    let continuation = page(page_size, continuation)?;
+    let continuation = page(page_size, continuation, 74)?;
     let value = client(&source, deadline)
         .await?
         .cloud_workspaces(page_size as usize, &continuation)
@@ -76,7 +76,7 @@ pub(crate) async fn versions(
     deadline: Instant,
 ) -> Result<NativeCloudVersions> {
     let id = workspace(id)?;
-    let continuation = page(page_size, continuation)?;
+    let continuation = page(page_size, continuation, 82)?;
     let value = client(&source, deadline)
         .await?
         .cloud_versions(id, page_size as usize, &continuation)
@@ -93,6 +93,8 @@ pub(crate) async fn versions(
             })
             .collect(),
         through_generation: value.through_generation,
+        retired_through: value.retired_through,
+        retention_revision: value.retention_revision,
         continuation: hex(&value.continuation),
     })
 }
@@ -121,4 +123,65 @@ pub(crate) async fn select(
         manifest_blake3: raw.blake3,
         manifest_size_bytes: raw.size_bytes,
     })
+}
+
+/// The complete identity is saved by the host before entering this function.
+/// No retry path manufactures a fresh nonce or extends its admission fence.
+pub(crate) async fn select_pinned(
+    source: Arc<Source>,
+    workspace_id: [u8; 32],
+    identity: tinytree_client::CloudVersionPinIdentity,
+    generation: Option<u64>,
+    exact: Option<&NativeRestoreSelection>,
+    deadline: Instant,
+) -> Result<NativeRestoreSelection> {
+    use tinytree_client::{CloudManifestId, CloudPinSelection, RetainedVersionSelector};
+    ensure!(
+        workspace_id != [0; 32] && generation != Some(0),
+        "invalid cloud pin request"
+    );
+    let selection = if let Some(exact) = exact {
+        ensure!(
+            exact.workspace_id == workspace_id
+                && generation.is_none_or(|value| value == exact.generation),
+            "cloud pin exact selection differs"
+        );
+        CloudPinSelection::Exact {
+            selector: RetainedVersionSelector {
+                workspace_id,
+                generation: exact.generation,
+                manifest_id: CloudManifestId(exact.manifest_id),
+            },
+            selected: CloudRawDigest {
+                blake3: exact.manifest_blake3,
+                size_bytes: exact.manifest_size_bytes,
+            },
+        }
+    } else {
+        generation.map_or(
+            CloudPinSelection::LatestCaptured,
+            CloudPinSelection::Generation,
+        )
+    };
+    let pin = client(&source, deadline)
+        .await?
+        .acquire_cloud_version_pin(workspace_id, identity, selection)
+        .await?;
+    ensure!(pin.identity == identity, "cloud pin identity differs");
+    let selected = pin.version.selector();
+    let raw = pin.version.manifest_selected();
+    let value = NativeRestoreSelection {
+        workspace_id: selected.workspace_id,
+        generation: selected.generation,
+        manifest_id: selected.manifest_id.0,
+        manifest_blake3: raw.blake3,
+        manifest_size_bytes: raw.size_bytes,
+    };
+    ensure!(
+        value.workspace_id == workspace_id
+            && generation.is_none_or(|generation| generation == value.generation)
+            && exact.is_none_or(|expected| *expected == value),
+        "cloud pinned selection differs"
+    );
+    Ok(value)
 }

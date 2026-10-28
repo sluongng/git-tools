@@ -167,7 +167,20 @@ impl NativeClient {
                 tinytree_proto::PublicationFailureReason::ClientCaptureBytes.message(),
             ));
         }
-        self.cloud_publish_at(&intent.version, &intent.capture_data, true)
+        self.cloud_publish_at(&intent.version, &intent.capture_data, true, None)
+            .await
+    }
+    pub async fn cloud_publish_captured_version_v2(
+        &self,
+        intent: &CloudCapturedPublishIntent,
+        identity: CloudPublicationIdentity,
+    ) -> Result<CloudPublication, Status> {
+        let deadline = self.deadline();
+        identity.check_intent(&intent.version)?;
+        self.require_structured_publication(deadline).await?;
+        self.clone()
+            .with_operation_deadline(deadline)
+            .cloud_publish_at(&intent.version, &intent.capture_data, true, Some(identity))
             .await
     }
     pub async fn cloud_read_capture(

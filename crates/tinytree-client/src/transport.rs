@@ -711,6 +711,8 @@ pub(crate) enum Shape {
     CloudPublication,
     CloudPublicationResult,
     CloudVersion,
+    CloudVersionPin,
+    CloudPinReleased,
     CloudNativeAuthority,
     CloudNativeChunk,
     CloudIndexId,
@@ -946,7 +948,7 @@ fn scan(
             let valid = match (shape, number) {
                 (Shape::Capabilities, _) => value == 1,
                 (Shape::AnnotationFrontier, 4) => matches!(value, 1 | 2 | 3),
-                (Shape::FeatureCapability, _) => matches!(value, 1..=15 | 18),
+                (Shape::FeatureCapability, _) => (1..=18).contains(&value),
                 (Shape::AnnotationFrontier, 8) => (0..=7).contains(&value),
                 (Shape::AnnotationFrontier, 9) => value <= u32::MAX as u64,
                 (Shape::AnnotationLimits, _) => value > 0 && value <= usize::MAX as u64,
@@ -1082,6 +1084,8 @@ fn scan(
         | Shape::CloudIndexReceipt
         | Shape::CloudCaptureDescriptor => (1 << 1) | (1 << 2),
         Shape::CloudChunk | Shape::CloudWorkspace | Shape::CloudIndexChunk => 1 << 1,
+        Shape::CloudVersionPin => (1 << 1) | (1 << 2) | (1 << 3),
+        Shape::CloudPinReleased => (1 << 1) | (1 << 2),
         Shape::CloudVersion | Shape::CloudVersionSummary => (1 << 1) | (1 << 3),
         Shape::CloudVersionPage => 1 << 1,
         Shape::CloudNativeAuthority => (1 << 2) | (1 << 3) | (1 << 4),
@@ -1262,7 +1266,7 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
         (Shape::Capabilities, 2) => text(128),
         (Shape::Capabilities, 3) => repeated(
             Shape::FeatureCapability,
-            16,
+            18,
             4 * std::mem::size_of::<p::FeatureCapability>(),
         ),
         (Shape::CloudWorkspacePage, 1) => repeated(
@@ -1270,14 +1274,18 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
             128,
             4 * std::mem::size_of::<tinytree_proto::cloud_v1::Workspace>(),
         ),
-        (Shape::CloudWorkspacePage, 2) | (Shape::CloudVersionPage, 3) => text(74),
+        (Shape::CloudWorkspacePage, 2) => text(74),
+        (Shape::CloudVersionPage, 3) => text(82),
         (Shape::CloudVersionPage, 1) => nested(Shape::CloudWorkspace),
+        (Shape::CloudVersionPin, 1) | (Shape::CloudPinReleased, 1) => text(16),
+        (Shape::CloudVersionPin, 2) => nested(Shape::CloudVersion),
+        (Shape::CloudVersionPin, 3) | (Shape::CloudPinReleased, 2) => scalar(),
         (Shape::CloudVersionPage, 2) => repeated(
             Shape::CloudVersionSummary,
             128,
             4 * std::mem::size_of::<tinytree_proto::cloud_v1::VersionSummary>(),
         ),
-        (Shape::CloudVersionPage, 4) | (Shape::CloudVersionSummary, 2) => scalar(),
+        (Shape::CloudVersionPage, 4 | 5 | 6) | (Shape::CloudVersionSummary, 2) => scalar(),
         (Shape::CloudVersionSummary, 1 | 3 | 4) => text(32),
         (Shape::CloudId, 1)
         | (Shape::CloudDigest, 2)
@@ -1486,22 +1494,26 @@ mod tests {
             )
         };
         check(&valid).unwrap();
-        // Additive known IDs survive without admitting the reserved holes.
-        for feature in [15, 18] {
+        // Additive negotiated features must survive the bounded wire scan.
+        for feature in [15, 16, 17, 18] {
             let value = p::Capabilities {
                 schema_version: 1,
                 repository_id: "example".into(),
-                features: vec![p::FeatureCapability { feature, supported: true, authorized: true }],
+                features: vec![p::FeatureCapability {
+                    feature,
+                    supported: true,
+                    authorized: true,
+                }],
                 root_readiness: 1,
-            }.encode_to_vec();
+            }
+            .encode_to_vec();
             check(&value).unwrap();
         }
         // Raw nested fields exercise values generated bool/enum setters cannot
         // produce, including a u32-truncating scalar before Prost decoding.
         for (name, nested) in [
             ("nonboolean support", vec![8, 1, 16, 2]),
-            ("reserved feature16", vec![8, 16]),
-            ("reserved feature17", vec![8, 17]),
+            ("next unknown feature", vec![8, 19]),
             ("unknown feature", vec![8, 99]),
             (
                 "u32 truncating feature",
@@ -1522,7 +1534,7 @@ mod tests {
                     supported: false,
                     authorized: false
                 };
-                17
+                19
             ],
             root_readiness: 1,
         }

@@ -142,6 +142,18 @@ struct CloudRestoreIntent {
     provider_identity: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requested_policy: Option<crate::native_restore_policy::Requested>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pin: Option<tinytree_client::CloudVersionPinIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selection_pending: Option<CloudRestorePending>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pin_confirmed: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudRestorePending {
+    generation: Option<u64>,
+    binding: [u8; 32],
 }
 struct Entry {
     record: Record,
@@ -226,6 +238,8 @@ pub(crate) fn inspect_provider_enrollments(
                 ensure!(existing.store == intent.store && existing.root == intent.root,
                     "provider restore census enrollment conflicts");
             }
+            ensure!(intent.selection_pending.is_none() || !known.contains_key(&intent.workspace_id),
+                "pending cloud selection cannot authorize per-workspace census state");
             let intent_only = !known.contains_key(&intent.workspace_id);
             known.entry(intent.workspace_id).or_insert(None).get_or_insert(ProviderEnrollment {
                 workspace_id: intent.workspace_id, store: intent.store, root: intent.root, pending: true, retired: false, intent_only,
@@ -391,7 +405,7 @@ impl Manager {
                 ensure!(
                     cloud_intents
                         .values()
-                        .any(|intent| intent.workspace_id == id),
+                        .any(|intent| intent.workspace_id == id && intent.selection_pending.is_none()),
                     "unknown native workspace state; preserve it"
                 );
                 reconcile_cloud_temporary_files(&child)?;
@@ -587,13 +601,21 @@ impl Manager {
                     && generation.is_none_or(|value| value == source.generation()),
                 "cloud restore selection differs from the saved destination intent"
             );
-            // A retry of latest reuses the original pin, not a newly moved head.
             ensure!(
                 source.provider_identity() == provider_identity,
                 "cloud restore provider differs from the saved destination intent"
             );
+            ensure!(
+                saved_intent
+                    .as_ref()
+                    .is_none_or(|intent| intent.selection_pending.is_none()),
+                "pending cloud selection cannot authorize workspace state"
+            );
             (id, selection_from_identity(&source), true)
-        } else if let Some(intent) = &saved_intent {
+        } else if let Some(intent) = saved_intent
+            .as_ref()
+            .filter(|intent| intent.selection_pending.is_none())
+        {
             ensure!(
                 intent.store == store
                     && intent.provider_identity == provider_identity
@@ -603,71 +625,133 @@ impl Manager {
             );
             (hex(&intent.workspace_id), intent.source.clone(), true)
         } else {
-            ensure!(
-                self.reserved_workspaces() < self.config.native.workspaces.max_workspaces,
-                "native workspace reservation limit reached"
-            );
-            ensure!(
-                !self
-                    .entries
-                    .values()
-                    .any(|entry| overlaps(&entry.record.root, &root))
-                    && !self
-                        .cloud_intents
+            let reused = saved_intent.is_some();
+            let pending = if let Some(intent) = saved_intent {
+                ensure!(
+                    intent.store == store
+                        && intent.provider_identity == provider_identity
+                        && intent.source.workspace_id == source_id
+                        && intent
+                            .selection_pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.generation == generation),
+                    "cloud restore pending request/provider differs"
+                );
+                intent
+            } else {
+                ensure!(
+                    self.reserved_workspaces() < self.config.native.workspaces.max_workspaces,
+                    "native workspace reservation limit reached"
+                );
+                ensure!(
+                    !self
+                        .entries
                         .values()
-                        .any(|intent| overlaps(&intent.root, &root)),
-                "native workspace roots overlap"
+                        .any(|entry| overlaps(&entry.record.root, &root))
+                        && !self
+                            .cloud_intents
+                            .values()
+                            .any(|intent| overlaps(&intent.root, &root)),
+                    "native workspace roots overlap"
+                );
+                let id = format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                );
+                let workspace_id = unhex(&id)?;
+                ensure!(
+                    !self.entries.contains_key(&id)
+                        && !self.retirements.contains_key(&id)
+                        && !self
+                            .cloud_intents
+                            .values()
+                            .any(|intent| intent.workspace_id == workspace_id)
+                        && !self.directory.path().join(&id).try_exists()?,
+                    "generated cloud restore identity is already reserved"
+                );
+                // This placeholder binds only the requested source workspace.
+                // It has no exact manifest and cannot authorize destination state.
+                let source = pending_selection(source_id);
+                let requested = crate::native_restore_policy::Requested::resolve(
+                    &self.config.native.workspaces,
+                    &crate::native_restore_policy::Binding {
+                        root: &root,
+                        store: &store,
+                        workspace_id,
+                        source: &source,
+                        provider_identity,
+                    },
+                    self.repositories[&store].remote,
+                )?;
+                let mut intent = CloudRestoreIntent {
+                    version: 2,
+                    root: root.clone(),
+                    store: store.clone(),
+                    workspace_id,
+                    source,
+                    provider_identity,
+                    requested_policy: Some(requested),
+                    pin: Some(new_restore_pin()?),
+                    pin_confirmed: false,
+                    selection_pending: Some(CloudRestorePending {
+                        generation,
+                        binding: [0; 32],
+                    }),
+                };
+                let binding = cloud_pending_binding(&intent)?;
+                intent.selection_pending.as_mut().unwrap().binding = binding;
+                intent
+            };
+            let id = hex(&pending.workspace_id);
+            ensure!(
+                !self.directory.path().join(&id).try_exists()?,
+                "pending cloud selection cannot authorize per-workspace state"
             );
-            let source = crate::native_cloud::select(
+            // Reserve memory before ambiguous fsync; retry retains this identity
+            // even if publication's acknowledgement is lost.
+            self.cloud_intents.insert(key.clone(), pending.clone());
+            persist_cloud_intent(&self.cloud_intents_directory, &pending)?;
+            #[cfg(test)]
+            if let Some(hook) = self.after_cloud_intent_publication.take() {
+                hook()?;
+            }
+            let source = crate::native_cloud::select_pinned(
                 self.cloud_source(&store)?,
-                &source_workspace,
+                source_id,
+                pending.pin.context("cloud restore pending pin missing")?,
                 generation,
+                None,
                 deadline.min(self.cloud_deadline()),
             )
             .await?;
-            let id = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            let requested = crate::native_restore_policy::Requested::resolve(
-                &self.config.native.workspaces,
-                &crate::native_restore_policy::Binding {
-                    root: &root,
-                    store: &store,
-                    workspace_id: unhex(&id)?,
-                    source: &source,
-                    provider_identity,
-                },
-                self.repositories[&store].remote,
-            )?;
-            let intent = CloudRestoreIntent {
-                requested_policy: Some(requested),
-                version: 1,
-                root: root.clone(),
-                store: store.clone(),
-                workspace_id: unhex(&id)?,
-                source: source.clone(),
+            let old_binding = cloud_policy_binding(&pending);
+            let selected_binding = crate::native_restore_policy::Binding {
+                root: &root,
+                store: &store,
+                workspace_id: pending.workspace_id,
+                source: &source,
                 provider_identity,
             };
-            ensure!(
-                !self.entries.contains_key(&id)
-                    && !self.retirements.contains_key(&id)
-                    && !self
-                        .cloud_intents
-                        .values()
-                        .any(|old| old.workspace_id == intent.workspace_id)
-                    && !self.directory.path().join(&id).try_exists()?,
-                "generated cloud restore identity is already reserved"
-            );
-            // Memory owns the exact pin before any possibly ambiguous durable
-            // publication. No per-ID state or destination has been touched.
-            self.cloud_intents.insert(key.clone(), intent);
-            (id, source, false)
+            let requested = pending
+                .requested_policy
+                .as_ref()
+                .context("cloud restore pending policy missing")?
+                .rebind(&old_binding, &selected_binding)?;
+            let selected = CloudRestoreIntent {
+                source: source.clone(),
+                requested_policy: Some(requested),
+                selection_pending: None,
+                pin_confirmed: true,
+                ..pending
+            };
+            self.cloud_intents.insert(key.clone(), selected);
+            (id, source, reused)
         };
         if let Some(intent) = self.cloud_intents.get(&key) {
             ensure!(
-                intent.workspace_id == unhex(&id)?
+                intent.selection_pending.is_none()
+                    && intent.workspace_id == unhex(&id)?
                     && intent.source == source
                     && intent.store == store
                     && intent.provider_identity == provider_identity,
@@ -1321,12 +1405,14 @@ impl Manager {
                         .timeout_ms,
                 ),
         );
+        let root = canonical_candidate(&root)?;
         let access = self
             .commands
             .as_ref()
             .context("native restore requires managed command admission")?
             .outer_host_access_until(deadline)
             .await?;
+        self.ensure_restore_source_pin(&root, &store, &workspace_id, &selection, deadline).await?;
         let mut started = false;
         let result = self
             .restore_inner(
@@ -1345,6 +1431,123 @@ impl Manager {
             let _ = self.failed(&workspace_id);
         }
         result
+    }
+    async fn ensure_restore_source_pin(
+        &mut self,
+        root: &Path,
+        store: &str,
+        workspace_id: &str,
+        selection: &crate::control::NativeRestoreSelection,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        validate_selection(selection)?;
+        normalized(root)?;
+        ensure!(
+            !overlaps(root, &self.config.state_dir),
+            "cloud restore root overlaps daemon state"
+        );
+        let id = unhex(workspace_id)?;
+        ensure!(
+            id != [0; 32] && !self.retirements.contains_key(workspace_id),
+            "native restore workspace identity is invalid or retired"
+        );
+        let repository = self
+            .repositories
+            .get(store)
+            .context("native repository alias is not configured")?;
+        let provider_identity = repository.identity;
+        let existing = self
+            .entries
+            .get(workspace_id)
+            .map(|entry| entry.record.clone());
+        if let Some(record) = &existing {
+            let Origin::Restore { source, .. } = &record.origin else {
+                anyhow::bail!("native restore destination belongs to a clone origin");
+            };
+            ensure!(
+                record.root == root
+                    && record.store == store
+                    && source.provider_identity() == provider_identity
+                    && selection_from_identity(source) == *selection,
+                "native restore source/provider differs from saved intent"
+            );
+        }
+        let key = cloud_intent_key(root)?;
+        let mut intent = if let Some(intent) = self.cloud_intents.get(&key) {
+            ensure!(
+                intent.selection_pending.is_none()
+                    && intent.workspace_id == id
+                    && intent.root == root
+                    && intent.store == store
+                    && intent.provider_identity == provider_identity
+                    && intent.source == *selection,
+                "native restore source differs from selected cloud intent"
+            );
+            intent.clone()
+        } else {
+            ensure!(
+                existing.is_some()
+                    || self.reserved_workspaces() < self.config.native.workspaces.max_workspaces,
+                "native workspace reservation limit reached"
+            );
+            ensure!(
+                !self
+                    .cloud_intents
+                    .values()
+                    .any(|intent| intent.workspace_id == id || overlaps(&intent.root, root))
+                    && !self
+                        .entries
+                        .values()
+                        .any(|entry| entry.record.workspace_id != id
+                            && overlaps(&entry.record.root, root)),
+                "native workspace roots overlap"
+            );
+            CloudRestoreIntent {
+                version: 2,
+                root: root.to_owned(),
+                store: store.to_owned(),
+                workspace_id: id,
+                source: selection.clone(),
+                provider_identity,
+                requested_policy: existing.as_ref().and_then(|record| {
+                    record
+                        .restore_enrollment
+                        .as_ref()
+                        .map(|verified| verified.requested.clone())
+                }),
+                pin: Some(new_restore_pin()?),
+                selection_pending: None,
+                pin_confirmed: false,
+            }
+        };
+        if intent.pin.is_none() {
+            intent.version = 2;
+            intent.pin = Some(new_restore_pin()?);
+        }
+        self.cloud_intents.insert(key.clone(), intent.clone());
+        persist_cloud_intent(&self.cloud_intents_directory, &intent)?;
+        if intent.pin_confirmed {
+            return Ok(());
+        }
+        let pinned = crate::native_cloud::select_pinned(
+            self.cloud_source(store)?,
+            selection.workspace_id,
+            intent.pin.context("cloud restore source pin missing")?,
+            Some(selection.generation),
+            Some(selection),
+            deadline,
+        )
+        .await?;
+        ensure!(
+            pinned == *selection,
+            "cloud restore exact source pin differs"
+        );
+        intent.pin_confirmed = true;
+        self.cloud_intents.insert(key, intent.clone());
+        persist_cloud_intent(&self.cloud_intents_directory, &intent)?;
+        // The root-key intent owns this pin after Ready, stop, and restart. It
+        // is not an RPC lease and must never be released by a temporary owner.
+        Ok(())
     }
     async fn restore_inner(
         &mut self,
@@ -2339,29 +2542,170 @@ fn cloud_intent_key(root: &Path) -> Result<String> {
     digest.update(&serde_json::to_vec(root)?);
     Ok(hex(digest.finalize().as_bytes()))
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+fn pending_selection(workspace_id: [u8; 32]) -> crate::control::NativeRestoreSelection {
+    crate::control::NativeRestoreSelection {
+        workspace_id,
+        generation: 0,
+        manifest_id: [0; 32],
+        manifest_blake3: [0; 32],
+        manifest_size_bytes: 0,
+    }
+}
+fn new_restore_pin() -> Result<tinytree_client::CloudVersionPinIdentity> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("cloud pin clock unavailable")?
+        .as_secs();
+    let not_after = i64::try_from(now)?
+        .checked_add(120)
+        .context("cloud pin admission overflow")?;
+    Ok(tinytree_client::CloudVersionPinIdentity {
+        pin_id: *uuid::Uuid::new_v4().as_bytes(),
+        acquire_not_after_unix_seconds: not_after,
+    })
+}
+fn cloud_policy_binding(intent: &CloudRestoreIntent) -> crate::native_restore_policy::Binding<'_> {
+    crate::native_restore_policy::Binding {
+        root: &intent.root,
+        store: &intent.store,
+        workspace_id: intent.workspace_id,
+        source: &intent.source,
+        provider_identity: intent.provider_identity,
+    }
+}
+fn cloud_pending_binding(intent: &CloudRestoreIntent) -> Result<[u8; 32]> {
+    let pending = intent
+        .selection_pending
+        .as_ref()
+        .context("cloud restore pending request missing")?;
+    let bytes = serde_json::to_vec(&(
+        intent.root.as_path(),
+        &intent.store,
+        intent.workspace_id,
+        intent.provider_identity,
+        intent.source.workspace_id,
+        pending.generation,
+        intent.pin,
+        &intent.requested_policy,
+    ))?;
+    ensure!(
+        bytes.len() <= MAX_RECORD,
+        "cloud restore pending binding exceeds limit"
+    );
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"native-cloud-restore-pending-v1\0");
+    hash.update(&bytes);
+    Ok(*hash.finalize().as_bytes())
+}
 fn validate_cloud_intent(intent: &CloudRestoreIntent) -> Result<()> {
     normalized(&intent.root)?;
-    validate_selection(&intent.source)?;
     ensure!(
-        intent.version == 1
-            && intent.workspace_id != [0; 32]
+        (intent.version == 1
+            && intent.pin.is_none()
+            && intent.selection_pending.is_none()
+            && !intent.pin_confirmed)
+            || (intent.version == 2 && intent.pin.is_some()),
+        "invalid cloud restore intent version"
+    );
+    ensure!(
+        intent.workspace_id != [0; 32]
             && intent.provider_identity != [0; 32]
             && !intent.store.is_empty()
             && intent.store.len() <= 64,
         "invalid cloud restore intent"
     );
+    if let Some(pin) = intent.pin {
+        ensure!(
+            pin.pin_id != [0; 16] && pin.acquire_not_after_unix_seconds > 0,
+            "invalid cloud restore pin identity"
+        );
+    }
+    if let Some(pending) = &intent.selection_pending {
+        ensure!(
+            pending.generation != Some(0)
+                && intent.source.workspace_id != [0; 32]
+                && intent.source == pending_selection(intent.source.workspace_id)
+                && intent.requested_policy.is_some()
+                && !intent.pin_confirmed
+                && pending.binding == cloud_pending_binding(intent)?,
+            "invalid cloud restore pending selection"
+        );
+    } else {
+        validate_selection(&intent.source)?;
+    }
     if let Some(requested) = &intent.requested_policy {
-        requested.validate(&crate::native_restore_policy::Binding {
-            root: &intent.root,
-            store: &intent.store,
-            workspace_id: intent.workspace_id,
-            source: &intent.source,
-            provider_identity: intent.provider_identity,
-        })?;
+        requested.validate(&cloud_policy_binding(intent))?;
     }
     Ok(())
 }
+fn cloud_intent_transition(old: &CloudRestoreIntent, new: &CloudRestoreIntent) -> Result<()> {
+    validate_cloud_intent(old)?;
+    if old == new {
+        return Ok(());
+    }
+    ensure!(
+        old.root == new.root
+            && old.store == new.store
+            && old.workspace_id == new.workspace_id
+            && old.provider_identity == new.provider_identity,
+        "immutable cloud restore intent differs"
+    );
+    if old.version == 1
+        && new.version == 2
+        && old.selection_pending.is_none()
+        && new.selection_pending.is_none()
+        && old.source == new.source
+        && old.requested_policy == new.requested_policy
+        && old.pin.is_none()
+        && new.pin.is_some()
+        && !new.pin_confirmed
+    {
+        return Ok(());
+    }
+    if old.version == 2
+        && new.version == 2
+        && old.selection_pending.is_none()
+        && new.selection_pending.is_none()
+        && old.source == new.source
+        && old.pin == new.pin
+        && old.requested_policy == new.requested_policy
+        && !old.pin_confirmed
+        && new.pin_confirmed
+    {
+        return Ok(());
+    }
+    let pending = old
+        .selection_pending
+        .as_ref()
+        .context("immutable cloud restore intent differs")?;
+    ensure!(
+        old.version == 2
+            && new.version == 2
+            && new.selection_pending.is_none()
+            && old.pin == new.pin
+            && new.pin_confirmed
+            && old.source.workspace_id == new.source.workspace_id
+            && pending
+                .generation
+                .is_none_or(|generation| generation == new.source.generation),
+        "immutable cloud restore selection differs"
+    );
+    let requested = old
+        .requested_policy
+        .as_ref()
+        .context("cloud restore pending policy missing")?
+        .rebind(&cloud_policy_binding(old), &cloud_policy_binding(new))?;
+    ensure!(
+        new.requested_policy.as_ref() == Some(&requested),
+        "cloud restore selected policy differs from saved pending policy"
+    );
+    Ok(())
+}
 fn validate_cloud_record(intent: &CloudRestoreIntent, record: &Record) -> Result<()> {
+    ensure!(intent.selection_pending.is_none(), "pending cloud selection cannot authorize workspace state");
     let Origin::Restore { source, .. } = &record.origin else {
         anyhow::bail!("cloud restore reservation conflicts with workspace origin");
     };
@@ -2392,10 +2736,10 @@ fn persist_cloud_intent(directory: &PrivateDir, intent: &CloudRestoreIntent) -> 
         "cloud restore intent exceeds limit"
     );
     match fs::symlink_metadata(directory.path().join(&name)) {
-        Ok(_) => ensure!(
-            directory.read(&name, MAX_RECORD)? == encoded,
-            "immutable cloud restore intent differs"
-        ),
+        Ok(_) => {
+            let prior: CloudRestoreIntent = serde_json::from_slice(&directory.read(&name, MAX_RECORD)?)?;
+            cloud_intent_transition(&prior, intent)?;
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -3160,7 +3504,7 @@ mod tests {
         repository.remote.as_mut().unwrap().query.max_replays = 256;
         config.native.repositories.insert("example".into(),repository);
         let old = crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None)?["example"];
-        let intent = CloudRestoreIntent { version:1,root:temporary.path().join("restored"),store:"example".into(),
+        let intent = CloudRestoreIntent { pin: None, selection_pending: None, pin_confirmed: false, version:1,root:temporary.path().join("restored"),store:"example".into(),
             workspace_id:[7;32],provider_identity:old,requested_policy:None,
             source:crate::control::NativeRestoreSelection {workspace_id:[1;32],generation:1,
                 manifest_id:[2;32],manifest_blake3:[3;32],manifest_size_bytes:256} };
@@ -3203,6 +3547,124 @@ mod tests {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn cloud_restore_pending_selection_is_durable_before_network_and_never_renews()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut config = Config::default();
+        let state = PrivateDir::create(temporary.path().join("state"))?;
+        config.state_dir = state.path().to_owned();
+        config.native.workspaces.max_workspaces = 2;
+        let objects = PrivateDir::create(temporary.path().join("objects"))?;
+        let io = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
+        let cache = LocalCas::open(
+            temporary.path().join("cas"),
+            Arc::new(NoRemoteContent),
+            Default::default(),
+        )?;
+        let repositories = BTreeMap::from([(
+            "example".into(),
+            Repository {
+                local_objects: io.clone(),
+                upload: None,
+                query: None,
+                io,
+                scope: Scope::from_configured_identity("example", &[8; 32])?,
+                remote: true,
+                identity: [8; 32],
+            },
+        )]);
+        let root = temporary.path().join("restored");
+        let mut manager = Manager::open(config.clone(), cache.clone(), repositories.clone())?;
+        manager.after_cloud_intent_publication = Some(Box::new(|| {
+            anyhow::bail!("pending selection sync acknowledgement lost")
+        }));
+        let error = manager
+            .restore_cloud_version(root.clone(), "example".into(), hex(&[1; 32]), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pending selection sync acknowledgement lost")
+        );
+        let key = cloud_intent_key(&root)?;
+        let intent = manager.cloud_intents[&key].clone();
+        assert!(
+            intent
+                .selection_pending
+                .as_ref()
+                .is_some_and(|request| request.generation.is_none())
+        );
+        assert_eq!(intent.source, pending_selection([1; 32]));
+        let identity = intent.pin.context("saved pending pin")?;
+        let file = format!("{key}.json");
+        let saved = manager.cloud_intents_directory.read(&file, MAX_RECORD)?;
+        assert!(!root.exists());
+        assert!(
+            !manager
+                .directory
+                .path()
+                .join(hex(&intent.workspace_id))
+                .exists()
+        );
+        drop(manager);
+
+        // Different host defaults cannot change the saved request/policy or
+        // mint a new pin on a network-unavailable retry.
+        config.native.workspaces.index_mode = crate::config::NativeIndexMode::Legacy;
+        config.native.workspaces.capture.policy = crate::config::NativeCapturePolicy::Disabled;
+        config.native.workspaces.upload.policy = crate::config::NativeCaptureUploadPolicy::Disabled;
+        let mut manager = Manager::open(config.clone(), cache.clone(), repositories.clone())?;
+        for _ in 0..2 {
+            assert!(
+                manager
+                    .restore_cloud_version(root.clone(), "example".into(), hex(&[1; 32]), None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(manager.cloud_intents[&key], intent);
+            assert_eq!(manager.cloud_intents[&key].pin, Some(identity));
+            assert_eq!(
+                manager.cloud_intents_directory.read(&file, MAX_RECORD)?,
+                saved
+            );
+        }
+        for (source, generation) in [([2; 32], None), ([1; 32], Some(7))] {
+            assert!(
+                manager
+                    .restore_cloud_version(root.clone(), "example".into(), hex(&source), generation)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                manager.cloud_intents_directory.read(&file, MAX_RECORD)?,
+                saved
+            );
+        }
+        let mut tampered: serde_json::Value = serde_json::from_slice(&saved)?;
+        tampered["selection_pending"]["generation"] = 7.into();
+        manager
+            .cloud_intents_directory
+            .replace(&file, &serde_json::to_vec(&tampered)?)?;
+        assert!(Manager::open(config.clone(), cache.clone(), repositories.clone()).is_err());
+        manager.cloud_intents_directory.replace(&file, &saved)?;
+
+        // A pending source selection reserves a slot, never arbitrary per-ID
+        // files. Startup refuses these bytes rather than adopting/deleting them.
+        let child = PrivateDir::create(manager.directory.path().join(hex(&intent.workspace_id)))?;
+        fs::write(child.path().join("foreign"), b"preserve unknown state")?;
+        assert!(Manager::open(config, cache, repositories).is_err());
+        assert_eq!(
+            fs::read(child.path().join("foreign"))?,
+            b"preserve unknown state"
+        );
+        assert!(!root.exists());
+        Ok(())
+    }
     async fn exercise_cloud_restore_intent_restart(automatic: bool) -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let state = PrivateDir::create(temporary.path().join("state"))?;
@@ -3242,6 +3704,7 @@ mod tests {
             manifest_size_bytes: 256,
         };
         let mut intent = CloudRestoreIntent {
+            pin: None, selection_pending: None, pin_confirmed: false,
             requested_policy: None,
             version: 1,
             root: root.clone(),

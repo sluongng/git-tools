@@ -521,6 +521,30 @@ impl Inner {
             if physical.as_ref() == b"format" {
                 continue;
             }
+            if physical.as_ref() == b"cloud-retirement-activated" {
+                let format = view
+                    .get(&self.spaces.meta, b"format")?
+                    .ok_or(Error::Corrupt("cloud retirement store feature"))?;
+                budget.visit(b"format", &format)?;
+                if bytes.as_ref() != [1] || store_feature(Some(&format))? < 12 {
+                    return Err(Error::Corrupt("cloud retirement activation marker"));
+                }
+                continue;
+            }
+            if physical.as_ref() == b"cloud-pin-admission-floor" {
+                let format = view
+                    .get(&self.spaces.meta, b"format")?
+                    .ok_or(Error::Corrupt("cloud pin store feature"))?;
+                budget.visit(b"format", &format)?;
+                let raw: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("cloud pin admission floor"))?;
+                if i64::from_be_bytes(raw) < 0 || store_feature(Some(&format))? < 12 {
+                    return Err(Error::Corrupt("cloud pin admission floor"));
+                }
+                continue;
+            }
             let (_repo, suffix) = physical_parts(&physical)?;
             if !suffix.starts_with(b"retention/") {
                 continue;

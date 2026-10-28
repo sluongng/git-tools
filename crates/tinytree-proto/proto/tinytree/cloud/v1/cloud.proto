@@ -25,6 +25,10 @@ service WorkspaceCloud {
   rpc ReadCapture(ReadCaptureRequest) returns (stream CaptureChunk);
   rpc ReadNativeClosure(ReadNativeClosureRequest) returns (stream NativeClosureChunk);
   rpc GetPublication(GetPublicationRequest) returns (GetPublicationResponse);
+  // Durable owner-scoped job pins; replay the same nonce to retain its original
+  // selection. Release is explicit, never implicit on shutdown or restore Ready.
+  rpc AcquireVersionPin(AcquireVersionPinRequest) returns (VersionPin);
+  rpc ReleaseVersionPin(ReleaseVersionPinRequest) returns (VersionPinReleased);
 }
 enum ObjectKind {
   OBJECT_KIND_UNSPECIFIED = 0;
@@ -82,6 +86,13 @@ message Publication {
   string idempotency_key = 1;
   Workspace workspace = 2;
 }
+// Explicit V2 replay namespace. An absent identity always uses the opaque legacy
+// key namespace, even when the key text resembles a V2 token.
+message PublicationIdentity {
+  bytes workspace_id = 1; // Exactly 32 bytes.
+  uint64 target_generation = 2; // Positive; expected_generation + 1 on publish.
+  bytes nonce = 3; // Exactly 16 bytes.
+}
 message PublishVersionRequest {
   string repository_id = 1;
   bytes workspace_id = 2;
@@ -91,6 +102,9 @@ message PublishVersionRequest {
   bytes manifest = 6; // Canonical tinytree-cloud manifest encoding.
   repeated string staging_leases = 7;
   bytes capture_data = 8; // Canonical capture DATA, required by manifest v3.
+  PublicationIdentity publication_identity = 9; // Requires STRUCTURED_CLOUD_PUBLICATION_V2.
+  // With identity, idempotency_key is its exact r2-<workspace hex64>-<generation
+  // hex16>-<nonce hex32> display token. The server never infers identity from text.
 }
 message GetWorkspaceRequest {
   string repository_id = 1;
@@ -116,6 +130,7 @@ message Version {
 message GetPublicationRequest {
   string repository_id = 1;
   string idempotency_key = 2;
+  PublicationIdentity publication_identity = 3; // Same exact token binding as publish.
 }
 message GetPublicationResponse { optional Publication publication = 1; }
 
@@ -251,4 +266,37 @@ message ListVersionsResponse {
   repeated VersionSummary versions = 2; // Ascending generation.
   bytes continuation = 3;
   uint64 through_generation = 4; // Frozen initial current generation ceiling.
+  uint64 retired_through = 5; // First retained generation is this floor + 1.
+  uint64 retention_revision = 6; // Changes atomically with the floor; cursor bound.
+}
+
+message ExactVersionSelection {
+  RetainedVersionSelector version = 1;
+  RawDigest manifest_selected = 2;
+}
+message AcquireVersionPinRequest {
+  string repository_id = 1;
+  bytes workspace_id = 2;
+  bytes pin_id = 3; // Exactly 16 bytes; nonce plus admission expiry is one identity.
+  oneof selection {
+    bool latest_captured = 4; // Must be true. Replay never reselects latest.
+    uint64 generation = 5; // Positive, exact generation.
+    ExactVersionSelection exact = 6;
+  }
+  int64 acquire_not_after_unix_seconds = 7; // Immutable admission fence, not a pin TTL.
+}
+message VersionPin {
+  bytes pin_id = 1;
+  Version version = 2; // Fully checked retained selection committed before reply.
+  int64 acquire_not_after_unix_seconds = 3;
+}
+message ReleaseVersionPinRequest {
+  string repository_id = 1;
+  bytes pin_id = 2;
+  ExactVersionSelection exact = 3;
+  int64 acquire_not_after_unix_seconds = 4;
+}
+message VersionPinReleased {
+  bytes pin_id = 1;
+  int64 acquire_not_after_unix_seconds = 2;
 }

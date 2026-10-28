@@ -10,9 +10,10 @@ pub use client::cloud::{
     CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,
     CloudDescriptor, CloudIndexArtifact, CloudIndexArtifactDescriptor, CloudIndexArtifactId,
     CloudIndexWriteReceipt, CloudLimits, CloudManifestId, CloudObject, CloudObjectId,
-    CloudPublication, CloudPublishIntent, CloudRawDigest, CloudVersion, CloudVersionPage,
-    CloudVersionSummary, CloudWorkspace, CloudWorkspacePage, CloudWriteReceipt,
-    RetainedVersionSelector, VerifiedCapturedVersion, VerifiedRetainedVersion,
+    CloudPinSelection, CloudPublication, CloudPublicationIdentity, CloudPublishIntent,
+    CloudRawDigest, CloudVersion, CloudVersionPage, CloudVersionPin, CloudVersionPinIdentity, CloudVersionSummary,
+    CloudWorkspace, CloudWorkspacePage, CloudWriteReceipt, RetainedVersionSelector,
+    VerifiedCapturedVersion, VerifiedRetainedVersion,
 };
 pub use client::history::{
     CheckedAnnotationBlame, CheckedAnnotationFrontier, CheckedAnnotationInput, CheckedBlame,

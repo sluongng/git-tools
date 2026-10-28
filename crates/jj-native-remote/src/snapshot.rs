@@ -12,15 +12,19 @@ impl RemoteObjectIo {
         tinytree_client::NativeClient,
         tinytree_client::VerifiedRetainedVersion,
     )> {
-        self.inner
-            .ledger
-            .validate_authority(&crate::ledger::Authority::CloudQuery(authority.clone()))?;
+        let ledger = self.inner.ledger.clone();
+        let captured = authority.clone();
+        let source_read = io::blocking_owned(owner.clone(), move || {
+            ledger.retain_cloud_query_read(&captured)
+        })
+        .await?;
         let client = self
             .inner
             .connector
             .get()
             .await?
-            .with_rpc_lifetime_guard(Arc::new(owner));
+            .with_lifetime_guard(source_read)
+            .with_rpc_lifetime_guard(Arc::new(owner.clone()));
         let client = match io::scope() {
             Some(scope) => client.with_operation_deadline(scope.deadline),
             None => client,
@@ -33,6 +37,15 @@ impl RemoteObjectIo {
             authority.agrees(&proof),
             "snapshot version ownership or source binding changed"
         );
+        if crate::cloud::captured_manifest(proof.manifest()) {
+            crate::retained_offload::adopt_query_source_pin(
+                &self.inner,
+                owner,
+                &client,
+                authority.clone(),
+            )
+            .await?;
+        }
         Ok((client, proof))
     }
     pub(crate) async fn snapshot_metadata(

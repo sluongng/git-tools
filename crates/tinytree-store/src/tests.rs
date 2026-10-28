@@ -8197,6 +8197,1939 @@ fn captured_cloud_request(
     }
 }
 
+fn retirement_clone(request: &PublishCapturedCloudRequest) -> PublishCapturedCloudRequest {
+    PublishCapturedCloudRequest {
+        publication: request.publication.clone(),
+        capture_data: request.capture_data.clone(),
+    }
+}
+fn retirement_selector(request: &PublishCapturedCloudRequest) -> CloudVersionSelector {
+    CloudVersionSelector {
+        workspace: request.publication.workspace,
+        generation: request.publication.expected_generation + 1,
+        manifest: request.publication.manifest,
+        selected: tinytree_cloud::BlobDigest::of(&request.publication.manifest_bytes),
+    }
+}
+fn retirement_request(
+    template: &PublishCapturedCloudRequest,
+    generation: u64,
+    previous: Option<tinytree_cloud::ManifestId>,
+) -> (CloudPublicationIdentity, PublishCapturedCloudRequest) {
+    let mut manifest = tinytree_cloud::decode_manifest_v3(
+        &template.publication.manifest_bytes,
+        template.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    manifest.history.recovery.sequence = generation;
+    manifest.history.recovery.parents = previous.into_iter().collect();
+    let identity = CloudPublicationIdentity {
+        workspace: template.publication.workspace,
+        generation,
+        nonce: [generation as u8; 16],
+    };
+    let bytes = tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    let mut request = retirement_clone(template);
+    request.publication.expected_generation = generation - 1;
+    request.publication.idempotency_key = identity.token();
+    request.publication.manifest = tinytree_cloud::ManifestId::of(&bytes);
+    request.publication.manifest_bytes = bytes;
+    if generation != 1 {
+        request.publication.staging_leases.clear();
+    }
+    (identity, request)
+}
+fn retirement_alternate_raw(
+    store: &Store,
+    owner: CloudOwner,
+    request: &mut PublishCapturedCloudRequest,
+) -> (CloudObjectDescriptor, Vec<u8>) {
+    let mut manifest = tinytree_cloud::decode_manifest_v3(
+        &request.publication.manifest_bytes,
+        request.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    let member = manifest
+        .history
+        .recovery
+        .members
+        .iter_mut()
+        .find(|member| matches!(member.id, tinytree_cloud::ObjectId::Operation(_)))
+        .unwrap();
+    let mut lease = store
+        .read_cloud_object("demo", owner, member.id, Default::default())
+        .unwrap();
+    let mut original = Vec::new();
+    lease.read_to_end(&mut original).unwrap();
+    drop(lease);
+    let raw = reverse_cloud_fields(&original);
+    assert_ne!(raw, original);
+    let descriptor = CloudObjectDescriptor {
+        id: member.id,
+        selected: tinytree_cloud::BlobDigest::of(&raw),
+    };
+    let primary = store
+        .put_cloud_object(
+            "demo",
+            owner,
+            member.id,
+            member.selected,
+            &original,
+            1,
+            Default::default(),
+        )
+        .unwrap();
+    request
+        .publication
+        .staging_leases
+        .retain(|lease| lease != &primary.staging_lease);
+    let receipt = store
+        .put_cloud_object_representation(
+            "demo",
+            owner,
+            descriptor.id,
+            descriptor.selected,
+            &raw,
+            1,
+            Default::default(),
+        )
+        .unwrap();
+    member.selected = descriptor.selected;
+    request
+        .publication
+        .staging_leases
+        .push(receipt.staging_lease);
+    let mut data = tinytree_cloud::decode_data(
+        &request.capture_data,
+        tinytree_cloud::data_digest(&request.capture_data),
+        &Default::default(),
+    )
+    .unwrap();
+    let blob = data
+        .blobs
+        .iter_mut()
+        .find(|blob| blob.kind == 1 && blob.id == hex(descriptor.id.bytes()))
+        .unwrap();
+    blob.blake3 = descriptor.selected.blake3;
+    blob.size = descriptor.selected.size_bytes;
+    request.capture_data = tinytree_cloud::encode_capture_data(&data, Default::default()).unwrap();
+    manifest.capture = tinytree_cloud::CaptureDescriptor::of(&request.capture_data);
+    request.publication.manifest_bytes =
+        tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    request.publication.manifest =
+        tinytree_cloud::ManifestId::of(&request.publication.manifest_bytes);
+    (descriptor, raw)
+}
+
+#[test]
+fn cloud_pin_release_fences_are_bounded_and_survive_clock_rollback() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut policy = config();
+    policy.cloud.max_versions_per_workspace = 2;
+    policy.cloud.max_pin_lifecycle_records_per_workspace = 2;
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [126; 32],
+    };
+    let (_, root, head) = fixture(&store, "pin lifecycle source");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let template = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "pin-lifecycle-source",
+    );
+    let (publication, request) = retirement_request(&template, 1, None);
+    store
+        .publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            publication,
+            &request,
+            1,
+            &Default::default(),
+        )
+        .unwrap();
+    let selected = retirement_selector(&request);
+    let identity = |byte, deadline| CloudVersionPinIdentity {
+        pin_id: [byte; 16],
+        acquire_not_after_unix_seconds: deadline,
+    };
+    let active = identity(1, 200);
+    let absent_release = identity(2, 200);
+    let missing = identity(3, 200);
+    store
+        .pin_cloud_version("demo", owner, active, selected, || Ok(100))
+        .unwrap();
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, selected.workspace, active, || Ok(300))
+            .unwrap(),
+        Some(selected),
+        "admission expiry never expires an active source"
+    );
+    store
+        .pin_cloud_version("demo", owner, active, selected, || {
+            Err(Error::Invalid("unused active-replay clock"))
+        })
+        .unwrap();
+    store
+        .release_cloud_version_pin("demo", owner, absent_release, selected, || Ok(110))
+        .unwrap();
+    assert!(
+        matches!(
+            store.pin_cloud_version("demo", owner, absent_release, selected, || Ok(111)),
+            Err(Error::CloudReplayExpired)
+        ),
+        "Release fences even an accepted worker with no previous row"
+    );
+    assert!(matches!(
+        store.pin_cloud_version("demo", owner, missing, selected, || Ok(111)),
+        Err(Error::Limit("cloud pin lifecycle records"))
+    ));
+    assert!(
+        matches!(
+            store.release_cloud_version_pin("demo", owner, missing, selected, || Ok(111)),
+            Err(Error::Limit("cloud pin lifecycle records"))
+        ),
+        "a full fence pool cannot acknowledge an absent release without fencing it"
+    );
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, selected.workspace, active, || Ok(111))
+            .unwrap(),
+        Some(selected),
+        "capacity refusal preserves the active pin"
+    );
+    let held = store
+        .read_cloud_version(
+            "demo",
+            owner,
+            selected.workspace,
+            selected.generation,
+            Default::default(),
+        )
+        .unwrap();
+    store
+        .release_cloud_version_pin("demo", owner, active, selected, || Ok(112))
+        .unwrap();
+    assert!(
+        matches!(
+            store.pin_cloud_version_from_read_guard("demo", owner, active, &held, || Ok(113)),
+            Err(Error::CloudReplayExpired)
+        ),
+        "a delayed accepted read cannot recreate its released durable pin"
+    );
+    let mut wrong = selected;
+    wrong.selected.size_bytes += 1;
+    assert!(matches!(
+        store.release_cloud_version_pin("demo", owner, active, wrong, || Ok(113)),
+        Err(Error::IdempotencyConflict)
+    ));
+    drop(held);
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    // This terminal missing result also reclaims both expired release fences.
+    assert!(matches!(
+        store.cloud_version_pin("demo", owner, selected.workspace, missing, || Ok(201)),
+        Err(Error::CloudReplayExpired)
+    ));
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert!(
+        matches!(
+            store.pin_cloud_version("demo", owner, active, selected, || Ok(100)),
+            Err(Error::CloudReplayExpired)
+        ),
+        "reopen plus wall-clock rollback cannot undo a reclaimed release fence"
+    );
+    let terminal_missing = identity(4, 300);
+    assert!(matches!(
+        store.cloud_version_pin("demo", owner, selected.workspace, terminal_missing, || Ok(
+            301
+        )),
+        Err(Error::CloudReplayExpired)
+    ));
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert!(
+        matches!(
+            store.pin_cloud_version("demo", owner, terminal_missing, selected, || Ok(100)),
+            Err(Error::CloudReplayExpired)
+        ),
+        "ExpiredMissing persists its floor even without any fence to reclaim"
+    );
+    // A changed expiry denotes a different complete identity, never a renewal.
+    let replacement = identity(3, 400);
+    store
+        .pin_cloud_version("demo", owner, replacement, selected, || Ok(301))
+        .unwrap();
+    assert!(matches!(
+        store.cloud_version_pin("demo", owner, selected.workspace, missing, || Ok(301)),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, selected.workspace, replacement, || Ok(900))
+            .unwrap(),
+        Some(selected)
+    );
+    assert!(
+        store
+            .cloud_version_pin(
+                "demo",
+                CloudOwner {
+                    principal: [127; 32]
+                },
+                selected.workspace,
+                replacement,
+                || Ok(301)
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store.pin_cloud_version("demo", owner, replacement, wrong, || Ok(301)),
+        Err(Error::IdempotencyConflict)
+    ));
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    let cold = store
+        .read_cloud_version(
+            "demo",
+            owner,
+            selected.workspace,
+            selected.generation,
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        tinytree_cloud::BlobDigest::of(cold.manifest_bytes()),
+        selected.selected,
+        "active sources reopen cold after their acquisition window"
+    );
+    drop(cold);
+    store
+        .release_cloud_version_pin("demo", owner, replacement, selected, || Ok(402))
+        .unwrap();
+    let fresh = identity(5, 450);
+    store
+        .pin_cloud_version("demo", owner, fresh, selected, || Ok(402))
+        .unwrap();
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, selected.workspace, fresh, || Ok(1000))
+            .unwrap(),
+        Some(selected),
+        "expired fences do not create a lifetime row ceiling"
+    );
+    assert!(matches!(
+        store.pin_cloud_version("demo", owner, identity(6, 1000), selected, || Ok(402)),
+        Err(Error::Invalid("cloud pin admission horizon"))
+    ));
+    assert!(matches!(
+        store.cloud_version_pin("demo", owner, selected.workspace, identity(7, 450), || Err(
+            Error::Invalid("trusted clock failed")
+        )),
+        Err(Error::Invalid("trusted clock failed"))
+    ));
+}
+
+#[test]
+fn cloud_rolling_policy_shrink_waits_for_successful_atomic_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut policy = config();
+    policy.cloud.max_versions_per_workspace = 8;
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [124; 32],
+    };
+    let (_, root, head) = fixture(&store, "rolling policy adoption");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let template = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "policy-adoption",
+    );
+    let mut previous = None;
+    for generation in 1..=4 {
+        let (identity, request) = retirement_request(&template, generation, previous);
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &request,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        previous = Some(request.publication.manifest);
+    }
+    let before = store.cloud_catalog_budget_summary().unwrap();
+    let workspace = template.publication.workspace;
+    let state = store
+        .cloud_retention_state("demo", owner, workspace)
+        .unwrap();
+    assert_eq!(state.retained_versions, 4);
+    drop(store);
+    policy.cloud.max_versions_per_workspace = 2;
+    assert!(
+        matches!(
+            Store::open_existing(directory.path(), policy.clone()),
+            Err(Error::Limit("cloud retained version quota"))
+        ),
+        "nonrolling hard bounds remain unchanged"
+    );
+    policy.cloud.retirement_enabled = true;
+    policy.cloud.rolling_retention_enabled = true;
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap(),
+        before,
+        "reopen does not retire the existing normal suffix"
+    );
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, workspace)
+            .unwrap(),
+        state
+    );
+    assert_eq!(
+        store
+            .list_cloud_versions("demo", owner, workspace, 128, &[])
+            .unwrap()
+            .versions
+            .len(),
+        4
+    );
+    let old = store
+        .read_cloud_version("demo", owner, workspace, 1, Default::default())
+        .unwrap();
+    assert_eq!(old.version().generation, 1);
+    drop(old);
+    let latest = store
+        .read_latest_captured_cloud_version(
+            "demo",
+            owner,
+            workspace,
+            Default::default(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version().generation, 4);
+    drop(latest);
+    let (identity, next) = retirement_request(&template, 5, previous);
+    let mut invalid = retirement_clone(&next);
+    invalid.capture_data.clear();
+    assert!(
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &invalid,
+                1,
+                &Default::default()
+            )
+            .is_err()
+    );
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap(), before);
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, workspace)
+            .unwrap(),
+        state
+    );
+    store
+        .publish_captured_cloud_version_v2("demo", owner, identity, &next, 1, &Default::default())
+        .unwrap();
+    let state = store
+        .cloud_retention_state("demo", owner, workspace)
+        .unwrap();
+    assert_eq!((state.retired_through, state.retained_versions), (3, 2));
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap().versions, 2);
+    assert_eq!(
+        store
+            .list_cloud_versions("demo", owner, workspace, 128, &[])
+            .unwrap()
+            .versions
+            .iter()
+            .map(|version| version.generation)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert!(matches!(
+        store.read_cloud_version("demo", owner, workspace, 1, Default::default()),
+        Err(Error::CloudVersionExpired)
+    ));
+    let after = store.cloud_catalog_budget_summary().unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy).unwrap();
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap(), after);
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, workspace)
+            .unwrap(),
+        state
+    );
+}
+
+#[test]
+fn cloud_rolling_window_keeps_only_live_pin_and_reader_exceptions() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut policy = config();
+    policy.cloud.max_versions_per_workspace = 2;
+    policy.cloud.retirement_enabled = true;
+    policy.cloud.rolling_retention_enabled = true;
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [123; 32],
+    };
+    let (_, root, old_head) = fixture(&store, "pinned old snapshot");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        old_head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(old_head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let template = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "rolling-source",
+    );
+    let (first_identity, first) = retirement_request(&template, 1, None);
+    store
+        .publish_captured_cloud_version("demo", owner, &first, 1, &Default::default())
+        .unwrap();
+    let old = retirement_selector(&first);
+    let pin = CloudVersionPinIdentity {
+        pin_id: [1; 16],
+        acquire_not_after_unix_seconds: 200,
+    };
+    store
+        .pin_cloud_version("demo", owner, pin, old, || Ok(100))
+        .unwrap();
+    let (second_identity, second) =
+        retirement_request(&template, 2, Some(first.publication.manifest));
+    store
+        .publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            second_identity,
+            &second,
+            1,
+            &Default::default(),
+        )
+        .unwrap();
+    let reader = store
+        .read_cloud_version("demo", owner, old.workspace, 2, Default::default())
+        .unwrap();
+
+    // A genuinely different snapshot need not contain all old DATA or undo.
+    let (_, new_root, new_head) = fixture(&store, "independent current snapshot");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        new_head,
+        new_root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(new_head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let replacement = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        2,
+        "rolling-replacement",
+    );
+    let second_replay = retirement_clone(&second);
+    let mut current = second;
+    for generation in 3..=6 {
+        let (identity, mut next) =
+            retirement_request(&replacement, generation, Some(current.publication.manifest));
+        if generation == 3 {
+            next.publication.staging_leases = replacement.publication.staging_leases.clone();
+        }
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &next,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        current = next;
+    }
+    let state = store
+        .cloud_retention_state("demo", owner, old.workspace)
+        .unwrap();
+    assert_eq!((state.retired_through, state.retained_versions), (4, 2));
+    let listed = store
+        .list_cloud_versions("demo", owner, old.workspace, 128, &[])
+        .unwrap();
+    assert_eq!(
+        listed
+            .versions
+            .iter()
+            .map(|version| version.generation)
+            .collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap().versions, 4);
+    let cold = store
+        .read_cloud_version("demo", owner, old.workspace, 1, Default::default())
+        .unwrap();
+    assert_eq!(cold.manifest_bytes(), first.publication.manifest_bytes);
+    assert!(matches!(
+        store.cloud_publication("demo", owner, &first.publication.idempotency_key),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.publish_captured_cloud_version("demo", owner, &first, 1, &Default::default()),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.cloud_publication_v2("demo", owner, second_identity),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            second_identity,
+            &second_replay,
+            1,
+            &Default::default()
+        ),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.cloud_publication_v2("demo", owner, first_identity),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            first_identity,
+            &first,
+            1,
+            &Default::default()
+        ),
+        Err(Error::CloudReplayExpired)
+    ));
+    let latest = store
+        .read_latest_captured_cloud_version(
+            "demo",
+            owner,
+            old.workspace,
+            Default::default(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version().generation, 6);
+    drop(latest);
+    let (next_identity, next) =
+        retirement_request(&replacement, 7, Some(current.publication.manifest));
+    let mut invalid = retirement_clone(&next);
+    invalid.capture_data.clear();
+    assert!(
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                next_identity,
+                &invalid,
+                1,
+                &Default::default()
+            )
+            .is_err()
+    );
+    let (stale_identity, stale) =
+        retirement_request(&replacement, 8, Some(current.publication.manifest));
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            stale_identity,
+            &stale,
+            1,
+            &Default::default()
+        ),
+        Err(Error::StaleCloudWorkspace(_))
+    ));
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, old.workspace)
+            .unwrap(),
+        state
+    );
+
+    drop(reader);
+    assert!(
+        matches!(
+            store.read_cloud_version("demo", owner, old.workspace, 2, Default::default()),
+            Err(Error::CloudVersionExpired)
+        ),
+        "stale metadata cannot grant an exact read"
+    );
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap().versions,
+        4,
+        "guard drop performs no database write"
+    );
+    // A malformed stale receipt must abort publication/cleanup without erasing
+    // either the evidence or the valid recent window.
+    let receipts = store
+        .inner
+        .db
+        .keyspace("cloud-receipts-v1", KeyspaceCreateOptions::default)
+        .unwrap();
+    let (receipt_key, original) = store
+        .inner
+        .db
+        .read_tx()
+        .iter(&receipts)
+        .map(|item| item.into_inner().unwrap())
+        .find(|(_, bytes)| {
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["version"]["generation"]
+                == 2
+        })
+        .unwrap();
+    let mut bad: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let byte = bad["version"]["manifest"][0].as_u64().unwrap();
+    bad["version"]["manifest"][0] = serde_json::Value::from(byte ^ 1);
+    let bad = serde_json::to_vec(&bad).unwrap();
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    tx.insert(&receipts, &*receipt_key, &bad);
+    tx.commit().unwrap();
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            next_identity,
+            &next,
+            1,
+            &Default::default()
+        ),
+        Err(Error::Corrupt(_))
+    ));
+    assert!(matches!(store.gc("demo", 100), Err(Error::Corrupt(_))));
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, old.workspace)
+            .unwrap(),
+        state
+    );
+    assert_eq!(
+        store
+            .inner
+            .db
+            .read_tx()
+            .get(&receipts, &receipt_key)
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        bad.as_slice()
+    );
+    let mut tx = store
+        .inner
+        .db
+        .write_tx()
+        .durability(Some(PersistMode::SyncAll));
+    tx.insert(&receipts, &*receipt_key, &*original);
+    tx.commit().unwrap();
+    store.gc("demo", 100).unwrap();
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap().versions, 3);
+    assert_eq!(
+        store.descriptor("demo", old_head.key).unwrap(),
+        Some(old_head)
+    );
+    assert_eq!(
+        store.descriptor("demo", new_head.key).unwrap(),
+        Some(new_head)
+    );
+    drop(cold);
+    drop(receipts);
+    drop(store);
+
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    let cold = store
+        .read_cloud_version("demo", owner, old.workspace, 1, Default::default())
+        .unwrap();
+    assert_eq!(cold.manifest_bytes(), first.publication.manifest_bytes);
+    store
+        .release_cloud_version_pin("demo", owner, pin, old, || Ok(100))
+        .unwrap();
+    let still_held = store
+        .read_cloud_version("demo", owner, old.workspace, 1, Default::default())
+        .unwrap();
+    drop(still_held);
+    drop(cold);
+    assert!(matches!(
+        store.read_cloud_version("demo", owner, old.workspace, 1, Default::default()),
+        Err(Error::CloudVersionExpired)
+    ));
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap().versions, 3);
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap().versions,
+        2,
+        "reopen reaps well-formed unprotected exceptions"
+    );
+    assert!(matches!(
+        store.read_cloud_version("demo", owner, old.workspace, 1, Default::default()),
+        Err(Error::CloudVersionExpired)
+    ));
+    store.gc("demo", 100).unwrap();
+    assert_eq!(store.descriptor("demo", old_head.key).unwrap(), None);
+    assert_eq!(
+        store.descriptor("demo", new_head.key).unwrap(),
+        Some(new_head)
+    );
+    // Delayed compatible captures must not move the logical head backwards
+    // when its publication generation leaves the dense recent window.
+    let with_sequence = |mut request: PublishCapturedCloudRequest, sequence| {
+        let mut manifest = tinytree_cloud::decode_manifest_v3(
+            &request.publication.manifest_bytes,
+            request.publication.manifest,
+            Default::default(),
+        )
+        .unwrap();
+        manifest.history.recovery.sequence = sequence;
+        request.publication.manifest_bytes =
+            tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+        request.publication.manifest =
+            tinytree_cloud::ManifestId::of(&request.publication.manifest_bytes);
+        request
+    };
+    for (generation, sequence, expected) in [(7, 100, 7), (8, 99, 7), (9, 98, 7)] {
+        let (identity, next) =
+            retirement_request(&replacement, generation, Some(current.publication.manifest));
+        let next = with_sequence(next, sequence);
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &next,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let latest = store
+            .read_latest_captured_cloud_version(
+                "demo",
+                owner,
+                old.workspace,
+                Default::default(),
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.version().generation, expected);
+        drop(latest);
+        current = next;
+    }
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap().versions,
+        3,
+        "only one unpinned logical-head exception supplements recent-N"
+    );
+    assert!(
+        matches!(
+            store.read_cloud_version("demo", owner, old.workspace, 7, Default::default()),
+            Err(Error::CloudVersionExpired)
+        ),
+        "the logical singleton is not direct old-source authority"
+    );
+    store.gc("demo", 100).unwrap();
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy).unwrap();
+    let latest = store
+        .read_latest_captured_cloud_version(
+            "demo",
+            owner,
+            old.workspace,
+            Default::default(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.version().generation,
+        7,
+        "the singleton survives cold reopen and GC"
+    );
+    drop(latest);
+    let (identity, next) = retirement_request(&replacement, 10, Some(current.publication.manifest));
+    let next = with_sequence(next, 101);
+    store
+        .publish_captured_cloud_version_v2("demo", owner, identity, &next, 1, &Default::default())
+        .unwrap();
+    assert_eq!(
+        store.cloud_catalog_budget_summary().unwrap().versions,
+        2,
+        "a newer logical head reaps the old singleton"
+    );
+    let latest = store
+        .read_latest_captured_cloud_version(
+            "demo",
+            owner,
+            old.workspace,
+            Default::default(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version().generation, 10);
+    drop(latest);
+    let state = store
+        .cloud_retention_state("demo", owner, old.workspace)
+        .unwrap();
+    let before = store.cloud_catalog_budget_summary().unwrap();
+    let (identity, conflicting) =
+        retirement_request(&replacement, 11, Some(next.publication.manifest));
+    let mut conflicting = with_sequence(conflicting, 101);
+    let mut data = tinytree_cloud::decode_data(
+        &conflicting.capture_data,
+        tinytree_cloud::CaptureDataId::of(&conflicting.capture_data).0,
+        &Default::default(),
+    )
+    .unwrap();
+    data.remote = Some(tinytree_cloud::PortableRemoteState {
+        observations: vec![],
+        archived_pushes: vec![],
+        landing: None,
+    });
+    conflicting.capture_data =
+        tinytree_cloud::encode_capture_data(&data, Default::default()).unwrap();
+    let mut manifest = tinytree_cloud::decode_manifest_v3(
+        &conflicting.publication.manifest_bytes,
+        conflicting.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    manifest.capture = tinytree_cloud::CaptureDescriptor::of(&conflicting.capture_data);
+    conflicting.publication.manifest_bytes =
+        tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    conflicting.publication.manifest =
+        tinytree_cloud::ManifestId::of(&conflicting.publication.manifest_bytes);
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            identity,
+            &conflicting,
+            1,
+            &Default::default()
+        ),
+        Err(Error::Invalid("ambiguous latest capture sequence"))
+    ));
+    manifest.history.recovery.sequence = 102;
+    manifest.history.recovery.exporter = [43; 16];
+    conflicting.publication.manifest_bytes =
+        tinytree_cloud::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    conflicting.publication.manifest =
+        tinytree_cloud::ManifestId::of(&conflicting.publication.manifest_bytes);
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            identity,
+            &conflicting,
+            1,
+            &Default::default()
+        ),
+        Err(Error::Invalid("ambiguous latest capture exporter"))
+    ));
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, old.workspace)
+            .unwrap(),
+        state
+    );
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap(), before);
+}
+
+#[test]
+fn cloud_retirement_keeps_monotonic_generations_exact_pins_undo_and_raw_selections() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut policy = config();
+    policy.cloud.max_versions_per_workspace = 2;
+    policy.cloud.retirement_enabled = true;
+    policy.cloud.resident = Some(CloudResidentLimits {
+        max_bytes: 256 * 1024 * 1024,
+        max_entries: 65_536,
+    });
+    let store = Store::open(directory.path(), policy.clone()).unwrap();
+    store.create_repository("demo").unwrap();
+    let owner = CloudOwner {
+        principal: [121; 32],
+    };
+    let (_, root, head) = fixture(&store, "retained private undo source");
+    let (history, leases, artifacts) = cloud_v2_capture(
+        &store,
+        owner,
+        head,
+        root,
+        tinytree_cloud::PortableIndexSnapshot {
+            roots: vec![CommitId(head.key.id.0)],
+            drafts: vec![],
+        },
+    );
+    let mut template = captured_cloud_request(
+        &store,
+        owner,
+        history,
+        leases,
+        &artifacts,
+        0,
+        "retirement-source",
+    );
+    let (raw_descriptor, raw) = retirement_alternate_raw(&store, owner, &mut template);
+    let (legacy_identity, first) = retirement_request(&template, 1, None);
+    store
+        .publish_captured_cloud_version("demo", owner, &first, 1, &Default::default())
+        .unwrap();
+    // A legacy text token looking exactly like v2 cannot occupy v2's binary domain.
+    assert!(
+        store
+            .cloud_publication_v2("demo", owner, legacy_identity)
+            .unwrap()
+            .is_none()
+    );
+    let (second_identity, second) =
+        retirement_request(&template, 2, Some(first.publication.manifest));
+    let second_receipt = store
+        .publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            second_identity,
+            &second,
+            1,
+            &Default::default(),
+        )
+        .unwrap();
+    let old = retirement_selector(&first);
+    let pin_id = CloudVersionPinIdentity {
+        pin_id: [7; 16],
+        acquire_not_after_unix_seconds: 200,
+    };
+    store
+        .pin_cloud_version("demo", owner, pin_id, old, || Ok(100))
+        .unwrap();
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, old.workspace, pin_id, || Ok(100))
+            .unwrap(),
+        Some(old)
+    );
+    store
+        .pin_cloud_version("demo", owner, pin_id, old, || Ok(100))
+        .unwrap();
+    let request = CloudRetirementRequest {
+        expected_current: retirement_selector(&second),
+        expected_floor: 0,
+        expected_revision: 0,
+        retire_through: 1,
+    };
+    let reader = store
+        .read_cloud_version("demo", owner, old.workspace, 1, Default::default())
+        .unwrap();
+    assert!(matches!(
+        store.retire_cloud_versions("demo", owner, request),
+        Err(Error::Invalid("cloud version has active readers"))
+    ));
+    drop(reader);
+    assert!(matches!(
+        store.retire_cloud_versions("demo", owner, request),
+        Err(Error::Invalid("cloud version has durable pins"))
+    ));
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert!(matches!(
+        store.retire_cloud_versions("demo", owner, request),
+        Err(Error::Invalid("cloud version has durable pins"))
+    ));
+    let mut wrong = old;
+    wrong.selected.size_bytes += 1;
+    assert!(matches!(
+        store.release_cloud_version_pin("demo", owner, pin_id, wrong, || Ok(100)),
+        Err(Error::IdempotencyConflict)
+    ));
+    store
+        .release_cloud_version_pin("demo", owner, pin_id, old, || Ok(100))
+        .unwrap();
+    assert!(matches!(
+        store.cloud_version_pin("demo", owner, old.workspace, pin_id, || Ok(100)),
+        Err(Error::CloudReplayExpired)
+    ));
+    store
+        .release_cloud_version_pin("demo", owner, pin_id, old, || Ok(100))
+        .unwrap();
+    let cursor = store
+        .list_cloud_versions("demo", owner, old.workspace, 1, &[])
+        .unwrap()
+        .continuation;
+    assert!(!cursor.is_empty());
+    // Corruption boundary: retirement must not erase a malformed receipt and
+    // make a catalog pass reopen by deleting the evidence of a wrong binding.
+    {
+        let receipts = store
+            .inner
+            .db
+            .keyspace("cloud-receipts-v1", KeyspaceCreateOptions::default)
+            .unwrap();
+        let (receipt_key, original_receipt) = store
+            .inner
+            .db
+            .read_tx()
+            .iter(&receipts)
+            .map(|item| item.into_inner().unwrap())
+            .find(|(_, bytes)| {
+                serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["format"] == 1
+            })
+            .unwrap();
+        let mut corrupted: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+        let byte = corrupted["version"]["manifest"][0].as_u64().unwrap();
+        corrupted["version"]["manifest"][0] = serde_json::Value::from(byte ^ 1);
+        let corrupted = serde_json::to_vec(&corrupted).unwrap();
+        let mut tx = store
+            .inner
+            .db
+            .write_tx()
+            .durability(Some(PersistMode::SyncAll));
+        tx.insert(&receipts, &*receipt_key, &corrupted);
+        tx.commit().unwrap();
+        assert!(matches!(
+            store.retire_cloud_versions("demo", owner, request),
+            Err(Error::Corrupt("cloud receipt replay history"))
+        ));
+        assert_eq!(
+            store
+                .cloud_retention_state("demo", owner, old.workspace)
+                .unwrap()
+                .retired_through,
+            0
+        );
+        assert_eq!(
+            store
+                .inner
+                .db
+                .read_tx()
+                .get(&receipts, &receipt_key)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            corrupted.as_slice()
+        );
+        let mut tx = store
+            .inner
+            .db
+            .write_tx()
+            .durability(Some(PersistMode::SyncAll));
+        tx.insert(&receipts, &*receipt_key, &*original_receipt);
+        tx.commit().unwrap();
+    }
+    let retired = store.retire_cloud_versions("demo", owner, request).unwrap();
+    assert_eq!(retired.retired_through, 1);
+    assert_eq!(
+        store.retire_cloud_versions("demo", owner, request).unwrap(),
+        retired
+    );
+    assert!(matches!(
+        store.list_cloud_versions("demo", owner, old.workspace, 1, &cursor),
+        Err(Error::CloudRetentionChanged)
+    ));
+    assert!(matches!(
+        store.read_cloud_version("demo", owner, old.workspace, 1, Default::default()),
+        Err(Error::CloudVersionExpired)
+    ));
+    assert!(matches!(
+        store.publish_captured_cloud_version("demo", owner, &first, 1, &Default::default()),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.cloud_publication("demo", owner, &legacy_identity.token()),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(matches!(
+        store.cloud_publication_v2("demo", owner, legacy_identity),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert_eq!(
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                second_identity,
+                &second,
+                1,
+                &Default::default()
+            )
+            .unwrap(),
+        second_receipt
+    );
+    let mut conflict = retirement_clone(&second);
+    conflict.publication.manifest_bytes.push(0);
+    assert!(matches!(
+        store.publish_captured_cloud_version_v2(
+            "demo",
+            owner,
+            second_identity,
+            &conflict,
+            1,
+            &Default::default()
+        ),
+        Err(Error::IdempotencyConflict)
+    ));
+    let mut foreign_workspace = retirement_clone(&first);
+    foreign_workspace.publication.workspace = [177; 32];
+    foreign_workspace.publication.expected_generation = 0;
+    assert!(matches!(
+        store.publish_captured_cloud_version(
+            "demo",
+            owner,
+            &foreign_workspace,
+            1,
+            &Default::default()
+        ),
+        Err(Error::CloudReplayExpired)
+    ));
+    assert!(
+        store
+            .cloud_publication(
+                "demo",
+                CloudOwner {
+                    principal: [122; 32]
+                },
+                &legacy_identity.token()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store.supports_durable_retained_offload(),
+        "old eternal-exact capability is not a pin-aware lifecycle contract"
+    );
+    let mut current = second;
+    let mut current_identity = second_identity;
+    for generation in 3..=6 {
+        let state = store
+            .cloud_retention_state("demo", owner, old.workspace)
+            .unwrap();
+        if state.retained_versions == 2 {
+            store
+                .retire_cloud_versions(
+                    "demo",
+                    owner,
+                    CloudRetirementRequest {
+                        expected_current: retirement_selector(&current),
+                        expected_floor: state.retired_through,
+                        expected_revision: state.retention_revision,
+                        retire_through: state.retired_through + 1,
+                    },
+                )
+                .unwrap();
+        }
+        let (identity, next) =
+            retirement_request(&template, generation, Some(current.publication.manifest));
+        let receipt = store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &next,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(receipt.workspace.generation, generation);
+        current = next;
+        current_identity = identity;
+        store.gc("demo", 100).unwrap();
+    }
+    let state = store
+        .cloud_retention_state("demo", owner, old.workspace)
+        .unwrap();
+    assert_eq!(state.retired_through, 4);
+    assert_eq!(state.retained_versions, 2);
+    let listed = store
+        .list_cloud_versions("demo", owner, old.workspace, 128, &[])
+        .unwrap();
+    assert_eq!(
+        listed
+            .versions
+            .iter()
+            .map(|version| version.generation)
+            .collect::<Vec<_>>(),
+        vec![5, 6]
+    );
+    let latest = store
+        .read_latest_captured_cloud_version(
+            "demo",
+            owner,
+            old.workspace,
+            Default::default(),
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version().generation, 6);
+    let mut selected = store
+        .read_cloud_object_representation("demo", owner, raw_descriptor, Default::default())
+        .unwrap();
+    let mut actual = Vec::new();
+    selected.read_to_end(&mut actual).unwrap();
+    assert_eq!(
+        actual, raw,
+        "successor keeps the exact non-primary OP representation"
+    );
+    drop(selected);
+    drop(latest);
+    let before = store.cloud_catalog_budget_summary().unwrap();
+    assert_eq!(before.versions, 2);
+    assert_eq!(before.publication_receipts, 2);
+    drop(store);
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    assert_eq!(store.cloud_catalog_budget_summary().unwrap(), before);
+    assert!(
+        store
+            .cloud_publication_v2("demo", owner, current_identity)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.descriptor("demo", head.key).unwrap(), Some(head));
+    let read = store
+        .read_cloud_version("demo", owner, old.workspace, 5, Default::default())
+        .unwrap();
+    let fifth = CloudVersionSelector {
+        workspace: old.workspace,
+        generation: 5,
+        manifest: read.version().manifest,
+        selected: tinytree_cloud::BlobDigest::of(read.manifest_bytes()),
+    };
+    drop(read);
+    // Calibrate the exact prospective catalog: release fences are now durable
+    // rows, so a replacement Active hold coexists with those rows. The finite
+    // policy still fits one such arena plus slack, never two physical arenas.
+    let calibration_pin = CloudVersionPinIdentity {
+        pin_id: [98; 16],
+        acquire_not_after_unix_seconds: 200,
+    };
+    store
+        .pin_cloud_version("demo", owner, calibration_pin, fifth, || Ok(100))
+        .unwrap();
+    store
+        .release_cloud_version_pin("demo", owner, calibration_pin, fifth, || Ok(100))
+        .unwrap();
+    let prospective_probe = CloudVersionPinIdentity {
+        pin_id: [97; 16],
+        acquire_not_after_unix_seconds: 120,
+    };
+    store
+        .pin_cloud_version("demo", owner, prospective_probe, fifth, || Ok(100))
+        .unwrap();
+    drop(store);
+    let prospective = cloud::resident::preflight(directory.path(), &policy)
+        .unwrap()
+        .charge()
+        .unwrap();
+    let store = Store::open_existing(directory.path(), policy.clone()).unwrap();
+    // Reclaim this probe only after its admission window; the durable clock
+    // floor prevents a delayed probe Acquire from returning after deletion.
+    store
+        .release_cloud_version_pin("demo", owner, prospective_probe, fifth, || Ok(120))
+        .unwrap();
+    drop(store);
+    let arena = cloud::resident::preflight(directory.path(), &policy)
+        .unwrap()
+        .charge()
+        .unwrap();
+    let max_bytes = prospective.bytes + 65536;
+    assert!(max_bytes < 2 * arena.bytes);
+    policy.cloud.resident.as_mut().unwrap().max_bytes = max_bytes;
+    let store = Store::open_existing(directory.path(), policy).unwrap();
+    let request = CloudRetirementRequest {
+        expected_current: retirement_selector(&current),
+        expected_floor: state.retired_through,
+        expected_revision: state.retention_revision,
+        retire_through: 5,
+    };
+    let read = store
+        .read_cloud_version("demo", owner, old.workspace, 5, Default::default())
+        .unwrap();
+    let replay = store
+        .cloud_publication_v2("demo", owner, current_identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                current_identity,
+                &current,
+                1,
+                &Default::default()
+            )
+            .unwrap(),
+        replay,
+        "scalar receipt lookup and exact replay share exclusion without a second catalog arena"
+    );
+    let transfer_pin = CloudVersionPinIdentity {
+        pin_id: [99; 16],
+        acquire_not_after_unix_seconds: 200,
+    };
+    assert_eq!(
+        store
+            .pin_cloud_version_from_read_guard("demo", owner, transfer_pin, &read, || Ok(100))
+            .unwrap(),
+        fifth
+    );
+    assert_eq!(
+        store
+            .pin_cloud_version_from_read_guard("demo", owner, transfer_pin, &read, || Ok(100))
+            .unwrap(),
+        fifth
+    );
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, old.workspace, transfer_pin, || Ok(100))
+            .unwrap(),
+        Some(fifth)
+    );
+    let (_foreign_directory, foreign) = open();
+    for result in [
+        foreign.pin_cloud_version_from_read_guard("demo", owner, transfer_pin, &read, || Ok(100)),
+        store.pin_cloud_version_from_read_guard("other", owner, transfer_pin, &read, || Ok(100)),
+        store.pin_cloud_version_from_read_guard(
+            "demo",
+            CloudOwner {
+                principal: [122; 32],
+            },
+            transfer_pin,
+            &read,
+            || Ok(100),
+        ),
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::Invalid("cloud version pin read guard scope"))
+        ));
+    }
+    drop(read);
+    let independent = store
+        .read_cloud_version("demo", owner, old.workspace, 6, Default::default())
+        .unwrap();
+    assert!(matches!(
+        store.retire_cloud_versions("demo", owner, request),
+        Err(Error::Limit("cloud resident memory"))
+    ));
+    assert!(matches!(
+        store.pin_cloud_version_from_read_guard("demo", owner, transfer_pin, &independent, || Ok(
+            100
+        )),
+        Err(Error::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store
+            .cloud_version_pin("demo", owner, old.workspace, transfer_pin, || Ok(100))
+            .unwrap(),
+        Some(fifth)
+    );
+    drop(independent);
+    assert!(
+        matches!(
+            store.retire_cloud_versions("demo", owner, request),
+            Err(Error::Invalid("cloud version has durable pins"))
+        ),
+        "durable transfer survives the last ephemeral reader"
+    );
+    store
+        .release_cloud_version_pin("demo", owner, transfer_pin, fifth, || Ok(100))
+        .unwrap();
+    assert_eq!(
+        store
+            .cloud_retention_state("demo", owner, old.workspace)
+            .unwrap(),
+        state
+    );
+    assert_eq!(
+        store
+            .retire_cloud_versions("demo", owner, request)
+            .unwrap()
+            .retired_through,
+        5
+    );
+    assert!(matches!(
+        store.retire_cloud_versions(
+            "demo",
+            owner,
+            CloudRetirementRequest {
+                expected_revision: 0,
+                ..request
+            }
+        ),
+        Err(Error::CloudRetentionChanged)
+    ));
+}
+
+#[test]
+fn cloud_retirement_rejects_valid_successors_missing_undo_or_exact_raw_coverage() {
+    for omit_undo in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = config();
+        policy.cloud.retirement_enabled = true;
+        let store = Store::open(directory.path(), policy.clone()).unwrap();
+        store.create_repository("demo").unwrap();
+        let owner = CloudOwner {
+            principal: [123; 32],
+        };
+        let (_, root, head) = fixture(&store, "old private undo");
+        let (history, leases, artifacts) = cloud_v2_capture(
+            &store,
+            owner,
+            head,
+            root,
+            tinytree_cloud::PortableIndexSnapshot {
+                roots: vec![CommitId(head.key.id.0)],
+                drafts: vec![],
+            },
+        );
+        let original = captured_cloud_request(
+            &store,
+            owner,
+            history,
+            leases,
+            &artifacts,
+            0,
+            "coverage-first",
+        );
+        let mut first = retirement_clone(&original);
+        retirement_alternate_raw(&store, owner, &mut first);
+        store
+            .publish_captured_cloud_version("demo", owner, &first, 1, &Default::default())
+            .unwrap();
+        let template = if omit_undo {
+            let mut snapshot = commit(TreeId(root.key.id.0), "independent newer working copy");
+            snapshot.change_id = ChangeId([231; 16]);
+            let other = put_object(&store, Object::Commit(snapshot), 0);
+            let (history, leases, artifacts) = cloud_v2_capture(
+                &store,
+                owner,
+                other,
+                root,
+                tinytree_cloud::PortableIndexSnapshot {
+                    roots: vec![CommitId(other.key.id.0)],
+                    drafts: vec![],
+                },
+            );
+            captured_cloud_request(
+                &store,
+                owner,
+                history,
+                leases,
+                &artifacts,
+                1,
+                "coverage-second",
+            )
+        } else {
+            original
+        };
+        let (identity, mut second) =
+            retirement_request(&template, 2, Some(first.publication.manifest));
+        // Newly uploaded independent selections still need their initial stages.
+        if omit_undo {
+            second.publication.staging_leases = template.publication.staging_leases.clone();
+        }
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &second,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let before = store.cloud_catalog_budget_summary().unwrap();
+        let request = CloudRetirementRequest {
+            expected_current: retirement_selector(&second),
+            expected_floor: 0,
+            expected_revision: 0,
+            retire_through: 1,
+        };
+        assert!(
+            matches!(
+                store.retire_cloud_versions("demo", owner, request),
+                Err(Error::Invalid(
+                    "cloud retirement successor coverage incomplete"
+                ))
+            ),
+            "omit_undo={omit_undo}"
+        );
+        assert_eq!(store.cloud_catalog_budget_summary().unwrap(), before);
+        assert!(
+            store
+                .cloud_publication("demo", owner, "unknown-legacy-key")
+                .unwrap()
+                .is_none(),
+            "refusal cannot close replay namespace"
+        );
+        assert_eq!(
+            store
+                .read_cloud_version(
+                    "demo",
+                    owner,
+                    first.publication.workspace,
+                    1,
+                    Default::default()
+                )
+                .unwrap()
+                .manifest_bytes(),
+            first.publication.manifest_bytes
+        );
+        drop(store);
+        let default_store = Store::open_existing(directory.path(), config()).unwrap();
+        assert!(
+            default_store.supports_durable_retained_offload(),
+            "v2 receipts alone do not enable retirement or weaken the old promise"
+        );
+        assert!(matches!(
+            default_store.retire_cloud_versions("demo", owner, request),
+            Err(Error::Invalid("cloud retirement is disabled"))
+        ));
+    }
+}
+
+fn retirement_remote_state(
+    request: &mut PublishCapturedCloudRequest,
+    remote: tinytree_cloud::PortableRemoteState,
+) {
+    use tinytree_cloud as c;
+    let mut data = c::decode_data(
+        &request.capture_data,
+        c::data_digest(&request.capture_data),
+        &Default::default(),
+    )
+    .unwrap();
+    data.version = if remote.landing.is_some() { 2 } else { 1 };
+    data.remote = Some(remote);
+    let mut manifest = c::decode_manifest_v3(
+        &request.publication.manifest_bytes,
+        request.publication.manifest,
+        Default::default(),
+    )
+    .unwrap();
+    // Wrapper IDs depend on DATA; only their native root union is needed to
+    // construct the exact final DATA/root binding below.
+    let intents =
+        c::capture_recovery_intents(&data, c::CaptureDataId([0; 32]), Default::default()).unwrap();
+    manifest.history.recovery.native_roots.extend(
+        intents
+            .iter()
+            .flat_map(|intent| intent.roots.iter().copied()),
+    );
+    manifest
+        .history
+        .recovery
+        .native_roots
+        .sort_by_key(|key| (key.kind as u8, key.id.0));
+    manifest.history.recovery.native_roots.dedup();
+    data.roots = manifest
+        .history
+        .recovery
+        .native_roots
+        .iter()
+        .map(|key| c::CapturedRoot {
+            kind: key.kind as u8,
+            id: key.id.0,
+        })
+        .collect();
+    request.capture_data = c::encode_capture_data(&data, Default::default()).unwrap();
+    manifest.capture = c::CaptureDescriptor::of(&request.capture_data);
+    manifest.history.recovery.intent_roots =
+        c::capture_recovery_intents(&data, manifest.capture.id, Default::default()).unwrap();
+    request.publication.manifest_bytes =
+        c::encode_manifest_v3(&manifest, Default::default()).unwrap();
+    request.publication.manifest = c::ManifestId::of(&request.publication.manifest_bytes);
+}
+
+#[test]
+fn cloud_retirement_compares_verified_observations_without_expiring_uncertain_intents() {
+    use tinytree_cloud as c;
+    enum Head {
+        Old,
+        Advanced,
+    }
+    struct Case {
+        name: &'static str,
+        observation: Option<(u64, Head)>,
+        confirmed_push: Option<u64>,
+        landing_profile: &'static str,
+        allowed: bool,
+    }
+    let cases = [
+        Case {
+            name: "advanced observed main",
+            observation: Some((3, Head::Advanced)),
+            confirmed_push: None,
+            landing_profile: "v1",
+            allowed: true,
+        },
+        Case {
+            name: "missing observation",
+            observation: None,
+            confirmed_push: None,
+            landing_profile: "v1",
+            allowed: false,
+        },
+        Case {
+            name: "regressing observed generation",
+            observation: Some((1, Head::Old)),
+            confirmed_push: None,
+            landing_profile: "v1",
+            allowed: false,
+        },
+        Case {
+            name: "equal generation changed head",
+            observation: Some((2, Head::Advanced)),
+            confirmed_push: None,
+            landing_profile: "v1",
+            allowed: false,
+        },
+        Case {
+            name: "changed pending push",
+            observation: Some((3, Head::Advanced)),
+            confirmed_push: Some(3),
+            landing_profile: "v1",
+            allowed: false,
+        },
+        Case {
+            name: "changed pending landing",
+            observation: Some((3, Head::Advanced)),
+            confirmed_push: None,
+            landing_profile: "v2",
+            allowed: false,
+        },
+    ];
+    for case in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = config();
+        policy.cloud.retirement_enabled = true;
+        policy.cloud.max_versions_per_workspace = 2;
+        let store = Store::open(directory.path(), policy).unwrap();
+        store.create_repository("demo").unwrap();
+        let owner = CloudOwner {
+            principal: [124; 32],
+        };
+        let (_, root, head) = fixture(&store, "private source with pending intents");
+        let mut advanced = commit(TreeId(root.key.id.0), "observed main advanced");
+        advanced.parents = vec![CommitId(head.key.id.0)];
+        let advanced = put_object(&store, Object::Commit(advanced), 0);
+        let (history, leases, artifacts) = cloud_v2_capture(
+            &store,
+            owner,
+            head,
+            root,
+            c::PortableIndexSnapshot {
+                roots: vec![CommitId(head.key.id.0)],
+                drafts: vec![],
+            },
+        );
+        let template = captured_cloud_request(
+            &store,
+            owner,
+            history,
+            leases,
+            &artifacts,
+            0,
+            "intent-source",
+        );
+        let data = c::decode_data(
+            &template.capture_data,
+            c::data_digest(&template.capture_data),
+            &Default::default(),
+        )
+        .unwrap();
+        let old_remote = c::PortableRemoteState {
+            observations: vec![c::RemoteObservation {
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 2,
+                head: Some(hex(&head.key.id.0)),
+            }],
+            archived_pushes: vec![c::ArchivedIntent {
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 2,
+                head: Some(hex(&head.key.id.0)),
+                request_id: "13".repeat(16),
+                base_operation: data.working_copy.wc_operation.clone(),
+                confirmed_generation: None,
+            }],
+            landing: Some(c::PortableLanding {
+                request_id: "12".repeat(16),
+                source_base: "00".repeat(32),
+                source_head: hex(&head.key.id.0),
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation: 2,
+                expected_head: hex(&head.key.id.0),
+                profile_name: "checks".into(),
+                profile_version: "v1".into(),
+                source_operation: data.working_copy.wc_operation.clone(),
+                source_stack: vec![hex(&head.key.id.0)],
+                fork_operation: None,
+                fork_acknowledged: false,
+                job_id: None,
+                result_roots: vec![],
+                candidate_head: None,
+                apply_operation: None,
+                operation_writing: None,
+                acknowledged: false,
+                terminal: None,
+                observed: None,
+                restored_lookup_only: false,
+            }),
+        };
+        let (first_identity, mut first) = retirement_request(&template, 1, None);
+        retirement_remote_state(&mut first, old_remote.clone());
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                first_identity,
+                &first,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let mut new_remote = old_remote;
+        new_remote.observations = case
+            .observation
+            .map(|(generation, selected)| c::RemoteObservation {
+                reference: "main".into(),
+                bookmark: "main".into(),
+                generation,
+                head: Some(hex(&match selected {
+                    Head::Old => head.key.id.0,
+                    Head::Advanced => advanced.key.id.0,
+                })),
+            })
+            .into_iter()
+            .collect();
+        new_remote.archived_pushes[0].confirmed_generation = case.confirmed_push;
+        new_remote.landing.as_mut().unwrap().profile_version = case.landing_profile.into();
+        let (identity, mut second) =
+            retirement_request(&template, 2, Some(first.publication.manifest));
+        retirement_remote_state(&mut second, new_remote);
+        // Primary publication verifies each manifest against its own DATA and
+        // captured intent roots. Retirement never bypasses that verifier.
+        store
+            .publish_captured_cloud_version_v2(
+                "demo",
+                owner,
+                identity,
+                &second,
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let before = store.cloud_catalog_budget_summary().unwrap();
+        let result = store.retire_cloud_versions(
+            "demo",
+            owner,
+            CloudRetirementRequest {
+                expected_current: retirement_selector(&second),
+                expected_floor: 0,
+                expected_revision: 0,
+                retire_through: 1,
+            },
+        );
+        if case.allowed {
+            assert_eq!(result.unwrap().retired_through, 1, "{}", case.name);
+            store.gc("demo", 100).unwrap();
+            assert_eq!(
+                store.descriptor("demo", head.key).unwrap(),
+                Some(head),
+                "old intent/source roots stay covered"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Invalid(
+                        "cloud retirement successor coverage incomplete"
+                    ))
+                ),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                store.cloud_catalog_budget_summary().unwrap(),
+                before,
+                "{}",
+                case.name
+            );
+        }
+    }
+}
+
 #[test]
 fn captured_versions_publish_atomically_replay_and_retain_the_exact_capsule_through_gc_pack_restart()
  {

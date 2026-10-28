@@ -1,7 +1,12 @@
-//! Atomic workspace versions. All published history is retained in this format.
+//! Atomic workspace versions with explicit, opt-in retained-prefix retirement.
 mod latest;
+mod retirement;
+mod rolling;
 use super::artifacts::{IndexStage, artifact_key};
 use super::*;
+pub use retirement::{
+    CloudPublicationIdentity, CloudRetentionState, CloudRetirementReceipt, CloudRetirementRequest,
+};
 use tinytree_cloud::{
     IndexArtifactDescriptor, IndexArtifactId, IndexRootId, Manifest, ManifestId, ManifestLimits,
     ManifestV2, ManifestV2Limits, VerifiedIndexArtifact, decode_manifest, decode_manifest_v2,
@@ -264,6 +269,8 @@ pub struct CloudVersionPage {
     pub workspace: CloudWorkspace,
     pub versions: Vec<CloudVersion>,
     pub through_generation: u64,
+    pub retired_through: u64,
+    pub retention_revision: u64,
     pub continuation: Vec<u8>,
 }
 const DISCOVERY_CURSOR_BYTES: usize = 74;
@@ -308,7 +315,9 @@ fn discovery_after(
     let ceiling = u64::from_be_bytes(cursor[66..74].try_into().unwrap());
     if (domain == 1 && ceiling != 0)
         || (domain == 2
-            && (after[8..] != [0; 24]
+            && (after[16..] != [0; 16]
+                || u64::from_be_bytes(after[8..16].try_into().unwrap())
+                    >= u64::from_be_bytes(after[..8].try_into().unwrap())
                 || ceiling == 0
                 || u64::from_be_bytes(after[..8].try_into().unwrap()) == 0
                 || u64::from_be_bytes(after[..8].try_into().unwrap()) >= ceiling))
@@ -345,6 +354,14 @@ pub struct CloudPublicationLimits {
 struct WorkspaceRecord {
     generation: u64,
     manifest: [u8; 32],
+    #[serde(default, skip_serializing_if = "retirement::zero")]
+    retired_through: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary_manifest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "retirement::zero")]
+    retention_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_retirement: Option<[u8; 32]>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -636,6 +653,7 @@ impl Drop for ValidationGuard {
 }
 pub struct CloudVersionReadGuard {
     version: CloudVersion,
+    format: u8,
     manifest: Vec<u8>,
     capture: Option<super::captures::CaptureRecord>,
     _guard: ValidationGuard,
@@ -703,6 +721,7 @@ impl Inner {
                 manifest: None,
             }),
             Some(record) => {
+                record.validate_lifecycle()?;
                 if record.generation == 0 {
                     return Err(Error::Corrupt("cloud workspace generation"));
                 }
@@ -720,20 +739,43 @@ impl Inner {
         owner: CloudOwner,
         request: &PublishCloudRequest,
         fingerprint: [u8; 32],
+        identity: Option<CloudPublicationIdentity>,
     ) -> Result<Option<CloudPublication>> {
+        // A retained physical exception is a source hold, not an extension of
+        // the finite publication-outcome replay window.
+        if identity.is_some() {
+            self.check_publication_identity(repo, owner, request, identity)?;
+        }
         let record = self
             .db
             .read_tx()
             .get(
                 &self.spaces.cloud.receipts,
-                receipt_key(repo, owner, &request.idempotency_key),
+                retirement::publication_receipt_key(repo, owner, request, identity)?,
             )?
             .map(|bytes| decode::<ReceiptRecord>(&bytes))
             .transpose()?;
+        if record.is_none() && identity.is_none() {
+            self.check_publication_identity(repo, owner, request, identity)?;
+        }
         record
             .map(|record| {
-                if record.format != 1 {
+                if record.format != if identity.is_some() { 2 } else { 1 } {
                     return Err(Error::Corrupt("cloud receipt format"));
+                }
+                if let Some(identity) = identity {
+                    if record.version.workspace != identity.workspace
+                        || record.version.generation != identity.generation
+                    {
+                        return Err(Error::Corrupt("cloud structured receipt identity"));
+                    }
+                }
+                if record.version.generation
+                    <= self
+                        .workspace_lifecycle(repo, owner, record.version.workspace)?
+                        .retired_through
+                {
+                    return Err(Error::CloudReplayExpired);
                 }
                 if record.fingerprint != fingerprint {
                     return Err(Error::IdempotencyConflict);
@@ -1953,14 +1995,36 @@ impl Store {
             return Err(Error::Invalid("cloud discovery page size"));
         }
         let binding = discovery_binding(repo, owner, Some(workspace), page_size);
-        let after = discovery_after(continuation, 2, binding)?;
         let _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
         let current = self.inner.cloud_workspace(repo, owner, workspace)?;
+        let lifecycle = self.inner.workspace_lifecycle(repo, owner, workspace)?;
+        let after = if continuation.is_empty() {
+            None
+        } else {
+            if continuation.len() != DISCOVERY_CURSOR_BYTES + 8 {
+                return Err(Error::Invalid("cloud discovery continuation size"));
+            }
+            let revision =
+                u64::from_be_bytes(continuation[DISCOVERY_CURSOR_BYTES..].try_into().unwrap());
+            if revision != lifecycle.retention_revision {
+                return Err(Error::CloudRetentionChanged);
+            }
+            let position = discovery_after(&continuation[..DISCOVERY_CURSOR_BYTES], 2, binding)?;
+            if position.as_ref().is_some_and(|(position, _)| {
+                u64::from_be_bytes(position[8..16].try_into().unwrap()) != lifecycle.retired_through
+            }) {
+                return Err(Error::CloudRetentionChanged);
+            }
+            position
+        };
         let (after_generation, ceiling) = after
             .map(|(id, ceiling)| (u64::from_be_bytes(id[..8].try_into().unwrap()), ceiling))
-            .unwrap_or((0, current.generation));
-        if ceiling > current.generation {
+            .unwrap_or((lifecycle.retired_through, current.generation));
+        if ceiling > current.generation
+            || after_generation < lifecycle.retired_through
+            || after_generation > ceiling
+        {
             return Err(Error::Invalid("cloud discovery continuation generation"));
         }
         let view = self.inner.db.read_tx();
@@ -1979,7 +2043,9 @@ impl Store {
                 || record.workspace != workspace
                 || record.generation != after_generation + versions.len() as u64 + 1
                 || key.as_ref() != version_key(repo, owner, workspace, record.generation).as_slice()
-                || (record.generation == 1) != record.previous.is_none()
+                || (record.generation == lifecycle.retired_through + 1
+                    && record.previous != lifecycle.boundary_manifest)
+                || (record.generation > lifecycle.retired_through + 1 && record.previous.is_none())
             {
                 return Err(Error::Corrupt("cloud version discovery identity"));
             }
@@ -1995,7 +2061,10 @@ impl Store {
         let continuation = if last < ceiling {
             let mut id = [0; 32];
             id[..8].copy_from_slice(&last.to_be_bytes());
-            discovery_cursor(2, binding, id, ceiling)
+            id[8..16].copy_from_slice(&lifecycle.retired_through.to_be_bytes());
+            let mut cursor = discovery_cursor(2, binding, id, ceiling);
+            cursor.extend_from_slice(&lifecycle.retention_revision.to_be_bytes());
+            cursor
         } else {
             Vec::new()
         };
@@ -2003,6 +2072,8 @@ impl Store {
             workspace: current,
             versions,
             through_generation: ceiling,
+            retired_through: lifecycle.retired_through,
+            retention_revision: lifecycle.retention_revision,
             continuation,
         })
     }
@@ -2015,17 +2086,26 @@ impl Store {
         request_token(key)?;
         let _gate = self.inner.lock()?;
         self.inner.repository(repo)?;
-        self.inner
-            .db
-            .read_tx()
-            .get(
-                &self.inner.spaces.cloud.receipts,
-                receipt_key(repo, owner, key),
-            )?
+        let receipt = self.inner.db.read_tx().get(
+            &self.inner.spaces.cloud.receipts,
+            receipt_key(repo, owner, key),
+        )?;
+        if receipt.is_none() && self.inner.legacy_replay_closed(repo, owner)? {
+            return Err(Error::CloudReplayExpired);
+        }
+        receipt
             .map(|bytes| {
                 let record: ReceiptRecord = decode(&bytes)?;
                 if record.format != 1 {
                     return Err(Error::Corrupt("cloud receipt format"));
+                }
+                if record.version.generation
+                    <= self
+                        .inner
+                        .workspace_lifecycle(repo, owner, record.version.workspace)?
+                        .retired_through
+                {
+                    return Err(Error::CloudReplayExpired);
                 }
                 Ok(publication(key, &record.version))
             })
@@ -2079,13 +2159,34 @@ impl Store {
         let (record, manifest_bytes, manifest, mut guard, indexed, capture) = {
             let mut gate = self.inner.lock()?;
             self.inner.repository(repo)?;
+            let state = self.inner.workspace_lifecycle(repo, owner, workspace)?;
+            let protection = if generation != 0 && generation <= state.retired_through {
+                let mut scan = Scan {
+                    records: 0,
+                    bytes: 0,
+                    payload: 0,
+                };
+                let protection = self
+                    .inner
+                    .version_protection(repo, owner, workspace, generation, &gate, &mut scan)?;
+                if !protection.held() {
+                    return Err(Error::CloudVersionExpired);
+                }
+                Some(protection)
+            } else {
+                None
+            };
             let key = version_key(repo, owner, workspace, generation);
             let bytes = self
                 .inner
                 .db
                 .read_tx()
                 .get(&self.inner.spaces.cloud.versions, &key)?
-                .ok_or(Error::Invalid("cloud version unavailable"))?;
+                .ok_or(if protection.is_some() {
+                    Error::Corrupt("cloud protected version missing")
+                } else {
+                    Error::Invalid("cloud version unavailable")
+                })?;
             let record: VersionRecord = decode(&bytes)?;
             if ![1, 2, 3].contains(&record.format)
                 || record.workspace != workspace
@@ -2108,6 +2209,9 @@ impl Store {
                 )?
                 .ok_or(Error::Corrupt("cloud version manifest missing"))?
                 .to_vec();
+            if let Some(protection) = protection {
+                protection.verify(&record, BlobDigest::of(&bytes))?;
+            }
             let manifest = self
                 .inner
                 .decode_recovery(&bytes, id, limits)
@@ -2192,6 +2296,7 @@ impl Store {
         }
         Ok(Some(CloudVersionReadGuard {
             version: version(&record),
+            format: record.format,
             manifest: manifest_bytes,
             capture,
             _guard: guard,
@@ -2215,6 +2320,18 @@ impl Store {
         capture_data: Option<&[u8]>,
         now: i64,
         limits: &CloudPublicationLimits,
+    ) -> Result<CloudPublication> {
+        self.publish_cloud_version_key(repo, owner, request, capture_data, now, limits, None)
+    }
+    fn publish_cloud_version_key(
+        &self,
+        repo: &str,
+        owner: CloudOwner,
+        request: &PublishCloudRequest,
+        capture_data: Option<&[u8]>,
+        now: i64,
+        limits: &CloudPublicationLimits,
+        identity: Option<CloudPublicationIdentity>,
     ) -> Result<CloudPublication> {
         request_token(&request.idempotency_key)?;
         limits.retention.validate()?;
@@ -2244,9 +2361,15 @@ impl Store {
             }
         };
         {
-            let _gate = self.inner.lock()?;
+            // Exact replay reads only scalar receipt/anchor rows. A caller may
+            // already own a verified version arena; replay needs exclusion,
+            // not another physical operation model.
+            let _gate = self.inner.lock_read()?;
             self.inner.repository(repo)?;
-            if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
+            if let Some(receipt) =
+                self.inner
+                    .cloud_replay(repo, owner, request, fingerprint, identity)?
+            {
                 return Ok(receipt);
             }
         }
@@ -2260,7 +2383,10 @@ impl Store {
         let mut guard = {
             let mut gate = self.inner.lock()?;
             self.inner.repository(repo)?;
-            if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
+            if let Some(receipt) =
+                self.inner
+                    .cloud_replay(repo, owner, request, fingerprint, identity)?
+            {
                 return Ok(receipt);
             }
             let current = self.inner.cloud_workspace(repo, owner, request.workspace)?;
@@ -2279,14 +2405,17 @@ impl Store {
             capture_data,
         )?;
         let mut _gate = self.inner.lock_reusing_arena(guard._resident.as_ref())?;
-        if roots.capture_feature >= 9 {
+        if roots.capture_feature >= 9 || identity.is_some() {
             // Feature nine includes the earlier Store-owned layout fence. This
             // establishes only the empty durable namespace, never a runner or
             // permission to dispatch checks.
             self.enable_external_checks_locked(&_gate)?;
         }
         self.inner.repository(repo)?;
-        if let Some(receipt) = self.inner.cloud_replay(repo, owner, request, fingerprint)? {
+        if let Some(receipt) =
+            self.inner
+                .cloud_replay(repo, owner, request, fingerprint, identity)?
+        {
             return Ok(receipt);
         }
         let current = self.inner.cloud_workspace(repo, owner, request.workspace)?;
@@ -2300,7 +2429,19 @@ impl Store {
             .generation
             .checked_add(1)
             .ok_or(Error::Limit("cloud workspace generation"))?;
-        if generation > self.inner.config.cloud.max_versions_per_workspace {
+        let mut lifecycle = self
+            .inner
+            .workspace_lifecycle(repo, owner, request.workspace)?;
+        let rolling = self.inner.config.cloud.rolling_retention_enabled
+            && self.inner.config.cloud.retirement_enabled
+            && identity.is_some()
+            && capture_data.is_some()
+            && manifest.format() == 3;
+        if !rolling
+            && generation
+                .checked_sub(lifecycle.retired_through)
+                .is_none_or(|count| count > self.inner.config.cloud.max_versions_per_workspace)
+        {
             return Err(Error::Limit("cloud retained version quota"));
         }
         // Immutable selected descriptors and native root presence are rechecked at
@@ -2444,6 +2585,26 @@ impl Store {
         {
             return Err(Error::Corrupt("cloud version slot already occupied"));
         }
+        // All incoming snapshot, CAS, lease and quota checks precede planning.
+        // Cleanup and floor advancement are committed only with this version.
+        let cleanup = if rolling {
+            self.inner.rolling_publication(
+                repo,
+                owner,
+                request.workspace,
+                generation,
+                request.manifest,
+                &manifest,
+                &mut lifecycle,
+                &_gate,
+            )?
+        } else {
+            rolling::Cleanup {
+                changes: Vec::new(),
+                delta: Delta::default(),
+            }
+        };
+        changes.extend(cleanup.changes);
         if let Some(bytes) = capture_data {
             let descriptor = manifest
                 .capture()
@@ -2457,10 +2618,11 @@ impl Store {
         changes.push((
             &self.inner.spaces.cloud.workspaces,
             workspace_key(repo, owner, request.workspace),
-            Some(encode(&WorkspaceRecord {
-                generation,
-                manifest: request.manifest.0,
-            })?),
+            Some({
+                lifecycle.generation = generation;
+                lifecycle.manifest = request.manifest.0;
+                encode(&lifecycle)?
+            }),
         ));
         changes.push((
             &self.inner.spaces.cloud.versions,
@@ -2478,9 +2640,9 @@ impl Store {
         ));
         changes.push((
             &self.inner.spaces.cloud.receipts,
-            receipt_key(repo, owner, &request.idempotency_key),
+            retirement::publication_receipt_key(repo, owner, request, identity)?,
             Some(encode(&ReceiptRecord {
-                format: 1,
+                format: if identity.is_some() { 2 } else { 1 },
                 fingerprint,
                 version: version.clone(),
             })?),
@@ -2494,12 +2656,19 @@ impl Store {
         advance_feature(
             &mut tx,
             &self.inner.spaces.meta,
-            match manifest.format() {
-                3 => roots.capture_feature.max(5),
-                2 => 4,
-                _ => 3,
+            if identity.is_some() {
+                12
+            } else {
+                match manifest.format() {
+                    3 => roots.capture_feature.max(5),
+                    2 => 4,
+                    _ => 3,
+                }
             },
         )?;
+        if rolling && lifecycle.retired_through != 0 {
+            tx.insert(&self.inner.spaces.meta, b"cloud-retirement-activated", [1]);
+        }
         let payload_work = manifest.members.iter().try_fold(0u64, |sum, member| {
             sum.checked_add(member.selected.size_bytes)
                 .ok_or(Error::Limit("cloud version validation bytes"))
@@ -2524,13 +2693,15 @@ impl Store {
             Delta {
                 stages: -consumed,
                 workspaces: i128::from(current.generation == 0),
-                versions: 1,
-                receipts: 1,
-                version_payload_bytes: payload_work as i128,
-                version_metadata_bytes: metadata_work as i128,
+                versions: 1 + cleanup.delta.versions,
+                receipts: 1 + cleanup.delta.receipts,
+                version_payload_bytes: payload_work as i128 + cleanup.delta.version_payload_bytes,
+                version_metadata_bytes: metadata_work as i128
+                    + cleanup.delta.version_metadata_bytes,
                 version_records: 3
                     + 2 * manifest.members.len() as i128
-                    + roots.extra.records as i128,
+                    + roots.extra.records as i128
+                    + cleanup.delta.version_records,
                 ..Default::default()
             },
         )?;
@@ -2553,6 +2724,7 @@ pub(super) struct RetainedPlan {
     versions: HashMap<Vec<u8>, VersionRecord>,
     current: HashMap<Vec<u8>, VersionRecord>,
     manifests: HashSet<Vec<u8>>,
+    manifest_descriptors: HashMap<Vec<u8>, BlobDigest>,
     payload_work: HashMap<Vec<u8>, u64>,
     metadata_work: HashMap<Vec<u8>, u64>,
     record_work: HashMap<Vec<u8>, u64>,
@@ -2585,6 +2757,7 @@ impl Inner {
             versions: HashMap::new(),
             current: HashMap::new(),
             manifests: HashSet::new(),
+            manifest_descriptors: HashMap::new(),
             payload_work: HashMap::new(),
             metadata_work: HashMap::new(),
             record_work: HashMap::new(),
@@ -2598,6 +2771,7 @@ impl Inner {
         let view = self.db.read_tx();
         let limits = self.manifest_limits(self.config.cloud.manifest_limits)?;
         let mut native_by_repo = HashMap::<String, HashSet<ObjectKey>>::new();
+        let mut anchors = HashMap::<Vec<u8>, WorkspaceRecord>::new();
         for item in view.prefix(&self.spaces.cloud.versions, prefix) {
             let (key, bytes) = item.into_inner()?;
             scan.visit(self, &key, &bytes)?;
@@ -2618,8 +2792,32 @@ impl Inner {
             }
             let workspace_key = workspace_key(actual, principal, workspace);
             let previous = plan.current.get(&workspace_key);
-            if generation != previous.map_or(1, |old| old.generation + 1)
-                || record.previous != previous.map(|old| old.manifest)
+            if !anchors.contains_key(&workspace_key) {
+                let bytes = view
+                    .get(&self.spaces.cloud.workspaces, &workspace_key)?
+                    .ok_or(Error::Corrupt("cloud workspace current missing"))?;
+                scan.visit(self, &workspace_key, &bytes)?;
+                let lifecycle: WorkspaceRecord = decode(&bytes)?;
+                lifecycle.validate_lifecycle()?;
+                if !self.config.cloud.rolling_retention_enabled
+                    && lifecycle.generation - lifecycle.retired_through
+                        > self.config.cloud.max_versions_per_workspace
+                {
+                    return Err(Error::Limit("cloud retained version quota"));
+                }
+                anchors.insert(workspace_key.clone(), lifecycle);
+            }
+            let lifecycle = &anchors[&workspace_key];
+            if lifecycle.generation == 0
+                || generation > lifecycle.generation
+                || (generation > lifecycle.retired_through
+                    && (generation
+                        != previous
+                            .map_or(lifecycle.retired_through + 1, |old| old.generation + 1)
+                        || record.previous
+                            != previous
+                                .map(|old| old.manifest)
+                                .or(lifecycle.boundary_manifest)))
             {
                 return Err(Error::Corrupt("cloud version history gap"));
             }
@@ -2802,8 +3000,12 @@ impl Inner {
                 key.to_vec(),
                 3 + 2 * manifest.members.len() as u64 + indexed.extra.records,
             );
+            plan.manifest_descriptors
+                .insert(manifest_key.clone(), BlobDigest::of(&manifest_bytes));
             plan.manifests.insert(manifest_key);
-            plan.current.insert(workspace_key, record.clone());
+            if generation > lifecycle.retired_through {
+                plan.current.insert(workspace_key, record.clone());
+            }
             plan.versions.insert(key.to_vec(), record);
         }
         if validate {
@@ -3168,24 +3370,9 @@ impl Inner {
                         }
                     }
                     7 => {
-                        let name = std::str::from_utf8(suffix)
-                            .map_err(|_| Error::Corrupt("cloud receipt key"))?;
-                        request_token(name)?;
-                        let record: ReceiptRecord = decode(&bytes)?;
-                        let target = version_key(
-                            repo,
-                            owner,
-                            record.version.workspace,
-                            record.version.generation,
-                        );
-                        let actual = plan
-                            .versions
-                            .get(&target)
-                            .ok_or(Error::Corrupt("cloud receipt version missing"))?;
-                        if record.format != 1
-                            || encode(actual)? != encode(&record.version)?
-                            || !receipts.insert(target)
-                        {
+                        let target =
+                            self.retained_receipt_target(repo, owner, suffix, &bytes, &plan)?;
+                        if !receipts.insert(target) {
                             return Err(Error::Corrupt("cloud receipt replay history"));
                         }
                         adjust(&mut account.receipts, 1)?;
@@ -3217,6 +3404,7 @@ impl Inner {
                 return Err(Error::Corrupt("cloud workspace current missing"));
             }
         }
+        self.validate_lifecycle_on_reopen(expected, scan, &plan)?;
         Ok(())
     }
 }
@@ -3399,6 +3587,7 @@ impl Store {
         }
         let CloudVersionReadGuard {
             version,
+            format: _,
             manifest,
             capture,
             _guard,

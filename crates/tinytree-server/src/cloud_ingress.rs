@@ -71,12 +71,19 @@ impl Service<http::Request<Body>> for CloudGrpcService {
                         | "GetVersion"
                         | "GetLatestCapturedVersion"
                         | "GetPublication"
+                        | "AcquireVersionPin"
+                        | "ReleaseVersionPin"
                 ) {
                     return Err(Status::unimplemented("unknown private workspace method"));
                 }
                 if matches!(
                     method.as_str(),
-                    "PutObject" | "PutObjectRepresentation" | "PutIndexArtifact" | "PublishVersion"
+                    "PutObject"
+                        | "PutObjectRepresentation"
+                        | "PutIndexArtifact"
+                        | "PublishVersion"
+                        | "AcquireVersionPin"
+                        | "ReleaseVersionPin"
                 ) {
                     identity.cloud_write_capability()?;
                 }

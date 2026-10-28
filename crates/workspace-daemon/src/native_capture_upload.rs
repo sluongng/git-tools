@@ -24,7 +24,7 @@ use std::{
 };
 use tinytree_client::{
     CloudCapturedPublishIntent, CloudIndexArtifactId, CloudManifestId, CloudObjectId,
-    CloudPublishIntent, CloudRawDigest, RetainedVersionSelector,
+    CloudPublicationIdentity, CloudPublishIntent, CloudRawDigest, RetainedVersionSelector,
 };
 use tinytree_cloud as c;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -435,6 +435,27 @@ struct Header {
     capture_size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     successor: Option<Successor>,
+    // Absent in legacy durable envelopes: never infer a typed receipt domain
+    // from key text, and never rewrite an uncertain legacy attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_identity: Option<PublicationIdentityV2>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublicationIdentityV2 {
+    version: u32,
+    workspace: [u8; 32],
+    generation: u64,
+    nonce: [u8; 16],
+}
+impl PublicationIdentityV2 {
+    fn sdk(&self) -> CloudPublicationIdentity {
+        CloudPublicationIdentity {
+            workspace_id: self.workspace,
+            generation: self.generation,
+            nonce: self.nonce,
+        }
+    }
 }
 // Small envelope-only journal: payload bytes always come from the original job.
 // The accepted header commits the exact complete predecessor list for cleanup.
@@ -459,9 +480,46 @@ fn attempt_filename(name: &str) -> Option<([u8; 32], usize)> {
         .then_some((ticket, ordinal))
 }
 impl Header {
+    fn identity(&self) -> Result<Option<CloudPublicationIdentity>> {
+        let Some(identity) = &self.publication_identity else {
+            return Ok(None);
+        };
+        let sdk = identity.sdk();
+        ensure!(
+            self.version == 2
+                && identity.version == 2
+                && identity.workspace == self.workspace
+                && self.expected_generation.checked_add(1) == Some(identity.generation)
+                && self.key == sdk.token(),
+            "capture structured publication identity differs"
+        );
+        Ok(Some(sdk))
+    }
+    fn use_new_v2_identity(&mut self) -> Result<()> {
+        self.version = 2;
+        let identity = PublicationIdentityV2 {
+            version: 2,
+            workspace: self.workspace,
+            generation: self
+                .expected_generation
+                .checked_add(1)
+                .context("capture generation overflow")?,
+            nonce: *uuid::Uuid::new_v4().as_bytes(),
+        };
+        self.key = identity.sdk().token();
+        self.publication_identity = Some(identity);
+        Ok(())
+    }
     fn valid(&self) -> bool {
+        let typed = self.publication_identity.is_some();
         let envelope = match &self.successor {
-            None => self.version == 1 && self.key == format!("capture_{}", hex(&self.ticket)),
+            None => {
+                if typed {
+                    self.version == 2
+                } else {
+                    self.version == 1 && self.key == format!("capture_{}", hex(&self.ticket))
+                }
+            }
             Some(s) => {
                 self.version == 2
                     && s.predecessors.len() < MAX_SUCCESSORS
@@ -470,16 +528,58 @@ impl Header {
                     && s.predecessors
                         .iter()
                         .all(|p| p.size_bytes > 0 && p.size_bytes <= 4096)
-                    && self.key
-                        == format!(
-                            "capture_{}_attempt_{}",
-                            hex(&self.ticket),
-                            s.predecessors.len() + 1
-                        )
+                    && (typed
+                        || self.key
+                            == format!(
+                                "capture_{}_attempt_{}",
+                                hex(&self.ticket),
+                                s.predecessors.len() + 1
+                            ))
             }
         };
-        envelope && self.manifest_size <= 8 * 1024 * 1024 && self.capture_size <= 8 * 1024 * 1024
+        envelope
+            && self.identity().is_ok()
+            && self.manifest_size <= 8 * 1024 * 1024
+            && self.capture_size <= 8 * 1024 * 1024
     }
+}
+async fn publication(
+    client: &tinytree_client::NativeClient,
+    header: &Header,
+) -> Result<Option<tinytree_client::CloudPublication>> {
+    Ok(match header.identity()? {
+        Some(identity) => client.cloud_publication_v2(identity).await?,
+        None => client.cloud_publication(&header.key).await?,
+    })
+}
+async fn publish(
+    client: &tinytree_client::NativeClient,
+    intent: &Intent,
+) -> Result<tinytree_client::CloudPublication> {
+    let sdk = intent.sdk()?;
+    Ok(match intent.header.identity()? {
+        Some(identity) => {
+            client
+                .cloud_publish_captured_version_v2(&sdk, identity)
+                .await?
+        }
+        None => client.cloud_publish_captured_version(&sdk).await?,
+    })
+}
+async fn require_new_publication_v2(client: &tinytree_client::NativeClient) -> Result<()> {
+    let features = client
+        .capabilities(&[tinytree_client::CapabilityFeature::StructuredCloudPublicationV2])
+        .await?;
+    let feature = features.features[0];
+    ensure!(
+        feature.authorized,
+        tonic::Status::permission_denied("structured cloud publication is not authorized")
+    );
+    ensure!(
+        feature.supported,
+        tonic::Status::unimplemented("structured cloud publication is not supported")
+    );
+    Ok(())
 }
 /// Header-only startup witness; deliberately no formatting or serialization.
 pub(crate) struct ProviderJournalWitness {
@@ -556,7 +656,7 @@ pub(crate) fn inspect_provider_journals(
             "invalid provider upload census header"
         );
         ensure!(
-            (!job || header.version == 1 && header.successor.is_none())
+            (!job || header.successor.is_none())
                 && attempt_filename(&name).is_none_or(|(_, ordinal)| header
                     .successor
                     .as_ref()
@@ -657,9 +757,8 @@ impl Intent {
         );
         let header: Header = serde_json::from_slice(&bytes[12..12 + n])?;
         ensure!(
-            header.version == 1
+            header.valid()
                 && header.successor.is_none()
-                && header.key == format!("capture_{}", hex(&header.ticket))
                 && header.manifest_size <= 8 * 1024 * 1024
                 && header.capture_size <= 8 * 1024 * 1024,
             "invalid capture job declaration"
@@ -1036,11 +1135,16 @@ impl Worker {
                         > headers.last().unwrap_or(&original).expected_generation,
                 "capture successor chain differs"
             );
+            ensure!(
+                header.publication_identity.is_some() == original.publication_identity.is_some(),
+                "capture successor publication family differs"
+            );
             let mut normalized = header.clone();
             normalized.version = original.version;
             normalized.expected_generation = original.expected_generation;
             normalized.key = original.key.clone();
             normalized.successor = None;
+            normalized.publication_identity = original.publication_identity.clone();
             ensure!(
                 normalized == original && serde_json::to_vec(&header)? == bytes,
                 "capture successor payload binding differs"
@@ -1409,15 +1513,24 @@ impl Worker {
             coverage: native_retention::OwnedCaptureCoverage::new(objects, coverage_owner),
         }))
     }
-    async fn reconcile_retained_sources(self: &Arc<Self>, admission: Arc<Admission>) -> Result<()> {
+    async fn reconcile_retained_sources(
+        self: &Arc<Self>,
+        admission: Arc<Admission>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let worker = self.clone();
         tokio::spawn(async move {
-            let _admission = admission;
-            worker.reconcile_retained_sources_owned().await
+            worker
+                .reconcile_retained_sources_owned(admission, deadline)
+                .await
         })
         .await?
     }
-    async fn reconcile_retained_sources_owned(&self) -> Result<()> {
+    async fn reconcile_retained_sources_owned(
+        &self,
+        admission: Arc<Admission>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let bindings = match self
             .host
             .capture_registry()
@@ -1431,12 +1544,26 @@ impl Worker {
         // poll owns the sole uploader admission; new local captures do not
         // independently create provider pins. The registry fence is gone here.
         // This releases only demonstrably orphaned cleanup PIN rows, never
-        // source authorities or backing. It needs no network capability probe:
-        // an unavailable old provider must not starve new backup publication.
+        // source authorities or backing. This local pass needs no network
+        // capability probe. Durable source obligations are reconciled afterward
+        // with the original deadline and physical uploader admission owner.
         for source in self.sources.values() {
             source
                 .control
                 .reconcile_retained_offload_pins(bindings.clone())
+                .await?;
+        }
+        for source in self.sources.values() {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "retained source maintenance deadline exceeded"
+            );
+            source
+                .control
+                .reconcile_retained_source_pins_until(
+                    Arc::new((source.clone(), admission.clone())),
+                    deadline,
+                )
                 .await?;
         }
         Ok(())
@@ -1609,7 +1736,7 @@ impl Worker {
         // immutable backup gets its turn, even on an unavailable other source.
         let reconciliation_progress = Progress::new("retained_pin_reconciliation");
         let reconciliation =
-            tokio::time::timeout_at(deadline, self.reconcile_retained_sources(admission.clone()))
+            tokio::time::timeout_at(deadline, self.reconcile_retained_sources(admission.clone(), deadline))
                 .await;
         if !matches!(&reconciliation, Ok(Ok(()))) {
             self.stats
@@ -1694,12 +1821,25 @@ impl Worker {
             .control
             .client_for_owned_work(owner, deadline)
             .await?;
-        let Some(capability) = client.durable_retained_offload_capability().await? else {
-            return Ok(None);
+        let capabilities = match client
+            .capabilities(&[tinytree_client::CapabilityFeature::DurableCloudVersionPinV1])
+            .await
+        {
+            Ok(capabilities) => capabilities,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
         };
+        let capability = capabilities.features[0];
         ensure!(
             capability.authorized,
-            tonic::Status::permission_denied("durable retained offload is not authorized")
+            tonic::Status::permission_denied("durable retained source pins are not authorized")
         );
         if !capability.supported {
             return Ok(None);
@@ -2738,6 +2878,9 @@ impl Worker {
         let mut intent = if let Some(intent) = existing {
             intent
         } else {
+            // Only a genuinely new durable family adopts V2. Legacy journals
+            // retain their original receipt domain even on uncertain retries.
+            require_new_publication_v2(&client).await?;
             let current = client.cloud_workspace(workspace).await?;
             let identity = c::CaptureExportIdentity {
                 workspace,
@@ -2755,6 +2898,7 @@ impl Worker {
             let physical = owner.clone();
             blocking_owned(owner.clone(), move || {
                 let mut intent = worker.prepare(&ticket, identity, current.generation, physical)?;
+                intent.header.use_new_v2_identity()?;
                 let bytes = intent.encode()?;
                 intent.original_job = Some(raw_descriptor(&bytes));
                 worker.persist(&format!("{}.job", hex(&ticket.id.0)), &bytes)?;
@@ -2803,7 +2947,7 @@ impl Worker {
         // Always reconcile every prepared key before choosing another envelope.
         // A current head match is never an idempotency receipt.
         for header in std::iter::once(&original).chain(attempts.iter()) {
-            if let Some(receipt) = client.cloud_publication(&header.key).await? {
+            if let Some(receipt) = publication(&client, header).await? {
                 ensure_publication(header, &receipt)?;
                 ensure!(accepted.is_none(), "multiple capture publication receipts");
                 accepted = Some(header.clone());
@@ -2842,7 +2986,7 @@ impl Worker {
                 // generation read, even after its local waiter was released.
                 let mut fenced_receipt = None;
                 for header in std::iter::once(&original).chain(attempts.iter()) {
-                    if let Some(receipt) = client.cloud_publication(&header.key).await? {
+                    if let Some(receipt) = publication(&client, header).await? {
                         ensure_publication(header, &receipt)?;
                         ensure!(
                             fenced_receipt.is_none(),
@@ -2871,6 +3015,9 @@ impl Worker {
                         hex(&ticket.id.0),
                         attempts.len() + 1
                     );
+                    if original.publication_identity.is_some() {
+                        header.use_new_v2_identity()?;
+                    }
                     header.successor = Some(Successor {
                         original: saved_descriptor,
                         predecessors: attempts
@@ -3077,14 +3224,24 @@ impl Worker {
                 !self._hooks.fail_before_publication.load(Ordering::Acquire),
                 "injected failure before publication"
             );
-            let receipt = client
-                .cloud_publish_captured_version(&intent.sdk()?)
+            // A publication can retire earlier versions of this workspace.
+            // Protect installed lazy sources before it can remove their backing;
+            // unrelated maintenance still follows the queued upload in poll.
+            progress.at("publication_source_pins");
+            source
+                .control
+                .reconcile_retained_source_pins_before_publish_until(
+                    intent.header.workspace,
+                    owner.clone(),
+                    deadline,
+                )
                 .await?;
+            progress.at("publication");
+            let receipt = publish(&client, &intent).await?;
             ensure_publication(&intent.header, &receipt)?;
         }
         progress.at("retained_verification");
-        let publication = client
-            .cloud_publication(&intent.header.key)
+        let publication = publication(&client, &intent.header)
             .await?
             .context("capture publication not visible")?;
         ensure_publication(&intent.header, &publication)?;
@@ -3336,6 +3493,7 @@ impl Worker {
             manifest_size: prepared.bytes().len() as u64,
             capture_size: capture.len() as u64,
             successor: None,
+            publication_identity: None,
         };
         Ok(Intent {
             original_job: None,
@@ -3817,11 +3975,20 @@ max_manifest_members=1024
         let cloud = tonic::service::interceptor::InterceptedService::new(
             service.cloud_grpc_service(),
             move |request: tonic::Request<()>| {
-                availability_hooks.availability_calls.fetch_add(1, Ordering::Relaxed);
-                match availability_hooks.availability_fault.load(Ordering::Relaxed) {
+                availability_hooks
+                    .availability_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                match availability_hooks
+                    .availability_fault
+                    .load(Ordering::Relaxed)
+                {
                     1 => return Err(tonic::Status::not_found("synthetic private missing marker")),
                     // This isolated observation permits its GetVersion, then fails ReadCapture.
-                    2 => { availability_hooks.availability_fault.store(3, Ordering::Relaxed); }
+                    2 => {
+                        availability_hooks
+                            .availability_fault
+                            .store(3, Ordering::Relaxed);
+                    }
                     3 => return Err(tonic::Status::data_loss("synthetic private corrupt marker")),
                     _ => {}
                 }
@@ -4293,6 +4460,28 @@ max_manifest_members=1024
         managed_collection: bool,
         server_contract: bool,
     ) -> Result<SavedUploads> {
+        saved_uploads_with_mode(
+            newer_generation,
+            retiring,
+            memory,
+            distinct_workspaces,
+            dropped_remote_head,
+            managed_collection,
+            server_contract,
+            false,
+        )
+        .await
+    }
+    async fn saved_uploads_with_mode(
+        newer_generation: u64,
+        retiring: bool,
+        memory: Option<u64>,
+        distinct_workspaces: bool,
+        dropped_remote_head: bool,
+        managed_collection: bool,
+        server_contract: bool,
+        typed: bool,
+    ) -> Result<SavedUploads> {
         let hooks = Arc::new(TestHooks {
             start_stopped: true,
             managed_collection,
@@ -4322,7 +4511,7 @@ max_manifest_members=1024
         let pending = tickets.clone();
         blocking_owned(physical.clone(), move || {
             for (index, ticket) in pending.iter().enumerate() {
-                let intent = saved.prepare(
+                let mut intent = saved.prepare(
                     ticket,
                     c::CaptureExportIdentity {
                         workspace: [7; 32],
@@ -4333,6 +4522,9 @@ max_manifest_members=1024
                     if index == 0 { 0 } else { newer_generation },
                     physical.clone(),
                 )?;
+                if typed {
+                    intent.header.use_new_v2_identity()?;
+                }
                 saved.persist(&format!("{}.job", hex(&ticket.id.0)), &intent.encode()?)?;
             }
             Ok(())
@@ -4509,12 +4701,16 @@ max_manifest_members=1024
         let _ = stop.send(());
         server.await??;
 
-        let mut f = saved_uploads_with_roots_and_collection(0, false, None, false, false, true, true).await?;
+        let mut f =
+            saved_uploads_with_roots_and_collection(0, false, None, false, false, true, true)
+                .await?;
         process_saved(&f.worker, &f.tickets[1]).await?;
         let registry = f.worker.host.capture_registry();
         let newest = &f.tickets[1];
         let command = registry.begin_command(newest.registration).await?;
-        registry.checkpoint(command.token(), newest.checkpoint.clone()).await?;
+        registry
+            .checkpoint(command.token(), newest.checkpoint.clone())
+            .await?;
         drop(command);
         let collector = registry.acquire_collector().await?;
         Arc::get_mut(&mut f.worker).unwrap().policy.timeout_ms = 100;
@@ -4526,21 +4722,41 @@ max_manifest_members=1024
             while f.worker._hooks.availability_reads.load(Ordering::Relaxed) == 0 {
                 tokio::task::yield_now().await;
             }
-        }).await?;
+        })
+        .await?;
         observing.await?;
-        assert_eq!(f.worker.admission.available_permits(), 0,
-            "expired waiter leaves the capture read physically queued behind collection");
-        assert_eq!(f.worker.stats.status()["selected_capsule_availability"]["last_attempt"], "timeout");
+        assert_eq!(
+            f.worker.admission.available_permits(),
+            0,
+            "expired waiter leaves the capture read physically queued behind collection"
+        );
+        assert_eq!(
+            f.worker.stats.status()["selected_capsule_availability"]["last_attempt"],
+            "timeout"
+        );
         drop(collector);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while f.worker.admission.available_permits() == 0 { tokio::task::yield_now().await; }
-        }).await?;
-        assert_eq!(f.worker._hooks.availability_proofs.load(Ordering::Relaxed), proofs,
-            "late capture read must not begin a saved-pack proof");
-        assert_eq!(f.worker._hooks.availability_calls.load(Ordering::Relaxed), calls,
-            "late capture read must not begin SDK work");
-        assert_eq!(f.worker.stats.status()["selected_capsule_availability"]["state"], "unknown");
-        let _ = f.stop.send(()); f.server.await??;
+            while f.worker.admission.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            f.worker._hooks.availability_proofs.load(Ordering::Relaxed),
+            proofs,
+            "late capture read must not begin a saved-pack proof"
+        );
+        assert_eq!(
+            f.worker._hooks.availability_calls.load(Ordering::Relaxed),
+            calls,
+            "late capture read must not begin SDK work"
+        );
+        assert_eq!(
+            f.worker.stats.status()["selected_capsule_availability"]["state"],
+            "unknown"
+        );
+        let _ = f.stop.send(());
+        f.server.await??;
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4706,93 +4922,121 @@ max_manifest_members=1024
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successor_restart_reconciles_prepared_and_accepted_envelopes() -> Result<()> {
-        for accepted in [false, true] {
-            let f = saved_uploads_with_data(0, false, None, true).await?;
-            process_saved(&f.worker, &f.tickets[0]).await?;
-            let ticket = &f.tickets[1];
-            let original = f
-                .worker
-                .read_durable(&format!("{}.job", hex(&ticket.id.0)))?;
-            f.worker
-                ._hooks
-                .fail_after_attempt
-                .store(!accepted, Ordering::Release);
-            f.worker
-                ._hooks
-                .fail_before_marker
-                .store(accepted, Ordering::Release);
-            assert!(process_saved(&f.worker, ticket).await.is_err());
-            let attempts = f.worker.saved_attempts(&ticket.id.0)?;
-            assert_eq!(attempts.len(), 1);
-            let saved = f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?;
-            assert_eq!(
-                f.client
-                    .cloud_publication(&attempts[0].key)
-                    .await?
-                    .is_some(),
-                accepted
-            );
-            f.worker
-                ._hooks
-                .fail_after_attempt
-                .store(false, Ordering::Release);
-            f.worker
-                ._hooks
-                .fail_before_marker
-                .store(false, Ordering::Release);
-            let mut reopened = reopen_worker(&f.worker);
-            // Existing capture slots are full; a successor is metadata, not a
-            // new pending capture admission.
-            Arc::get_mut(&mut reopened).unwrap().policy.max_jobs = f.tickets.len();
-            process_saved(&reopened, ticket).await?;
-            assert_eq!(reopened.saved_attempts(&ticket.id.0)?.len(), 1);
-            assert_eq!(
-                reopened.read_durable(&attempt_name(&ticket.id.0, 1))?,
-                saved
-            );
-            assert_eq!(
-                reopened.read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
-                original
-            );
-            assert_saved_tickets(&f).await?;
-            let marker = reopened.read_durable(&format!("{}.published", hex(&ticket.id.0)))?;
-            assert!(
-                validate_attempt_cleanup(&reopened.directory, &marker)?
-                    .iter()
-                    .all(Option::is_some)
-            );
-            let _ = f.stop.send(());
-            f.server.await??;
+        for typed in [false, true] {
+            for accepted in [false, true] {
+                let f = saved_uploads_with_mode(0, false, None, true, false, false, true, typed)
+                    .await?;
+                process_saved(&f.worker, &f.tickets[0]).await?;
+                let ticket = &f.tickets[1];
+                let original = f
+                    .worker
+                    .read_durable(&format!("{}.job", hex(&ticket.id.0)))?;
+                f.worker
+                    ._hooks
+                    .fail_after_attempt
+                    .store(!accepted, Ordering::Release);
+                f.worker
+                    ._hooks
+                    .fail_before_marker
+                    .store(accepted, Ordering::Release);
+                assert!(process_saved(&f.worker, ticket).await.is_err());
+                let attempts = f.worker.saved_attempts(&ticket.id.0)?;
+                assert_eq!(attempts.len(), 1);
+                let saved = f.worker.read_durable(&attempt_name(&ticket.id.0, 1))?;
+                let original_header = Intent::decode(&original)?.header;
+                assert_eq!(original_header.publication_identity.is_some(), typed);
+                assert_eq!(attempts[0].publication_identity.is_some(), typed);
+                assert_eq!(
+                    Intent::decode(&original)?.encode()?,
+                    original,
+                    "reopening preserves the original durable envelope bytes"
+                );
+                if typed {
+                    let old = original_header.identity()?.unwrap();
+                    let next = attempts[0].identity()?.unwrap();
+                    assert_eq!(old.generation, 1);
+                    assert_eq!(next.generation, 2);
+                    assert_ne!(old.nonce, next.nonce);
+                } else {
+                    assert!(
+                        !String::from_utf8_lossy(&original).contains("publication_identity"),
+                        "legacy None fields must remain absent from original bytes"
+                    );
+                }
+                assert_eq!(
+                    publication(&f.client, &attempts[0]).await?.is_some(),
+                    accepted
+                );
+                f.worker
+                    ._hooks
+                    .fail_after_attempt
+                    .store(false, Ordering::Release);
+                f.worker
+                    ._hooks
+                    .fail_before_marker
+                    .store(false, Ordering::Release);
+                let mut reopened = reopen_worker(&f.worker);
+                // Existing capture slots are full; a successor is metadata, not a
+                // new pending capture admission.
+                Arc::get_mut(&mut reopened).unwrap().policy.max_jobs = f.tickets.len();
+                process_saved(&reopened, ticket).await?;
+                assert_eq!(reopened.saved_attempts(&ticket.id.0)?.len(), 1);
+                assert_eq!(
+                    reopened.read_durable(&attempt_name(&ticket.id.0, 1))?,
+                    saved
+                );
+                assert_eq!(
+                    reopened.read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
+                    original
+                );
+                assert_saved_tickets(&f).await?;
+                let marker = reopened.read_durable(&format!("{}.published", hex(&ticket.id.0)))?;
+                assert!(
+                    validate_attempt_cleanup(&reopened.directory, &marker)?
+                        .iter()
+                        .all(Option::is_some)
+                );
+                let _ = f.stop.send(());
+                f.server.await??;
+            }
         }
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn original_receipt_and_uncertain_lookup_never_construct_successors() -> Result<()> {
-        let f = saved_uploads_with_data(0, false, None, true).await?;
-        f.denied.store(true, Ordering::Release);
-        assert!(process_saved(&f.worker, &f.tickets[0]).await.is_err());
-        assert!(f.worker.saved_attempts(&f.tickets[0].id.0)?.is_empty());
-        f.denied.store(false, Ordering::Release);
-        f.worker
-            ._hooks
-            .fail_before_marker
-            .store(true, Ordering::Release);
-        assert!(process_saved(&f.worker, &f.tickets[0]).await.is_err());
-        assert!(
-            f.client
-                .cloud_publication(&format!("capture_{}", hex(&f.tickets[0].id.0)))
-                .await?
-                .is_some()
-        );
-        f.worker
-            ._hooks
-            .fail_before_marker
-            .store(false, Ordering::Release);
-        process_saved(&reopen_worker(&f.worker), &f.tickets[0]).await?;
-        assert!(f.worker.saved_attempts(&f.tickets[0].id.0)?.is_empty());
-        assert_saved_tickets(&f).await?;
-        let _ = f.stop.send(());
-        f.server.await??;
+        for typed in [false, true] {
+            let f =
+                saved_uploads_with_mode(0, false, None, true, false, false, true, typed).await?;
+            let original = f
+                .worker
+                .read_durable(&format!("{}.job", hex(&f.tickets[0].id.0)))?;
+            let original_header = Intent::decode(&original)?.header;
+            f.denied.store(true, Ordering::Release);
+            assert!(process_saved(&f.worker, &f.tickets[0]).await.is_err());
+            assert!(f.worker.saved_attempts(&f.tickets[0].id.0)?.is_empty());
+            f.denied.store(false, Ordering::Release);
+            f.worker
+                ._hooks
+                .fail_before_marker
+                .store(true, Ordering::Release);
+            assert!(process_saved(&f.worker, &f.tickets[0]).await.is_err());
+            assert!(publication(&f.client, &original_header).await?.is_some());
+            f.worker
+                ._hooks
+                .fail_before_marker
+                .store(false, Ordering::Release);
+            process_saved(&reopen_worker(&f.worker), &f.tickets[0]).await?;
+            assert!(f.worker.saved_attempts(&f.tickets[0].id.0)?.is_empty());
+            assert_eq!(
+                f.worker
+                    .read_durable(&format!("{}.job", hex(&f.tickets[0].id.0)))?,
+                original,
+                "uncertain lookup/replay must not create a new identity or Start"
+            );
+            assert_saved_tickets(&f).await?;
+            let _ = f.stop.send(());
+            f.server.await??;
+        }
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4836,54 +5080,55 @@ max_manifest_members=1024
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn publication_committing_between_absence_and_generation_fence_is_reconciled()
     -> Result<()> {
-        let f = saved_uploads_with_data(0, false, None, true).await?;
-        let ticket = &f.tickets[0];
-        f.worker
-            ._hooks
-            .fail_before_publication
-            .store(true, Ordering::Release);
-        assert!(process_saved(&f.worker, ticket).await.is_err());
-        f.worker
-            ._hooks
-            .fail_before_publication
-            .store(false, Ordering::Release);
-        let pause = Arc::new(CatalogPause::default());
-        let release = ReleasePause(pause.clone());
-        *f.worker._hooks.fence_pause.lock().unwrap() = Some(pause.clone());
-        let worker = f.worker.clone();
-        let target = ticket.clone();
-        let task = tokio::spawn(async move { process_saved(&worker, &target).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pause.entered.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        let original = f
-            .worker
-            .read_durable(&format!("{}.job", hex(&ticket.id.0)))?;
-        let intent = Intent::decode(&original)?;
-        f.client
-            .cloud_publish_captured_version(&intent.sdk()?)
+        for typed in [false, true] {
+            let f =
+                saved_uploads_with_mode(0, false, None, true, false, false, true, typed).await?;
+            let ticket = &f.tickets[0];
+            f.worker
+                ._hooks
+                .fail_before_publication
+                .store(true, Ordering::Release);
+            assert!(process_saved(&f.worker, ticket).await.is_err());
+            f.worker
+                ._hooks
+                .fail_before_publication
+                .store(false, Ordering::Release);
+            let pause = Arc::new(CatalogPause::default());
+            let release = ReleasePause(pause.clone());
+            *f.worker._hooks.fence_pause.lock().unwrap() = Some(pause.clone());
+            let worker = f.worker.clone();
+            let target = ticket.clone();
+            let task = tokio::spawn(async move { process_saved(&worker, &target).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !pause.entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await?;
-        drop(release);
-        task.await??;
-        assert!(f.worker.saved_attempts(&ticket.id.0)?.is_empty());
-        assert_eq!(
-            f.worker
-                .read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
-            original
-        );
-        assert!(
-            f.worker
-                .directory
-                .path()
-                .join(format!("{}.published", hex(&ticket.id.0)))
-                .exists()
-        );
-        assert_saved_tickets(&f).await?;
-        let _ = f.stop.send(());
-        f.server.await??;
+            let original = f
+                .worker
+                .read_durable(&format!("{}.job", hex(&ticket.id.0)))?;
+            let intent = Intent::decode(&original)?;
+            publish(&f.client, &intent).await?;
+            drop(release);
+            task.await??;
+            assert!(f.worker.saved_attempts(&ticket.id.0)?.is_empty());
+            assert_eq!(
+                f.worker
+                    .read_durable(&format!("{}.job", hex(&ticket.id.0)))?,
+                original
+            );
+            assert!(
+                f.worker
+                    .directory
+                    .path()
+                    .join(format!("{}.published", hex(&ticket.id.0)))
+                    .exists()
+            );
+            assert_saved_tickets(&f).await?;
+            let _ = f.stop.send(());
+            f.server.await??;
+        }
         Ok(())
     }
     async fn competing_publication(f: &SavedUploads) -> Result<()> {
@@ -5483,11 +5728,11 @@ max_manifest_members=1024
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scheduled_retained_offload_requires_the_actual_server_backing_contract() -> Result<()>
+    async fn scheduled_retained_offload_uses_pins_without_the_legacy_contract() -> Result<()>
     {
         let f = saved_uploads_with_roots_and_collection(1, true, None, false, true, false, false)
             .await?;
-        // Scheduling alone cannot manufacture feature13 or reinterpret feature9.
+        // Durable source pins protect offload independently of the legacy contract.
         f.worker
             ._hooks
             .retained_offload
@@ -5510,16 +5755,19 @@ max_manifest_members=1024
             .await?
             .context("new server vocabulary missing")?;
         assert!(!contract.supported && contract.authorized);
+        let pins = client
+            .capabilities(&[tinytree_client::CapabilityFeature::DurableCloudVersionPinV1])
+            .await?;
+        assert!(pins.features[0].supported && pins.features[0].authorized);
         assert!(f.worker.poll().await?);
         assert!(f.worker.poll().await?);
-        assert_saved_tickets(&f).await?;
-        assert!(!f.worker.host.capture_registry().capture_cleanup_pending()?);
-        assert_eq!(f.worker.stats.retired.load(Ordering::Acquire), 0);
         assert_eq!(
-            f.worker.stats.failed.load(Ordering::Acquire),
-            0,
-            "unsupported is not a failed admission or legacy fallback"
+            f.worker.host.capture_registry().pending_captures().await?,
+            vec![f.tickets[1].clone()]
         );
+        assert!(!f.worker.host.capture_registry().capture_cleanup_pending()?);
+        assert_eq!(f.worker.stats.retired.load(Ordering::Acquire), 1);
+        assert_eq!(f.worker.stats.failed.load(Ordering::Acquire), 0);
         let _ = f.stop.send(());
         f.server.await??;
         Ok(())
@@ -5551,7 +5799,7 @@ max_manifest_members=1024
         *policy_worker._hooks.cleanup_pause.lock().unwrap() = Some(pause.clone());
         let worker = policy_worker.clone();
         let admission = cleanup_admission(&worker).await?;
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             worker
                 .retire_one(
                     tokio::time::Instant::now() + Duration::from_secs(10),
@@ -5562,11 +5810,19 @@ max_manifest_members=1024
         });
         let _release = ReleasePause(pause.clone());
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !pause.entered.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
+            tokio::select! {
+                _ = async {
+                    while !pause.entered.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                } => Ok(()),
+                result = &mut task => {
+                    result?.context("retirement failed before cleanup boundary")?;
+                    anyhow::bail!("retirement finished before cleanup boundary")
+                }
             }
         })
-        .await?;
+        .await??;
         private_file(&publication, b"changed immutable publication")?;
         pause.release();
         assert!(task.await?.is_err());
@@ -5621,13 +5877,18 @@ max_manifest_members=1024
                 .generation,
             1
         );
-        assert!(
-            healthy
-                .client
-                .cloud_publication(&format!("capture_{}", hex(&healthy_ticket.id.0)))
-                .await?
-                .is_some()
-        );
+        let healthy_header: Header = serde_json::from_slice(
+            &multi.read_durable(&format!("{}.published", hex(&healthy_ticket.id.0)))?,
+        )?;
+        let healthy_identity = healthy_header
+            .identity()?
+            .context("new healthy publication identity absent")?;
+        let healthy_receipt = healthy
+            .client
+            .cloud_publication_v2(healthy_identity)
+            .await?
+            .context("healthy typed publication absent")?;
+        ensure_publication(&healthy_header, &healthy_receipt)?;
         assert_eq!(
             registry.capture_cleanup().await?,
             Some(pending.clone()),
@@ -5896,6 +6157,29 @@ max_manifest_members=1024
                 .len(),
             3
         );
+        for ticket in worker.host.capture_registry().pending_captures().await? {
+            let bytes = worker.read_durable(&format!("{}.job", hex(&ticket.id.0)))?;
+            let intent = Intent::decode(&bytes)?;
+            assert_eq!(intent.header.version, 2);
+            let identity = intent
+                .header
+                .identity()?
+                .context("new publication identity absent")?;
+            assert_eq!(identity.workspace_id, intent.header.workspace);
+            assert_eq!(
+                Some(identity.generation),
+                intent.header.expected_generation.checked_add(1)
+            );
+            assert!(publication(&client, &intent.header).await?.is_some());
+            assert!(
+                client
+                    .cloud_publication(&intent.header.key)
+                    .await?
+                    .is_none(),
+                "display token must not alias a legacy receipt lookup"
+            );
+            assert_eq!(intent.encode()?, bytes);
+        }
         assert_eq!(worker.stats.attempts.load(Ordering::Acquire), 3);
         assert_eq!(worker.stats.failed.load(Ordering::Acquire), 0);
         // Observe the final no-progress inventory reaching backoff before
@@ -6268,6 +6552,7 @@ max_manifest_members=1024
             manifest_size: 0,
             capture_size: 0,
             successor: None,
+            publication_identity: None,
         };
         let published = serde_json::to_vec(&header)?;
         let publication = worker
@@ -6573,6 +6858,7 @@ max_manifest_members=1024
             manifest_size: 0,
             capture_size: 0,
             successor: None,
+            publication_identity: None,
         };
         let name = format!("{}.published", hex(&header.ticket));
         let bytes = serde_json::to_vec(&header)?;

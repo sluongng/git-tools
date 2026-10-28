@@ -139,6 +139,7 @@ pub(crate) struct Ledger {
     cloud_authorities: fjall::SingleWriterTxKeyspace,
     cloud_queries: fjall::SingleWriterTxKeyspace,
     offload_pins: fjall::SingleWriterTxKeyspace,
+    source_pins: fjall::SingleWriterTxKeyspace,
     offload_owners:
         Mutex<std::collections::HashMap<String, std::sync::Weak<offload::OffloadPinLease>>>,
     cloud_read_owners:
@@ -157,6 +158,7 @@ const SPARSE_FORMAT: &[u8] = b"tinytree-native-admission-2\n";
 const QUERY_FORMAT: &[u8] = b"tinytree-native-admission-3\n";
 const FORMAT: &[u8] = b"tinytree-native-admission-4\n";
 const CLOUD_QUERY_FORMAT: &[u8] = b"tinytree-native-admission-5\n";
+const SOURCE_PIN_FORMAT: &[u8] = b"tinytree-native-admission-8\n";
 const OFFLOAD_FORMAT: &[u8] = b"tinytree-native-admission-6\n";
 pub(crate) fn preflight(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
@@ -177,7 +179,8 @@ pub(crate) fn preflight(path: &Path) -> Result<bool> {
             );
             let marker = std::fs::read(path.join(MARKER))?;
             ensure!(
-                marker == OFFLOAD_FORMAT
+                marker == SOURCE_PIN_FORMAT
+                    || marker == OFFLOAD_FORMAT
                     || marker == FORMAT
                     || marker == CLOUD_QUERY_FORMAT
                     || marker == QUERY_FORMAT
@@ -241,7 +244,10 @@ impl Ledger {
             .read_tx()
             .get(&self.meta, b"format")?
             .context("native feature gate missing")?;
-        if format.as_ref() == CLOUD_QUERY_FORMAT || format.as_ref() == OFFLOAD_FORMAT {
+        if format.as_ref() == SOURCE_PIN_FORMAT
+            || format.as_ref() == CLOUD_QUERY_FORMAT
+            || format.as_ref() == OFFLOAD_FORMAT
+        {
             return Ok(());
         }
         ensure!(
@@ -307,7 +313,7 @@ impl Ledger {
         }
         let meta = db.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == SOURCE_PIN_FORMAT || value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("known-references-v2")
@@ -316,7 +322,7 @@ impl Ledger {
             );
         }
         if !fresh
-            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==OFFLOAD_FORMAT||value==CLOUD_QUERY_FORMAT||value==FORMAT||value==QUERY_FORMAT)
+            && matches!(db.read_tx().get(&meta,b"format")?.as_deref(),Some(value) if value==SOURCE_PIN_FORMAT||value==OFFLOAD_FORMAT||value==CLOUD_QUERY_FORMAT||value==FORMAT||value==QUERY_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("query-authorities-v3") && db.keyspace_exists("query-grants-v3"),
@@ -324,14 +330,29 @@ impl Ledger {
             );
         }
         if !fresh
-            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == FORMAT || value == CLOUD_QUERY_FORMAT)
+            && matches!(db.read_tx().get(&meta, b"format")?.as_deref(), Some(value) if value == SOURCE_PIN_FORMAT || value == OFFLOAD_FORMAT || value == FORMAT || value == CLOUD_QUERY_FORMAT)
         {
             ensure!(
                 db.keyspace_exists("cloud-authorities-v4"),
                 "recognized cloud admission keyspace missing"
             );
         }
-        let has_offload = db.read_tx().get(&meta, b"format")?.as_deref() == Some(OFFLOAD_FORMAT);
+        let has_source_pins =
+            db.read_tx().get(&meta, b"format")?.as_deref() == Some(SOURCE_PIN_FORMAT);
+        let has_offload = has_source_pins
+            || db.read_tx().get(&meta, b"format")?.as_deref() == Some(OFFLOAD_FORMAT);
+        ensure!(
+            !has_source_pins || db.keyspace_exists("retained-source-pins-v8"),
+            "retained source pin keyspace missing"
+        );
+        let source_pins = db.keyspace(
+            "retained-source-pins-v8",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
+        ensure!(
+            has_source_pins || db.read_tx().iter(&source_pins).next().is_none(),
+            "retained source pin feature gate missing"
+        );
         let has_cloud_queries = has_offload
             || db.read_tx().get(&meta, b"format")?.as_deref() == Some(CLOUD_QUERY_FORMAT);
         ensure!(
@@ -381,7 +402,7 @@ impl Ledger {
         if !fresh {
             let stored_format = db.read_tx().get(&meta, b"format")?;
             ensure!(
-                matches!(stored_format.as_deref(), Some(value) if value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
+                matches!(stored_format.as_deref(), Some(value) if value == SOURCE_PIN_FORMAT || value == OFFLOAD_FORMAT || value == CLOUD_QUERY_FORMAT || value == FORMAT || value == QUERY_FORMAT || value == SPARSE_FORMAT || value == LEGACY_FORMAT),
                 "native admission ledger format identity missing"
             );
             let counter = db
@@ -459,13 +480,25 @@ impl Ledger {
             client != [0; 16],
             "invalid native admission ledger client identity"
         );
+        if has_source_pins {
+            offload::validate_saved_source_pins(
+                &db,
+                &meta,
+                &source_pins,
+                &cloud_authorities,
+                &cloud_queries,
+                config,
+            )?;
+        }
         if has_offload {
             offload::validate_saved_pins(&db, &offload_pins, &cloud_authorities, config)?;
         }
         let mut tx = db.write_tx().durability(Some(fjall::PersistMode::SyncAll));
         // The durable database feature gate precedes the marker replacement.
         // Old readers reject the database even after a crash between these writes.
-        let format = if has_offload {
+        let format = if has_source_pins {
+            SOURCE_PIN_FORMAT
+        } else if has_offload {
             OFFLOAD_FORMAT
         } else if has_cloud_queries {
             CLOUD_QUERY_FORMAT
@@ -495,6 +528,7 @@ impl Ledger {
             cloud_authorities,
             cloud_queries,
             offload_pins,
+            source_pins,
             offload_owners: Mutex::new(Default::default()),
             cloud_read_owners: Mutex::new(Default::default()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -1078,6 +1112,15 @@ impl Ledger {
         &self,
         changes: Vec<(&fjall::SingleWriterTxKeyspace, Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<()> {
+        self.write_locked_with_format(changes, None)
+    }
+    /// Feature metadata is not charged to the payload byte counter. Change its
+    /// gate in the same durable transaction as the first feature payload row.
+    fn write_locked_with_format(
+        &self,
+        changes: Vec<(&fjall::SingleWriterTxKeyspace, Vec<u8>, Option<Vec<u8>>)>,
+        format: Option<&[u8]>,
+    ) -> Result<()> {
         self.check()?;
         let mut tx = self
             .db
@@ -1108,6 +1151,9 @@ impl Ledger {
             }
         }
         tx.insert(&self.meta, b"bytes", serde_json::to_vec(&bytes)?);
+        if let Some(format) = format {
+            tx.insert(&self.meta, b"format", format);
+        }
         if let Err(error) = tx.commit() {
             self.poisoned
                 .store(true, std::sync::atomic::Ordering::Release);

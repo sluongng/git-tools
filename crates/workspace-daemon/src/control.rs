@@ -45,6 +45,8 @@ pub struct NativeCloudVersions {
     pub workspace: NativeCloudWorkspace,
     pub versions: Vec<NativeCloudVersion>,
     pub through_generation: u64,
+    pub retired_through: u64,
+    pub retention_revision: u64,
     pub continuation: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

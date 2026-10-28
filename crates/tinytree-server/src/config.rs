@@ -141,6 +141,11 @@ impl ServiceConfig {
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudStoreConfig {
+    pub retirement_enabled: bool,
+    pub rolling_retention_enabled: bool,
+    pub max_versions_per_workspace: u64,
+    pub max_pin_lifecycle_records_per_workspace: u64,
+    pub max_pin_acquisition_seconds: i64,
     pub resident: Option<tinytree_store::CloudResidentLimits>,
     pub max_object_bytes: usize,
     pub max_decode_bytes: usize,
@@ -153,6 +158,11 @@ impl Default for CloudStoreConfig {
     fn default() -> Self {
         let c = tinytree_store::CloudConfig::default();
         Self {
+            retirement_enabled: c.retirement_enabled,
+            rolling_retention_enabled: c.rolling_retention_enabled,
+            max_versions_per_workspace: c.max_versions_per_workspace,
+            max_pin_lifecycle_records_per_workspace: c.max_pin_lifecycle_records_per_workspace,
+            max_pin_acquisition_seconds: c.max_pin_acquisition_seconds,
             resident: c.resident,
             max_object_bytes: c.max_object_bytes,
             max_decode_bytes: c.max_decode_bytes,
@@ -204,6 +214,12 @@ impl StoreConfig {
     pub fn materialize(&self, metadata_bytes: usize) -> tinytree_store::Config {
         let mut config = tinytree_store::Config::default();
         config.model_limits.max_object_bytes = metadata_bytes;
+        config.cloud.retirement_enabled = self.cloud.retirement_enabled;
+        config.cloud.rolling_retention_enabled = self.cloud.rolling_retention_enabled;
+        config.cloud.max_versions_per_workspace = self.cloud.max_versions_per_workspace;
+        config.cloud.max_pin_lifecycle_records_per_workspace =
+            self.cloud.max_pin_lifecycle_records_per_workspace;
+        config.cloud.max_pin_acquisition_seconds = self.cloud.max_pin_acquisition_seconds;
         config.cloud.resident = self.cloud.resident;
         config.cloud.max_object_bytes = self.cloud.max_object_bytes;
         config.cloud.max_field_bytes = config
@@ -235,7 +251,11 @@ impl StoreConfig {
                 .validate()
                 .map_err(|_| ConfigError("invalid native store resident limits"))?;
         }
-        if !(1024..=64 * 1024 * 1024).contains(&self.cloud.max_object_bytes)
+        if (self.cloud.rolling_retention_enabled && !self.cloud.retirement_enabled)
+            || !(1..=1_000_000).contains(&self.cloud.max_versions_per_workspace)
+            || !(1..=1_000_000).contains(&self.cloud.max_pin_lifecycle_records_per_workspace)
+            || !(1..=86_400).contains(&self.cloud.max_pin_acquisition_seconds)
+            || !(1024..=64 * 1024 * 1024).contains(&self.cloud.max_object_bytes)
             || self.cloud.max_decode_bytes < self.cloud.max_object_bytes
             || self.cloud.max_decode_bytes > 1024 * 1024 * 1024
             || !(65536..=1024 * 1024 * 1024).contains(&self.cloud.max_version_decode_bytes)

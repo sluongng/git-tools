@@ -1771,6 +1771,28 @@ struct RestoreCloudFixture {
 impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud
     for RestoreCloudFixture
 {
+    async fn acquire_version_pin(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::AcquireVersionPinRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::VersionPin>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "legacy admin fixture has no durable version pins",
+        ))
+    }
+    async fn release_version_pin(
+        &self,
+        _: tonic::Request<tinytree_client::cloud_protocol::ReleaseVersionPinRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tinytree_client::cloud_protocol::VersionPinReleased>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "legacy admin fixture has no durable version pins",
+        ))
+    }
     async fn put_object_representation(
         &self,
         _: tonic::Request<tinytree_client::cloud_protocol::PutObjectRequest>,
