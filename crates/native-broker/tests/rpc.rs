@@ -5505,3 +5505,158 @@ async fn limited_annotation_refuses_old_broker_and_old_provider_before_frontier_
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forge_projection_chunks_share_one_deadline_and_keep_cancelled_owner_until_work_ends() {
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tinytree_client::forge_protocol as f;
+    #[derive(Clone)]
+    struct Peer {
+        data: Arc<Vec<u8>>,
+        id: [u8; 32],
+        reads: Arc<AtomicUsize>,
+    }
+    #[tonic::async_trait]
+    impl f::forge_server::Forge for Peer {
+        async fn call(
+            &self,
+            request: tonic::Request<f::ForgeCallRequest>,
+        ) -> Result<tonic::Response<f::ForgeCallResponse>, tonic::Status> {
+            let input = request.into_inner();
+            let op = f::ForgeOperation::try_from(input.operation).unwrap();
+            let result = match op {
+                f::ForgeOperation::ResolveView => {
+                    json!({"account_id":"example","view":"public","view_version":vec![1u8;32],"revision":vec![2u8;32],"policy_epoch":1,"root_prefix":"","projected_commit":vec![3u8;32],"projected_tree":vec![4u8;32],"paths":[],"readme":null,"readme_error":null,"complete":true})
+                }
+                f::ForgeOperation::ReadObject => {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&input.payload_json).unwrap();
+                    assert_eq!(payload["kind"], tinytree_model::Kind::File as u8);
+                    assert_eq!(payload["id"], json!(self.id));
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let offset = payload["offset"].as_u64().unwrap() as usize;
+                    let cap = payload["max_bytes"].as_u64().unwrap() as usize;
+                    let end = (offset + cap).min(self.data.len());
+                    json!({"kind":tinytree_model::Kind::File as u8,"id":self.id,"data":&self.data[offset..end],"revision":vec![2u8;32],"view_version":vec![1u8;32],"policy_epoch":1,"size_bytes":self.data.len(),"format_version":tinytree_model::FORMAT_VERSION,"offset":offset,"eof":end==self.data.len()})
+                }
+                _ => {
+                    return Err(tonic::Status::permission_denied(
+                        "only projected fixture reads are available",
+                    ));
+                }
+            };
+            Ok(tonic::Response::new(f::ForgeCallResponse {
+                operation: input.operation,
+                state: "complete".into(),
+                result_json: serde_json::to_vec(&result).unwrap(),
+                account_id: input.account_id,
+                view: input.view,
+                request_id: input.request_id,
+            }))
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("local");
+    private(&path);
+    let local = Arc::new(DirectObjectIo::init(&path, backend_config()).unwrap());
+    let data = Arc::new(vec![b'X'; 4 * 65536]);
+    let id = tinytree_model::describe_file(&data).key.id.0;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = oneshot::channel();
+    let peer = Peer {
+        data,
+        id,
+        reads: reads.clone(),
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(f::forge_server::ForgeServer::new(peer))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client = tinytree_client::Config {
+        endpoint,
+        repository_id: "forge-example".into(),
+        ..Default::default()
+    };
+    client.rpc.operation_timeout_ms = 350;
+    client.rpc.rpc_timeout_ms = 250;
+    client.rpc.connect_timeout_ms = 100;
+    let provider = native_broker::ForgeObjectIo::open(
+        local.clone(),
+        native_broker::ForgeRemoteConfig {
+            account_id: "example".into(),
+            view: "public".into(),
+            view_version: Some([1; 32]),
+            client,
+        },
+    )
+    .await
+    .unwrap();
+    let started = Instant::now();
+    assert!(
+        provider
+            .read_file(tinytree_model::FileId(id))
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "every chunk must share one operation deadline"
+    );
+    assert!(reads.load(Ordering::SeqCst) >= 2);
+    let key = tinytree_model::ObjectKey {
+        kind: tinytree_model::Kind::File,
+        id: tinytree_model::ObjectId(id),
+    };
+    assert!(
+        local.descriptor(key).await.unwrap().is_none(),
+        "incomplete bodies must never become resident files"
+    );
+    struct Owner(Arc<AtomicBool>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    reads.store(0, Ordering::SeqCst);
+    let released = Arc::new(AtomicBool::new(false));
+    let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(Owner(released.clone()));
+    let task = tokio::spawn(async move {
+        provider
+            .read_file_with_owner(tinytree_model::FileId(id), owner)
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while reads.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "dropping the waiter must not release physical admission"
+    );
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while !released.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "bounded detached work did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(local.descriptor(key).await.unwrap().is_none());
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}

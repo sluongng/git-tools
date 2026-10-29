@@ -186,12 +186,25 @@ fn native_initialization_keeps_all_jj_administration_external_and_loader_is_nati
         let fixture = Fixture::new();
         fixture.registry.provision(&fixture.binding).unwrap();
         let pending = std::collections::BTreeSet::from([fixture.binding.workspace_id]);
-        let initializer = fixture.registry.initialization_lock(&fixture.binding).unwrap();
-        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&pending,128,1024*1024,8).is_err(),
-            "initializer before journal publication must be fenced");
+        let initializer = fixture
+            .registry
+            .initialization_lock(&fixture.binding)
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .inspect_enrollments(&fixture.binding.endpoint, &pending, 128, 1024 * 1024, 8)
+                .is_err(),
+            "initializer before journal publication must be fenced"
+        );
         drop(initializer);
-        let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&pending,128,1024*1024,8).unwrap();
-        assert_eq!(census.lock_count(),2); assert!(census.bindings.is_empty()); drop(census);
+        let census = fixture
+            .registry
+            .inspect_enrollments(&fixture.binding.endpoint, &pending, 128, 1024 * 1024, 8)
+            .unwrap();
+        assert_eq!(census.lock_count(), 2);
+        assert!(census.bindings.is_empty());
+        drop(census);
         assert!(!fixture.binding.admin.join(JOURNAL).exists());
         let captured_root = std::cell::RefCell::new(None);
         let backend_initializer =
@@ -231,31 +244,105 @@ fn native_initialization_keeps_all_jj_administration_external_and_loader_is_nati
         let before = fs::read(fixture.binding.admin.join(JOURNAL)).unwrap();
         let calls = fixture.connector.calls.load(Ordering::SeqCst);
         {
-            let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1024 * 1024, 8).unwrap();
+            let census = fixture
+                .registry
+                .inspect_enrollments(
+                    &fixture.binding.endpoint,
+                    &Default::default(),
+                    128,
+                    1024 * 1024,
+                    8,
+                )
+                .unwrap();
             assert_eq!(census.bindings, vec![fixture.binding.clone()]);
-            assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1024 * 1024, 8).is_err(), "census fences concurrent initialization");
+            assert!(
+                fixture
+                    .registry
+                    .inspect_enrollments(
+                        &fixture.binding.endpoint,
+                        &Default::default(),
+                        128,
+                        1024 * 1024,
+                        8
+                    )
+                    .is_err(),
+                "census fences concurrent initialization"
+            );
         }
-        assert_eq!(fixture.connector.calls.load(Ordering::SeqCst), calls, "census must not query a projection");
-        assert_eq!(fs::read(fixture.binding.admin.join(JOURNAL)).unwrap(), before);
-        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1, 8).is_err());
+        assert_eq!(
+            fixture.connector.calls.load(Ordering::SeqCst),
+            calls,
+            "census must not query a projection"
+        );
+        assert_eq!(
+            fs::read(fixture.binding.admin.join(JOURNAL)).unwrap(),
+            before
+        );
+        assert!(
+            fixture
+                .registry
+                .inspect_enrollments(&fixture.binding.endpoint, &Default::default(), 128, 1, 8)
+                .is_err()
+        );
         let admin = PrivateDir::open_existing(&fixture.binding.admin).unwrap();
         let records = PrivateDir::open_existing(fixture.registry.path().join("records")).unwrap();
         let row_name = record_name(&fixture.binding.workspace_id);
-        let row_before = records.read(&row_name,MAX_RECORD).unwrap();
+        let row_before = records.read(&row_name, MAX_RECORD).unwrap();
         let mut foreign = fixture.binding.clone();
-        foreign.endpoint = Endpoint::UnixSocket {path:fixture._directory.path().join("foreign.sock")};
-        let mut journal:Initialization = serde_json::from_slice(&before).unwrap();
+        foreign.endpoint = Endpoint::UnixSocket {
+            path: fixture._directory.path().join("foreign.sock"),
+        };
+        let mut journal: Initialization = serde_json::from_slice(&before).unwrap();
         journal.binding = foreign.clone();
-        admin.replace(JOURNAL,&serde_json::to_vec(&journal).unwrap()).unwrap();
-        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).is_err(),
-            "same-ID ready record and foreign journal must conflict before filtering");
-        records.replace(&row_name,&serde_json::to_vec(&foreign).unwrap()).unwrap();
-        let census = fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).unwrap();
-        assert!(census.bindings.is_empty(),"coherent foreign enrollment is excluded"); drop(census);
-        admin.replace(JOURNAL,&before).unwrap();
-        assert!(fixture.registry.inspect_enrollments(&fixture.binding.endpoint,&Default::default(),128,1024*1024,8).is_err(),
-            "foreign ready record and our journal must also conflict");
-        records.replace(&row_name,&row_before).unwrap();
+        admin
+            .replace(JOURNAL, &serde_json::to_vec(&journal).unwrap())
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .inspect_enrollments(
+                    &fixture.binding.endpoint,
+                    &Default::default(),
+                    128,
+                    1024 * 1024,
+                    8
+                )
+                .is_err(),
+            "same-ID ready record and foreign journal must conflict before filtering"
+        );
+        records
+            .replace(&row_name, &serde_json::to_vec(&foreign).unwrap())
+            .unwrap();
+        let census = fixture
+            .registry
+            .inspect_enrollments(
+                &fixture.binding.endpoint,
+                &Default::default(),
+                128,
+                1024 * 1024,
+                8,
+            )
+            .unwrap();
+        assert!(
+            census.bindings.is_empty(),
+            "coherent foreign enrollment is excluded"
+        );
+        drop(census);
+        admin.replace(JOURNAL, &before).unwrap();
+        assert!(
+            fixture
+                .registry
+                .inspect_enrollments(
+                    &fixture.binding.endpoint,
+                    &Default::default(),
+                    128,
+                    1024 * 1024,
+                    8
+                )
+                .is_err(),
+            "foreign ready record and our journal must also conflict"
+        );
+        records.replace(&row_name, &row_before).unwrap();
         assert_eq!(
             captured_root.borrow().as_ref(),
             Some(repo.op_store().root_operation_id())
@@ -717,10 +804,15 @@ impl native_broker::NativeQueryIo for NoCaptureQueries {
         &self,
         _: native_broker::CloudAuthorizationSource,
         _: native_broker::QueryOwner,
-    ) -> std::result::Result<Option<native_broker::QueryReply<Arc<dyn native_broker::NativeQueryIo>>>, tonic::Status> {
+    ) -> std::result::Result<
+        Option<native_broker::QueryReply<Arc<dyn native_broker::NativeQueryIo>>>,
+        tonic::Status,
+    > {
         self.setup_call();
         if self.deny_prepare.load(Ordering::Acquire) {
-            return Err(tonic::Status::permission_denied("fixture authorization preparation denied"));
+            return Err(tonic::Status::permission_denied(
+                "fixture authorization preparation denied",
+            ));
         }
         Ok(None)
     }
@@ -2350,7 +2442,14 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
     for (name, deny_prepare, deny_cloud, bad_echo, deny_close, expected_closes) in [
         ("prepare_refusal_no_fallback", true, false, false, false, 0),
         ("unprepared_scope_refusal", false, true, false, false, 0),
-        ("validation_refusal_closes_scope", false, false, true, false, 1),
+        (
+            "validation_refusal_closes_scope",
+            false,
+            false,
+            true,
+            false,
+            1,
+        ),
         ("close_ack_refusal", false, false, false, true, 1),
     ] {
         queries.deny_prepare.store(deny_prepare, Ordering::Release);
@@ -2398,10 +2497,17 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
             .is_err()
         );
         assert!(!fixture.binding.admin.exists(), "{name}");
-        assert_eq!(queries.closes.load(Ordering::SeqCst) - closes_before, expected_closes, "{name}");
+        assert_eq!(
+            queries.closes.load(Ordering::SeqCst) - closes_before,
+            expected_closes,
+            "{name}"
+        );
         if deny_prepare {
-            assert_eq!(queries.calls.load(Ordering::SeqCst) - calls_before, 1,
-                "preparation error cannot invoke the per-root fallback");
+            assert_eq!(
+                queries.calls.load(Ordering::SeqCst) - calls_before,
+                1,
+                "preparation error cannot invoke the per-root fallback"
+            );
         }
     }
     queries.deny_prepare.store(false, Ordering::Release);
@@ -5356,4 +5462,82 @@ fn shared_landing_digests_preserve_v1_wire_recipe_and_ignore_observed_job() {
         hex(&landing_resolution::candidate_digest(&candidate)),
         "391d55607ba06b7401be6b91c5413c84f42d5b3c207324027750ecbbf71c6d42"
     );
+}
+
+#[test]
+fn forge_review_journal_retains_exact_sources_and_rejects_rebound_replay() {
+    use crate::forge_pending::{PendingReview, State};
+    let original = PendingReview {
+        request_id: "review-example".into(),
+        scope_hash: [1; 32],
+        change_id: "66".repeat(16),
+        patchset_id: None,
+        review_dispatched: false,
+        superseded: false,
+        apply_write_started: false,
+        source_operation: "11".repeat(64),
+        source_base: "22".repeat(32),
+        source_head: "33".repeat(32),
+        view_version: [4; 32],
+        landed_projected_head: None,
+        apply_operation: None,
+    };
+    let mut state = State::default();
+    state.retain(original.clone()).unwrap();
+    state.retain(original.clone()).unwrap();
+    assert_eq!(state.requests.len(), 1);
+    let encoded = state.encode().unwrap();
+    let decoded = State::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded.commit_heads().collect::<Vec<_>>(),
+        vec![original.source_base.as_str(), original.source_head.as_str()]
+    );
+    assert_eq!(
+        decoded.operations().collect::<Vec<_>>(),
+        vec![original.source_operation.as_str()]
+    );
+    // Re-reading A while B is in flight must not erase B's uncertainty.
+    let mut grouped = state.clone();
+    assert!(
+        grouped
+            .acknowledge("review-example", &"aa".repeat(32), true)
+            .unwrap()
+    );
+    let mut replacement = original.clone();
+    replacement.request_id = "replacement-example".into();
+    replacement.source_head = "77".repeat(32);
+    replacement.review_dispatched = true;
+    grouped.retain(replacement).unwrap();
+    assert!(
+        !grouped
+            .acknowledge("review-example", &"aa".repeat(32), true)
+            .unwrap()
+    );
+    assert!(!grouped.requests[1].superseded);
+    assert!(grouped.requests[1].patchset_id.is_none());
+    assert!(
+        grouped
+            .acknowledge("replacement-example", &"bb".repeat(32), true)
+            .unwrap()
+    );
+    assert!(grouped.requests[0].superseded);
+    assert!(!grouped.requests[1].superseded);
+    assert!(
+        !grouped
+            .acknowledge("review-example", &"aa".repeat(32), false)
+            .unwrap()
+    );
+    assert!(!grouped.requests[1].superseded);
+    assert_eq!(grouped.commit_heads().count(), 4);
+    let mut rebound = original.clone();
+    rebound.source_head = "55".repeat(32);
+    assert!(state.retain(rebound).is_err());
+    assert_eq!(state.encode().unwrap(), encoded);
+    let mut invalid = original;
+    invalid.source_operation = "11".repeat(128);
+    let mut empty = State::default();
+    assert!(empty.retain(invalid).is_err());
+    let mut untrusted: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    untrusted["actor"] = serde_json::json!("owner");
+    assert!(State::decode(&serde_json::to_vec(&untrusted).unwrap()).is_err());
 }

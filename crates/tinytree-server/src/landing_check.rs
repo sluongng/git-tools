@@ -260,10 +260,11 @@ pub(crate) struct CheckerHost {
     current: Option<Current>,
     policy: LandingCheckerConfig,
     profiles: Vec<LandingProfile>,
+    forge_profile: Option<String>,
     landing_enabled: bool,
     repositories: Vec<String>,
     global: Arc<Semaphore>,
-    per_repo: HashMap<String, Arc<Semaphore>>,
+    per_repo: Mutex<HashMap<String, Arc<Semaphore>>>,
     active: AtomicUsize,
     closing: AtomicBool,
     changed: Notify,
@@ -340,6 +341,7 @@ impl CheckerHost {
         profiles: Vec<LandingProfile>,
         repositories: &[String],
         landing_enabled: bool,
+        forge_profile: Option<String>,
     ) -> Result<Option<Arc<Self>>, ConfigError> {
         let settings = configuration.clone().unwrap_or_default();
         settings.validate()?;
@@ -368,6 +370,7 @@ impl CheckerHost {
                     .profile_version(&profile.name)
                     .map_err(|_| ConfigError("cannot fingerprint checker profile"))?
                     != profile.version
+                    || (forge_profile.as_ref() == Some(&profile.name) && !selected.forge_accounts)
                     || profile
                         .repositories
                         .iter()
@@ -442,7 +445,11 @@ impl CheckerHost {
             record
                 .validate()
                 .map_err(|_| ConfigError("invalid checker job binding"))?;
-            if !repositories.contains(&record.repository)
+            if !(repositories.contains(&record.repository)
+                || (store
+                    .forge_account_repositories(1024)
+                    .map_err(|_| ConfigError("Forge account discovery failed"))?
+                    .contains(&record.repository)))
                 || entry.file_name().to_str()
                     != Some(job_name(&record.repository, record.job).as_str())
             {
@@ -481,18 +488,21 @@ impl CheckerHost {
             current,
             policy: settings.clone(),
             profiles,
+            forge_profile,
             landing_enabled,
             repositories: repositories.to_vec(),
             global: Arc::new(Semaphore::new(settings.max_checks)),
-            per_repo: repositories
-                .iter()
-                .map(|repo| {
-                    (
-                        repo.clone(),
-                        Arc::new(Semaphore::new(settings.max_checks_per_repository)),
-                    )
-                })
-                .collect(),
+            per_repo: Mutex::new(
+                repositories
+                    .iter()
+                    .map(|repo| {
+                        (
+                            repo.clone(),
+                            Arc::new(Semaphore::new(settings.max_checks_per_repository)),
+                        )
+                    })
+                    .collect(),
+            ),
             active: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             changed: Notify::new(),
@@ -520,7 +530,12 @@ impl CheckerHost {
             && self.profiles.iter().any(|p| {
                 p.name == profile.name
                     && p.version == profile.version
-                    && p.repositories.iter().any(|r| r == repo)
+                    && (p.repositories.iter().any(|r| r == repo)
+                        || (self.forge_profile.as_ref() == Some(&p.name)
+                            && self
+                                .store
+                                .forge_account_repositories(1024)
+                                .is_ok_and(|repos| repos.iter().any(|r| r == repo))))
             })
     }
     /// The decision and Store transition are covered by the same gate used to
@@ -788,10 +803,21 @@ impl CheckerHost {
         let Ok(global) = self.global.clone().try_acquire_owned() else {
             return false;
         };
-        let Some(repository) = self.per_repo.get(repo) else {
-            return true;
+        let repository = {
+            let Ok(mut repos) = self.per_repo.lock() else {
+                return true;
+            };
+            if !repos.contains_key(repo)
+                && repos.len() >= self.repositories.len().saturating_add(1024)
+            {
+                return true;
+            }
+            repos
+                .entry(repo.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.policy.max_checks_per_repository)))
+                .clone()
         };
-        let Ok(repository) = repository.clone().try_acquire_owned() else {
+        let Ok(repository) = repository.try_acquire_owned() else {
             return false;
         };
         let Ok(mut state) = self.state.lock() else {
@@ -841,12 +867,23 @@ impl CheckerHost {
         }
         let weak = Arc::downgrade(self);
         let wake = self.wake.clone();
-        let repositories = self.repositories.clone();
+
         *worker = Some(tokio::spawn(async move {
             let initial = || {
-                repositories
-                    .iter()
-                    .cloned()
+                weak.upgrade()
+                    .map(|host| {
+                        let mut repos = host.repositories.clone();
+                        if host.forge_profile.is_some() {
+                            if let Ok(accounts) = host.store.forge_account_repositories(1024) {
+                                repos.extend(accounts);
+                            }
+                        }
+                        repos.sort();
+                        repos.dedup();
+                        repos
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
                     .map(|repo| (repo, None))
                     .collect::<VecDeque<(String, Option<s::LandingScanCursor>)>>()
             };
@@ -1389,7 +1426,9 @@ impl CheckerHost {
             },
             now()?,
         )?;
-        if checked.state == s::LandingState::Checked {
+        if checked.state == s::LandingState::Checked
+            && !self.store.forge_review_manages_landing(&key.0, key.1)?
+        {
             // This also gates restart finalization; a bare Checked state without
             // our exact saved receipt never authorizes publication.
             self.refresh(&key.0, &job.profile)?;

@@ -622,7 +622,15 @@ fn open_native_host(
 
         let provider = Arc::new(provider);
         local_objects.insert(alias.clone(), provider.clone());
-        if let Some(remote_config) = &settings.remote {
+        if let Some(forge_config) = &settings.forge {
+            let remote = tokio::runtime::Handle::try_current()
+                .context("Forge provider requires the daemon runtime")?
+                .block_on(native_broker::ForgeObjectIo::open_with_ca_certificate(provider, forge_config.clone(), native_ca.get(alias).cloned()))
+                .map_err(|_| anyhow::anyhow!("cannot open configured Forge projection; local work retained"))?;
+            let remote = Arc::new(remote);
+            stores.insert(alias.clone(), remote.clone());
+            controls.insert(alias.clone(), remote);
+        } else if let Some(remote_config) = &settings.remote {
             let remote_root = config.state_dir.join("native-remote");
             private_dir(&remote_root)?;
             let remote_root = remote_root.join(alias);
@@ -662,11 +670,7 @@ fn open_native_host(
         scopes.insert(alias.clone(), scope);
         descriptions.insert(
             alias.clone(),
-            config.native.workspaces.creation_description(
-                identity,
-                settings.remote.is_some(),
-                queries.contains_key(alias),
-            ),
+            settings.creation_description(&config.native.workspaces, identity, queries.contains_key(alias)),
         );
     }
     let identities = descriptions
@@ -713,7 +717,7 @@ fn open_native_host(
                     .source_io(alias)
                     .map_err(|_| anyhow::anyhow!("cannot configure native source provider"))?,
                 scope: scopes.remove(alias).expect("configured provider scope"),
-                remote: settings.remote.is_some(),
+                remote: settings.is_remote(),
                 identity: identities[alias],
             },
         );

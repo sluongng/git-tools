@@ -78,6 +78,8 @@ async fn configured_tls_authenticates_principals_and_verifies_server_identity() 
         repositories: vec!["alpha".into(), "beta".into()],
         principals: vec![PrincipalConfig {
             id: "alpha-reader".into(),
+            forge_only: false,
+            forge_checker: false,
             token_env: TOKEN_ENV.into(),
             repositories: vec!["alpha".into()],
             write: false,

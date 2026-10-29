@@ -6,6 +6,8 @@ pub(crate) mod cloud;
 pub(crate) mod history;
 #[path = "landing.rs"]
 pub(crate) mod landing;
+#[path = "forge.rs"]
+pub(crate) mod forge;
 #[path = "query.rs"]
 pub(crate) mod query;
 #[path = "search.rs"]

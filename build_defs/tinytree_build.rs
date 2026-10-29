@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/tinytree/query/v1/query.proto",
                 "proto/tinytree/cloud/v1/cloud.proto",
                 "proto/tinytree/landing/v1/landing.proto",
+                "proto/tinytree/forge/v1/forge.proto",
             ],
             &["proto"],
         )?;
@@ -23,5 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/tinytree/query/v1/query.proto");
     println!("cargo:rerun-if-changed=proto/tinytree/cloud/v1/cloud.proto");
     println!("cargo:rerun-if-changed=proto/tinytree/landing/v1/landing.proto");
+    println!("cargo:rerun-if-changed=proto/tinytree/forge/v1/forge.proto");
     Ok(())
 }

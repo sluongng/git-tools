@@ -23,10 +23,10 @@ mod snapshot;
 mod staging;
 mod transfer;
 use anyhow::{Context, Result, ensure};
-pub use config::{ClosureLimits, Config, QueryLimits};
+pub use config::{ClosureLimits, Config, QueryLimits, ServerRetainedCandidate};
 pub use control::{
-    AdmittedHead, AdmittedReference, ConfirmedPublication, ObservedReference, PublishRequest,
-    RemoteRepositoryControl,
+    AdmittedHead, AdmittedReference, AdmittedRetention, ConfirmedPublication, ObservedReference,
+    PublishRequest, RemoteRepositoryControl,
 };
 use jj_native_backend::DirectObjectIo;
 use local_cas::LocalCas;

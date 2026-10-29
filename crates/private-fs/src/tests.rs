@@ -22,6 +22,18 @@ fn creation_publication_and_bounded_reads() {
     assert!(private.read("state.json", 4).is_err());
     private.replace("state.json", b"second").unwrap();
     assert_eq!(private.read("state.json", 6).unwrap(), b"second");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(private.path().join("state.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     assert!(private.replace("../escape", b"bad").is_err());
     assert!(private.read("../escape", 10).is_err());
     assert!(private.replace("", b"bad").is_err());

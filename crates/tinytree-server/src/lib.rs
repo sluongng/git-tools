@@ -9,6 +9,13 @@
 pub(crate) const SERVER_CODEC_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 mod auth;
+mod forge;
+mod forge_accounts;
+mod forge_review;
+mod forge_transforms;
+mod forge_upload;
+mod forge_ingress;
+pub use forge_ingress::ForgeGrpcService;
 mod body_deadline;
 pub use body_deadline::DeadlineLayer;
 mod cloud;
@@ -160,7 +167,13 @@ pub async fn serve(
             .map(|p| {
                 let token = std::env::var(&p.token_env)
                     .map_err(|_| ConfigError("cannot resolve native principal token"))?;
-                Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write).map(
+                (if p.forge_checker {
+                    Principal::new_forge_checker(p.id.clone(), &token)
+                } else if p.forge_only {
+                    Principal::new_forge(p.id.clone(), &token)
+                } else {
+                    Principal::new(p.id.clone(), &token, p.repositories.clone(), p.write)
+                }).map(
                     |principal| {
                         principal
                             .with_retention(p.retain)
@@ -265,8 +278,13 @@ pub async fn serve(
             tokio::select! {
                 _=stop.changed()=>break,
                 _=ticks.tick()=>{
-                    for repo in &repositories {
-                        let store=gc_store.clone();let repo=repo.clone();
+                    let discovery_store=gc_store.clone();
+                    let discovered=tokio::task::spawn_blocking(move||discovery_store.forge_account_repositories(1024)).await;
+                    let mut sweep:std::collections::BTreeSet<String>=repositories.iter().cloned().collect();
+                    match discovered {Ok(Ok(accounts))=>sweep.extend(accounts),_=>eprintln!("native account GC discovery failed; retained state requires inspection")}
+                    for repo in sweep {
+                        if *stop.borrow(){break;}
+                        let store=gc_store.clone();
                         let result=tokio::task::spawn_blocking(move||{
                             let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|())?.as_secs();
                             let now=i64::try_from(now).map_err(|_|())?;
@@ -411,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn forge_checker_configuration_is_exclusive_and_defaults_to_disabled() {
+        let principal=serde_json::json!({"id":"checker","token_env":"TINYTREE_CHECKER_TEST_TOKEN","forge_checker":true});
+        let config=serde_json::from_value::<Config>(serde_json::json!({"repositories":[],"principals":[principal.clone()]})).unwrap();
+        assert!(config.validate().is_ok());
+        for (field,value) in [("forge_only",serde_json::json!(true)),("write",serde_json::json!(true)),("retain",serde_json::json!(true)),("cloud",serde_json::json!(true)),("repositories",serde_json::json!(["default"])),("landing_profiles",serde_json::json!(["check"]))] {
+            let mut invalid=principal.clone();invalid[field]=value;
+            let config=serde_json::from_value::<Config>(serde_json::json!({"repositories":[],"principals":[invalid]})).unwrap();
+            assert!(config.validate().is_err(),"{field}");
+        }
+        let raw:PrincipalConfig=serde_json::from_value(serde_json::json!({"id":"reader","token_env":"TINYTREE_CHECKER_TEST_TOKEN","repositories":["default"]})).unwrap();assert!(!raw.forge_checker);
+        let invalid=Principal::new_forge_checker("checker","test-checker-token-not-a-secret").unwrap().with_cloud(true);
+        assert!(auth::Authorization::new(vec![invalid],&[]).is_err());
+    }
+    #[test]
     fn config_rejects_unsafe_transport_and_unbounded_limits() {
         let mut config = Config::default();
         assert!(config.validate().is_ok());
@@ -438,6 +470,8 @@ mod tests {
             id: "writer".into(),
             token_env: "TINYTREE_TEST_TOKEN".into(),
             repositories: vec!["default".into()],
+            forge_only: false,
+            forge_checker:false,
             write: true,
             retain: false,
             cloud: false,

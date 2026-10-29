@@ -23,6 +23,137 @@ fn private_tempdir() -> tempfile::TempDir {
     directory
 }
 const TOKEN: &str = "client-loopback-test-token-not-a-secret";
+
+#[derive(Clone, Copy)]
+enum ForgeReplyMode {
+    RetryExact,
+    OtherAccount,
+    OtherView,
+    OtherRequest,
+}
+
+#[derive(Clone)]
+struct ForgeTransportFixture {
+    mode: ForgeReplyMode,
+    calls: Arc<AtomicUsize>,
+    inputs: Arc<std::sync::Mutex<Vec<tinytree_client::forge_protocol::ForgeCallRequest>>>,
+}
+
+#[tonic::async_trait]
+impl tinytree_client::forge_protocol::forge_server::Forge for ForgeTransportFixture {
+    async fn call(
+        &self,
+        request: Request<tinytree_client::forge_protocol::ForgeCallRequest>,
+    ) -> Result<Response<tinytree_client::forge_protocol::ForgeCallResponse>, Status> {
+        use tinytree_client::forge_protocol::ForgeCallResponse;
+        assert_eq!(
+            request.metadata().get("authorization").unwrap().to_str().unwrap(),
+            format!("Bearer {TOKEN}"),
+        );
+        let input = request.into_inner();
+        self.inputs.lock().unwrap().push(input.clone());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.mode, ForgeReplyMode::RetryExact) && call == 0 {
+            return Err(Status::unavailable("transient fixture failure"));
+        }
+        let mut response = ForgeCallResponse {
+            operation: input.operation,
+            state: "ready".into(),
+            result_json: br#"{"ready":true}"#.to_vec(),
+            account_id: input.account_id,
+            view: input.view,
+            request_id: input.request_id,
+        };
+        match self.mode {
+            ForgeReplyMode::RetryExact => {}
+            ForgeReplyMode::OtherAccount => response.account_id = "other".into(),
+            ForgeReplyMode::OtherView => response.view = "other".into(),
+            ForgeReplyMode::OtherRequest => response.request_id = "other".into(),
+        }
+        Ok(Response::new(response))
+    }
+}
+
+async fn forge_transport_fixture(
+    mode: ForgeReplyMode,
+) -> (
+    NativeClient,
+    ForgeTransportFixture,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = ForgeTransportFixture {
+        mode,
+        calls: Arc::new(AtomicUsize::new(0)),
+        inputs: Default::default(),
+    };
+    let service = fixture.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(tinytree_client::forge_protocol::forge_server::ForgeServer::new(service))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async { let _ = stopped.await; },
+            )
+            .await
+            .unwrap();
+    });
+    let client = NativeClient::connect(Config {
+        endpoint: format!("http://{address}"),
+        token_env: Some("TINYTREE_CLIENT_TEST_TOKEN".into()),
+        compression: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    (client, fixture, stop, task)
+}
+
+#[tokio::test]
+async fn forge_call_preserves_intent_on_retry_and_rejects_rebound_responses() {
+    use tinytree_client::forge_protocol::{ForgeCallRequest, ForgeOperation};
+    for (mode, expected_error, expected_calls) in [
+        (ForgeReplyMode::RetryExact, None, 2),
+        (ForgeReplyMode::OtherAccount, Some(Code::DataLoss), 1),
+        (ForgeReplyMode::OtherView, Some(Code::DataLoss), 1),
+        (ForgeReplyMode::OtherRequest, Some(Code::DataLoss), 1),
+    ] {
+        let (client, fixture, stop, task) = forge_transport_fixture(mode).await;
+        let input = ForgeCallRequest {
+            operation: ForgeOperation::GetAccount as i32,
+            account_id: "alpha".into(),
+            view: "public".into(),
+            request_id: "saved-request".into(),
+            payload_json: b"{}".to_vec(),
+        };
+        let actual = client.forge_call(input.clone()).await;
+        assert_eq!(actual.as_ref().err().map(|e| e.code()), expected_error);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), expected_calls);
+        assert!(fixture.inputs.lock().unwrap().iter().all(|received| received == &input));
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn forge_call_rejects_oversized_request_before_dispatch() {
+    use tinytree_client::forge_protocol::{ForgeCallRequest, ForgeOperation};
+    let (client, fixture, stop, task) = forge_transport_fixture(ForgeReplyMode::RetryExact).await;
+    let input = ForgeCallRequest {
+        operation: ForgeOperation::WriteObject as i32,
+        account_id: "alpha".into(),
+        view: "private".into(),
+        request_id: "saved-upload".into(),
+        payload_json: vec![b' '; tinytree_proto::FORGE_MAX_REQUEST_BYTES],
+    };
+    assert_eq!(client.forge_call(input).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    stop.send(()).unwrap();
+    task.await.unwrap();
+}
 struct LifetimeProbe(Arc<AtomicUsize>);
 impl Drop for LifetimeProbe {
     fn drop(&mut self) {

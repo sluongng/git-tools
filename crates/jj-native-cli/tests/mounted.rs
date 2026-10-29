@@ -12069,3 +12069,695 @@ fn native_landing_waits_for_an_interrupted_publication_without_mutating_either_i
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
     fixture.stop_daemon();
 }
+
+#[cfg(feature = "forge-cli")]
+fn forge_mount_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+#[cfg(feature = "forge-cli")]
+struct ForgeMountedServer {
+    _directory: tempfile::TempDir,
+    runtime: Option<tokio::runtime::Runtime>,
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    store: tinytree_store::Store,
+    endpoint: String,
+    seed_base: String,
+    seed_head: String,
+    seed_view: String,
+    scratch: PathBuf,
+}
+#[cfg(feature = "forge-cli")]
+impl ForgeMountedServer {
+    const TOKEN: &'static str = "public-forge-mounted-owner-fixture-token";
+    fn start() -> Self {
+        // The selected native wrapper runs this one case serially. Establish
+        // only its public fixture credential before starting any runtime or
+        // child; this never reads or mutates the user's parent environment.
+        unsafe {
+            std::env::set_var(
+                "FORGE_MOUNT_CHECKER_TOKEN",
+                "public-forge-mounted-checker-fixture-token",
+            );
+        }
+        use sha2::{Digest as _, Sha256};
+        use tinytree_store::{AccountId, ForgeActor, ForgeViewVisibility, ViewSpec};
+        let directory = tempfile::Builder::new()
+            .prefix("tt-forge-server-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let base = directory.path();
+        let operator = private_fs::PrivateDir::create(base.join("operator")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let executable = Path::new(env!("TINYTREE_CHECKER_FIXTURE"))
+            .canonicalize()
+            .unwrap();
+        let pin = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let quoted = |p: &Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
+        let daemon = operator.path().join("daemon.toml");
+        let cache_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let git_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Valid, explicit trusted raw-read template. The testonly runner below
+        // does not mount this template or establish real build/check evidence.
+        fs::write(
+            &daemon,
+            format!(
+                r#"state_dir={}
+[cache]
+listen="{}"
+upstream="grpc://127.0.0.1:9"
+api_key_env="UNUSED_FORGE_MOUNT_FIXTURE_KEY"
+[git_proxy]
+listen="{}"
+[bes]
+enabled=false
+[bos]
+enabled=false
+[native.workspaces.capture]
+policy="disabled"
+[native.workspaces.upload]
+policy="disabled"
+[native.repositories.checker-template]
+checker_forge_accounts=true
+[native.repositories.checker-template.remote]
+authorization_profile="trusted-forge-checker-fixture"
+[native.repositories.checker-template.remote.remote]
+endpoint="{}"
+repository_id="template"
+token_env="FORGE_MOUNT_CHECKER_TOKEN"
+"#,
+                quoted(&operator.path().join("daemon-state")),
+                cache_listener.local_addr().unwrap(),
+                git_listener.local_addr().unwrap(),
+                endpoint
+            ),
+        )
+        .unwrap();
+        workspace_daemon::config::Config::load(&daemon).unwrap();
+        drop((cache_listener, git_listener));
+        let scratch = operator.path().join("checker-state");
+        let policy = operator.path().join("checker.toml");
+        fs::write(
+            &policy,
+            format!(
+                r#"scratch={}
+daemon_config={}
+rbe_socket={}
+runner_sha256="{}"
+workspace_environment=["FORGE_MOUNT_CHECKER_TOKEN"]
+[workspace]
+path={}
+sha256="{}"
+[bazel]
+path={}
+sha256="{}"
+[[profiles]]
+name="checks"
+repositories=[]
+forge_accounts=true
+store="checker-template"
+mode="build"
+targets=["//fixture:checks"]
+flags=["--define=fixture_mode=pass"]
+timeout_seconds=60
+"#,
+                quoted(&scratch),
+                quoted(&daemon),
+                quoted(&operator.path().join("rbe.sock")),
+                pin,
+                quoted(&executable),
+                pin,
+                quoted(&executable),
+                pin
+            ),
+        )
+        .unwrap();
+        let version = tinytree_check_runner::Config::load(&policy)
+            .unwrap()
+            .profile_version("checks")
+            .unwrap();
+        let mut store_config = tinytree_store::Config::default();
+        store_config.max_retention_validation_records = 4096;
+        store_config.max_retention_validation_bytes = 8 * 1024 * 1024;
+        store_config.max_closure_objects = 8192;
+        store_config.max_closure_edges = 32768;
+        store_config.max_path_contexts = 8192;
+        store_config.max_path_context_bytes = 8 * 1024 * 1024;
+        let store = tinytree_store::Store::open(base.join("store"), store_config).unwrap();
+        let account = AccountId("mounted".into());
+        let actor = ForgeActor {
+            principal: "owner".into(),
+        };
+        let state = store.forge_provision_account(&account, &actor).unwrap();
+        let canonical = store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0;
+        let view = store
+            .forge_publish_view(
+                &account,
+                &actor,
+                ViewSpec {
+                    name: "workspace".into(),
+                    root_prefix: "".into(),
+                    include_prefixes: vec!["".into()],
+                    exclude_prefixes: vec![],
+                    visibility: ForgeViewVisibility::Members,
+                    revision: canonical,
+                    export_allowed: true,
+                },
+                state.epoch,
+                false,
+            )
+            .unwrap();
+        let projected = store.forge_project_view(&view, 0).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut entries = Vec::new();
+        for (path, bytes) in [
+            ("copy.txt", b"copy baseline\n".as_slice()),
+            ("rename.txt", b"rename baseline\n".as_slice()),
+        ] {
+            let d = m::describe_file(bytes);
+            store
+                .forge_upload_object(&view, &actor, path, d, bytes, now)
+                .unwrap();
+            entries.push(m::TreeEntry {
+                name: path.into(),
+                value: m::TreeValue::File {
+                    id: m::FileId(d.key.id.0),
+                    executable: false,
+                    size_bytes: d.size_bytes,
+                    copy_id: None,
+                },
+            });
+        }
+        let tree = m::encode(&m::Object::Tree(m::Tree { entries }), Default::default()).unwrap();
+        store
+            .forge_upload_object(&view, &actor, "", tree.descriptor, &tree.bytes, now)
+            .unwrap();
+        let signature = m::Signature {
+            name: "Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: m::Timestamp {
+                millis_since_epoch: now * 1000,
+                tz_offset_minutes: 0,
+            },
+        };
+        let head = m::encode(
+            &m::Object::Commit(m::Commit {
+                parents: vec![m::CommitId(projected.projected_commit)],
+                predecessors: vec![],
+                root_tree: m::TreeMerge {
+                    terms: vec![m::TreeId(tree.descriptor.key.id.0)],
+                    labels: vec![String::new()],
+                },
+                change_id: m::ChangeId([191; 16]),
+                description: "Seed mounted fixture".into(),
+                author: signature.clone(),
+                committer: signature,
+                secure_signature: None,
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        store
+            .forge_upload_object(&view, &actor, "", head.descriptor, &head.bytes, now)
+            .unwrap();
+        let mut config = tinytree_server::ServiceConfig::default();
+        config.max_buffered_bytes = 256 * 1024 * 1024;
+        config.landing.enabled = true;
+        config.landing.poll_interval_ms = 10;
+        config.landing.job_ttl_seconds = 120;
+        config.landing.max_buffered_bytes = 6 * 1024 * 1024 * 1024;
+        config.landing.forge_profile = Some("checks".into());
+        config.landing.profiles = vec![tinytree_server::LandingProfile {
+            name: "checks".into(),
+            version,
+            repositories: vec![],
+        }];
+        config.landing.checker = Some(tinytree_server::LandingCheckerConfig {
+            enabled: true,
+            executable,
+            sha256: pin,
+            config: policy,
+            max_checks: 1,
+            max_checks_per_repository: 1,
+            max_jobs: 16,
+            max_attempts: 2,
+            max_recovery_attempts: 8,
+            retry_delay_seconds: 1,
+            execution_timeout_seconds: 30,
+            cleanup_grace_seconds: 10,
+        });
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            config,
+            vec![],
+            vec![
+                tinytree_server::Principal::new_forge("owner", Self::TOKEN).unwrap(),
+                tinytree_server::Principal::new_forge_checker(
+                    "checker",
+                    "public-forge-mounted-checker-fixture-token",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(tinytree_server::serve_tcp(listener, service, None, async {
+            let _ = stopped.await;
+        }));
+        Self {
+            _directory: directory,
+            runtime: Some(runtime),
+            task: Some(task),
+            stop: Some(stop),
+            store,
+            endpoint,
+            seed_base: forge_mount_hex(&projected.projected_commit),
+            seed_head: forge_mount_hex(&head.descriptor.key.id.0),
+            seed_view: forge_mount_hex(&view.version().0),
+            scratch,
+        }
+    }
+    fn current_view(&self) -> [u8; 32] {
+        use tinytree_store::{AccountId, ForgeActor, ForgeViewVisibility, ViewSpec};
+        let account = AccountId("mounted".into());
+        let actor = ForgeActor {
+            principal: "owner".into(),
+        };
+        let revision = self
+            .store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0;
+        let epoch = self
+            .store
+            .forge_get_account(&account, &actor)
+            .unwrap()
+            .epoch;
+        self.store
+            .forge_publish_view(
+                &account,
+                &actor,
+                ViewSpec {
+                    name: "workspace".into(),
+                    root_prefix: "".into(),
+                    include_prefixes: vec!["".into()],
+                    exclude_prefixes: vec![],
+                    visibility: ForgeViewVisibility::Members,
+                    revision,
+                    export_allowed: true,
+                },
+                epoch,
+                false,
+            )
+            .unwrap()
+            .version()
+            .0
+    }
+}
+#[cfg(feature = "forge-cli")]
+impl Drop for ForgeMountedServer {
+    fn drop(&mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        let task = self.task.take().unwrap();
+        self.runtime.as_ref().unwrap().block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        });
+        self.runtime
+            .take()
+            .unwrap()
+            .shutdown_timeout(Duration::from_secs(5));
+    }
+}
+#[cfg(feature = "forge-cli")]
+fn forge_mount_json(fixture: &mut Fixture, root: &Path, args: &[&str]) -> serde_json::Value {
+    let mut args = args.to_vec();
+    args.push("--json");
+    serde_json::from_str(&fixture.success_with_watchdog(root, &args, Duration::from_secs(90)))
+        .unwrap()
+}
+#[cfg(feature = "forge-cli")]
+fn forge_mount_checked(fixture: &mut Fixture, root: &Path, change: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let value = forge_mount_json(fixture, root, &["review", "show", change]);
+        if value["state"] == "prepared" || value["state"] == "ready_to_land" {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "trusted fixture checker did not pass: {value}"
+        );
+        assert!(
+            !matches!(
+                value["state"].as_str(),
+                Some("check_failed" | "unsupported" | "expired" | "conflict")
+            ),
+            "{value}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+#[cfg(feature = "forge-cli")]
+fn forge_mount_approve_land(
+    fixture: &mut Fixture,
+    root: &Path,
+    checked: &serde_json::Value,
+    request: &str,
+) -> serde_json::Value {
+    let review = &checked["result"]["value"];
+    let change = review["change_id"].as_str().unwrap();
+    let patchset = review["patchset_id"].as_str().unwrap();
+    let candidate = review["candidate"]["id"].as_str().unwrap();
+    forge_mount_json(
+        fixture,
+        root,
+        &[
+            "review",
+            "approve",
+            change,
+            "--patchset",
+            patchset,
+            "--candidate",
+            candidate,
+            "--request-id",
+            &format!("{request}-approve"),
+        ],
+    );
+    let landed = forge_mount_json(
+        fixture,
+        root,
+        &[
+            "review",
+            "land",
+            change,
+            "--patchset",
+            patchset,
+            "--candidate",
+            candidate,
+            "--request-id",
+            &format!("{request}-land"),
+        ],
+    );
+    assert_eq!(landed["state"], "landed");
+    landed
+}
+
+#[cfg(feature = "forge-cli")]
+#[test]
+#[ignore = "requires Linux FUSE; pinned checker subprocess is testonly orchestration evidence, not a real Bazel/RBE check"]
+fn forge_product_mounted_push_check_land_reconcile_preserves_iteration() {
+    let server = ForgeMountedServer::start();
+    let mut fixture = Fixture::new();
+    // This acceptance case deliberately exercises a file beyond the default
+    // new-file snapshot guard, using the supported explicit bounded setting.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.jj_config)
+        .unwrap()
+        .write_all(b"\n[snapshot]\nmax-new-file-size=2097152\n")
+        .unwrap();
+    let base = fixture.base().to_owned();
+    fixture.child_env.push((
+        "FORGE_MOUNT_OWNER_TOKEN".into(),
+        ForgeMountedServer::TOKEN.into(),
+    ));
+    forge_mount_json(
+        &mut fixture,
+        &base,
+        &[
+            "context",
+            "set",
+            "--server",
+            &server.endpoint,
+            "--account",
+            "mounted",
+            "--view",
+            "workspace",
+            "--token-env",
+            "FORGE_MOUNT_OWNER_TOKEN",
+        ],
+    );
+    // Bootstrap visible source through an owned upload and the same real server
+    // checker/approval/landing path, without forging a caller-side check verdict.
+    let seed = forge_mount_json(
+        &mut fixture,
+        &base,
+        &[
+            "push",
+            "--source-base",
+            &server.seed_base,
+            "--source-head",
+            &server.seed_head,
+            "--view-version",
+            &server.seed_view,
+            "--request-id",
+            "mounted-seed",
+        ],
+    );
+    let seed_change = seed["result"]["value"]["change_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checked = forge_mount_checked(&mut fixture, &base, &seed_change);
+    forge_mount_approve_land(&mut fixture, &base, &checked, "mounted-seed");
+    let version = server.current_view();
+    let mut daemon: toml::Value =
+        toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+    let mut client = tinytree_client::Config::default();
+    client.endpoint = server.endpoint.clone();
+    client.token_env = Some("FORGE_MOUNT_OWNER_TOKEN".into());
+    let forge = native_broker::ForgeRemoteConfig {
+        account_id: "mounted".into(),
+        view: "workspace".into(),
+        view_version: Some(version),
+        client,
+    };
+    daemon["native"]["repositories"]["example"]
+        .as_table_mut()
+        .unwrap()
+        .insert("forge".into(), toml::Value::try_from(forge).unwrap());
+    fs::write(&fixture.daemon_config, toml::to_string(&daemon).unwrap()).unwrap();
+    fixture.start();
+    let root = base.join("forge-work");
+    let broker = fixture.broker.clone();
+    forge_mount_json(
+        &mut fixture,
+        &base,
+        &[
+            "work",
+            root.to_str().unwrap(),
+            "--broker",
+            broker.to_str().unwrap(),
+            "--store",
+            "example",
+            "--version",
+            &forge_mount_hex(&version),
+        ],
+    );
+    assert_fuse_mounted(&root);
+    assert_eq!(
+        fs::read(root.join("rename.txt")).unwrap(),
+        b"rename baseline\n"
+    );
+    forge_mount_json(&mut fixture, &root, &["move", "rename.txt", "renamed.txt"]);
+    forge_mount_json(&mut fixture, &root, &["copy", "copy.txt", "copied.txt"]);
+    // Force >1MiB FILE transfer through sequential authenticated upload sessions.
+    let mut large = vec![b'x'; 1024 * 1024 + 17];
+    fs::write(root.join("large.bin"), &large).unwrap();
+    fixture.success(
+        &root,
+        &["describe", "-m", "rename, copy and large authored file"],
+    );
+    let source = fixture.revision(&root, "@");
+    let pushed = forge_mount_json(
+        &mut fixture,
+        &root,
+        &["push", "--request-id", "mounted-source"],
+    );
+    let change = pushed["result"]["value"]["change_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(pushed["result"]["value"]["source_head"], source);
+    assert_ne!(
+        fixture.revision(&root, "@"),
+        source,
+        "push starts a fresh WIP child"
+    );
+    fs::write(root.join("continued.txt"), b"iteration before amendment\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "continued local iteration"]);
+    fixture.success(&root, &["bookmark", "set", "continued-wip"]);
+    let first_checked = forge_mount_checked(&mut fixture, &root, &change);
+    let first_patchset = first_checked["result"]["value"]["patchset_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_candidate = first_checked["result"]["value"]["candidate"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    forge_mount_json(
+        &mut fixture,
+        &root,
+        &[
+            "review",
+            "approve",
+            &change,
+            "--patchset",
+            &first_patchset,
+            "--candidate",
+            &first_candidate,
+            "--request-id",
+            "mounted-first-approval",
+        ],
+    );
+    // A replacement is the same logical source change, never a second active
+    // unrelated review. The already-snapshotted continuation stays a descendant.
+    fixture.success(&root, &["edit", &source]);
+    large[0] = b'y';
+    fs::write(root.join("large.bin"), &large).unwrap();
+    fixture.success(
+        &root,
+        &["describe", "-m", "amended source retains explicit lineage"],
+    );
+    let replacement = forge_mount_json(
+        &mut fixture,
+        &root,
+        &[
+            "push",
+            "--expected-patchset",
+            &first_patchset,
+            "--request-id",
+            "mounted-replacement",
+        ],
+    );
+    assert_eq!(replacement["result"]["value"]["change_id"], change);
+    assert_ne!(
+        replacement["result"]["value"]["patchset_id"],
+        first_patchset
+    );
+    assert_eq!(
+        replacement["result"]["value"]["approvals"], 0,
+        "replacement cannot inherit first candidate approval"
+    );
+    let historical = forge_mount_json(
+        &mut fixture,
+        &root,
+        &["review", "show", &change, "--patchset", &first_patchset],
+    );
+    assert_eq!(historical["result"]["value"]["patchset_id"], first_patchset);
+    assert_eq!(historical["result"]["value"]["source_head"], source);
+    assert_eq!(historical["result"]["value"]["is_current"], false);
+    fixture.success(&root, &["edit", "continued-wip"]);
+    assert_eq!(
+        fs::read(root.join("continued.txt")).unwrap(),
+        b"iteration before amendment\n"
+    );
+    fs::write(root.join("descendant.txt"), b"newer descendant\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "newer local descendant"]);
+    let descendant = fixture.revision(&root, "@");
+    fixture.success(&root, &["bookmark", "set", "draft-tip", "-r", &descendant]);
+    fixture.success(&root, &["new", "-m", "dirty WIP above descendant"]);
+    fs::write(root.join("dirty.txt"), b"dirty iteration must survive\n").unwrap();
+    let checked = forge_mount_checked(&mut fixture, &root, &change);
+    let lineage = checked["result"]["value"]["lineage"].as_array().unwrap();
+    assert!(lineage.iter().any(|edge| edge["operation"] == "rename"
+        && edge["source_path"] == "rename.txt"
+        && edge["target_path"] == "renamed.txt"));
+    assert!(lineage.iter().any(|edge| edge["operation"] == "copy"
+        && edge["source_path"] == "copy.txt"
+        && edge["target_path"] == "copied.txt"));
+    let landed = forge_mount_approve_land(&mut fixture, &root, &checked, "mounted-replacement");
+    assert_eq!(
+        fixture.revision(&root, "@-"),
+        descendant,
+        "land does not silently reconcile local state"
+    );
+    let reconciled = forge_mount_json(
+        &mut fixture,
+        &root,
+        &["request", "reconcile", "mounted-replacement"],
+    );
+    assert_eq!(
+        reconciled["result"]["value"]["local_reconciliation"],
+        "applied"
+    );
+    assert_eq!(
+        fs::read(root.join("dirty.txt")).unwrap(),
+        b"dirty iteration must survive\n"
+    );
+    assert_eq!(
+        fs::read(root.join("descendant.txt")).unwrap(),
+        b"newer descendant\n"
+    );
+    assert_eq!(
+        fs::read(root.join("copied.txt")).unwrap(),
+        b"copy baseline\n"
+    );
+    assert_eq!(
+        fs::read(root.join("renamed.txt")).unwrap(),
+        b"rename baseline\n"
+    );
+    assert!(!root.join("rename.txt").exists());
+    assert_eq!(fs::read(root.join("large.bin")).unwrap(), large);
+    let projected = landed["result"]["value"]["projected_head"]
+        .as_str()
+        .unwrap();
+    assert_eq!(fixture.revision(&root, "draft-tip-"), projected);
+    assert_eq!(
+        fixture.revision(&root, "@-"),
+        fixture.revision(&root, "draft-tip")
+    );
+    let applied_working_copy = fixture.revision(&root, "@");
+    let applied_descendant = fixture.revision(&root, "draft-tip");
+    let replay = forge_mount_json(
+        &mut fixture,
+        &root,
+        &["request", "reconcile", "mounted-replacement"],
+    );
+    assert_eq!(replay["state"], "landed");
+    assert_eq!(
+        fixture.revision(&root, "@"),
+        applied_working_copy,
+        "reconciliation replay cannot rewrite newer WIP again"
+    );
+    assert_eq!(fixture.revision(&root, "draft-tip"), applied_descendant);
+    assert_eq!(
+        fs::read(root.join("continued.txt")).unwrap(),
+        b"iteration before amendment\n"
+    );
+    assert_eq!(
+        fs::read(root.join("dirty.txt")).unwrap(),
+        b"dirty iteration must survive\n"
+    );
+    let executions = fs::read_to_string(server.scratch.join("executions")).unwrap();
+    assert_eq!(
+        executions.lines().filter(|line| *line == "run").count(),
+        3,
+        "one pinned physical fixture process per seed/first/replacement candidate"
+    );
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+}

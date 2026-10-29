@@ -33,7 +33,8 @@ struct CandidateRetirement {
     version: u32,
     record: Record,
     binding: Binding,
-    root_tree: [u8; 32],
+    /// None proves no provider namespace or external administration existed.
+    root_tree: Option<[u8; 32]>,
     complete: bool,
     root_removed: bool,
 }
@@ -958,11 +959,8 @@ impl Manager {
                 !immutable && plan.root == commit,
                 "native creation plan root mismatch"
             );
-            let description = self.config.native.workspaces.creation_description(
-                repository.identity,
-                repository.remote,
-                repository.query.is_some(),
-            );
+            let description = self.config.native.repositories[&store].creation_description(
+                &self.config.native.workspaces, repository.identity, repository.query.is_some());
             let expected = description.creation_plan(commit)?;
             ensure!(
                 plan == expected,
@@ -2182,10 +2180,61 @@ impl Manager {
         );
         recover_entry(&self.config, entry)
     }
+    fn never_initialized_candidate(&self, id: &str) -> Result<Option<(Record, Binding)>> {
+        let Some(entry) = self.entries.get(id) else {
+            return Ok(None);
+        };
+        if entry.record.version != 3
+            || !matches!(entry.record.origin, Origin::Candidate { .. })
+            || entry.record.native_mount.is_some()
+            || entry.mount.is_some()
+            || entry.controller.is_some()
+            || entry.registered
+            || entry.provider_failure.is_some()
+            || entry.startup.is_some()
+            || entry.command_startup.is_some()
+            || entry.restore_intent.is_some()
+            || entry.restore_receipt.is_some()
+        {
+            return Ok(None);
+        }
+        if crate::recovery::identity(&entry.record.root)?.is_some() {
+            return Ok(None);
+        }
+        for item in fs::read_dir(entry.directory.path())? {
+            let item = item?;
+            if item.file_name() != "workspace.json" || !item.file_type()?.is_file() {
+                return Ok(None);
+            }
+        }
+        let binding = self.binding(&entry.record)?;
+        match fs::symlink_metadata(&binding.admin) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Some((entry.record.clone(), binding)))
+            }
+            Ok(_) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub async fn stop(&mut self, id: &str) -> Result<()> {
         let deadline = self.host_admission_deadline();
         let _access = self.outer_host_access_until(deadline).await?;
         let _ = unhex(id)?;
+        if self.never_initialized_candidate(id)?.is_some() {
+            if let (Some(commands), Some(access)) = (&self.commands, _access.as_ref()) {
+                if commands
+                    .candidate_never_registered(id, access.clone())
+                    .await?
+                {
+                    let entry = self
+                        .entries
+                        .get_mut(id)
+                        .context("pending candidate disappeared")?;
+                    entry.record.state = Lifecycle::Stopped;
+                    return persist(entry);
+                }
+            }
+        }
         if let Some(entry) = self.entries.get_mut(id) {
             if matches!(&entry.record.origin, Origin::Restore { .. })
                 && entry.mount.is_none()
@@ -2415,6 +2464,41 @@ impl Manager {
             crate::recovery::identity(&entry.record.root)?.is_none(),
             "candidate kernel mount is still present"
         );
+        if let Some((record, binding)) = self.never_initialized_candidate(id)? {
+            let commands = self
+                .commands
+                .as_ref()
+                .context("candidate retirement requires command fencing")?
+                .clone();
+            let access = access
+                .clone()
+                .context("candidate retirement requires host fencing")?;
+            ensure!(
+                commands.candidate_never_registered(id, access).await?,
+                "candidate command registration is not absent"
+            );
+            let registry = self.open_existing_registry()?;
+            let _admin = registry.lock_uninitialized_candidate_retirement(&binding)?;
+            let mut receipt = CandidateRetirement {
+                version: 1,
+                record,
+                binding,
+                root_tree: None,
+                complete: false,
+                root_removed: false,
+            };
+            self.publish_retirement_intent(id, &receipt)?;
+            // Durable intent closes this exact identity before deleting even
+            // its private pending record. No namespace/admin/history is erased.
+            finish_uninitialized_candidate_retirement(&self.directory, &mut receipt)?;
+            self.retirements_directory
+                .replace(format!("{id}.json"), &serde_json::to_vec(&receipt)?)?;
+            self.retirements.insert(id.into(), receipt.clone());
+            self.entries.remove(id);
+            return Ok(
+                serde_json::json!({"retired":true,"root_removed":receipt.root_removed,"retention_gc":false}),
+            );
+        }
         let record = entry.record.clone();
         let registry = self.open_existing_registry()?;
         let binding = self.binding(&record)?;
@@ -2461,7 +2545,7 @@ impl Manager {
             version: 1,
             record,
             binding,
-            root_tree: namespace.root_tree,
+            root_tree: Some(namespace.root_tree),
             complete: false,
             root_removed: false,
         };
@@ -2737,9 +2821,10 @@ fn persist_cloud_intent(directory: &PrivateDir, intent: &CloudRestoreIntent) -> 
     );
     match fs::symlink_metadata(directory.path().join(&name)) {
         Ok(_) => {
-            let prior: CloudRestoreIntent = serde_json::from_slice(&directory.read(&name, MAX_RECORD)?)?;
+            let prior: CloudRestoreIntent =
+                serde_json::from_slice(&directory.read(&name, MAX_RECORD)?)?;
             cloud_intent_transition(&prior, intent)?;
-        },
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -2888,7 +2973,8 @@ fn validate_retirement(receipt: &CandidateRetirement, id: [u8; 32]) -> Result<()
             && receipt.record.version == 3
             && receipt.record.workspace_id == id
             && receipt.record.state == Lifecycle::Stopped
-            && receipt.root_tree != [0; 32]
+            && receipt.root_tree.is_none_or(|tree| tree != [0; 32])
+            && (receipt.root_tree.is_some() || receipt.record.native_mount.is_none())
             && matches!(receipt.record.origin, Origin::Candidate { bootstrap_commit } if bootstrap_commit != [0;32])
             && receipt.binding.workspace_id == id
             && receipt.binding.root == receipt.record.root
@@ -2916,6 +3002,40 @@ fn remove_empty_candidate_root(root: &Path) -> Result<bool> {
         Err(error) => Err(error.into()),
     }
 }
+fn finish_uninitialized_candidate_retirement(
+    directory: &PrivateDir,
+    receipt: &mut CandidateRetirement,
+) -> Result<()> {
+    validate_retirement(receipt, receipt.record.workspace_id)?;
+    ensure!(
+        receipt.root_tree.is_none() && receipt.record.native_mount.is_none(),
+        "candidate was initialized"
+    );
+    ensure!(
+        crate::recovery::identity(&receipt.record.root)?.is_none(),
+        "candidate kernel mount remains"
+    );
+    ensure!(
+        matches!(fs::symlink_metadata(&receipt.binding.admin),Err(ref error) if error.kind()==std::io::ErrorKind::NotFound),
+        "candidate administration exists; preserve it"
+    );
+    let id = hex(&receipt.record.workspace_id);
+    let path = directory.path().join(&id);
+    if path.try_exists()? {
+        let child = PrivateDir::open_existing(&path)?;
+        for item in fs::read_dir(child.path())? {
+            let item = item?;
+            ensure!(
+                item.file_name() == "workspace.json" && item.file_type()?.is_file(),
+                "unknown pending candidate state is preserved"
+            );
+        }
+        directory.remove_child_tree(&id, 2, 1)?;
+    }
+    receipt.root_removed = remove_empty_candidate_root(&receipt.record.root)?;
+    receipt.complete = true;
+    Ok(())
+}
 /// Replay only daemon-authored durable disposal intent; no provider or network.
 fn finish_candidate_retirement(
     config: &Config,
@@ -2937,6 +3057,10 @@ fn finish_candidate_retirement(
         .map(Ok)
         .unwrap_or_else(Registry::default_path)?;
     let registry = Registry::open_existing(registry_path)?;
+    if receipt.root_tree.is_none() {
+        let _admin = registry.lock_uninitialized_candidate_retirement(&receipt.binding)?;
+        return finish_uninitialized_candidate_retirement(directory, receipt);
+    }
     let admin = registry.lock_candidate_retirement(&receipt.binding)?;
     let lease_path =
         native_vfs_rpc::command_lock_path(&receipt.binding.admin, &receipt.binding.rpc_mount_id)?;
@@ -4097,7 +4221,7 @@ mod tests {
             version: 1,
             record,
             binding,
-            root_tree: [6; 32],
+            root_tree: Some([6; 32]),
             complete: false,
             root_removed: false,
         };
@@ -4503,6 +4627,95 @@ mod tests {
             "legacy format cannot smuggle an ignored origin"
         );
         assert_eq!(fs::read(&record_path)?, mixed);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn failed_candidate_before_admission_can_stop_and_retire_without_relaxing_unknown_writers(
+    ) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let state = PrivateDir::create(directory.path().join("state"))?;
+        let objects = PrivateDir::create(directory.path().join("objects"))?;
+        let provider = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
+        let cache = LocalCas::open(
+            directory.path().join("cas"),
+            Arc::new(NoRemoteContent),
+            Default::default(),
+        )?;
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
+        config.native.workspaces.registry_path = Some(directory.path().join("registry"));
+        config
+            .native
+            .repositories
+            .insert("example".into(), Default::default());
+        let commands = Arc::new(
+            crate::native_commands::NativeCommandHost::open(&state.path().join("commands")).await?,
+        );
+        let providers = BTreeMap::from([(
+            "example".into(),
+            Repository {
+                local_objects: provider.clone(),
+                upload: None,
+                query: None,
+                io: provider,
+                scope: Scope::from_configured_identity("example", &[8; 32])?,
+                remote: false,
+                identity: [8; 32],
+            },
+        )]);
+        let mut manager = Manager::open(config.clone(), cache.clone(), providers.clone())?
+            .with_commands(commands.clone())?;
+        let id = hex(&[91; 32]);
+        let commit = hex(&[92; 32]);
+        let root = directory.path().join("candidate");
+        drop(PrivateDir::create(&root)?);
+        assert!(
+            manager
+                .create_candidate(root.clone(), "example".into(), commit.clone(), id.clone())
+                .await
+                .is_err(),
+            "fixture deliberately fails remote admission before any native provider starts"
+        );
+        assert!(
+            commands.active(&id),
+            "unknown mappings remain fail-closed for ordinary active()"
+        );
+        let child = manager.entries[&id].directory.path().to_owned();
+        fs::create_dir(child.join("unknown"))?;
+        assert!(
+            manager.stop(&id).await.is_err(),
+            "unknown pending artifacts must be preserved"
+        );
+        assert!(child.join("unknown").is_dir());
+        fs::remove_dir(child.join("unknown"))?;
+        manager.stop(&id).await?;
+        assert_eq!(manager.entries[&id].record.state, Lifecycle::Stopped);
+        assert!(
+            commands.active(&id),
+            "specific pending cleanup must not weaken global unknown-writer policy"
+        );
+        fs::write(root.join("keep"), b"foreign source state")?;
+        assert!(manager
+            .retire_candidate(&id, &hex(&[93; 32]))
+            .await
+            .is_err());
+        let result = manager.retire_candidate(&id, &commit).await?;
+        assert_eq!(result["retired"], true);
+        assert_eq!(result["root_removed"], false);
+        assert_eq!(fs::read(root.join("keep"))?, b"foreign source state");
+        assert!(!manager.entries.contains_key(&id));
+        assert!(manager.retirements[&id].root_tree.is_none());
+        assert_eq!(manager.retire_candidate(&id, &commit).await?, result);
+        drop(manager);
+        let mut reopened = Manager::open(config, cache, providers)?.with_commands(commands)?;
+        assert!(reopened
+            .create_candidate(root, "example".into(), commit.clone(), id.clone())
+            .await
+            .is_err());
+        assert_eq!(reopened.retire_candidate(&id, &commit).await?, result);
         Ok(())
     }
 }

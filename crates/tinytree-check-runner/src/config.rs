@@ -62,6 +62,9 @@ impl Mode {
 pub struct Profile {
     pub name: String,
     pub repositories: Vec<String>,
+    /// Permit authenticated service-selected provisioned Forge account repositories.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forge_accounts: bool,
     pub store: String,
     pub mode: Mode,
     /// Exact labels, not patterns. Test mode requires a testSummary for each.
@@ -209,7 +212,7 @@ impl Config {
                 "invalid checker profile"
             );
             ensure!(
-                !p.repositories.is_empty()
+                (!p.repositories.is_empty() || p.forge_accounts)
                     && p.repositories.len() <= 128
                     && p.repositories.iter().all(|r| name(r)),
                 "invalid profile repository scope"
@@ -363,4 +366,8 @@ fn setting_assignment(value: &str) -> bool {
         && !setting.is_empty()
         && !setting.contains(':')
         && components(setting)
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

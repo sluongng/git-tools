@@ -667,6 +667,19 @@ where
             intent_operations.push(id);
         }
     }
+    let forge_sidecar = crate::forge_source::retained_roots(&working_copy.state_path)
+        .map_err(|_| CollectError("forge source retention state is unavailable or invalid"))?;
+    if let Some(saved) = &forge_sidecar {
+        budget.bytes(saved.encoded_bytes())?;
+        for head in saved.state.commit_heads() {
+            sidecar_heads.push(decode_hex(head, 32)?);
+        }
+        for id in saved.state.operations() {
+            let id = OperationId::from_bytes(&decode_hex(id, 128)?);
+            budget.opaque_id(&id)?;
+            intent_operations.push(id);
+        }
+    }
     let intent_operations = sorted_ids(intent_operations);
     let mut roots = BTreeMap::new();
     for id in sidecar_heads {
@@ -772,6 +785,14 @@ where
         != sidecar
     {
         return Err(CollectError("native sidecar changed during collection"));
+    }
+    if crate::forge_source::retained_roots(&after_wc.state_path)
+        .map_err(|_| CollectError("forge source retention state changed or became unavailable"))?
+        != forge_sidecar
+    {
+        return Err(CollectError(
+            "forge source retention state changed during collection",
+        ));
     }
     budget.check_time()?;
     Ok(RootCheckpoint {

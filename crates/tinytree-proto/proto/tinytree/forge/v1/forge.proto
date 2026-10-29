@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package tinytree.forge.v1;
+
+// Account-scoped product control plane. Operation payloads have bounded,
+// versioned JSON schemas; the envelope does not accept a principal, checker
+// verdict, arbitrary method name, or destination repository override.
+// Authentication is transport metadata. The service resolves current account
+// and view authority before inspecting any object or operation identity.
+service Forge {
+  rpc Call(ForgeCallRequest) returns (ForgeCallResponse);
+}
+
+enum ForgeOperation {
+  FORGE_OPERATION_UNSPECIFIED = 0;
+  FORGE_OPERATION_PROVISION_ACCOUNT = 1;
+  FORGE_OPERATION_GET_ACCOUNT = 2;
+  FORGE_OPERATION_SET_MEMBER = 3;
+  FORGE_OPERATION_PUBLISH_VIEW = 4;
+  FORGE_OPERATION_LIST_VIEWS = 5;
+  FORGE_OPERATION_RESOLVE_VIEW = 6;
+  FORGE_OPERATION_READ_FILE = 7;
+  FORGE_OPERATION_SEARCH = 8;
+  FORGE_OPERATION_READ_OBJECT = 9;
+  FORGE_OPERATION_WRITE_OBJECT = 10;
+  FORGE_OPERATION_RETIRE_VIEW = 11;
+  FORGE_OPERATION_PUSH_REVIEW = 20;
+  FORGE_OPERATION_GET_REVIEW = 21;
+  FORGE_OPERATION_GET_REVIEW_OPERATION = 22;
+  FORGE_OPERATION_DECIDE_REVIEW = 23;
+  FORGE_OPERATION_LAND_REVIEW = 24;
+  FORGE_OPERATION_START_TRANSFORM = 30;
+  FORGE_OPERATION_GET_TRANSFORM = 31;
+  FORGE_OPERATION_SET_PIN = 32;
+  FORGE_OPERATION_RESOLVE_PIN = 33;
+  FORGE_OPERATION_RETIRE_PIN = 34;
+  FORGE_OPERATION_READ_LINEAGE = 35;
+}
+
+message ForgeCallRequest {
+  ForgeOperation operation = 1;
+  string account_id = 2;
+  string view = 3;
+  // Mutations must persist this exact intent identity before dispatch. Reuse
+  // with different normalized inputs is an error, not a second operation.
+  string request_id = 4;
+  bytes payload_json = 5;
+}
+
+message ForgeCallResponse {
+  ForgeOperation operation = 1;
+  // Explicit pending/conflict/stale/ready/landed states are not interchangeable.
+  string state = 2;
+  bytes result_json = 3;
+  string account_id = 4;
+  string view = 5;
+  string request_id = 6;
+}

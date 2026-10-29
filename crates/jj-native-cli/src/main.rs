@@ -2,6 +2,12 @@
 mod broker;
 mod cloud;
 mod commands;
+#[cfg(feature = "forge-cli")]
+mod forge;
+#[cfg(feature="forge-cli")]
+mod forge_paths;
+#[path = "forge/source.rs"]
+pub(crate) mod forge_source;
 mod history;
 mod landing;
 mod query_source;
@@ -426,6 +432,8 @@ fn main() -> std::process::ExitCode {
             .set_workspace_loader_factory(Box::new(vfs::Loader))
             .add_working_copy_factories(working_copies)
     };
+    #[cfg(feature = "forge-cli")]
+    let runner = forge::configure(runner);
     let status = runner
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(factories)

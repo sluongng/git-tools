@@ -36,6 +36,14 @@ pub use cloud::{
 };
 mod external_checks;
 mod landing;
+mod forge_accounts;
+pub use forge_accounts::{ForgeAccountMutation, AccountId, ViewVersion, PolicyEpoch, ForgeActor, ForgeAction, ForgeAccess, ForgeMember, ForgeAccount, ForgeViewVisibility, ViewSpec, ResolvedView, ForgeFile};
+mod forge_projection;
+pub use forge_projection::{ForgeProjection,ForgeCopyOrigin};
+pub mod forge_transforms;
+pub mod forge_upload;
+mod forge_review;
+pub use forge_review::{ForgeReviewLineageHint, ForgeReviewLineageOperation,ForgeReview, ForgeReviewCandidate, ForgeReviewComment, ForgeReviewDecision, ForgeReviewDependency, ForgeReviewPushRequest, ForgeReviewRewrite, ForgeReviewState};
 pub use landing::{
     LandingCandidate, LandingCandidateLease, LandingCheckIdentity, LandingCheckProfile,
     LandingConfig, LandingHandle, LandingJob, LandingOwner, LandingReceipt, LandingRequest,
@@ -69,6 +77,9 @@ pub enum Error {
     StaleReference(Reference),
     IdempotencyConflict,
     StaleCloudWorkspace(cloud::CloudWorkspace),
+    ForgeAccessDenied,
+    StaleForgePolicy,
+    StaleForgeReview,
     CloudVersionExpired,
     CloudReplayExpired,
     CloudRetentionChanged,
@@ -87,6 +98,9 @@ impl fmt::Display for Error {
             Self::MissingObject(_) => f.write_str("native object is unavailable"),
             Self::StaleReference(_) => f.write_str("native reference generation changed"),
             Self::StaleCloudWorkspace(_) => f.write_str("cloud workspace generation changed"),
+            Self::ForgeAccessDenied => f.write_str("forge access denied"),
+            Self::StaleForgePolicy => f.write_str("forge access policy changed"),
+            Self::StaleForgeReview => f.write_str("forge review version or dependency changed"),
             Self::CloudVersionExpired => f.write_str("exact cloud version expired"),
             Self::CloudReplayExpired => f.write_str("cloud publication replay expired"),
             Self::CloudRetentionChanged => f.write_str("cloud retention changed"),
@@ -474,6 +488,9 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 fn store_feature(value: Option<&[u8]>) -> Result<u8> {
+    // Forge is an independent authority capability, not evidence that cloud or
+    // external-check layouts were activated. Older readers reject the suffix.
+    let value = value.map(|v| v.strip_suffix(b"-forge-1").unwrap_or(v));
     match value {
         Some(b"tinytree-store-1") => Ok(1),
         Some(b"tinytree-store-2") => Ok(2),
@@ -495,7 +512,9 @@ fn advance_feature(
     meta: &SingleWriterTxKeyspace,
     minimum: u8,
 ) -> Result<()> {
-    let current = store_feature(tx.get(meta, b"format")?.as_deref())?;
+    let encoded = tx.get(meta, b"format")?;
+    let forge = encoded.as_deref().is_some_and(forge_feature);
+    let current = store_feature(encoded.as_deref())?;
     if current < minimum {
         let value = match minimum {
             2 => b"tinytree-store-2".as_slice(),
@@ -511,7 +530,33 @@ fn advance_feature(
             12 => b"tinytree-store-12".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
-        tx.insert(meta, b"format", value);
+        if forge {
+            let mut value = value.to_vec();
+            value.extend_from_slice(b"-forge-1");
+            tx.insert(meta, b"format", value);
+        } else {
+            tx.insert(meta, b"format", value);
+        }
+    }
+    Ok(())
+}
+fn forge_feature(value: &[u8]) -> bool {
+    value.ends_with(b"-forge-1")
+}
+/// Activate account/review authority in the transaction creating its first
+/// durable record. This does not initialize unrelated cloud/check namespaces.
+fn activate_forge_feature(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    meta: &SingleWriterTxKeyspace,
+) -> Result<()> {
+    let value = tx
+        .get(meta, b"format")?
+        .ok_or(Error::Corrupt("missing store format"))?;
+    store_feature(Some(&value))?;
+    if !forge_feature(&value) {
+        let mut next = value.to_vec();
+        next.extend_from_slice(b"-forge-1");
+        tx.insert(meta, b"format", next);
     }
     Ok(())
 }
@@ -825,6 +870,15 @@ impl Store {
             store.inner.validate_packs_on_reopen()?;
             store.inner.validate_cloud_on_reopen()?;
             store.inner.validate_landing_on_reopen()?;
+            store.inner.validate_forge_accounts_on_reopen()?;
+            store.inner.validate_forge_projections_on_reopen()?;
+            store.inner.validate_forge_reviews_on_reopen()?;
+        }
+        if !planned.fresh {
+            // These public validators acquire their own publication/arena
+            // guards. Do not retain the startup arena across nested admission.
+            store.forge_validate_transforms_on_reopen()?;
+            store.forge_validate_uploads_on_reopen()?;
         }
         if !planned.fresh {
             // Strict reopen validation above must see stale packages before
@@ -1588,6 +1642,7 @@ impl Store {
         {
             let _guard = self.inner.lock()?;
             self.inner.repository(repo)?;
+            self.inner.forge_review_reject_publication(repo, &request.reference_name)?;
             if let Some(receipt) = self.inner.replay(repo, request, fingerprint)? {
                 return Ok(receipt);
             }
@@ -1623,6 +1678,7 @@ impl Store {
         let commit = root_lease.as_ref().map(|lease| lease.descriptor);
         let _guard = self.inner.lock()?;
         self.inner.repository(repo)?;
+        self.inner.forge_review_reject_publication(repo, &request.reference_name)?;
         // Another caller can have published while validation ran. Recheck both
         // idempotency and generation at the actual publication linearization.
         if let Some(receipt) = self.inner.replay(repo, request, fingerprint)? {
@@ -1716,6 +1772,7 @@ impl Store {
         }
         roots.extend(cloud.strict.iter().copied());
         roots.extend(self.inner.landing_roots(repo)?);
+        roots.extend(self.inner.forge_review_roots(repo)?);
         let mut retained = self.inner.closure(repo, roots, true, false)?;
         let mut expired = Vec::new();
         let mut stage_roots = HashSet::new();

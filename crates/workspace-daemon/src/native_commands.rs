@@ -15,8 +15,8 @@ use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
     },
 };
 use tonic::Status;
@@ -1336,6 +1336,44 @@ impl NativeCommandHost {
             .registry
             .workspace(workspace.registration)
             .await?)
+    }
+    /// Negative proof is usable only by Manager's exact never-mounted candidate
+    /// path under its host fence. Unknown general workspaces remain active().
+    pub(crate) async fn candidate_never_registered(
+        &self,
+        mount: &str,
+        access: Arc<native_retention::HostAccessGuard>,
+    ) -> Result<bool> {
+        self.inner.registry.validate_host_access(&access)?;
+        let _start = self.inner.starts.lock().await;
+        if self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("candidate command sessions unavailable"))?
+            .values()
+            .any(|session| session.workspace.mapping.mount == mount)
+        {
+            return Ok(false);
+        }
+        if self
+            .inner
+            .workspaces
+            .read()
+            .map_err(|_| anyhow::anyhow!("candidate command map unavailable"))?
+            .contains_key(mount)
+        {
+            return Ok(false);
+        }
+        let absent = match std::fs::symlink_metadata(
+            self.inner.records.path().join(format!("{mount}.json")),
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(_) => false,
+            Err(error) => return Err(error.into()),
+        };
+        self.inner.registry.validate_host_access(&access)?;
+        Ok(absent)
     }
     pub fn active(&self, mount: &str) -> bool {
         match self.inner.sessions.lock() {

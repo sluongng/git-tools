@@ -1,4 +1,4 @@
-use crate::{Config, Evidence, Mode, Outcome, Receipt, Request, bep, process};
+use crate::{bep, process, Config, Evidence, Mode, Outcome, Receipt, Request};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use private_fs::PrivateDir;
@@ -24,6 +24,159 @@ struct Journal {
     cleanup_sequence: u32,
     receipt: Option<Receipt>,
 }
+fn forge_repository(config: &Config, request: &Request) -> Result<bool> {
+    let profile = config.profile(&request.profile_name)?;
+    Ok(profile.forge_accounts
+        && request
+            .repository_id
+            .strip_prefix("forge-")
+            .is_some_and(|id| {
+                !id.is_empty()
+                    && id.len() <= 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            }))
+}
+fn actual_store<'a>(config: &'a Config, request: &'a Request) -> Result<&'a str> {
+    Ok(if forge_repository(config, request)? {
+        &request.repository_id
+    } else {
+        &config.profile(&request.profile_name)?.store
+    })
+}
+/// Deterministic trusted-template derivation. No endpoint, credential, alias or
+/// command is accepted from repository contents or the check request.
+pub(crate) fn derived_daemon(
+    config: &Config,
+    request: &Request,
+    root: &Path,
+    template: &[u8],
+) -> Result<Vec<u8>> {
+    if !forge_repository(config, request)? {
+        return Ok(template.to_vec());
+    }
+    let mut daemon: toml::Value = toml::from_str(std::str::from_utf8(template)?)?;
+    let profile = config.profile(&request.profile_name)?;
+    let mut repository = daemon
+        .get("native")
+        .and_then(|v| v.get("repositories"))
+        .and_then(|v| v.get(&profile.store))
+        .cloned()
+        .context("Forge checker template is unavailable")?;
+    ensure!(
+        repository
+            .get("checker_forge_accounts")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+            && repository.get("forge").is_none(),
+        "Forge checker template is not explicitly raw-remote enabled"
+    );
+    repository
+        .as_table_mut()
+        .context("invalid raw checker template")?
+        .get_mut("remote")
+        .and_then(toml::Value::as_table_mut)
+        .context("missing raw candidate provider")?
+        .insert(
+            "server_retained_candidate".into(),
+            toml::Value::Table(
+                [
+                    ("job_id".into(), toml::Value::String(request.job_id.clone())),
+                    (
+                        "head".into(),
+                        toml::Value::String(request.candidate_commit.clone()),
+                    ),
+                    (
+                        "root_tree".into(),
+                        toml::Value::String(request.root_tree.clone()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+    let remote = repository
+        .get_mut("remote")
+        .and_then(|v| v.get_mut("remote"))
+        .and_then(toml::Value::as_table_mut)
+        .context("Forge checker template requires a raw remote provider")?;
+    remote.insert(
+        "repository_id".into(),
+        toml::Value::String(request.repository_id.clone()),
+    );
+    let table = daemon
+        .as_table_mut()
+        .context("invalid checker daemon template")?;
+    table.insert(
+        "state_dir".into(),
+        toml::Value::String(
+            root.join("d")
+                .to_str()
+                .context("invalid daemon state path")?
+                .into(),
+        ),
+    );
+    // A check daemon owns only its exact account provider and private registry.
+    let native = table
+        .get_mut("native")
+        .and_then(toml::Value::as_table_mut)
+        .context("missing native checker template")?;
+    native.insert(
+        "repositories".into(),
+        toml::Value::Table(
+            [(request.repository_id.clone(), repository)]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let workspaces = native
+        .entry("workspaces")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("invalid native checker workspace policy")?;
+    workspaces.insert(
+        "registry_path".into(),
+        toml::Value::String(
+            root.join("daemon-registry")
+                .to_str()
+                .context("invalid daemon registry path")?
+                .into(),
+        ),
+    );
+    for name in ["capture", "upload", "gc"] {
+        let settings = workspaces
+            .entry(name)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("invalid checker workspace settings")?;
+        settings.insert("policy".into(), toml::Value::String("disabled".into()));
+    }
+    for name in ["bos", "bes"] {
+        let settings = table
+            .entry(name)
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("invalid checker optional service")?;
+        settings.insert("enabled".into(), toml::Value::Boolean(false));
+    }
+    if let Some(git) = table
+        .get_mut("git_proxy")
+        .and_then(toml::Value::as_table_mut)
+    {
+        git.insert(
+            "repositories".into(),
+            toml::Value::Table(Default::default()),
+        );
+    }
+    let derived = toml::to_string(&daemon)?.into_bytes();
+    ensure!(
+        derived.len() <= 65536,
+        "derived checker daemon configuration limit"
+    );
+    Ok(derived)
+}
+
 struct Attempt {
     root: PrivateDir,
     _lock: fs::File,
@@ -37,7 +190,16 @@ impl Attempt {
         if !recovery {
             let profile = config.profile(&request.profile_name)?;
             ensure!(
-                profile.repositories.contains(&request.repository_id),
+                profile.repositories.contains(&request.repository_id)
+                    || (profile.forge_accounts
+                        && request
+                            .repository_id
+                            .strip_prefix("forge-")
+                            .is_some_and(|id| !id.is_empty()
+                                && id.len() <= 64
+                                && id.bytes().all(|b| b.is_ascii_lowercase()
+                                    || b.is_ascii_digit()
+                                    || b == b'-'))),
                 "repository is not authorized by check profile"
             );
             ensure!(
@@ -233,7 +395,11 @@ impl Attempt {
                 == self.journal.request.profile_version,
             "management configuration changed during setup"
         );
-        self.root.replace("daemon.toml", &bytes)?;
+        self.root.replace("daemon-template.toml", &bytes)?;
+        self.root.replace(
+            "daemon.toml",
+            &derived_daemon(config, &self.journal.request, self.root.path(), &bytes)?,
+        )?;
         // Revalidate after copying: a concurrent operator edit cannot silently
         // execute under the server's older frozen profile fingerprint.
         ensure!(
@@ -325,6 +491,7 @@ async fn run_owned(
     );
     attempt.prepare(config)?;
     let profile = config.profile(&request.profile_name)?;
+    let store = actual_store(config, &request)?;
     let deadline = Instant::now() + Duration::from_secs(profile.timeout_seconds);
     let mut evidence: Option<Evidence> = None;
     let mut outcome = Outcome::Unavailable;
@@ -341,7 +508,7 @@ async fn run_owned(
                     "native-candidate-mount",
                     root_string,
                     "--store",
-                    &profile.store,
+                    store,
                     "--commit",
                     &request.candidate_commit,
                     "--workspace-id",
@@ -354,7 +521,7 @@ async fn run_owned(
             .await?;
         ensure!(
             mounted["binding"]["root"].as_str() == Some(root_string)
-                && mounted["binding"]["repository"].as_str() == Some(profile.store.as_str()),
+                && mounted["binding"]["repository"].as_str() == Some(store),
             "mounted binding differs"
         );
         let proof = attempt
@@ -376,7 +543,7 @@ async fn run_owned(
             &request,
             &attempt.journal.workspace_id,
             &root,
-            &profile.store,
+            store,
         )?;
         require_readonly_mount(&root, &attempt.journal.workspace_id)?;
         let mut command = attempt.command(&attempt.path("tools/bazel"), false);
@@ -435,7 +602,7 @@ async fn run_owned(
             &request,
             &attempt.journal.workspace_id,
             &root,
-            &profile.store,
+            store,
         )?;
         ensure!(!*cancelled.borrow(), "check cancelled before verdict");
         outcome = if completion.success {
@@ -501,7 +668,21 @@ async fn recover_owned(config: &Config, request: Request) -> Result<Receipt> {
         "incomplete setup requires operator inspection"
     );
     let config = attempt.journal.config.clone();
-    let frozen_daemon = attempt.root.read("daemon.toml", 65536)?;
+    let frozen_daemon = match attempt.root.read("daemon-template.toml", 65536) {
+        Ok(bytes) => bytes,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !forge_repository(&config, &request)? =>
+        {
+            attempt.root.read("daemon.toml", 65536)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        attempt.root.read("daemon.toml", 65536)?
+            == derived_daemon(&config, &request, attempt.root.path(), &frozen_daemon)?,
+        "derived cleanup configuration binding differs"
+    );
     ensure!(
         config.profile_version_for_daemon(&request.profile_name, &frozen_daemon)?
             == request.profile_version,
@@ -614,6 +795,29 @@ async fn cleanup(config: &Config, attempt: &Attempt, prefix: &str) -> Result<()>
         }
     }
     ensure!(absent && retired, "cleanup is not confirmed");
+    if forge_repository(config, &attempt.journal.request)? && attempt.path("d").exists() {
+        // Shutdown never auto-starts a daemon; wait for its owner lock before
+        // acknowledging that an isolated check's provider has stopped.
+        let state = PrivateDir::open_existing(attempt.path("d"))?;
+        let lock = state.open_lock("daemon.lock")?;
+        if lock.try_lock_exclusive().is_err() {
+            attempt
+                .control(&["shutdown"], &format!("{prefix}-daemon-shutdown"), timeout)
+                .await?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if lock.try_lock_exclusive().is_ok() {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "check daemon shutdown remains uncertain"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        FileExt::unlock(&lock)?;
+    }
     Ok(())
 }
 fn remaining(deadline: Instant) -> Result<Duration> {

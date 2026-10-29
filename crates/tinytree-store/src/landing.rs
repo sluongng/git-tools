@@ -314,7 +314,7 @@ fn encode_record<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>> {
     serde_json::to_writer(&mut writer, value).map_err(|_| Error::Limit("landing record bytes"))?;
     Ok(writer.bytes)
 }
-fn job_id(repo: &str, owner: LandingOwner, token: &str) -> [u8; 32] {
+pub(super) fn job_id(repo: &str, owner: LandingOwner, token: &str) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"tinytree-landing-job-v1\0");
     h.update(&(repo.len() as u64).to_be_bytes());
@@ -468,6 +468,9 @@ impl Drop for WorkGuard {
     }
 }
 impl Inner {
+    pub(super) fn landing_record_for_review(&self, repo: &str, id: [u8; 32]) -> Result<Option<LandingJob>> {
+        self.landing_record(repo, id)?.map(|r| public(id, &r)).transpose()
+    }
     fn landing_record(&self, repo: &str, id: [u8; 32]) -> Result<Option<Record>> {
         self.db
             .read_tx()
@@ -616,7 +619,8 @@ impl Inner {
             return Ok(());
         };
         let mut old_parent = CommitId(r.intent.base);
-        let mut new_parent = CommitId(r.intent.target);
+        let mut new_parent = self.forge_review_build_plan(repo, job_id(repo, LandingOwner(r.owner), &r.intent.token))?
+            .map(|plan| plan.target).unwrap_or(CommitId(r.intent.target));
         let mut changes = HashSet::new();
         let mut final_tree = None;
         for pair in &candidate.pairs {
@@ -961,6 +965,12 @@ impl Store {
         request: &LandingRequest,
         now: i64,
     ) -> Result<LandingJob> {
+        self.begin_landing_inner(repo, owner, request, now, false)
+    }
+    pub(super) fn begin_review_landing(&self, repo: &str, owner: LandingOwner, request: &LandingRequest, now: i64) -> Result<LandingJob> {
+        self.begin_landing_inner(repo, owner, request, now, true)
+    }
+    fn begin_landing_inner(&self, repo: &str, owner: LandingOwner, request: &LandingRequest, now: i64, review: bool) -> Result<LandingJob> {
         request_token(&request.idempotency_key)?;
         reference_name(&request.reference_name)?;
         profile(&request.check_profile)?;
@@ -975,6 +985,7 @@ impl Store {
         {
             let _gate = self.inner.lock()?;
             self.inner.repository(repo)?;
+            self.inner.forge_review_admit_landing(repo, owner, request, review)?;
             if let Some(r) = self.inner.landing_record(repo, id)? {
                 if r.fingerprint != digest {
                     return Err(Error::IdempotencyConflict);
@@ -1124,16 +1135,23 @@ impl Store {
             repo,
             error: None,
         };
-        let built = tinytree_landing::build(
-            &mut reader,
-            tinytree_landing::Request {
+        let plan = self.inner.forge_review_build_plan(repo, id)?;
+        if let Some(plan) = &plan {
+            guard.add(ObjectKey { kind: Kind::Commit, id: ObjectId(plan.target.0) })?;
+            if let Some(base) = plan.mapped_base { guard.add(ObjectKey { kind: Kind::Commit, id: ObjectId(base.0) })?; }
+        }
+        let build_request = tinytree_landing::Request {
                 source_base: CommitId(record.intent.base),
                 source_head: CommitId(record.intent.head),
-                destination_head: CommitId(record.intent.target),
+                destination_head: plan.as_ref().map(|p| p.target).unwrap_or(CommitId(record.intent.target)),
                 committer: record.intent.committer.signature(),
-            },
-            candidate_limits(record.limits)?,
-        );
+            };
+        let built = if let Some(mapped) = plan.as_ref().and_then(|p| p.mapped_base) {
+            if plan.as_ref().is_some_and(|p| p.projected) { tinytree_landing::build_on_projected_base(&mut reader, build_request, mapped, candidate_limits(record.limits)?) } else {
+            tinytree_landing::build_on_mapped_base(&mut reader, build_request, mapped, candidate_limits(record.limits)?) }
+        } else {
+            tinytree_landing::build(&mut reader, build_request, candidate_limits(record.limits)?)
+        };
         if let Some(error) = reader.error {
             return Err(error);
         }
@@ -1409,6 +1427,7 @@ impl Store {
         r.reference = Some(reference.clone());
         let bytes = encode_record(&r, self.inner.config.landing.max_record_bytes)?;
         self.inner.check_landing_record_budget(repo, id, &bytes)?;
+        let review_writes = self.inner.forge_review_before_finalize(repo, &r.intent.reference, id, c.head, now)?;
         let mut tx = self
             .inner
             .db
@@ -1418,6 +1437,8 @@ impl Store {
         // authoritative result record, in the SAME transaction as the reference.
         tx.insert(&self.inner.spaces.refs, ref_key, super::encode(&reference)?);
         tx.insert(&self.inner.spaces.landing, key(repo, &id), bytes);
+        for (key, value) in review_writes { tx.insert(&self.inner.spaces.meta, key, value); }
+        if r.intent.reference == "main" {self.inner.forge_advance_main_views_in(&mut tx,repo,CommitId(c.head))?;}
         self.inner.commit(tx)?;
         public(id, &r)
     }

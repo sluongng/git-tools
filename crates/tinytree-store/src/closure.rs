@@ -95,6 +95,48 @@ impl Inner {
         )
     }
 
+    /// Validate a supplied subtree at its exact repository-relative location.
+    /// The graph walk and contextual provenance proof share ordinary budgets;
+    /// only the initial tree context differs from a repository-root closure.
+    pub(super) fn closure_at_tree_path(
+        &self,
+        repo: &str,
+        root: TreeId,
+        path: &str,
+    ) -> Result<HashSet<ObjectKey>> {
+        let mut walk = Walk::new(&self.config, u64::MAX);
+        enqueue(
+            ObjectKey {
+                kind: Kind::Tree,
+                id: ObjectId(root.0),
+            },
+            &mut walk.discovered,
+            &mut walk.pending,
+            &mut walk.budget,
+            self.config.max_closure_objects,
+        )?;
+        self.enqueue_context(
+            root,
+            Arc::from(path),
+            &mut walk.contexts,
+            &mut walk.pending_contexts,
+            &mut walk.context_bytes,
+            &self.config,
+        )?;
+        // The root is already queued with its explicit context. Passing it as
+        // a new generic root would also seed an incorrect empty-path context.
+        self.extend_closure(
+            repo,
+            [],
+            true,
+            false,
+            &HashMap::new(),
+            &self.config,
+            &mut walk,
+        )?;
+        Ok(walk.discovered)
+    }
+
     pub(super) fn closure_bounded(
         &self,
         repo: &str,

@@ -83,6 +83,336 @@ fn request(id: &str, generation: u64, target: Option<Descriptor>) -> PublishRequ
     }
 }
 
+fn forge_fixture(store: &Store, account: &AccountId) -> CommitId {
+    let repo = account.repository_id();
+    let put = |object: Object| {
+        let encoded = tinytree_model::encode(&object, Limits::default()).unwrap();
+        store.put(&repo, encoded.descriptor, &encoded.bytes, 0).unwrap();
+        encoded.descriptor
+    };
+    let mut entries = Vec::new();
+    for (name, bytes) in [("README.md", b"# Account\npublic needle\n".as_slice()), ("secret.txt", b"private needle\n".as_slice()), ("source.rs", b"fn needle() {}\n".as_slice())] {
+        let d = tinytree_model::describe_file(bytes);
+        store.put(&repo, d, bytes, 0).unwrap();
+        entries.push(TreeEntry { name: name.into(), value: TreeValue::File { id: FileId(d.key.id.0), executable: false, size_bytes: d.size_bytes, copy_id: None } });
+    }
+    let tree = put(Object::Tree(Tree { entries }));
+    let mut commit = commit(TreeId(tree.key.id.0), "forge fixture");
+    commit.parents = vec![CommitId(store.references(&repo, &["main".into()]).unwrap()[0].commit.unwrap().key.id.0)];
+    CommitId(put(Object::Commit(commit)).key.id.0)
+}
+fn forge_public_view(revision: CommitId) -> ViewSpec {
+    ViewSpec { name: "public".into(), root_prefix: String::new(), include_prefixes: vec![String::new()], exclude_prefixes: vec![], visibility: ForgeViewVisibility::Public, revision: revision.0, export_allowed: true }
+}
+
+#[test]
+fn forge_account_provision_is_single_owned_durable_monorepo() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), config()).unwrap();
+    let id = AccountId("sample".into());
+    let owner = ForgeActor { principal: "owner".into() };
+    let first = store.forge_provision_account(&id, &owner).unwrap();
+    let second = store.forge_provision_account(&id, &owner).unwrap();
+    assert_eq!(first.repository, second.repository);
+    assert_eq!(first.repository, "forge-sample");
+    assert!(matches!(store.forge_provision_account(&id, &ForgeActor { principal: "other".into() }), Err(Error::ForgeAccessDenied)));
+    assert!(store.forge_provision_account(&AccountId("../other".into()), &owner).is_err());
+    let main = store.references(&first.repository, &["main".into()]).unwrap().remove(0);
+    assert_eq!(main.generation, 1);
+    assert!(main.commit.is_some());
+    assert_eq!(store.list_objects(&first.repository, Kind::Commit, None, 10).unwrap().len(), 1);
+    assert_eq!(store.list_objects(&first.repository, Kind::Tree, None, 10).unwrap().len(), 1);
+    let format = store.inner.db.read_tx().get(&store.inner.spaces.meta,b"format").unwrap().unwrap();
+    assert!(forge_feature(&format)); assert_eq!(store_feature(Some(&format)).unwrap(),1);
+    // Packing advances the independent base feature without implying cloud/check
+    // activation or erasing the forge authority marker.
+    store.pack(&first.repository,PackOptions::default()).unwrap();
+    let packed_format = store.inner.db.read_tx().get(&store.inner.spaces.meta,b"format").unwrap().unwrap();
+    assert!(forge_feature(&packed_format)); assert!(store_feature(Some(&packed_format)).unwrap()>1);
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(reopened.forge_provision_account(&id, &owner).unwrap().repository, first.repository);
+    assert_eq!(reopened.references(&first.repository, &["main".into()]).unwrap()[0].commit, main.commit);
+}
+
+#[test]
+fn forge_public_and_locked_views_recheck_policy_and_confine_direct_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), config()).unwrap();
+    let account = AccountId("sample".into());
+    let owner = ForgeActor { principal: "owner".into() };
+    store.forge_provision_account(&account, &owner).unwrap();
+    let revision = forge_fixture(&store, &account);
+    let public = store.forge_publish_view(&account, &owner, forge_public_view(revision), PolicyEpoch(1), true).unwrap();
+    let old_version = public.version();
+    let anonymous = store.forge_resolve_view(&account, None, "", None).unwrap();
+    assert_eq!(store.forge_read_view_file(&anonymous, "secret.txt", 1024).unwrap(), b"private needle\n");
+    let mut restricted = forge_public_view(revision);
+    restricted.exclude_prefixes = vec!["secret.txt".into()];
+    store.forge_publish_view(&account, &owner, restricted, public.epoch(), true).unwrap();
+    assert!(matches!(store.forge_read_view_file(&anonymous, "README.md", 1024), Err(Error::StaleForgePolicy)));
+    let old_projection = store.forge_resolve_view(&account, None, "public", Some(old_version)).unwrap();
+    assert!(matches!(store.forge_read_view_file(&old_projection, "secret.txt", 1024), Err(Error::ForgeAccessDenied)));
+    assert!(matches!(store.forge_read_view_file(&old_projection, "../secret.txt", 1024), Err(Error::Invalid(_))));
+    let files = store.forge_view_files(&old_projection, 10).unwrap();
+    assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["README.md", "source.rs"]);
+    let mut locked = forge_public_view(revision);
+    locked.name = "locked".into(); locked.visibility = ForgeViewVisibility::Roles(vec!["security".into()]);
+    let private = store.forge_publish_view(&account, &owner, locked, old_projection.epoch(), false).unwrap();
+    assert!(matches!(store.forge_resolve_view(&account, None, "locked", None), Err(Error::ForgeAccessDenied)));
+    let member = ForgeActor { principal: "reader".into() };
+    let policy = store.forge_set_member(&account, &owner, ForgeMember { principal: member.principal.clone(), can_write: false, can_review: true, is_admin: false, roles: vec!["security".into()] }, private.epoch()).unwrap();
+    let readable = store.forge_resolve_view(&account, Some(&member), "locked", None).unwrap();
+    assert_eq!(store.forge_read_view_file(&readable, "secret.txt", 1024).unwrap(), b"private needle\n");
+    store.forge_remove_member(&account, &owner, &member.principal, policy.epoch).unwrap();
+    assert!(matches!(store.forge_read_view_file(&readable, "secret.txt", 1024), Err(Error::ForgeAccessDenied)));
+    let other = AccountId("other".into());
+    store.forge_provision_account(&other, &owner).unwrap();
+    assert!(matches!(store.forge_resolve_view(&other, None, "public", Some(old_version)), Err(Error::ForgeAccessDenied)));
+}
+
+#[test]
+fn forge_published_view_revision_survives_source_reference_movement_and_gc() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), config()).unwrap();
+    let account = AccountId("sample".into());
+    let owner = ForgeActor { principal: "owner".into() };
+    let info = store.forge_provision_account(&account, &owner).unwrap();
+    let revision = forge_fixture(&store, &account);
+    store.forge_publish_view(&account, &owner, forge_public_view(revision), info.epoch, true).unwrap();
+    store.gc(&info.repository, 100).unwrap();
+    let view = store.forge_resolve_view(&account, None, "", None).unwrap();
+    assert_eq!(view.revision(), revision);
+    assert_eq!(store.forge_read_view_file(&view, "README.md", 1024).unwrap(), b"# Account\npublic needle\n");
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    let view = reopened.forge_resolve_view(&account, None, "", None).unwrap();
+    assert_eq!(reopened.forge_read_view_file(&view, "source.rs", 1024).unwrap(), b"fn needle() {}\n");
+}
+
+#[test]
+fn forge_retired_historical_view_releases_only_its_source_gc_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), config()).unwrap();
+    let account = AccountId("retirement".into());
+    let actor = ForgeActor { principal: "owner".into() };
+    store.forge_provision_account(&account, &actor).unwrap();
+    let revision = forge_fixture(&store, &account);
+    let old = store.forge_publish_view(&account, &actor, forge_public_view(revision), PolicyEpoch(1), true).unwrap();
+    assert!(store.forge_retire_view(&account, &actor, old.version(), old.epoch()).is_err());
+    let projection = store.forge_project_view(&old, 0).unwrap();
+    let genesis = store.references(old.repository(), &["main".into()]).unwrap()[0].commit.unwrap();
+    let current = store.forge_publish_view(&account, &actor, forge_public_view(CommitId(genesis.key.id.0)), old.epoch(), true).unwrap();
+    let file = tinytree_model::describe_file(b"fn needle() {}\n");
+    let mutation = ForgeAccountMutation::RetireView { version: old.version(), expected_epoch: current.epoch(), view: "public".into() };
+    let receipt = store.forge_mutate_account(&account, &actor, "retire-historical", mutation.clone()).unwrap();
+    assert_eq!(receipt["retired_version"], serde_json::json!(old.version().0));
+    assert_eq!(store.forge_mutate_account(&account, &actor, "retire-historical", mutation.clone()).unwrap(), receipt);
+    let mut mismatch = mutation.clone();
+    if let ForgeAccountMutation::RetireView { view, .. } = &mut mismatch { *view = "other".into(); }
+    assert!(store.forge_mutate_account(&account, &actor, "retire-historical", mismatch).is_err());
+    assert!(matches!(store.forge_mutate_account(&account, &actor, "stale-retirement", mutation.clone()), Err(Error::StaleForgePolicy)));
+    let info = store.forge_get_account(&account, &actor).unwrap();
+    assert!(matches!(store.forge_resolve_view(&account, None, "public", Some(old.version())), Err(Error::ForgeAccessDenied)));
+    assert!(store.forge_publish_view(&account, &actor, forge_public_view(revision), info.epoch, true).is_err());
+    store.gc(&info.repository, 100).unwrap();
+    assert!(store.descriptor(&info.repository, ObjectKey { kind: Kind::Commit, id: ObjectId(revision.0) }).unwrap().is_none());
+    assert!(store.descriptor(&info.repository, file.key).unwrap().is_none());
+    assert!(store.descriptor(&info.repository, ObjectKey { kind: Kind::Commit, id: ObjectId(projection.projected_commit) }).unwrap().is_none());
+    {
+        let _gate = store.inner.lock().unwrap();
+        assert_eq!(store.inner.forge_projection_relation_in(&store.inner.db.read_tx(), &account, old.version(), old.epoch(), CommitId(projection.projected_commit)).unwrap(), revision);
+    }
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(reopened.forge_mutate_account(&account, &actor, "retire-historical", mutation).unwrap(), receipt);
+    assert_eq!(reopened.forge_resolve_view(&account, None, "", None).unwrap().revision().0, genesis.key.id.0);
+}
+
+#[test]
+fn forge_projection_excludes_private_objects_and_uploads_are_actor_path_epoch_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), config()).unwrap();
+    let account = AccountId("projection".into());
+    let actor = ForgeActor { principal: "owner".into() };
+    store.forge_provision_account(&account, &actor).unwrap();
+    let revision = forge_fixture(&store, &account);
+    let mut spec = forge_public_view(revision); spec.exclude_prefixes = vec!["secret.txt".into()];
+    let view = store.forge_publish_view(&account, &actor, spec.clone(), PolicyEpoch(1), true).unwrap();
+    let projected = store.forge_project_view(&view, 0).unwrap();
+    assert_eq!(projected.projected_commit, store.forge_project_view(&view, 0).unwrap().projected_commit);
+    assert_ne!(projected.projected_commit, revision.0);
+    let bytes = store.forge_read_projected_object(&view, ObjectKey { kind:Kind::Commit, id:ObjectId(projected.projected_commit) }, 0, 4096).unwrap();
+    let Object::Commit(projected_payload) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("not a commit") };
+    assert_eq!(projected_payload.parents, vec![CommitId::ROOT]); assert!(projected_payload.predecessors.is_empty());
+    assert_eq!(projected_payload.description, "Projected workspace");
+    let private = tinytree_model::describe_file(b"private needle\n");
+    assert!(matches!(store.forge_read_projected_object(&view, private.key, 0, 4096), Err(Error::ForgeAccessDenied)));
+    assert!(matches!(store.forge_read_projected_object(&view, ObjectKey { kind:Kind::Commit,id:ObjectId(revision.0) }, 0, 4096), Err(Error::ForgeAccessDenied)));
+    let reviewed=store.forge_project_review_head(&view,revision,ChangeId([8;16]),CommitId(projected.projected_commit),0).unwrap();
+    let (descriptor,empty,eof)=store.forge_read_object_chunk(&view,None,ObjectKey{kind:Kind::Commit,id:ObjectId(reviewed.projected_commit)},0,0,0).unwrap();
+    assert!(empty.is_empty());assert!(!eof);assert!(descriptor.size_bytes>0);
+    let (_,chunk,eof)=store.forge_read_object_chunk(&view,None,descriptor.key,0,0,4096).unwrap();assert!(eof);
+    let Object::Commit(reviewed_payload)=tinytree_model::decode(&chunk,Limits::default()).unwrap() else{panic!("not a commit")};
+    assert_eq!(reviewed_payload.change_id,ChangeId([8;16]));assert_eq!(reviewed_payload.parents,vec![CommitId(projected.projected_commit)]);
+    let (_,tree_bytes)=store.read_metadata(view.repository(),ObjectKey{kind:Kind::Tree,id:ObjectId(projected.projected_tree)}).unwrap();
+    let Object::Tree(tree_payload)=tinytree_model::decode(&tree_bytes,Limits::default()).unwrap()else{panic!("not a tree")};
+    let (source_file,source_size,source_copy)=tree_payload.entries.iter().find_map(|e|if e.name=="source.rs"{if let TreeValue::File{id,size_bytes,copy_id:Some(copy),..}=e.value{Some((id,size_bytes,copy))}else{None}}else{None}).unwrap();
+    let origin={let _gate=store.inner.lock().unwrap();store.inner.forge_projected_copy_origin_in(&store.inner.db.read_tx(),&view,source_copy).unwrap()};
+    assert_eq!(origin.canonical_revision,revision.0);assert_eq!(origin.canonical_path,"source.rs");assert_eq!(origin.canonical_copy,None);
+    let copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"renamed.rs".into(),parents:vec![source_copy],salt:vec![1]}),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"renamed.rs",copy.descriptor,&copy.bytes,0).unwrap();
+    let renamed=tinytree_model::encode(&Object::Tree(Tree{entries:vec![TreeEntry{name:"renamed.rs".into(),value:TreeValue::File{id:source_file,size_bytes:source_size,executable:false,copy_id:Some(CopyId(copy.descriptor.key.id.0))}}]}),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"",renamed.descriptor,&renamed.bytes,0).unwrap();
+    let secret_copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"secret.txt".into(),parents:vec![],salt:vec![2]}),Limits::default()).unwrap();store.put(view.repository(),secret_copy.descriptor,&secret_copy.bytes,0).unwrap();
+    let forged=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"forged.rs".into(),parents:vec![CopyId(secret_copy.descriptor.key.id.0)],salt:vec![3]}),Limits::default()).unwrap();
+    assert!(matches!(store.forge_upload_object(&view,&actor,"forged.rs",forged.descriptor,&forged.bytes,0),Err(Error::ForgeAccessDenied)));
+    let uploaded = tinytree_model::describe_file(b"new public bytes");
+    store.forge_upload_file(&view, &actor, "new.rs", b"new public bytes", 0).unwrap();
+    {
+        let _gate = store.inner.lock().unwrap(); let tx = store.inner.db.read_tx();
+        assert_eq!(store.inner.forge_projection_base_in(&tx,&view,CommitId(projected.projected_commit)).unwrap(),revision);
+        assert!(store.inner.forge_validate_file_in(&tx,&view,&actor,"new.rs",private,0).is_err());
+        store.inner.forge_validate_file_in(&tx,&view,&actor,"new.rs",uploaded,0).unwrap();
+        assert!(store.inner.forge_validate_file_in(&tx,&view,&actor,"other.rs",uploaded,0).is_err());
+        assert!(store.inner.forge_validate_file_in(&tx,&view,&ForgeActor{principal:"other".into()},"new.rs",uploaded,0).is_err());
+    }
+    let make_tree = |descriptor:Descriptor| tinytree_model::encode(&Object::Tree(Tree { entries:vec![TreeEntry { name:"new.rs".into(),value:TreeValue::File { id:FileId(descriptor.key.id.0),executable:false,size_bytes:descriptor.size_bytes,copy_id:None } }] }),Limits::default()).unwrap();
+    let poisoned=make_tree(private);
+    assert!(matches!(store.forge_upload_object(&view,&actor,"",poisoned.descriptor,&poisoned.bytes,0),Err(Error::ForgeAccessDenied)));
+    let allowed=make_tree(uploaded);
+    store.forge_upload_object(&view,&actor,"",allowed.descriptor,&allowed.bytes,0).unwrap();
+    assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),allowed.descriptor.key,0,4096).unwrap(),allowed.bytes);
+    assert!(matches!(store.forge_read_authorized_object(&view,None,allowed.descriptor.key,0,4096),Err(Error::ForgeAccessDenied)));
+    let mut draft=commit(TreeId(allowed.descriptor.key.id.0),"author supplied draft");
+    draft.parents=vec![CommitId(projected.projected_commit)];
+    let draft=tinytree_model::encode(&Object::Commit(draft),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"",draft.descriptor,&draft.bytes,0).unwrap();
+    spec.exclude_prefixes.push("source.rs".into());
+    store.forge_publish_view(&account,&actor,spec,view.epoch(),true).unwrap();
+    assert!(matches!(store.forge_read_projected_object(&view,uploaded.key,0,4096),Err(Error::StaleForgePolicy)));
+    store.gc(view.repository(),100).unwrap();
+    drop(store);
+    Store::open_existing(directory.path(),config()).unwrap();
+}
+
+#[test]
+fn forge_account_mutations_replay_the_original_durable_acknowledgment() {
+    let directory=tempfile::tempdir().unwrap();let store=Store::open(directory.path(),config()).unwrap();
+    let account=AccountId("replay".into());let actor=ForgeActor{principal:"owner".into()};
+    let initial=store.forge_mutate_account(&account,&actor,"provision",ForgeAccountMutation::Provision).unwrap();
+    assert_eq!(initial["main_generation"],serde_json::json!(1));
+    assert_eq!(initial["main_revision"],store.forge_get_account_snapshot(&account,&actor).unwrap()["main_revision"]);
+    assert_ne!(initial["main_revision"],serde_json::json!(CommitId::ROOT.0));
+    let revision=forge_fixture(&store,&account);
+    let mutation=ForgeAccountMutation::PublishView{spec:forge_public_view(revision),expected_epoch:PolicyEpoch(1),make_default:true,follow_main:false};
+    let acknowledgment=store.forge_mutate_account(&account,&actor,"publish",mutation.clone()).unwrap();
+    assert_eq!(store.forge_mutate_account(&account,&actor,"publish",mutation.clone()).unwrap(),acknowledgment);
+    store.forge_set_member(&account,&actor,ForgeMember{principal:"reader".into(),can_write:false,can_review:false,is_admin:false,roles:vec![]},PolicyEpoch(2)).unwrap();
+    assert_eq!(store.forge_mutate_account(&account,&actor,"provision",ForgeAccountMutation::Provision).unwrap(),initial);
+    assert!(matches!(store.forge_mutate_account(&account,&actor,"publish",ForgeAccountMutation::Provision),Err(Error::Invalid("forge request replay mismatch"))));
+    drop(store);
+    let store=Store::open_existing(directory.path(),config()).unwrap();
+    assert_eq!(store.forge_mutate_account(&account,&actor,"publish",mutation).unwrap(),acknowledgment);
+    assert_eq!(store.forge_get_account(&account,&actor).unwrap().epoch,PolicyEpoch(3));
+}
+
+#[test]
+fn forge_projection_bounds_cumulative_paths_even_with_shared_long_prefixes() {
+    let (_directory,store)=open();let account=AccountId("bounded-paths".into());let actor=ForgeActor{principal:"owner".into()};store.forge_provision_account(&account,&actor).unwrap();let repo=account.repository_id();
+    let file=tinytree_model::describe_file(b"x");store.put(&repo,file,b"x",0).unwrap();
+    let put=|object:Object|{let encoded=tinytree_model::encode(&object,Limits::default()).unwrap();store.put(&repo,encoded.descriptor,&encoded.bytes,0).unwrap();encoded.descriptor};
+    let mut tree=put(Object::Tree(Tree{entries:(0..600).map(|i|TreeEntry{name:format!("file-{i:04}"),value:TreeValue::File{id:FileId(file.key.id.0),size_bytes:1,executable:false,copy_id:None}}).collect()}));
+    for i in 0..60 {tree=put(Object::Tree(Tree{entries:vec![TreeEntry{name:format!("{i:02}{}","p".repeat(60)),value:TreeValue::Tree(TreeId(tree.key.id.0))}]}));}
+    let revision=put(Object::Commit(commit(TreeId(tree.key.id.0),"shared prefix boundary")));
+    let view=store.forge_publish_view(&account,&actor,forge_public_view(CommitId(revision.key.id.0)),PolicyEpoch(1),true).unwrap();
+    assert!(matches!(store.forge_view_files(&view,1000),Err(Error::Limit("forge projected path bytes"))));
+    assert!(matches!(store.forge_project_view(&view,0),Err(Error::Limit("forge projected path bytes"))));
+}
+
+#[test]
+fn forge_following_named_views_advance_atomically_without_moving_historical_versions() {
+    let directory=tempfile::tempdir().unwrap();let store=Store::open(directory.path(),config()).unwrap();let account=AccountId("following".into());let actor=ForgeActor{principal:"owner".into()};
+    let provision=store.forge_mutate_account(&account,&actor,"provision",ForgeAccountMutation::Provision).unwrap();let repo=account.repository_id();let genesis=store.references(&repo,&["main".into()]).unwrap()[0].commit.unwrap();
+    store.forge_mutate_account(&account,&actor,"publish",ForgeAccountMutation::PublishView{spec:forge_public_view(CommitId(genesis.key.id.0)),expected_epoch:PolicyEpoch(1),make_default:true,follow_main:true}).unwrap();
+    let mut frozen=forge_public_view(CommitId(genesis.key.id.0));frozen.name="frozen".into();store.forge_publish_view(&account,&actor,frozen,PolicyEpoch(2),false).unwrap();
+    let historical=store.forge_resolve_view(&account,None,"",None).unwrap();let candidate=forge_fixture(&store,&account);
+    {
+        let _gate=store.inner.lock().unwrap();let mut tx=store.inner.db.write_tx().durability(Some(PersistMode::SyncAll));
+        store.inner.forge_check_following_view_capacity_in(&tx,&account,candidate).unwrap();
+        let d=store.inner.descriptor(&repo,ObjectKey{kind:Kind::Commit,id:ObjectId(candidate.0)}).unwrap().unwrap();
+        tx.insert(&store.inner.spaces.refs,key(&repo,b"main"),encode(&StoredReference{generation:2,commit:Some(d.into())}).unwrap());
+        store.inner.forge_advance_main_views_in(&mut tx,&repo,candidate).unwrap();store.inner.commit(tx).unwrap();
+    }
+    let current=store.forge_resolve_view(&account,None,"",None).unwrap();assert_eq!(current.revision(),candidate);assert_ne!(current.version(),historical.version());assert_eq!(current.epoch(),historical.epoch());
+    assert_eq!(store.forge_read_view_file(&current,"README.md",1024).unwrap(),b"# Account\npublic needle\n");
+    assert!(store.forge_view_files(&historical,10).unwrap().is_empty());assert_eq!(store.forge_resolve_view(&account,None,"public",Some(historical.version())).unwrap().revision().0,genesis.key.id.0);
+    assert_eq!(store.forge_resolve_view(&account,None,"frozen",None).unwrap().revision().0,genesis.key.id.0);
+    let snapshot=store.forge_get_account_snapshot(&account,&actor).unwrap();assert_eq!(snapshot["main_revision"],serde_json::json!(candidate.0));assert_eq!(snapshot["main_generation"],2);
+    assert_eq!(store.forge_mutate_account(&account,&actor,"provision",ForgeAccountMutation::Provision).unwrap(),provision);
+    // An uncommitted canonical transaction must not move the named pointer.
+    {let _gate=store.inner.lock().unwrap();let mut tx=store.inner.db.write_tx();store.inner.forge_advance_main_views_in(&mut tx,&repo,CommitId(genesis.key.id.0)).unwrap();}
+    assert_eq!(store.forge_resolve_view(&account,None,"",None).unwrap().revision(),candidate);
+    drop(store);let store=Store::open_existing(directory.path(),config()).unwrap();assert_eq!(store.forge_resolve_view(&account,None,"",None).unwrap().revision(),candidate);
+}
+
+#[test]
+fn forge_large_owned_catalogs_support_public_reads_reopen_and_exact_replay() {
+    let directory=tempfile::tempdir().unwrap();let store=Store::open(directory.path(),config()).unwrap();let account=AccountId("catalogs".into());let actor=ForgeActor{principal:"owner".into()};store.forge_provision_account(&account,&actor).unwrap();let repo=account.repository_id();
+    let file=tinytree_model::describe_file(b"catalog fixture\n");store.put(&repo,file,b"catalog fixture\n",0).unwrap();
+    let tree=tinytree_model::encode(&Object::Tree(Tree{entries:(0..120).map(|i|TreeEntry{name:format!("file-{i:04}"),value:TreeValue::File{id:FileId(file.key.id.0),size_bytes:file.size_bytes,executable:false,copy_id:None}}).collect()}),Limits::default()).unwrap();store.put(&repo,tree.descriptor,&tree.bytes,0).unwrap();
+    let source=tinytree_model::encode(&Object::Commit(commit(TreeId(tree.descriptor.key.id.0),"large owned catalogs")),Limits::default()).unwrap();store.put(&repo,source.descriptor,&source.bytes,0).unwrap();
+    let mut epoch=PolicyEpoch(1);
+    for i in 0..32 {epoch=store.forge_set_member(&account,&actor,ForgeMember{principal:format!("member-{i:02}"),can_write:false,can_review:false,is_admin:false,roles:(0..8).map(|r|format!("role-{r}-{}","x".repeat(64))).collect()},epoch).unwrap().epoch;}
+    let mut spec=forge_public_view(CommitId(source.descriptor.key.id.0));spec.include_prefixes=(0..63).map(|i|format!("path-{i:02}/{}","p".repeat(512))).chain(std::iter::once(String::new())).collect();
+    let mutation=ForgeAccountMutation::PublishView{spec:spec.clone(),expected_epoch:epoch,make_default:true,follow_main:false};
+    let acknowledgment=store.forge_mutate_account(&account,&actor,"publish-catalog",mutation.clone()).unwrap();
+    let view=store.forge_resolve_view(&account,None,"",None).unwrap();let projection=store.forge_project_view(&view,0).unwrap();
+    assert_eq!(store.forge_view_files(&view,200).unwrap().len(),120);assert_eq!(store.forge_read_view_file(&view,"file-0119",1024).unwrap(),b"catalog fixture\n");
+    assert!(store.forge_authorized_object_descriptor(&view,None,ObjectKey{kind:Kind::Commit,id:ObjectId(projection.projected_commit)},0).is_ok());
+    {
+        let tx=store.inner.db.read_tx();
+        for prefix in [b"forge/accounts/v1/".as_slice(),b"forge/views/v1/".as_slice(),b"forge/projections/v1/".as_slice()] {
+            assert!(tx.prefix(&store.inner.spaces.meta,prefix).any(|entry|entry.into_inner().unwrap().1.len()>16*1024),"representative catalog must exceed generic record limit");
+        }
+    }
+    let mut oversized=spec.clone();oversized.include_prefixes.push("extra".into());
+    assert!(store.forge_publish_view(&account,&actor,oversized,view.epoch(),true).is_err());
+    let mut oversized=spec;oversized.include_prefixes=vec!["\"".repeat(4096);64];oversized.exclude_prefixes=oversized.include_prefixes.clone();
+    assert!(matches!(store.forge_publish_view(&account,&actor,oversized,view.epoch(),true),Err(Error::Limit("forge view record"))));
+    assert_eq!(store.forge_mutate_account(&account,&actor,"publish-catalog",mutation.clone()).unwrap(),acknowledgment);
+    let genesis=store.references(&repo,&["main".into()]).unwrap()[0].commit.unwrap();
+    let current=store.forge_publish_view(&account,&actor,forge_public_view(CommitId(genesis.key.id.0)),view.epoch(),true).unwrap();
+    store.forge_retire_view(&account,&actor,view.version(),current.epoch()).unwrap();store.gc(&repo,100).unwrap();
+    assert!(store.descriptor(&repo,file.key).unwrap().is_none());
+    {
+        let _gate=store.inner.lock().unwrap();assert_eq!(store.inner.forge_projection_relation_in(&store.inner.db.read_tx(),&account,view.version(),view.epoch(),CommitId(projection.projected_commit)).unwrap().0,source.descriptor.key.id.0);
+    }
+    drop(store);let store=Store::open_existing(directory.path(),config()).unwrap();
+    assert_eq!(store.forge_mutate_account(&account,&actor,"publish-catalog",mutation).unwrap(),acknowledgment);
+    assert_eq!(store.forge_resolve_view(&account,None,"",None).unwrap().revision().0,genesis.key.id.0);
+}
+
+#[test]
+fn forge_rewritten_commit_predecessors_require_scoped_metadata_ownership() {
+    let directory=tempfile::tempdir().unwrap();let store=Store::open(directory.path(),config()).unwrap();let account=AccountId("evolution".into());let actor=ForgeActor{principal:"writer".into()};let peer=ForgeActor{principal:"peer".into()};store.forge_provision_account(&account,&actor).unwrap();
+    store.forge_set_member(&account,&actor,ForgeMember{principal:peer.principal.clone(),can_write:true,can_review:false,is_admin:false,roles:vec![]},PolicyEpoch(1)).unwrap();
+    let canonical=forge_fixture(&store,&account);let view=store.forge_publish_view(&account,&actor,forge_public_view(canonical),PolicyEpoch(2),true).unwrap();let projection=store.forge_project_view(&view,0).unwrap();
+    let peer_view=store.forge_resolve_view(&account,Some(&peer),"public",Some(view.version())).unwrap();
+    let mut original=commit(TreeId(projection.projected_tree),"original authored source");original.parents=vec![CommitId(projection.projected_commit)];original.predecessors.clear();
+    let original=tinytree_model::encode(&Object::Commit(original),Limits::default()).unwrap();store.forge_upload_object(&view,&actor,"",original.descriptor,&original.bytes,0).unwrap();
+    let Object::Commit(mut rewritten)=tinytree_model::decode(&original.bytes,Limits::default()).unwrap()else{panic!("not a commit")};rewritten.description="legitimate describe rewrite".into();rewritten.predecessors=vec![CommitId(original.descriptor.key.id.0)];
+    let rewritten=tinytree_model::encode(&Object::Commit(rewritten),Limits::default()).unwrap();store.forge_upload_object(&view,&actor,"",rewritten.descriptor,&rewritten.bytes,0).unwrap();
+    assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),rewritten.descriptor.key,0,4096).unwrap(),rewritten.bytes,"source identity/bytes must not be sanitized or dropped");
+    let Object::Commit(mut victim)=tinytree_model::decode(&original.bytes,Limits::default()).unwrap()else{panic!("not a commit")};victim.description="peer-owned metadata not submitted by writer".into();let victim=tinytree_model::encode(&Object::Commit(victim),Limits::default()).unwrap();store.forge_upload_object(&peer_view,&peer,"",victim.descriptor,&victim.bytes,0).unwrap();
+    for predecessor in [CommitId(victim.descriptor.key.id.0),canonical] {
+        let Object::Commit(mut forged)=tinytree_model::decode(&rewritten.bytes,Limits::default()).unwrap()else{panic!("not a commit")};forged.predecessors=vec![predecessor];let forged=tinytree_model::encode(&Object::Commit(forged),Limits::default()).unwrap();
+        assert!(matches!(store.forge_upload_object(&view,&actor,"",forged.descriptor,&forged.bytes,0),Err(Error::ForgeAccessDenied)),"known victim/private canonical predecessor digest is not an upload receipt");
+    }
+    let Object::Commit(mut excessive)=tinytree_model::decode(&rewritten.bytes,Limits::default()).unwrap()else{panic!("not a commit")};excessive.predecessors=vec![CommitId(original.descriptor.key.id.0);129];let excessive=tinytree_model::encode(&Object::Commit(excessive),Limits::default()).unwrap();assert!(matches!(store.forge_upload_object(&view,&actor,"",excessive.descriptor,&excessive.bytes,0),Err(Error::Invalid("forge uploaded commit shape"))));
+    drop(store);let store=Store::open_existing(directory.path(),config()).unwrap();let view=store.forge_resolve_view(&account,Some(&actor),"public",None).unwrap();assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),rewritten.descriptor.key,0,4096).unwrap(),rewritten.bytes);
+}
+
 struct BlockedRead {
     bytes: io::Cursor<&'static [u8]>,
     entered: Option<mpsc::Sender<()>>,
@@ -11206,6 +11536,1545 @@ fn landing_identity(job: &LandingJob) -> LandingCheckIdentity {
     }
 }
 
+fn forge_review_fixture() -> (
+    tempfile::TempDir,
+    Store,
+    AccountId,
+    ForgeActor,
+    ForgeActor,
+    ViewVersion,
+    CommitId,
+) {
+    let (directory, store) = open();
+    let account = AccountId("review-team".into());
+    let owner = ForgeActor {
+        principal: "writer".into(),
+    };
+    let reviewer = ForgeActor {
+        principal: "reviewer".into(),
+    };
+    store.forge_provision_account(&account, &owner).unwrap();
+    store
+        .forge_set_member(
+            &account,
+            &owner,
+            ForgeMember {
+                principal: reviewer.principal.clone(),
+                can_write: false,
+                can_review: true,
+                is_admin: false,
+                roles: vec![],
+            },
+            PolicyEpoch(1),
+        )
+        .unwrap();
+    let base = CommitId(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0,
+    );
+    let view = store
+        .forge_publish_view(
+            &account,
+            &owner,
+            ViewSpec {
+                name: "all".into(),
+                root_prefix: "".into(),
+                include_prefixes: vec!["".into()],
+                exclude_prefixes: vec![],
+                visibility: ForgeViewVisibility::Members,
+                revision: base.0,
+                export_allowed: true,
+            },
+            PolicyEpoch(2),
+            false,
+        )
+        .unwrap();
+    let projected = store.forge_project_view(&view, 0).unwrap();
+    (
+        directory,
+        store,
+        account,
+        owner,
+        reviewer,
+        view.version(),
+        CommitId(projected.projected_commit),
+    )
+}
+fn forge_review_source(
+    store: &Store,
+    account: &AccountId,
+    parent: CommitId,
+    paths: &[(&str, &[u8])],
+    change: u8,
+) -> CommitId {
+    let repo = account.repository_id();
+    let mut entries = Vec::new();
+    for (path, content) in paths {
+        let file = tinytree_model::describe_file(content);
+        let actor = ForgeActor {
+            principal: "writer".into(),
+        };
+        let view = store
+            .forge_resolve_view(account, Some(&actor), "all", None)
+            .unwrap();
+        store
+            .forge_upload_file(&view, &actor, path, content, 0)
+            .unwrap();
+        entries.push(TreeEntry {
+            name: (*path).into(),
+            value: TreeValue::File {
+                id: FileId(file.key.id.0),
+                executable: false,
+                size_bytes: file.size_bytes,
+                copy_id: None,
+            },
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let encoded =
+        tinytree_model::encode(&Object::Tree(Tree { entries }), Limits::default()).unwrap();
+    let actor = ForgeActor {
+        principal: "writer".into(),
+    };
+    let view = store
+        .forge_resolve_view(account, Some(&actor), "all", None)
+        .unwrap();
+    store
+        .forge_upload_object(&view, &actor, "", encoded.descriptor, &encoded.bytes, 0)
+        .unwrap();
+    let descriptor = landing_commit(
+        store,
+        &repo,
+        parent,
+        TreeId(encoded.descriptor.key.id.0),
+        change,
+        "review change",
+    );
+    let (_, bytes) = store.read_metadata(&repo, descriptor.key).unwrap();
+    store
+        .forge_upload_object(&view, &actor, "", descriptor, &bytes, 0)
+        .unwrap();
+    CommitId(descriptor.key.id.0)
+}
+fn forge_review_request(
+    base: CommitId,
+    head: CommitId,
+    view: ViewVersion,
+    token: &str,
+) -> ForgeReviewPushRequest {
+    ForgeReviewPushRequest {
+        request_id: token.into(),
+        source_base: base,
+        source_head: head,
+        view_version: view.0,
+        expected_patchset: None,
+        predecessor: None,
+        provenance: None,
+        lineage: vec![],
+        check_profile: LandingCheckProfile {
+            name: "checks".into(),
+            version: "v1".into(),
+        },
+    }
+}
+fn forge_review_signature() -> Signature {
+    Signature {
+        name: "Review service".into(),
+        email: "review@example.invalid".into(),
+        timestamp: Timestamp {
+            millis_since_epoch: 42,
+            tz_offset_minutes: 0,
+        },
+    }
+}
+// This helper is the trusted Store embedding, not a client-supplied verdict RPC.
+fn forge_review_check(store: &Store, account: &AccountId, review: &ForgeReview) -> LandingHandle {
+    let candidate = review.candidate.as_ref().unwrap();
+    let handle = store
+        .recover_landing_handle(&account.repository_id(), candidate.id)
+        .unwrap()
+        .unwrap();
+    let job = handle.status(store).unwrap();
+    handle
+        .record_check(
+            store,
+            &landing_identity(&job),
+            LandingVerdict {
+                passed: true,
+                evidence: [7; 32],
+            },
+            2,
+        )
+        .unwrap();
+    handle
+}
+
+#[test]
+fn forge_review_push_is_immutable_replayable_and_checks_never_bypass_explicit_review_land() {
+    let (_directory, store, account, writer, reviewer, view, _base) = forge_review_fixture();
+    let public_base = store
+        .references(&account.repository_id(), &["main".into()])
+        .unwrap()[0]
+        .commit
+        .unwrap()
+        .key
+        .id
+        .0;
+    store
+        .forge_mutate_account(
+            &account,
+            &writer,
+            "follow-public",
+            ForgeAccountMutation::PublishView {
+                spec: ViewSpec {
+                    name: "public".into(),
+                    root_prefix: "".into(),
+                    include_prefixes: vec!["".into()],
+                    exclude_prefixes: vec![],
+                    visibility: ForgeViewVisibility::Public,
+                    revision: public_base,
+                    export_allowed: true,
+                },
+                expected_epoch: PolicyEpoch(3),
+                make_default: true,
+                follow_main: true,
+            },
+        )
+        .unwrap();
+    let old_public = store.forge_resolve_view(&account, None, "", None).unwrap();
+    let selected = store
+        .forge_resolve_view(&account, Some(&writer), "all", Some(view))
+        .unwrap();
+    let base = CommitId(
+        store
+            .forge_project_view(&selected, 0)
+            .unwrap()
+            .projected_commit,
+    );
+
+    let head = forge_review_source(&store, &account, base, &[("source.txt", b"source")], 2);
+    let request = forge_review_request(base, head, view, "push-one");
+    let pushed = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 1)
+        .unwrap();
+    let candidate = pushed.candidate.as_ref().unwrap();
+    assert_eq!(pushed.source_head, head.0);
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        1
+    );
+    assert_eq!(
+        store
+            .forge_push_review(&account, &writer, &request, &forge_review_signature(), 2)
+            .unwrap()
+            .patchset_id,
+        pushed.patchset_id
+    );
+    let mut changed = request.clone();
+    changed.provenance = Some([9; 32]);
+    assert!(matches!(
+        store.forge_push_review(&account, &writer, &changed, &forge_review_signature(), 2),
+        Err(Error::IdempotencyConflict)
+    ));
+
+    let comment = store
+        .forge_comment_review(
+            &account,
+            &reviewer,
+            ChangeId(pushed.change_id),
+            pushed.patchset_id,
+            "comment-one",
+            "Review note",
+            Some("source.txt"),
+            2,
+        )
+        .unwrap();
+    assert_eq!(comment.comments.len(), 1);
+    assert_eq!(
+        store
+            .forge_comment_review(
+                &account,
+                &reviewer,
+                ChangeId(pushed.change_id),
+                pushed.patchset_id,
+                "comment-one",
+                "Review note",
+                Some("source.txt"),
+                2
+            )
+            .unwrap()
+            .comments
+            .len(),
+        1
+    );
+    assert!(matches!(
+        store.forge_comment_review(
+            &account,
+            &reviewer,
+            ChangeId(pushed.change_id),
+            pushed.patchset_id,
+            "comment-one",
+            "Changed note",
+            Some("source.txt"),
+            2
+        ),
+        Err(Error::IdempotencyConflict)
+    ));
+    let handle = forge_review_check(&store, &account, &pushed);
+    assert!(
+        store
+            .forge_review_manages_landing(&account.repository_id(), candidate.id)
+            .unwrap()
+    );
+    assert!(
+        handle.finalize(&store, 3).is_err(),
+        "passing checks alone cannot publish"
+    );
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(pushed.change_id),
+            pushed.patchset_id,
+            pushed.candidate.as_ref().unwrap().id,
+            "approve-one",
+            3,
+        )
+        .unwrap();
+    assert!(
+        handle.finalize(&store, 3).is_err(),
+        "approval alone is not an explicit land request"
+    );
+    assert!(matches!(
+        store.publish(
+            &account.repository_id(),
+            &PublishRequest {
+                idempotency_key: "bypass".into(),
+                reference_name: "main".into(),
+                expected_generation: 1,
+                new_commit: Some(head),
+                staging_leases: vec![]
+            },
+            3
+        ),
+        Err(Error::ForgeAccessDenied)
+    ));
+    let job = handle.status(&store).unwrap();
+    let raw = LandingRequest {
+        idempotency_key: "raw-bypass".into(),
+        source_base: base,
+        source_head: head,
+        reference_name: "main".into(),
+        expected_generation: 1,
+        expected_head: base,
+        committer: forge_review_signature(),
+        check_profile: job.profile,
+        expires_at: 100,
+    };
+    assert!(matches!(
+        store.begin_landing(&account.repository_id(), LandingOwner([1; 32]), &raw, 3),
+        Err(Error::ForgeAccessDenied)
+    ));
+    let landed = store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(pushed.change_id),
+            pushed.patchset_id,
+            candidate.id,
+            4,
+        )
+        .unwrap();
+    assert_eq!(landed.state, ForgeReviewState::Landed);
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0,
+        candidate.head
+    );
+    let current = store.forge_resolve_view(&account, None, "", None).unwrap();
+    assert_eq!(current.revision().0, candidate.head);
+    assert_ne!(current.version(), old_public.version());
+    assert_eq!(
+        current.epoch(),
+        old_public.epoch(),
+        "following main is not an ACL change"
+    );
+    let historical = store
+        .forge_resolve_view(&account, None, "public", Some(old_public.version()))
+        .unwrap();
+    assert_eq!(historical.revision().0, public_base);
+    assert!(store.forge_view_files(&old_public, 100).unwrap().is_empty());
+}
+
+#[test]
+fn forge_review_refresh_rebases_on_advanced_main_and_conflicts_preserve_original_patchsets() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let original = forge_review_source(&store, &account, base, &[("same.txt", b"original")], 2);
+    let first = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, original, view, "original"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let other = forge_review_source(&store, &account, base, &[("same.txt", b"other")], 3);
+    let second = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, other, view, "other"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    forge_review_check(&store, &account, &second);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(second.change_id),
+            second.patchset_id,
+            second.candidate.as_ref().unwrap().id,
+            "approve-other",
+            2,
+        )
+        .unwrap();
+    store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(second.change_id),
+            second.patchset_id,
+            second.candidate.unwrap().id,
+            3,
+        )
+        .unwrap();
+    let conflict = store
+        .forge_prepare_review(
+            &account,
+            &writer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            4,
+        )
+        .unwrap();
+    assert_eq!(conflict.state, ForgeReviewState::Conflict);
+    assert_eq!(conflict.source_head, original.0);
+    assert!(conflict.candidate.is_none());
+    assert_eq!(conflict.conflict_path.as_deref(), Some("same.txt"));
+    assert_eq!(
+        store
+            .forge_review_operation(&account, &writer, "original")
+            .unwrap()
+            .unwrap()
+            .patchset_id,
+        first.patchset_id
+    );
+}
+
+#[test]
+fn forge_review_pinned_predecessor_uses_exact_server_candidate_and_lands_approved_stack() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let parent_head = forge_review_source(&store, &account, base, &[("a", b"parent")], 2);
+    let parent = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, parent_head, view, "parent"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let child_head = forge_review_source(
+        &store,
+        &account,
+        parent_head,
+        &[("a", b"parent"), ("b", b"child")],
+        3,
+    );
+    let mut request = forge_review_request(parent_head, child_head, view, "child");
+    request.predecessor = Some(ForgeReviewDependency {
+        change_id: parent.change_id,
+        patchset_id: parent.patchset_id,
+    });
+    let child = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 1)
+        .unwrap();
+    let child_candidate = child.candidate.as_ref().unwrap();
+    let (_, bytes) = store
+        .read_metadata(
+            &account.repository_id(),
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(child_candidate.head),
+            },
+        )
+        .unwrap();
+    let Object::Commit(commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        commit.parents,
+        [CommitId(parent.candidate.as_ref().unwrap().head)]
+    );
+    forge_review_check(&store, &account, &parent);
+    forge_review_check(&store, &account, &child);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(child.change_id),
+            child.patchset_id,
+            child.candidate.as_ref().unwrap().id,
+            "child-approval",
+            2,
+        )
+        .unwrap();
+    assert!(
+        store
+            .forge_land_review(
+                &account,
+                &writer,
+                ChangeId(child.change_id),
+                child.patchset_id,
+                child_candidate.id,
+                3
+            )
+            .is_err(),
+        "unapproved predecessor cannot land as a side effect"
+    );
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(parent.change_id),
+            parent.patchset_id,
+            parent.candidate.as_ref().unwrap().id,
+            "parent-approval",
+            3,
+        )
+        .unwrap();
+    let landed = store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(child.change_id),
+            child.patchset_id,
+            child_candidate.id,
+            4,
+        )
+        .unwrap();
+    assert_eq!(landed.state, ForgeReviewState::Landed);
+    assert_eq!(
+        store
+            .forge_review(&account, &writer, ChangeId(parent.change_id))
+            .unwrap()
+            .state,
+        ForgeReviewState::Landed
+    );
+}
+
+#[test]
+fn forge_review_restart_retains_original_and_candidate_after_attempt_expiry_and_gc() {
+    let (directory, store, account, writer, _reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("durable.txt", b"durable")], 2);
+    let pushed = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "durable"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let candidate = pushed.candidate.as_ref().unwrap();
+    let handle = store
+        .recover_landing_handle(&account.repository_id(), candidate.id)
+        .unwrap()
+        .unwrap();
+
+    for index in 0..6 {
+        store
+            .forge_comment_review(
+                &account,
+                &writer,
+                ChangeId(pushed.change_id),
+                pushed.patchset_id,
+                &format!("durable-comment-{index}"),
+                &"review detail".repeat(300),
+                Some("durable.txt"),
+                2,
+            )
+            .unwrap();
+    }
+    assert!(
+        store
+            .forge_review(&account, &writer, ChangeId(pushed.change_id))
+            .unwrap()
+            .comments
+            .iter()
+            .map(|c| c.body.len())
+            .sum::<usize>()
+            > 16 * 1024
+    );
+    store
+        .forge_set_member(
+            &account,
+            &writer,
+            ForgeMember {
+                principal: "observer".into(),
+                can_write: false,
+                can_review: false,
+                is_admin: false,
+                roles: vec![],
+            },
+            PolicyEpoch(3),
+        )
+        .unwrap();
+    handle.expire(&store, 100_000).unwrap();
+    store.gc(&account.repository_id(), 100_001).unwrap();
+    assert!(
+        store
+            .descriptor(
+                &account.repository_id(),
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(head.0)
+                }
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .descriptor(
+                &account.repository_id(),
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(candidate.head)
+                }
+            )
+            .unwrap()
+            .is_some()
+    );
+    drop(handle);
+    drop(store);
+    let reopened = Store::open_existing(directory.path(), config()).unwrap();
+    let readback = reopened
+        .forge_review_operation(&account, &writer, "durable")
+        .unwrap()
+        .unwrap();
+    assert_eq!(readback.patchset_id, pushed.patchset_id);
+    assert_eq!(readback.source_head, head.0);
+    assert_eq!(readback.candidate.unwrap().head, candidate.head);
+}
+
+#[test]
+fn forge_review_projected_base_and_owned_upload_rebase_without_exposing_canonical_history() {
+    let (_directory, store, account, writer, _reviewer, view, _base) = forge_review_fixture();
+    let selected = store
+        .forge_resolve_view(&account, Some(&writer), "all", Some(view))
+        .unwrap();
+    let projection = store.forge_project_view(&selected, 0).unwrap();
+    let projected = CommitId(projection.projected_commit);
+    let head = forge_review_source(
+        &store,
+        &account,
+        projected,
+        &[("visible.txt", b"visible")],
+        5,
+    );
+    let review = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(projected, head, view, "projected"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    assert!(review.candidate.is_some());
+    assert_eq!(review.source_base, projection.projected_commit);
+    assert_ne!(
+        review.candidate.unwrap().target,
+        projection.projected_commit
+    );
+}
+
+#[test]
+fn forge_review_digest_knowledge_without_owned_upload_is_not_write_authority() {
+    let (_directory, store, account, writer, _reviewer, view, base) = forge_review_fixture();
+    let repo = account.repository_id();
+    let file = tinytree_model::describe_file(b"not-supplied-by-view-writer");
+    store
+        .put(&repo, file, b"not-supplied-by-view-writer", 0)
+        .unwrap();
+    let tree = tinytree_model::encode(
+        &Object::Tree(Tree {
+            entries: vec![TreeEntry {
+                name: "guessed.txt".into(),
+                value: TreeValue::File {
+                    id: FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store.put(&repo, tree.descriptor, &tree.bytes, 0).unwrap();
+    let head = CommitId(
+        landing_commit(
+            &store,
+            &repo,
+            base,
+            TreeId(tree.descriptor.key.id.0),
+            5,
+            "guessed reference",
+        )
+        .key
+        .id
+        .0,
+    );
+    assert!(matches!(
+        store.forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "guessed"),
+            &forge_review_signature(),
+            1
+        ),
+        Err(Error::ForgeAccessDenied)
+    ));
+    assert!(
+        store
+            .forge_review_operation(&account, &writer, "guessed")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn forge_review_revoked_policy_epoch_cannot_land_previously_checked_and_approved_candidate() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("visible.txt", b"visible")], 5);
+    let review = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "epoch"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    forge_review_check(&store, &account, &review);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(review.change_id),
+            review.patchset_id,
+            review.candidate.as_ref().unwrap().id,
+            "epoch-approve",
+            2,
+        )
+        .unwrap();
+    store
+        .forge_set_member(
+            &account,
+            &writer,
+            ForgeMember {
+                principal: reviewer.principal.clone(),
+                can_write: false,
+                can_review: false,
+                is_admin: false,
+                roles: vec![],
+            },
+            PolicyEpoch(3),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.forge_land_review(
+            &account,
+            &writer,
+            ChangeId(review.change_id),
+            review.patchset_id,
+            review.candidate.unwrap().id,
+            3
+        ),
+        Err(Error::StaleForgePolicy)
+    ));
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        1
+    );
+}
+
+#[test]
+fn forge_review_explicit_native_rename_and_copy_keep_scoped_provenance_through_rebase() {
+    for rename in [true, false] {
+        let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+        let source =
+            forge_review_source(&store, &account, base, &[("original.txt", b"content")], 4);
+        let first = store
+            .forge_push_review(
+                &account,
+                &writer,
+                &forge_review_request(base, source, view, "seed"),
+                &forge_review_signature(),
+                1,
+            )
+            .unwrap();
+        forge_review_check(&store, &account, &first);
+        store
+            .forge_approve_review(
+                &account,
+                &reviewer,
+                ChangeId(first.change_id),
+                first.patchset_id,
+                first.candidate.as_ref().unwrap().id,
+                "seed-approve",
+                2,
+            )
+            .unwrap();
+        let landed = store
+            .forge_land_review(
+                &account,
+                &writer,
+                ChangeId(first.change_id),
+                first.patchset_id,
+                first.candidate.unwrap().id,
+                3,
+            )
+            .unwrap();
+        let canonical = landed.candidate.unwrap().head;
+        let selected = store
+            .forge_publish_view(
+                &account,
+                &writer,
+                ViewSpec {
+                    name: "all".into(),
+                    root_prefix: "".into(),
+                    include_prefixes: vec!["".into()],
+                    exclude_prefixes: vec![],
+                    visibility: ForgeViewVisibility::Members,
+                    revision: canonical,
+                    export_allowed: true,
+                },
+                PolicyEpoch(3),
+                false,
+            )
+            .unwrap();
+        let projection = store.forge_project_view(&selected, 4).unwrap();
+        let repo = account.repository_id();
+        let (_, bytes) = store
+            .read_metadata(
+                &repo,
+                ObjectKey {
+                    kind: Kind::Tree,
+                    id: ObjectId(projection.projected_tree),
+                },
+            )
+            .unwrap();
+        let Object::Tree(tree) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+            panic!()
+        };
+        let original = tree.entries[0].value.clone();
+        let TreeValue::File {
+            copy_id: Some(parent_copy),
+            ..
+        } = original.clone()
+        else {
+            panic!("sanitized copy seed missing")
+        };
+        let copy = tinytree_model::encode(
+            &Object::CopyHistory(tinytree_model::CopyHistory {
+                current_path: "renamed.txt".into(),
+                parents: vec![parent_copy],
+                salt: vec![9],
+            }),
+            Limits::default(),
+        )
+        .unwrap();
+        store
+            .forge_upload_object(
+                &selected,
+                &writer,
+                "renamed.txt",
+                copy.descriptor,
+                &copy.bytes,
+                4,
+            )
+            .unwrap();
+        let edited = tinytree_model::describe_file(b"edited content");
+        store
+            .forge_upload_file(&selected, &writer, "renamed.txt", b"edited content", 4)
+            .unwrap();
+        let mut entries = if rename {
+            vec![]
+        } else {
+            vec![TreeEntry {
+                name: "original.txt".into(),
+                value: original,
+            }]
+        };
+        entries.push(TreeEntry {
+            name: "renamed.txt".into(),
+            value: TreeValue::File {
+                id: FileId(edited.key.id.0),
+                executable: false,
+                size_bytes: edited.size_bytes,
+                copy_id: Some(tinytree_model::CopyId(copy.descriptor.key.id.0)),
+            },
+        });
+        let tree =
+            tinytree_model::encode(&Object::Tree(Tree { entries }), Limits::default()).unwrap();
+        store
+            .forge_upload_object(&selected, &writer, "", tree.descriptor, &tree.bytes, 4)
+            .unwrap();
+        let head = CommitId(
+            landing_commit(
+                &store,
+                &repo,
+                CommitId(projection.projected_commit),
+                TreeId(tree.descriptor.key.id.0),
+                5,
+                "explicit lineage",
+            )
+            .key
+            .id
+            .0,
+        );
+        let (descriptor, bytes) = store
+            .read_metadata(
+                &repo,
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(head.0),
+                },
+            )
+            .unwrap();
+        store
+            .forge_upload_object(&selected, &writer, "", descriptor, &bytes, 4)
+            .unwrap();
+        let mut request = forge_review_request(
+            CommitId(projection.projected_commit),
+            head,
+            selected.version(),
+            "lineage",
+        );
+        request.lineage = vec![ForgeReviewLineageHint {
+            operation: if rename {
+                ForgeReviewLineageOperation::Rename
+            } else {
+                ForgeReviewLineageOperation::Copy
+            },
+            source_path: "original.txt".into(),
+            target_path: "renamed.txt".into(),
+        }];
+
+        let review = store
+            .forge_push_review(&account, &writer, &request, &forge_review_signature(), 5)
+            .unwrap();
+        assert_eq!(review.lineage, request.lineage);
+        assert!(review.candidate.is_some());
+        forge_review_check(&store, &account, &review);
+        store
+            .forge_approve_review(
+                &account,
+                &reviewer,
+                ChangeId(review.change_id),
+                review.patchset_id,
+                review.candidate.as_ref().unwrap().id,
+                "lineage-approve",
+                6,
+            )
+            .unwrap();
+        let landed = store
+            .forge_land_review(
+                &account,
+                &writer,
+                ChangeId(review.change_id),
+                review.patchset_id,
+                review.candidate.unwrap().id,
+                7,
+            )
+            .unwrap();
+        assert_eq!(landed.state, ForgeReviewState::Landed);
+        let safe = store
+            .forge_project_review_result(
+                &account,
+                &writer,
+                ChangeId(landed.change_id),
+                landed.patchset_id,
+                7,
+            )
+            .unwrap()
+            .unwrap();
+        let (_, bytes, _) = store
+            .forge_read_object_chunk(
+                &selected,
+                None,
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(safe.projected_commit),
+                },
+                7,
+                0,
+                65536,
+            )
+            .unwrap();
+        let Object::Commit(commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(commit.change_id, ChangeId(landed.change_id));
+        assert_eq!(commit.parents, vec![CommitId(projection.projected_commit)]);
+    }
+}
+
+#[test]
+fn forge_review_new_patchset_cannot_reuse_old_candidate_checks_or_approval() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("source.txt", b"first")], 5);
+    let request = forge_review_request(base, head, view, "version-one");
+    let first = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 1)
+        .unwrap();
+    forge_review_check(&store, &account, &first);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            first.candidate.as_ref().unwrap().id,
+            "old-approval",
+            2,
+        )
+        .unwrap();
+    let head = forge_review_source(&store, &account, base, &[("source.txt", b"updated")], 5);
+    let mut next = forge_review_request(base, head, view, "version-two");
+    next.expected_patchset = Some(first.patchset_id);
+    let second = store
+        .forge_push_review(&account, &writer, &next, &forge_review_signature(), 3)
+        .unwrap();
+    assert_eq!(first.change_id, second.change_id);
+    assert_ne!(first.patchset_id, second.patchset_id);
+    assert_eq!(second.approvals, 0);
+    assert!(matches!(
+        store.forge_land_review(
+            &account,
+            &writer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            first.candidate.unwrap().id,
+            4
+        ),
+        Err(Error::StaleForgeReview)
+    ));
+    assert!(matches!(
+        store.forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(second.change_id),
+            second.patchset_id,
+            second.candidate.as_ref().unwrap().id,
+            "old-approval",
+            4
+        ),
+        Err(Error::IdempotencyConflict)
+    ));
+    let replay = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 4)
+        .unwrap();
+    assert_eq!(replay.patchset_id, first.patchset_id);
+    assert!(!replay.is_current);
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        1
+    );
+}
+
+#[test]
+fn forge_review_accepts_owned_native_symlink_metadata_without_digest_only_authority() {
+    let (_directory, store, account, writer, _reviewer, view, base) = forge_review_fixture();
+    let selected = store
+        .forge_resolve_view(&account, Some(&writer), "all", Some(view))
+        .unwrap();
+    let link =
+        tinytree_model::encode(&Object::Symlink("source.txt".into()), Limits::default()).unwrap();
+    store
+        .forge_upload_object(&selected, &writer, "link", link.descriptor, &link.bytes, 0)
+        .unwrap();
+    let tree = tinytree_model::encode(
+        &Object::Tree(Tree {
+            entries: vec![TreeEntry {
+                name: "link".into(),
+                value: TreeValue::Symlink {
+                    id: tinytree_model::SymlinkId(link.descriptor.key.id.0),
+                    target_bytes: 10,
+                },
+            }],
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store
+        .forge_upload_object(&selected, &writer, "", tree.descriptor, &tree.bytes, 0)
+        .unwrap();
+    let head = CommitId(
+        landing_commit(
+            &store,
+            &account.repository_id(),
+            base,
+            TreeId(tree.descriptor.key.id.0),
+            5,
+            "owned symlink",
+        )
+        .key
+        .id
+        .0,
+    );
+    let (descriptor, bytes) = store
+        .read_metadata(
+            &account.repository_id(),
+            ObjectKey {
+                kind: Kind::Commit,
+                id: ObjectId(head.0),
+            },
+        )
+        .unwrap();
+    store
+        .forge_upload_object(&selected, &writer, "", descriptor, &bytes, 0)
+        .unwrap();
+    let review = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "symlink"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    assert!(review.candidate.is_some());
+}
+
+#[test]
+fn forge_review_rejects_another_writers_hash_only_source_commit_without_reserving_change() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let initial = forge_review_source(&store, &account, base, &[("remove.txt", b"visible")], 4);
+    let initial = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, initial, view, "initial"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    forge_review_check(&store, &account, &initial);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(initial.change_id),
+            initial.patchset_id,
+            initial.candidate.as_ref().unwrap().id,
+            "initial-approve",
+            2,
+        )
+        .unwrap();
+    let initial = store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(initial.change_id),
+            initial.patchset_id,
+            initial.candidate.unwrap().id,
+            3,
+        )
+        .unwrap();
+    let victim = ForgeActor {
+        principal: "second-writer".into(),
+    };
+    store
+        .forge_set_member(
+            &account,
+            &writer,
+            ForgeMember {
+                principal: victim.principal.clone(),
+                can_write: true,
+                can_review: false,
+                is_admin: false,
+                roles: vec![],
+            },
+            PolicyEpoch(3),
+        )
+        .unwrap();
+    let selected = store
+        .forge_publish_view(
+            &account,
+            &writer,
+            ViewSpec {
+                name: "all".into(),
+                root_prefix: "".into(),
+                include_prefixes: vec!["".into()],
+                exclude_prefixes: vec![],
+                visibility: ForgeViewVisibility::Members,
+                revision: initial.candidate.unwrap().head,
+                export_allowed: true,
+            },
+            PolicyEpoch(4),
+            false,
+        )
+        .unwrap();
+    let base = CommitId(
+        store
+            .forge_project_view(&selected, 0)
+            .unwrap()
+            .projected_commit,
+    );
+    let empty =
+        tinytree_model::encode(&Object::Tree(Tree { entries: vec![] }), Limits::default()).unwrap();
+    store
+        .forge_upload_object(&selected, &victim, "", empty.descriptor, &empty.bytes, 0)
+        .unwrap();
+    let head = landing_commit(
+        &store,
+        &account.repository_id(),
+        base,
+        TreeId(empty.descriptor.key.id.0),
+        9,
+        "second writer draft",
+    );
+    let (_, bytes) = store
+        .read_metadata(&account.repository_id(), head.key)
+        .unwrap();
+    store
+        .forge_upload_object(&selected, &victim, "", head, &bytes, 0)
+        .unwrap();
+    let request = forge_review_request(
+        base,
+        CommitId(head.key.id.0),
+        selected.version(),
+        "hash-only",
+    );
+    assert!(matches!(
+        store.forge_push_review(&account, &writer, &request, &forge_review_signature(), 1),
+        Err(Error::ForgeAccessDenied)
+    ));
+    assert!(
+        store
+            .forge_review_operation(&account, &writer, "hash-only")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .forge_review(&account, &writer, ChangeId([9; 16]))
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        2
+    );
+
+    let accepted = store
+        .forge_push_review(&account, &victim, &request, &forge_review_signature(), 1)
+        .unwrap();
+    assert_eq!(accepted.owner, victim.principal);
+    assert!(accepted.candidate.is_some());
+}
+
+#[test]
+fn forge_review_delayed_decision_cannot_approve_an_unseen_rebased_candidate() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("a", b"first")], 4);
+    let first = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "first"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let inspected = first.candidate.unwrap().id;
+    let head = forge_review_source(&store, &account, base, &[("b", b"other")], 5);
+    let other = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "other"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    forge_review_check(&store, &account, &other);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(other.change_id),
+            other.patchset_id,
+            other.candidate.as_ref().unwrap().id,
+            "other-approve",
+            2,
+        )
+        .unwrap();
+    store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(other.change_id),
+            other.patchset_id,
+            other.candidate.unwrap().id,
+            3,
+        )
+        .unwrap();
+    let refreshed = store
+        .forge_prepare_review(
+            &account,
+            &writer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            4,
+        )
+        .unwrap();
+    let current = refreshed.candidate.unwrap().id;
+    assert_ne!(current, inspected);
+    assert!(matches!(
+        store.forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            inspected,
+            "delayed-approve",
+            4
+        ),
+        Err(Error::StaleForgeReview)
+    ));
+    assert_eq!(
+        store
+            .forge_review(&account, &reviewer, ChangeId(first.change_id))
+            .unwrap()
+            .approvals,
+        0
+    );
+    let approved = store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(first.change_id),
+            first.patchset_id,
+            current,
+            "delayed-approve",
+            4,
+        )
+        .unwrap();
+    assert_eq!(approved.approvals, 1);
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        2
+    );
+}
+
+#[test]
+fn forge_review_expired_checked_predecessor_cannot_be_landed_by_a_newer_child() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("a", b"parent")], 4);
+    let parent = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "parent"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let head = forge_review_source(
+        &store,
+        &account,
+        head,
+        &[("a", b"parent"), ("b", b"child")],
+        5,
+    );
+    let mut request = forge_review_request(CommitId(parent.source_head), head, view, "child");
+    request.predecessor = Some(ForgeReviewDependency {
+        change_id: parent.change_id,
+        patchset_id: parent.patchset_id,
+    });
+    let child = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 2)
+        .unwrap();
+    let parent_handle = forge_review_check(&store, &account, &parent);
+    let child_handle = forge_review_check(&store, &account, &child);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(parent.change_id),
+            parent.patchset_id,
+            parent.candidate.as_ref().unwrap().id,
+            "parent-approve",
+            3,
+        )
+        .unwrap();
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(child.change_id),
+            child.patchset_id,
+            child.candidate.as_ref().unwrap().id,
+            "child-approve",
+            3,
+        )
+        .unwrap();
+    let expired_at = parent_handle.status(&store).unwrap().expires_at;
+    assert!(child_handle.status(&store).unwrap().expires_at > expired_at);
+    assert_eq!(
+        parent_handle.status(&store).unwrap().state,
+        LandingState::Checked
+    );
+    assert!(
+        store
+            .forge_land_review(
+                &account,
+                &writer,
+                ChangeId(child.change_id),
+                child.patchset_id,
+                child.candidate.unwrap().id,
+                expired_at
+            )
+            .is_err()
+    );
+    assert_eq!(
+        parent_handle.status(&store).unwrap().state,
+        LandingState::Checked,
+        "test does not rely on expiry worker transition"
+    );
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        1
+    );
+}
+
+#[test]
+fn forge_review_child_current_profile_does_not_replace_predecessors_profile_obligation() {
+    let (_directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let head = forge_review_source(&store, &account, base, &[("a", b"parent")], 4);
+    let parent = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &forge_review_request(base, head, view, "old-profile-parent"),
+            &forge_review_signature(),
+            1,
+        )
+        .unwrap();
+    let head = forge_review_source(
+        &store,
+        &account,
+        head,
+        &[("a", b"parent"), ("b", b"child")],
+        5,
+    );
+    let mut request = forge_review_request(
+        CommitId(parent.source_head),
+        head,
+        view,
+        "new-profile-child",
+    );
+    request.predecessor = Some(ForgeReviewDependency {
+        change_id: parent.change_id,
+        patchset_id: parent.patchset_id,
+    });
+    request.check_profile.version = "v2".into();
+    let child = store
+        .forge_push_review(&account, &writer, &request, &forge_review_signature(), 2)
+        .unwrap();
+    forge_review_check(&store, &account, &parent);
+    forge_review_check(&store, &account, &child);
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(parent.change_id),
+            parent.patchset_id,
+            parent.candidate.as_ref().unwrap().id,
+            "old-profile-approve",
+            3,
+        )
+        .unwrap();
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(child.change_id),
+            child.patchset_id,
+            child.candidate.as_ref().unwrap().id,
+            "new-profile-approve",
+            3,
+        )
+        .unwrap();
+    assert!(
+        store
+            .forge_land_review(
+                &account,
+                &writer,
+                ChangeId(child.change_id),
+                child.patchset_id,
+                child.candidate.unwrap().id,
+                4
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()[0]
+            .generation,
+        1
+    );
+}
+
 #[test]
 fn landing_restart_check_finalize_and_historical_replay_are_exact_and_atomic() {
     let (directory, store) = open();
@@ -13591,3 +15460,187 @@ fn latest_capture_does_not_select_history_only_versions() {
         1
     );
 }
+
+#[test]
+fn forge_review_concurrent_product_lands_have_one_winner_and_durable_stale_replay() {
+    let (directory, store, account, writer, reviewer, view, base) = forge_review_fixture();
+    let repo = account.repository_id();
+    let observed = store.references(&repo, &["main".into()]).unwrap().remove(0);
+    let mut reviews = Vec::new();
+    for (token, path, content, change) in [
+        ("race-first", "first.txt", b"first".as_slice(), 41),
+        ("race-second", "second.txt", b"second".as_slice(), 42),
+    ] {
+        let head = forge_review_source(&store, &account, base, &[(path, content)], change);
+        let review = store
+            .forge_push_review(
+                &account,
+                &writer,
+                &forge_review_request(base, head, view, token),
+                &forge_review_signature(),
+                1,
+            )
+            .unwrap();
+        let candidate = review.candidate.as_ref().unwrap();
+        assert_eq!(candidate.target, observed.commit.unwrap().key.id.0);
+        assert_eq!(candidate.target_generation, observed.generation);
+        forge_review_check(&store, &account, &review);
+        let approved = store
+            .forge_approve_review(
+                &account,
+                &reviewer,
+                ChangeId(review.change_id),
+                review.patchset_id,
+                candidate.id,
+                &format!("approve-{token}"),
+                2,
+            )
+            .unwrap();
+        assert_eq!(approved.state, ForgeReviewState::ReadyToLand);
+        reviews.push((token.to_owned(), review));
+    }
+    assert_ne!(
+        reviews[0].1.candidate.as_ref().unwrap().head,
+        reviews[1].1.candidate.as_ref().unwrap().head
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let threads = reviews
+        .iter()
+        .map(|(token, review)| {
+            let store = store.clone();
+            let account = account.clone();
+            let writer = writer.clone();
+            let barrier = barrier.clone();
+            let review = review.clone();
+            let token = format!("land-{token}");
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .forge_land_review_request(
+                        &account,
+                        &writer,
+                        ChangeId(review.change_id),
+                        review.patchset_id,
+                        review.candidate.unwrap().id,
+                        &token,
+                        3,
+                    )
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|review| review.state == ForgeReviewState::Landed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|review| review.state == ForgeReviewState::Stale)
+            .count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find(|review| review.state == ForgeReviewState::Landed)
+        .unwrap();
+    let main = store.references(&repo, &["main".into()]).unwrap().remove(0);
+    assert_eq!(
+        main.generation,
+        observed.generation + 1,
+        "only one main publication"
+    );
+    assert_eq!(
+        main.commit.unwrap().key.id.0,
+        winner.candidate.as_ref().unwrap().head
+    );
+    let (_, bytes) = store
+        .read_metadata(&repo, main.commit.unwrap().key)
+        .unwrap();
+    let Object::Commit(commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!("main is not a commit")
+    };
+    assert_eq!(
+        commit.parents,
+        vec![CommitId(observed.commit.unwrap().key.id.0)],
+        "winner remains single-parent"
+    );
+    drop(store);
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    for ((token, original), expected) in reviews.iter().zip(results.iter()) {
+        assert_eq!(
+            store
+                .forge_review(&account, &writer, ChangeId(original.change_id))
+                .unwrap(),
+            *expected
+        );
+        assert_eq!(
+            store
+                .forge_review_operation(&account, &writer, &format!("land-{token}"))
+                .unwrap()
+                .unwrap(),
+            *expected
+        );
+        assert_eq!(
+            store
+                .forge_land_review_request(
+                    &account,
+                    &writer,
+                    ChangeId(original.change_id),
+                    original.patchset_id,
+                    original.candidate.as_ref().unwrap().id,
+                    &format!("land-{token}"),
+                    4,
+                )
+                .unwrap(),
+            *expected,
+            "exact land retry preserves winner/stale disposition"
+        );
+    }
+    assert_eq!(
+        store.references(&repo, &["main".into()]).unwrap().remove(0),
+        main,
+        "restart and replays never publish again"
+    );
+}
+
+#[test]
+fn forge_scoped_subtree_upload_preserves_nested_projected_copy_context() {
+    let directory = tempfile::tempdir().unwrap(); let store = Store::open(directory.path(), config()).unwrap();
+    let account = AccountId("nested-upload".into()); let actor = ForgeActor { principal: "owner".into() };
+    store.forge_provision_account(&account, &actor).unwrap(); let repo = account.repository_id();
+    let old = forge_fixture(&store, &account);
+    let (_, bytes) = store.read_metadata(&repo, ObjectKey { kind:Kind::Commit,id:ObjectId(old.0) }).unwrap();
+    let Object::Commit(mut canonical) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("commit") };
+    let wrapped = tinytree_model::encode(&Object::Tree(Tree { entries:vec![TreeEntry { name:"vendor".into(),value:TreeValue::Tree(canonical.root_tree.terms[0]) }] }), Limits::default()).unwrap();
+    store.put(&repo, wrapped.descriptor, &wrapped.bytes, 0).unwrap(); canonical.root_tree.terms = vec![TreeId(wrapped.descriptor.key.id.0)];
+    let source = tinytree_model::encode(&Object::Commit(canonical), Limits::default()).unwrap(); store.put(&repo, source.descriptor, &source.bytes, 0).unwrap();
+    let view = store.forge_publish_view(&account, &actor, forge_public_view(CommitId(source.descriptor.key.id.0)), PolicyEpoch(1), true).unwrap();
+    let projection = store.forge_project_view(&view, 0).unwrap();
+    let (_, bytes) = store.read_metadata(&repo, ObjectKey { kind:Kind::Tree,id:ObjectId(projection.projected_tree) }).unwrap();
+    let Object::Tree(root) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("tree") };
+    let TreeValue::Tree(vendor) = root.entries[0].value else { panic!("vendor subtree") };
+    let (_, bytes) = store.read_metadata(&repo, ObjectKey { kind:Kind::Tree,id:ObjectId(vendor.0) }).unwrap();
+    let Object::Tree(mut subtree) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("tree") };
+    assert!(subtree.entries.iter().any(|entry|matches!(entry.value,TreeValue::File { copy_id:Some(_),.. })));
+    let edited = tinytree_model::describe_file(b"edited nested source\n"); store.forge_upload_file(&view, &actor, "vendor/edited.txt", b"edited nested source\n", 0).unwrap();
+    subtree.entries.push(TreeEntry { name:"edited.txt".into(),value:TreeValue::File { id:FileId(edited.key.id.0),size_bytes:edited.size_bytes,executable:false,copy_id:None } });subtree.entries.sort_by(|a,b|a.name.cmp(&b.name));
+    let subtree = tinytree_model::encode(&Object::Tree(subtree), Limits::default()).unwrap();
+    assert!(matches!(store.forge_upload_object(&view,&actor,"wrong",subtree.descriptor,&subtree.bytes,0),Err(Error::ForgeAccessDenied)));
+    store.forge_upload_object(&view,&actor,"vendor",subtree.descriptor,&subtree.bytes,0).unwrap();
+    assert!(matches!(store.inner.closure(&repo,[subtree.descriptor.key],true,false),Err(Error::Invalid("copy history current path"))),"ordinary repository-root validation remains strict");
+    let root = tinytree_model::encode(&Object::Tree(Tree { entries:vec![TreeEntry { name:"vendor".into(),value:TreeValue::Tree(TreeId(subtree.descriptor.key.id.0)) }] }),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"",root.descriptor,&root.bytes,0).unwrap();
+    let mut authored = commit(TreeId(root.descriptor.key.id.0),"edit existing nested directory");authored.parents=vec![CommitId(projection.projected_commit)];
+    let authored = tinytree_model::encode(&Object::Commit(authored),Limits::default()).unwrap();store.forge_upload_object(&view,&actor,"",authored.descriptor,&authored.bytes,0).unwrap();
+    assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),authored.descriptor.key,0,4096).unwrap(),authored.bytes);
+}
+

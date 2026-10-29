@@ -24,6 +24,7 @@ fn profile(mode: Mode) -> Profile {
     Profile {
         name: "unit".into(),
         repositories: vec!["example".into()],
+        forge_accounts: false,
         store: "example".into(),
         mode,
         targets: vec!["//app:unit".into()],
@@ -479,5 +480,65 @@ async fn dropping_a_check_handle_cancels_without_releasing_live_ownership() {
         fs::metadata(&heartbeat).unwrap().len(),
         before,
         "cancelled physical child must stop before owner releases"
+    );
+}
+
+#[test]
+fn forge_check_derivation_binds_actual_repository_and_isolates_daemon_state() {
+    let mut config: Config = toml::from_str(include_str!("../example.toml")).unwrap();
+    config.profiles[0].forge_accounts = true;
+    config.profiles[0].store = "template".into();
+    let mut request = request();
+    request.profile_name = config.profiles[0].name.clone();
+    request.repository_id = "forge-review-team".into();
+    let template = br#"state_dir="/unused/template-state"
+[native.repositories.template]
+checker_forge_accounts=true
+[native.repositories.template.remote.remote]
+endpoint="http://127.0.0.1:1"
+repository_id="template"
+[native.repositories.unrelated]
+max_file_bytes=4096
+"#;
+    let (_temporary, root) = private_fixture();
+    let derived = runner::derived_daemon(&config, &request, root.path(), template).unwrap();
+    let parsed: toml::Value = toml::from_str(std::str::from_utf8(&derived).unwrap()).unwrap();
+    let repositories = parsed["native"]["repositories"].as_table().unwrap();
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(
+        repositories["forge-review-team"]["remote"]["remote"]["repository_id"].as_str(),
+        Some("forge-review-team")
+    );
+    assert_eq!(
+        repositories["forge-review-team"]["remote"]["remote"]["endpoint"].as_str(),
+        Some("http://127.0.0.1:1")
+    );
+    assert_eq!(parsed["state_dir"].as_str(), root.path().join("d").to_str());
+    assert_eq!(
+        parsed["native"]["workspaces"]["registry_path"].as_str(),
+        root.path().join("daemon-registry").to_str()
+    );
+    assert_eq!(
+        parsed["native"]["workspaces"]["capture"]["policy"].as_str(),
+        Some("disabled")
+    );
+    assert_eq!(
+        derived,
+        runner::derived_daemon(&config, &request, root.path(), template).unwrap()
+    );
+    let disabled = String::from_utf8(template.to_vec()).unwrap().replace(
+        "checker_forge_accounts=true",
+        "checker_forge_accounts=false",
+    );
+    assert!(runner::derived_daemon(&config, &request, root.path(), disabled.as_bytes()).is_err());
+    let scoped = String::from_utf8(template.to_vec()).unwrap().replace(
+        "checker_forge_accounts=true",
+        "checker_forge_accounts=true\nforge={account_id=\"other\"}",
+    );
+    assert!(runner::derived_daemon(&config, &request, root.path(), scoped.as_bytes()).is_err());
+    config.profiles[0].forge_accounts = false;
+    assert_eq!(
+        runner::derived_daemon(&config, &request, root.path(), template).unwrap(),
+        template
     );
 }

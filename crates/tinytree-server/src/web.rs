@@ -33,6 +33,7 @@ pub(crate) fn routes(service: RepositoryService, port: Option<u16>) -> Routes {
         .add_service(service.query_grpc_service())
         .add_service(service.cloud_grpc_service())
         .add_service(service.landing_grpc_service())
+        .add_service(service.forge_grpc_service())
         .into_axum_router();
     grpc.merge(browser_routes(service, port)).into()
 }
@@ -52,6 +53,7 @@ fn browser_routes(service: RepositoryService, port: Option<u16>) -> Router {
         .route("/ui/app.js", get(script))
         .route("/ui/style.css", get(styles))
         .route("/ui/tinytree_ui.wasm", get(wasm))
+        .route("/ui/api/forge", post(forge_call))
         .route("/ui/api/repositories", post(repositories))
         .route("/ui/api/snapshot", post(snapshot))
         .route("/ui/api/file", post(file))
@@ -101,6 +103,7 @@ fn error(status: Status) -> HttpResponse {
         tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::Unimplemented | tonic::Code::FailedPrecondition => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -119,11 +122,7 @@ fn json_response(value: Value) -> HttpResponse {
 // No cookies, ambient credentials, CORS or token-bearing URLs. Requiring JSON
 // and checking Origin/Fetch Metadata blocks cross-site form and fetch reads.
 // Anonymous local access additionally rejects rebinding through a foreign Host.
-fn browser_identity(
-    state: &WebState,
-    headers: &HeaderMap,
-    uri: &http::Uri,
-) -> Result<Identity, Status> {
+fn browser_origin(state: &WebState, headers: &HeaderMap, uri: &http::Uri) -> Result<(), Status> {
     let header_host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     let uri_host = uri.authority().map(|a| a.as_str());
     if header_host
@@ -177,8 +176,64 @@ fn browser_identity(
             ));
         }
     }
+    Ok(())
+}
+fn browser_identity(
+    state: &WebState,
+    headers: &HeaderMap,
+    uri: &http::Uri,
+) -> Result<Identity, Status> {
+    browser_origin(state, headers, uri)?;
     let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
     state.service.inner.auth.identify(&metadata)
+}
+async fn forge_call(State(state): State<WebState>, request: HttpRequest) -> HttpResponse {
+    let result = async {
+        // Public views may be anonymous. Origin/Host safeguards still apply;
+        // Forge ingress, not the legacy local-owner shortcut, resolves identity.
+        browser_origin(&state, request.headers(), request.uri())?;
+        if request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(str::trim)
+            != Some("application/json")
+        {
+            return Err(Status::invalid_argument(
+                "browser API requires application/json",
+            ));
+        }
+        let headers = request.headers().clone();
+        let work = crate::forge::admit_http(&state.service, &headers).await?;
+        let deadline = work.deadline;
+        let bytes = tokio::time::timeout_at(
+            deadline,
+            to_bytes(
+                request.into_body(),
+                MAX_BODY.min(state.service.inner.config.max_request_bytes),
+            ),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("browser request deadline exceeded"))?
+        .map_err(|_| Status::resource_exhausted("browser request exceeds byte budget"))?;
+        let input = serde_json::from_slice::<crate::forge::ForgeHttpRequest>(&bytes)
+            .map_err(|_| Status::invalid_argument("invalid browser forge request"))?;
+        let value =
+            crate::forge::call_http_admitted(state.service, &headers, input, work.clone()).await?;
+        Ok::<_, Status>((value, work))
+    }
+    .await;
+    match result {
+        Ok((value, work)) => {
+            let mut response = json_response(value);
+            response
+                .extensions_mut()
+                .insert(crate::body_deadline::ResponseBudget::new(work));
+            response
+        }
+        Err(status) => error(status),
+    }
 }
 async fn input<T: serde::de::DeserializeOwned>(
     state: &WebState,
@@ -818,6 +873,366 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
     use axum::body::Body;
+
+    /// Manual provider for a real browser rendering the production embedded UI.
+    /// The parent owns browser actions/evidence and stops this disposable server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual real-browser provider; requires an explicit private readiness path"]
+    async fn forge_browser_provider_acceptance() -> anyhow::Result<()> {
+        use anyhow::{Context as _, ensure};
+        let ready = std::path::PathBuf::from(
+            std::env::var("TINYTREE_BROWSER_READY")
+                .context("explicit private TINYTREE_BROWSER_READY path required")?,
+        );
+        ensure!(
+            ready.is_absolute(),
+            "browser readiness path must be absolute"
+        );
+        let parent = private_fs::PrivateDir::open_existing(
+            ready.parent().context("readiness parent required")?,
+        )?;
+        let name = ready.file_name().context("readiness filename required")?;
+        let stop = ready.with_file_name(format!(
+            "{}.stop",
+            name.to_str().context("UTF-8 readiness filename required")?
+        ));
+        ensure!(
+            !ready.exists() && !stop.exists(),
+            "browser readiness/stop paths must be fresh"
+        );
+        let (_directory, store, account, actor, view) = crate::forge_accounts::tests::fixture();
+        store.forge_publish_view(
+            &account,
+            &actor,
+            tinytree_store::ViewSpec {
+                name: "locked".into(),
+                root_prefix: String::new(),
+                include_prefixes: vec![String::new()],
+                exclude_prefixes: vec![],
+                visibility: tinytree_store::ForgeViewVisibility::Members,
+                revision: view.revision().0,
+                export_allowed: false,
+            },
+            view.epoch(),
+            false,
+        )?;
+        let service = RepositoryService::new(
+            store,
+            ServiceConfig::default(),
+            vec![],
+            vec![Principal::new_forge(actor.principal, TOKEN)?],
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(crate::serve_tcp(listener, service, None, async {
+            let _ = receiver.await;
+        }));
+        let result=async {
+            // A genuine authenticated Forge RPC establishes readiness before a
+            // browser receives its URL; no local-owner identity is involved.
+            let channel=tonic::transport::Endpoint::from_shared(endpoint.clone())?.connect().await?;
+            let mut client=tinytree_proto::forge_v1::forge_client::ForgeClient::new(channel);
+            let mut request=tonic::Request::new(tinytree_proto::forge_v1::ForgeCallRequest{operation:tinytree_proto::forge_v1::ForgeOperation::GetAccount as i32,account_id:account.0.clone(),view:"public".into(),request_id:String::new(),payload_json:b"{}".to_vec()});
+            request.metadata_mut().insert("authorization",format!("Bearer {TOKEN}").parse()?);
+            client.call(request).await?;
+            parent.replace(name,&serde_json::to_vec_pretty(&json!({"schema_version":1,"state":"ready","url":format!("{endpoint}/ui/?account={}&view=public",account.0),"endpoint":endpoint,"account_id":account.0,"public_view":"public","locked_view":"locked","private_path":"private.txt","search_query":"needle","expected_search_path":"source.rs","public_fixture_token":TOKEN,"stop_file":stop,"maximum_lifetime_seconds":300}))?)?;
+            let deadline=Instant::now()+Duration::from_secs(300);
+            loop {
+                match std::fs::symlink_metadata(&stop) {
+                    Ok(meta)=>{ensure!(meta.is_file()&&!meta.file_type().is_symlink(),"stop signal must be a regular file");break;}
+                    Err(error)if error.kind()==std::io::ErrorKind::NotFound=>(),
+                    Err(error)=>return Err(error.into()),
+                }
+                ensure!(Instant::now()<deadline,"browser provider window expired without explicit stop; no browser acceptance claimed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        let _ = sender.send(());
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .context("browser provider service drain timed out")???;
+        result
+    }
+
+    #[tokio::test]
+    async fn forge_browser_body_collection_obeys_the_admitted_short_deadline() {
+        let (_directory, service, _) = setup(b"# Example", false, true);
+        let body = Body::from_stream(async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::from_static(b"{}"));
+        });
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/ui/api/forge")
+            .header("host", "localhost:8093")
+            .header("origin", "http://localhost:8093")
+            .header("content-type", "application/json")
+            .header("grpc-timeout", "20m")
+            .body(body)
+            .unwrap();
+        let response = browser_routes(service, Some(8093))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn forge_browser_public_entry_and_locked_view_follow_current_policy() {
+        let (_directory, store, account, actor, view) = crate::forge_accounts::tests::fixture();
+        let mut config = ServiceConfig::default();
+        config.max_inflight = 1;
+        config.max_inflight_per_repository = 1;
+        let service = RepositoryService::new(
+            store.clone(),
+            config,
+            vec![],
+            vec![Principal::new_forge(actor.principal.clone(), TOKEN).unwrap()],
+        )
+        .unwrap();
+        let envelope = |operation: &str, payload: Value| json!({"operation":operation,"account_id":account.0,"view":"public","request_id":"browser-read","payload":payload});
+        let (status, snapshot) = api(
+            &service,
+            "forge",
+            envelope("resolve_view", json!({})),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{snapshot}");
+        assert_eq!(snapshot["result"]["readme"]["path"], "README.md");
+        assert_eq!(
+            snapshot["result"]["paths"],
+            json!(["README.md", "source.rs"])
+        );
+        let (status, search) = api(
+            &service,
+            "forge",
+            envelope("search", json!({"query":"needle","regex":false,"limit":10})),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{search}");
+        assert_eq!(search["result"]["matches"].as_array().unwrap().len(), 1);
+        let (status, _) = api(
+            &service,
+            "forge",
+            envelope("read_file", json!({"path":"private.txt"})),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let spec = tinytree_store::ViewSpec {
+            name: "public".into(),
+            root_prefix: String::new(),
+            include_prefixes: vec![String::new()],
+            exclude_prefixes: vec!["private.txt".into()],
+            visibility: tinytree_store::ForgeViewVisibility::Members,
+            revision: view.revision().0,
+            export_allowed: true,
+        };
+        store
+            .forge_publish_view(&account, &actor, spec.clone(), view.epoch(), false)
+            .unwrap();
+        let (status, _) = api(
+            &service,
+            "forge",
+            envelope("resolve_view", json!({})),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, locked) =
+            api(&service, "forge", envelope("resolve_view", json!({})), true).await;
+        assert_eq!(status, StatusCode::OK, "{locked}");
+        // Even authenticated product users cannot use the raw repository browser.
+        let (status, _) = api(
+            &service,
+            "snapshot",
+            json!({"repository":account.repository_id()}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn forge_browser_warmed_private_reads_recheck_membership_after_revocation() {
+        let (_directory, store, account, owner, public) = crate::forge_accounts::tests::fixture();
+        let member = tinytree_store::ForgeActor {
+            principal: "member".into(),
+        };
+        let locked = store
+            .forge_publish_view(
+                &account,
+                &owner,
+                tinytree_store::ViewSpec {
+                    name: "locked".into(),
+                    root_prefix: String::new(),
+                    include_prefixes: vec![String::new()],
+                    exclude_prefixes: vec![],
+                    visibility: tinytree_store::ForgeViewVisibility::Members,
+                    revision: public.revision().0,
+                    export_allowed: false,
+                },
+                public.epoch(),
+                false,
+            )
+            .unwrap();
+        let policy = store
+            .forge_set_member(
+                &account,
+                &owner,
+                tinytree_store::ForgeMember {
+                    principal: member.principal.clone(),
+                    can_write: false,
+                    can_review: false,
+                    is_admin: false,
+                    roles: vec![],
+                },
+                locked.epoch(),
+            )
+            .unwrap();
+        let service = RepositoryService::new(
+            store.clone(),
+            ServiceConfig::default(),
+            vec![],
+            vec![
+                Principal::new_forge(
+                    owner.principal.clone(),
+                    "owner-browser-fixture-not-a-secret",
+                )
+                .unwrap(),
+                Principal::new_forge(member.principal, TOKEN).unwrap(),
+            ],
+        )
+        .unwrap();
+        async fn call(
+            service: &RepositoryService,
+            account: &str,
+            token: &str,
+            operation: &str,
+            payload: Value,
+        ) -> (StatusCode, Value) {
+            let request = HttpRequest::builder().method("POST").uri("/ui/api/forge")
+                .header("host", "localhost:8093").header("origin", "http://localhost:8093")
+                .header("content-type", "application/json").header("authorization", format!("Bearer {token}"))
+                .body(Body::from(json!({"operation":operation,"account_id":account,"view":"locked","request_id":format!("membership-proof-{operation}"),"payload":payload}).to_string())).unwrap();
+            let response = browser_routes(service.clone(), Some(8093))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4 * MAX_FILE).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+        let repositories = store.forge_account_repositories(10).unwrap();
+        let owner_token = "owner-browser-fixture-not-a-secret";
+        assert_eq!(
+            call(
+                &service,
+                &account.0,
+                owner_token,
+                "provision_account",
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &service,
+                &account.0,
+                owner_token,
+                "provision_account",
+                json!({"repository_id":"second-monorepo"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.forge_account_repositories(10).unwrap(), repositories);
+        let (status, snapshot) = call(&service, &account.0, TOKEN, "resolve_view", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{snapshot}");
+        let version = snapshot["result"]["view_version"].clone();
+        let private = tinytree_model::describe_file(b"secret needle\n");
+        let requests = [
+            ("read_file", json!({"version":version,"path":"private.txt"})),
+            (
+                "read_object",
+                json!({"version":version,"kind":tinytree_model::Kind::File as u8,"id":private.key.id.0}),
+            ),
+            (
+                "search",
+                json!({"version":version,"query":"secret","regex":false,"limit":10}),
+            ),
+        ];
+        for (operation, payload) in &requests {
+            let (status, result) =
+                call(&service, &account.0, TOKEN, operation, payload.clone()).await;
+            assert_eq!(status, StatusCode::OK, "warm {operation}: {result}");
+            if *operation == "search" {
+                assert_eq!(result["result"]["matches"][0]["path"], "private.txt");
+            }
+        }
+        let projected = json!({"version":version,"kind":tinytree_model::Kind::Commit as u8,"id":snapshot["result"]["projected_commit"]});
+        assert_eq!(
+            call(
+                &service,
+                &account.0,
+                TOKEN,
+                "read_object",
+                projected.clone()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        store
+            .forge_remove_member(&account, &owner, "member", policy.epoch)
+            .unwrap();
+        for (operation, payload) in &requests {
+            assert_eq!(
+                call(&service, &account.0, TOKEN, operation, payload.clone())
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "revoked {operation}"
+            );
+        }
+        assert_eq!(
+            call(&service, &account.0, TOKEN, "read_object", projected)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let owner_token = "owner-browser-fixture-not-a-secret";
+        assert_eq!(
+            call(
+                &service,
+                &account.0,
+                owner_token,
+                "resolve_view",
+                json!({"version":version})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        for (operation, payload) in &requests {
+            let (status, result) = call(
+                &service,
+                &account.0,
+                owner_token,
+                operation,
+                payload.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "owner {operation}: {result}");
+        }
+    }
 
     #[tokio::test]
     async fn browser_reads_readme_paths_and_literal_matches_at_exact_revision() {

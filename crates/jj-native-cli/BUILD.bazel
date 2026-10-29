@@ -16,6 +16,51 @@ rust_binary(
     deps = all_crate_deps(normal = True),
 )
 
+# Product CLI uses the same native Store, command fence and lazy working copy.
+rust_binary(
+    name = "tt",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["forge-cli"],
+    crate_name = "tt",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "forge_unit_tests",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_features = ["forge-cli"],
+    crate_name = "tt",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+
+rust_test(
+    name = "forge_cli_tests",
+    srcs = ["tests/cli.rs"],
+    aliases = aliases(),
+    crate_features = ["forge-cli"],
+    data = [":tt", ":protocol_fixture", "//crates/tinytree-server:checker_fixture"],
+    edition = "2024",
+    args = ["forge_product_"],
+    env = {
+        "FORGE_TEST_TOKEN": "public-forge-fixture-token-not-a-secret",
+        "FORGE_TWO_CHECKER_TOKEN": "public-two-account-checker-token-not-a-secret",
+    },
+    rustc_env = {
+        "TINYTREE_CHECKER_FIXTURE": "$(rootpath //crates/tinytree-server:checker_fixture)",
+        "CARGO_BIN_EXE_tt": "$(rootpath :tt)",
+        "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :protocol_fixture)",
+    },
+    deps = all_crate_deps(normal_dev = True),
+)
+
 # Actual native implementation with process-kill gates, never a materialized fixture.
 rust_binary(
     name = "landing_fault_driver",
@@ -160,4 +205,41 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# Shipped tt workflow on a real Linux mount. The declared checker subprocess is
+# an orchestration fixture, not evidence of real Bazel/RBE execution.
+rust_test(
+    name = "forge_mount_fixture",
+    srcs = ["tests/mounted.rs"],
+    aliases = aliases(),
+    crate_features = ["forge-cli"],
+    data = [
+        ":tt",
+        ":landing_fault_driver",
+        "//crates/workspace-daemon:workspace",
+        "//crates/tinytree-server:checker_fixture",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_BIN_EXE_tinytree-jj": "$(rootpath :tt)",
+        "CARGO_BIN_EXE_landing_fault_driver": "$(rootpath :landing_fault_driver)",
+        "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
+        "TINYTREE_CHECKER_FIXTURE": "$(rootpath //crates/tinytree-server:checker_fixture)",
+    },
+    tags = ["manual"],
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "forge_mounted_tests",
+    binary = ":forge_mount_fixture",
+    args = [
+        "--ignored",
+        "forge_product_mounted_push_check_land_reconcile_preserves_iteration",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ],
+    tags = ["local", "manual"],
 )

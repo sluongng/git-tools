@@ -404,11 +404,19 @@ impl NativeCapture {
     }
 }
 
+fn is_false(value: &bool) -> bool { !*value }
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NativeRepository {
+    /// Permit an operator checker to derive an exact account-specific raw provider.
+    #[serde(skip_serializing_if = "is_false")]
+    pub checker_forge_accounts: bool,
     /// Optional remote provider; paths and authorization are trusted host inputs.
     pub remote: Option<jj_native_remote::Config>,
+    /// Account/view projection provider. It cannot publish raw native refs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forge: Option<native_broker::ForgeRemoteConfig>,
     pub max_repository_bytes: u64,
     pub max_file_bytes: u64,
     pub max_objects_per_repository: u64,
@@ -420,6 +428,8 @@ impl Default for NativeRepository {
         let defaults = jj_native_backend::Config::default().store;
         Self {
             remote: None,
+            forge: None,
+            checker_forge_accounts: false,
             max_repository_bytes: defaults.max_repository_bytes,
             max_file_bytes: defaults.max_file_bytes,
             max_objects_per_repository: defaults.max_objects_per_repository,
@@ -429,6 +439,26 @@ impl Default for NativeRepository {
     }
 }
 impl NativeRepository {
+    pub(crate) fn transport(&self) -> Option<&tinytree_client::Config> {
+        self.remote.as_ref().map(|r| &r.remote).or_else(|| self.forge.as_ref().map(|f| &f.client))
+    }
+    pub(crate) fn is_remote(&self) -> bool { self.remote.is_some() || self.forge.is_some() }
+    pub(crate) fn creation_description(&self, settings: &NativeWorkspaces, identity: [u8;32], query: bool) -> native_broker::ProviderDescription {
+        if self.forge.is_none() { return settings.creation_description(identity,self.remote.is_some(),query); }
+        let mut projected = settings.clone();
+        projected.index_mode = NativeIndexMode::Legacy;
+        let mut description = projected.creation_description(identity,false,false);
+        let policy = description.creation_policy.as_mut().expect("configured creation policy");
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"forge-projection-creation-v1\0");
+        hash.update(&policy.digest);
+        policy.digest = *hash.finalize().as_bytes();
+        policy.capture_enabled = false;
+        policy.upload_enabled = false;
+        policy.auto_capture = false;
+        policy.auto_upload = false;
+        description
+    }
     pub(crate) fn materialize(&self) -> jj_native_backend::Config {
         let mut config = jj_native_backend::Config::default();
         config.store.max_repository_bytes = self.max_repository_bytes;
@@ -439,6 +469,13 @@ impl NativeRepository {
         config
     }
     fn validate(&self) -> Result<()> {
+        ensure!(!self.checker_forge_accounts || (self.remote.is_some() && self.forge.is_none()), "checker Forge template requires a raw remote provider");
+        ensure!(self.remote.is_none() || self.forge.is_none(), "raw remote and Forge projection cannot share an alias");
+        if let Some(forge) = &self.forge {
+            forge.validate().map_err(|_| anyhow::anyhow!("invalid Forge projection configuration"))?;
+            ensure!(forge.view_version.is_some(),
+                "Forge provider aliases require an immutable view version; create a new alias to select a new snapshot");
+        }
         if let Some(remote) = &self.remote {
             remote
                 .validate()
@@ -493,7 +530,7 @@ impl Native {
                     && self
                         .repositories
                         .values()
-                        .all(|repository| repository.remote.is_none()),
+                        .all(|repository| !repository.is_remote()),
                 "local-complete collection requires one fully local repository alias"
             );
         }
@@ -502,9 +539,8 @@ impl Native {
             "too many native repository aliases"
         );
         for (alias, repo) in &self.repositories {
-            let policy = self
-                .workspaces
-                .creation_description([1; 32], repo.remote.is_some(), repo.remote.is_some())
+            let policy = repo
+                .creation_description(&self.workspaces, [1; 32], repo.remote.is_some())
                 .creation_policy
                 .expect("configured policy");
             native_broker::CreationPolicy::checked(policy.wire())
@@ -516,10 +552,16 @@ impl Native {
                     "automatic redundant capture retirement requires at least two capture and upload slots"
                 );
             }
-            ensure!(alias.len() <= 64, "native repository alias is too long");
+            ensure!(alias.len() <= 128, "native repository alias is too long");
             tinytree_store::validate_repository_id(alias)
                 .context("invalid native repository alias")?;
             repo.validate()?;
+            if repo.forge.is_some() {
+                ensure!(self.workspaces.index_mode != NativeIndexMode::Federated,
+                    "Forge projection requires the snapshot index, not canonical graph queries");
+                ensure!(self.max_memory_bytes >= 256*1024*1024 && self.max_temporary_bytes >= 128*1024*1024,
+                    "Forge hydration must fit broker memory and temporary limits");
+            }
             if let Some(remote) = &repo.remote {
                 let required = remote.control_work_budget();
                 ensure!(
@@ -1270,7 +1312,7 @@ mod tests {
             "con",
             "lpt1",
             "",
-            &"x".repeat(65),
+            &"x".repeat(129),
         ] {
             let mut bad = old.clone();
             bad.native
@@ -1292,6 +1334,38 @@ mod tests {
             "{EXAMPLE}\n[native.repositories.example]\ncaller_path='/tmp/not-selected-by-clients'\n"
         );
         assert!(toml::from_str::<Config>(&unknown).is_err());
+    }
+
+    #[test]
+    fn forge_alias_is_snapshot_only_and_cannot_mix_raw_remote_authority() {
+        let mut config: Config = toml::from_str(EXAMPLE).unwrap();
+        let mut repository = NativeRepository::default();
+        assert!(serde_json::to_value(&repository).unwrap().get("forge").is_none());
+        repository.forge = Some(native_broker::ForgeRemoteConfig {
+            account_id: "sample".into(), view: "public".into(), view_version: Some([7;32]),
+            client: tinytree_client::Config::default(),
+        });
+        config.native.repositories.insert("source".into(),repository.clone());
+        config.validate().unwrap();
+        let description = repository.creation_description(&config.native.workspaces,[3;32],true);
+        assert_eq!(description.index_mode,native_broker::ProviderIndexMode::Legacy);
+        assert!(!description.query_capable);
+        let policy=description.creation_policy.unwrap();
+        assert!(!policy.capture_enabled && !policy.upload_enabled && !policy.auto_capture && !policy.auto_upload);
+        assert!(repository.is_remote(),"partial projected provider is not complete local storage");
+        let mut floating = repository.clone();
+        floating.forge.as_mut().unwrap().view_version=None;
+        config.native.repositories.insert("source".into(),floating);
+        assert!(config.validate().is_err(),"restart cannot silently rebind a lazy workspace to a newer named view");
+        repository.remote=Some(Default::default());
+        config.native.repositories.insert("source".into(),repository);
+        assert!(config.validate().is_err(),"raw and scoped providers cannot share an alias");
+        config.native.repositories.get_mut("source").unwrap().remote=None;
+        config.native.workspaces.index_mode=NativeIndexMode::Federated;
+        assert!(config.validate().is_err(),"canonical graph fallback is not allowed");
+        config.native.workspaces.index_mode=NativeIndexMode::Auto;
+        config.native.max_memory_bytes=64*1024*1024;
+        assert!(config.validate().is_err(),"hydration must fit physical broker budgets");
     }
 
     #[test]

@@ -9,6 +9,7 @@ description = "Jujutsu command-line entry point for native Tinytree repositories
 default = []
 protocol-fixture = []
 native-landing-fault-injection = []
+forge-cli = []
 
 [dependencies]
 anyhow = "1"
@@ -29,6 +30,7 @@ jj-lib = { version = "=0.46.0", default-features = false }
 jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
+tinytree-client = { path = "../tinytree-client" }
 tinytree-search = { path = "../tinytree-search" }
 tinytree-annotate = { path = "../tinytree-annotate" }
 tinytree-model = { path = "../tinytree-model" }
@@ -40,6 +42,8 @@ tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["zstd"] }
 
 [dev-dependencies]
+tinytree-check-runner = { path = "../tinytree-check-runner" }
+sha2 = "0.10"
 tinytree-cloud = { path = "../tinytree-cloud" }
 native-capture-pack = { path = "../native-capture-pack" }
 tinytree-index = { path = "../tinytree-index" }

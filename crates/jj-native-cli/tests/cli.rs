@@ -1,4 +1,1802 @@
 //! Real commands in separate processes, with no Git executable on PATH.
+
+#[cfg(feature = "forge-cli")]
+mod forge_product {
+    use super::*;
+
+    fn client() -> Client {
+        let mut value = Client::new();
+        value.binary = Path::new(env!("CARGO_BIN_EXE_tt")).canonicalize().unwrap();
+        value.extra_env.push((
+            "FORGE_TEST_TOKEN",
+            "public-forge-fixture-token-not-a-secret",
+        ));
+        value
+    }
+
+    #[test]
+    fn forge_product_context_is_private_machine_readable_and_never_a_login_claim() {
+        let client = client();
+        let help = client.success(&["--help"]);
+        assert!(help.contains("Tinytree VCS and code review"));
+        let result: serde_json::Value = serde_json::from_str(&client.success(&[
+            "context",
+            "set",
+            "--server",
+            "http://127.0.0.1:8093",
+            "--account",
+            "example",
+            "--view",
+            "public",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(result["schema_version"], 1);
+        assert_eq!(result["state"], "configured");
+        assert_eq!(result["result"]["account_id"], "example");
+        assert_eq!(result["result"]["token_env"], "FORGE_TEST_TOKEN");
+        let shown: serde_json::Value =
+            serde_json::from_str(&client.success(&["--json", "context", "show"])).unwrap();
+        assert_eq!(shown, result);
+        let path = client.home.join("config/tinytree/context.json");
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, result["result"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn forge_product_rejects_credential_urls_and_reports_workspace_failure_as_json() {
+        let client = client();
+        let failed = client.run(&[
+            "context",
+            "set",
+            "--server",
+            "https://user:secret@example.invalid",
+            "--account",
+            "example",
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["state"], "failed");
+        assert!(!String::from_utf8_lossy(&failed.stdout).contains("secret"));
+        assert!(!client.home.join("config/tinytree/context.json").exists());
+        let failed = client.run(&["status", "--json"]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["operation"], "status");
+        assert_eq!(report["state"], "failed");
+    }
+
+    #[test]
+    fn forge_product_failed_mutation_keeps_exact_replay_identity() {
+        let client = client();
+        // Reserve and close a loopback port: no fixture service or credentials.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+        ]);
+        let failed = client.run(&[
+            "account",
+            "provision",
+            "--request-id",
+            "provision-example",
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["state"], "uncertain");
+        assert_eq!(report["request_id"], "provision-example");
+        let path = client
+            .home
+            .join("config/tinytree/requests/request-provision-example.json");
+        let original = fs::read(&path).unwrap();
+        let shown: serde_json::Value = serde_json::from_str(&client.success(&[
+            "request",
+            "show",
+            "provision-example",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(shown["state"], "saved");
+        let resumed = client.run(&["request", "resume", "provision-example", "--json"]);
+        assert!(!resumed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+        assert_eq!(report["request_id"], "provision-example");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            &endpoint,
+            "--account",
+            "different",
+        ]);
+        let rebound = client.run(&["request", "resume", "provision-example", "--json"]);
+        assert!(!rebound.status.success());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn forge_product_push_saves_review_intent_and_rejects_changed_inputs() {
+        let client = client();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+        ]);
+        let base = "11".repeat(32);
+        let head = "22".repeat(32);
+        let view = "33".repeat(32);
+        let pushed = client.run(&[
+            "push",
+            "--source-base",
+            &base,
+            "--source-head",
+            &head,
+            "--view-version",
+            &view,
+            "--request-id",
+            "review-example",
+            "--json",
+        ]);
+        assert!(!pushed.status.success());
+        let output: serde_json::Value = serde_json::from_slice(&pushed.stdout).unwrap();
+        assert_eq!(output["state"], "uncertain");
+        let path = client
+            .home
+            .join("config/tinytree/requests/request-review-example.json");
+        let original = fs::read(&path).unwrap();
+        let intent: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(intent["payload"]["source_head"], head);
+        assert_eq!(intent["payload"]["source_base"], base);
+        assert!(intent["payload"].get("actor").is_none());
+        assert!(intent["payload"].get("check_profile").is_none());
+        let changed = "44".repeat(32);
+        let rebound = client.run(&[
+            "push",
+            "--source-base",
+            &base,
+            "--source-head",
+            &changed,
+            "--view-version",
+            &view,
+            "--request-id",
+            "review-example",
+            "--json",
+        ]);
+        assert!(!rebound.status.success());
+        let output: serde_json::Value = serde_json::from_slice(&rebound.stdout).unwrap();
+        assert_eq!(output["state"], "failed");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        // Sending immutable review IDs never creates or changes a local workspace.
+        assert!(!client.root.join(".jj").exists());
+    }
+
+    #[test]
+    fn forge_product_rejects_authority_hints_before_saving_transform_requests() {
+        let client = client();
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            "http://127.0.0.1:8093",
+            "--account",
+            "example",
+        ]);
+        let path = client.home.join("plan.json");
+        let plan = serde_json::json!({
+            "source_account":"upstream", "source_view":"public",
+            "source_before_view":"11".repeat(32), "source_after_view":"22".repeat(32),
+            "spec":{"mappings":[{"source_prefix":"lib","destination_prefix":"vendor/lib"}]},
+            "change_id":"33".repeat(16),
+            "actor":"owner"
+        });
+        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let failed = client.run(&[
+            "transform",
+            "start",
+            "--plan",
+            path.to_str().unwrap(),
+            "--request-id",
+            "transform-example",
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["state"], "failed");
+        assert!(
+            !client
+                .home
+                .join("config/tinytree/requests/request-transform-example.json")
+                .exists()
+        );
+        let failed = client.run(&[
+            "pin",
+            "resolve",
+            &"11".repeat(32),
+            "--max-bytes",
+            "65537",
+            "--path",
+            "file",
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["state"], "failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_real_service_auth_views_and_chunked_native_projection() {
+        use futures::AsyncReadExt as _;
+        use jj_native_backend::NativeObjectIo as _;
+        use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
+        use tinytree_model as m;
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            tinytree_store::Store::open(directory.path().join("server"), Default::default())
+                .unwrap();
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            Default::default(),
+            vec![],
+            vec![
+                tinytree_server::Principal::new_forge(
+                    "owner",
+                    "public-forge-fixture-token-not-a-secret",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, service, None, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let client = client();
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+        ]);
+        let provision: serde_json::Value = serde_json::from_str(&client.success(&[
+            "account",
+            "provision",
+            "--request-id",
+            "provision-service",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(provision["result"]["value"]["monorepo_id"], "forge-example");
+        let epoch = provision["result"]["value"]["policy_epoch"]
+            .as_u64()
+            .unwrap();
+        let repo = "forge-example";
+        let original = store.references(repo, &["main".into()]).unwrap().remove(0);
+        let file = |bytes: &[u8]| {
+            let descriptor = m::describe_file(bytes);
+            store.put(repo, descriptor, bytes, 0).unwrap();
+            m::TreeValue::File {
+                id: m::FileId(descriptor.key.id.0),
+                executable: false,
+                size_bytes: bytes.len() as u64,
+                copy_id: None,
+            }
+        };
+        let put = |object: m::Object| {
+            let encoded = m::encode(&object, Default::default()).unwrap();
+            store
+                .put(repo, encoded.descriptor, &encoded.bytes, 0)
+                .unwrap();
+            encoded.descriptor
+        };
+        let large = vec![b'Z'; 1024 * 1024 + 37];
+        let large_value = file(&large);
+        let m::TreeValue::File { id: large_id, .. } = large_value else {
+            unreachable!()
+        };
+        let private_value = file(b"private-sentinel-do-not-disclose");
+        let m::TreeValue::File { id: private_id, .. } = private_value else {
+            unreachable!()
+        };
+        let app = put(m::Object::Tree(m::Tree {
+            entries: vec![
+                m::TreeEntry {
+                    name: "README.md".into(),
+                    value: file(b"# Example\nhello public code"),
+                },
+                m::TreeEntry {
+                    name: "large.txt".into(),
+                    value: large_value,
+                },
+                m::TreeEntry {
+                    name: "main.rs".into(),
+                    value: file(b"fn main() { /* hello public */ }"),
+                },
+            ],
+        }));
+        let secrets = put(m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "token.txt".into(),
+                value: private_value,
+            }],
+        }));
+        let tree = put(m::Object::Tree(m::Tree {
+            entries: vec![
+                m::TreeEntry {
+                    name: "app".into(),
+                    value: m::TreeValue::Tree(m::TreeId(app.key.id.0)),
+                },
+                m::TreeEntry {
+                    name: "secrets".into(),
+                    value: m::TreeValue::Tree(m::TreeId(secrets.key.id.0)),
+                },
+            ],
+        }));
+        let signature = m::Signature {
+            name: "Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: m::Timestamp {
+                millis_since_epoch: 0,
+                tz_offset_minutes: 0,
+            },
+        };
+        let head = put(m::Object::Commit(m::Commit {
+            parents: vec![m::CommitId(original.commit.unwrap().key.id.0)],
+            predecessors: vec![],
+            root_tree: m::TreeMerge {
+                terms: vec![m::TreeId(tree.key.id.0)],
+                labels: vec![String::new()],
+            },
+            change_id: m::ChangeId([7; 16]),
+            description: "scoped fixture".into(),
+            author: signature.clone(),
+            committer: signature,
+            secure_signature: None,
+        }));
+        // An imported immutable snapshot is selected by an authenticated view;
+        // the fixture does not bypass checked account-main publication.
+        let spec = client.home.join("view.json");
+        fs::write(&spec,serde_json::to_vec(&serde_json::json!({"name":"public","root_prefix":"app","include_prefixes":[""],"exclude_prefixes":[],"visibility":{"kind":"public"},"revision":head.key.id.0,"export_allowed":true})).unwrap()).unwrap();
+        client.success(&[
+            "view",
+            "publish",
+            "--spec",
+            spec.to_str().unwrap(),
+            "--expected-epoch",
+            &epoch.to_string(),
+            "--make-default",
+            "--request-id",
+            "publish-service",
+            "--json",
+        ]);
+        let shown = client.success(&["view", "show", "--json"]);
+        let snapshot: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        assert!(shown.contains("hello public code"));
+        assert!(!shown.contains("private-sentinel"));
+        assert_eq!(
+            snapshot["result"]["value"]["view_version"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let search = client.success(&["search", "hello", "--json"]);
+        assert!(search.contains("README.md"));
+        let partial: serde_json::Value = serde_json::from_str(&search).unwrap();
+        assert_eq!(partial["state"], "incomplete");
+        assert_eq!(partial["result"]["value"]["complete"], false);
+        assert!(!search.contains("private-sentinel"));
+        let rejected = client.run(&["view", "read", "../secrets/token.txt", "--json"]);
+        assert!(!rejected.status.success());
+        assert!(!String::from_utf8_lossy(&rejected.stdout).contains("private-sentinel"));
+        let context = fs::read(client.home.join("config/tinytree/context.json")).unwrap();
+        let rejected = client.run(&[
+            "login",
+            "--server",
+            &endpoint,
+            "--account",
+            "missing",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+            "--json",
+        ]);
+        assert!(!rejected.status.success());
+        assert_eq!(
+            fs::read(client.home.join("config/tinytree/context.json")).unwrap(),
+            context
+        );
+        let resolved = store
+            .forge_resolve_view(
+                &tinytree_store::AccountId("example".into()),
+                Some(&tinytree_store::ForgeActor {
+                    principal: "owner".into(),
+                }),
+                "public",
+                None,
+            )
+            .unwrap();
+        let path = directory.path().join("local");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let local =
+            Arc::new(jj_native_backend::DirectObjectIo::init(&path, Default::default()).unwrap());
+        let config = tinytree_client::Config {
+            endpoint: endpoint.clone(),
+            repository_id: repo.into(),
+            token_env: Some("FORGE_TEST_TOKEN".into()),
+            ..Default::default()
+        };
+        let provider = native_broker::ForgeObjectIo::open(
+            local.clone(),
+            native_broker::ForgeRemoteConfig {
+                account_id: "example".into(),
+                view: "public".into(),
+                view_version: Some(resolved.version().0),
+                client: config.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let key = m::ObjectKey {
+            kind: m::Kind::File,
+            id: m::ObjectId(large_id.0),
+        };
+        assert_eq!(
+            provider.descriptor(key).await.unwrap().unwrap().size_bytes,
+            large.len() as u64
+        );
+        assert!(
+            local.descriptor(key).await.unwrap().is_none(),
+            "descriptor-only request must not fetch file bodies"
+        );
+        let (_, mut reader) = provider.read_file(large_id).await.unwrap().into_parts();
+        let mut body = vec![];
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, large);
+        assert!(provider.read_file(private_id).await.is_err());
+        assert!(
+            local
+                .descriptor(m::ObjectKey {
+                    kind: m::Kind::File,
+                    id: m::ObjectId(private_id.0)
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            provider.read_metadata(head.key).await.is_err(),
+            "canonical ancestry must not be a projected object capability"
+        );
+        let raw = tinytree_client::NativeClient::connect(config)
+            .await
+            .unwrap();
+        assert_eq!(
+            raw.open(vec!["main".into()]).await.unwrap_err().code(),
+            native_broker::ControlCode::PermissionDenied
+        );
+        use native_broker::NativeRepositoryControl as _;
+        assert_eq!(
+            provider
+                .publication("not-a-raw-grant")
+                .await
+                .unwrap_err()
+                .code(),
+            native_broker::ControlCode::PermissionDenied
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn service_value(client: &Client, args: &[&str]) -> serde_json::Value {
+        let output = client.success(args);
+        let envelope: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(envelope["schema_version"], 1);
+        envelope["result"]["value"].clone()
+    }
+    fn fixture_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn fixture_id<const N: usize>(hex: &str) -> [u8; N] {
+        assert_eq!(hex.len(), N * 2);
+        std::array::from_fn(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+    }
+    fn select_account(client: &Client, endpoint: &str, account: &str, view: &str, token: &str) {
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            endpoint,
+            "--account",
+            account,
+            "--view",
+            view,
+            "--token-env",
+            token,
+        ]);
+    }
+    fn publish_fixture_view(
+        client: &Client,
+        name: &str,
+        revision: [u8; 32],
+        include: &[&str],
+        public: bool,
+        key: &str,
+    ) -> String {
+        let account = service_value(client, &["account", "show", "--json"]);
+        let spec = client.home.join("selected-view.json");
+        fs::write(&spec,serde_json::to_vec(&serde_json::json!({"name":name,"root_prefix":"","include_prefixes":include,"exclude_prefixes":[],"visibility":{"kind":if public{"public"}else{"members"}},"revision":revision,"export_allowed":true})).unwrap()).unwrap();
+        let mut args = vec![
+            "view",
+            "publish",
+            "--spec",
+            spec.to_str().unwrap(),
+            "--expected-epoch",
+        ];
+        let epoch = account["policy_epoch"].as_u64().unwrap().to_string();
+        args.extend([&epoch, "--request-id", key, "--json"]);
+        if public {
+            args.push("--make-default");
+        }
+        service_value(client, &args);
+        service_value(client, &["view", "show", "--json"])["view_version"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    fn protocol_checker_config(
+        directory: &Path,
+        endpoint: &str,
+    ) -> (tinytree_server::ServiceConfig, PathBuf) {
+        use sha2::{Digest, Sha256};
+        let operator = directory.join("operator");
+        fs::create_dir(&operator).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&operator, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let executable = Path::new(env!("TINYTREE_CHECKER_FIXTURE"))
+            .canonicalize()
+            .unwrap();
+        let checksum = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let quoted = |p: &Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
+        let cache = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let git = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let daemon = operator.join("daemon.toml");
+        // Declared, pinned protocol process only: this template is not mounted
+        // and its fixture evidence must not be called a production RBE verdict.
+        fs::write(
+            &daemon,
+            format!(
+                r#"state_dir={}
+[cache]
+listen="{}"
+upstream="grpc://127.0.0.1:9"
+api_key_env="UNUSED_TWO_ACCOUNT_FIXTURE_KEY"
+[git_proxy]
+listen="{}"
+[bes]
+enabled=false
+[bos]
+enabled=false
+[native.workspaces.capture]
+policy="disabled"
+[native.workspaces.upload]
+policy="disabled"
+[native.repositories.checker-template]
+checker_forge_accounts=true
+[native.repositories.checker-template.remote]
+authorization_profile="trusted-two-account-checker-fixture"
+[native.repositories.checker-template.remote.remote]
+endpoint="{}"
+repository_id="template"
+token_env="FORGE_TWO_CHECKER_TOKEN"
+"#,
+                quoted(&operator.join("daemon-state")),
+                cache.local_addr().unwrap(),
+                git.local_addr().unwrap(),
+                endpoint
+            ),
+        )
+        .unwrap();
+        drop((cache, git));
+        let scratch = operator.join("checker-state");
+        let policy = operator.join("checker.toml");
+        fs::write(
+            &policy,
+            format!(
+                r#"scratch={}
+daemon_config={}
+rbe_socket={}
+runner_sha256="{}"
+workspace_environment=["FORGE_TWO_CHECKER_TOKEN"]
+[workspace]
+path={}
+sha256="{}"
+[bazel]
+path={}
+sha256="{}"
+[[profiles]]
+name="checks"
+repositories=[]
+forge_accounts=true
+store="checker-template"
+mode="build"
+targets=["//fixture:checks"]
+flags=["--define=fixture_mode=pass"]
+timeout_seconds=60
+"#,
+                quoted(&scratch),
+                quoted(&daemon),
+                quoted(&operator.join("rbe.sock")),
+                checksum,
+                quoted(&executable),
+                checksum,
+                quoted(&executable),
+                checksum
+            ),
+        )
+        .unwrap();
+        let version = tinytree_check_runner::Config::load(&policy)
+            .unwrap()
+            .profile_version("checks")
+            .unwrap();
+        let mut config = tinytree_server::ServiceConfig::default();
+        config.max_buffered_bytes = 256 * 1024 * 1024;
+        config.landing.enabled = true;
+        config.landing.poll_interval_ms = 10;
+        config.landing.job_ttl_seconds = 120;
+        config.landing.max_buffered_bytes = 6 * 1024 * 1024 * 1024;
+        config.landing.forge_profile = Some("checks".into());
+        config.landing.profiles = vec![tinytree_server::LandingProfile {
+            name: "checks".into(),
+            version,
+            repositories: vec![],
+        }];
+        config.landing.checker = Some(tinytree_server::LandingCheckerConfig {
+            enabled: true,
+            executable,
+            sha256: checksum,
+            config: policy,
+            max_checks: 1,
+            max_checks_per_repository: 1,
+            max_jobs: 16,
+            max_attempts: 2,
+            max_recovery_attempts: 8,
+            retry_delay_seconds: 1,
+            execution_timeout_seconds: 30,
+            cleanup_grace_seconds: 10,
+        });
+        (config, scratch)
+    }
+    fn imported_source_snapshot(
+        store: &tinytree_store::Store,
+        repo: &str,
+        base: [u8; 32],
+        renamed: bool,
+    ) -> ([u8; 32], tinytree_model::Descriptor) {
+        use tinytree_model as m;
+        // Trusted import fixture setup: independent immutable snapshots branch
+        // from genesis so historic view retirement can genuinely free old bytes.
+        // Actual native authoring/rename/WIP is separately covered by FUSE tests.
+        let file = |bytes: &[u8]| {
+            let d = m::describe_file(bytes);
+            store.put(repo, d, bytes, 0).unwrap();
+            (
+                m::TreeValue::File {
+                    id: m::FileId(d.key.id.0),
+                    executable: false,
+                    size_bytes: bytes.len() as u64,
+                    copy_id: None,
+                },
+                d,
+            )
+        };
+        let put = |object: m::Object| {
+            let encoded = m::encode(&object, Default::default()).unwrap();
+            store
+                .put(repo, encoded.descriptor, &encoded.bytes, 0)
+                .unwrap();
+            encoded.descriptor
+        };
+        let (readme, descriptor) = file(if renamed {
+            b"Renamed dependency README\nnew bytes v2\n"
+        } else {
+            b"Original dependency README\nfrozen bytes v1\n"
+        });
+        let (module, _) = file(b"pub fn dependency() {}\n");
+        let (private, _) = file(b"private-origin-only\n");
+        let mut package = vec![];
+        if renamed {
+            package.push(m::TreeEntry {
+                name: "README-renamed.md".into(),
+                value: readme.clone(),
+            });
+        }
+        package.push(m::TreeEntry {
+            name: "module.rs".into(),
+            value: module,
+        });
+        let package = put(m::Object::Tree(m::Tree { entries: package }));
+        let private = put(m::Object::Tree(m::Tree {
+            entries: vec![m::TreeEntry {
+                name: "secret.txt".into(),
+                value: private,
+            }],
+        }));
+        let mut entries = vec![];
+        if !renamed {
+            entries.push(m::TreeEntry {
+                name: "README.md".into(),
+                value: readme,
+            });
+        }
+        entries.extend([
+            m::TreeEntry {
+                name: "pkg".into(),
+                value: m::TreeValue::Tree(m::TreeId(package.key.id.0)),
+            },
+            m::TreeEntry {
+                name: "private".into(),
+                value: m::TreeValue::Tree(m::TreeId(private.key.id.0)),
+            },
+        ]);
+        let tree = put(m::Object::Tree(m::Tree { entries }));
+        let signature = m::Signature {
+            name: "Import Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: m::Timestamp {
+                millis_since_epoch: 0,
+                tz_offset_minutes: 0,
+            },
+        };
+        let commit = put(m::Object::Commit(m::Commit {
+            parents: vec![m::CommitId(base)],
+            predecessors: vec![],
+            root_tree: m::TreeMerge {
+                terms: vec![m::TreeId(tree.key.id.0)],
+                labels: vec![String::new()],
+            },
+            change_id: m::ChangeId([if renamed { 32 } else { 31 }; 16]),
+            description: "independent imported fixture snapshot".into(),
+            author: signature.clone(),
+            committer: signature,
+            secure_signature: None,
+        }));
+        (commit.key.id.0, descriptor)
+    }
+
+    // HTTP/2 response-loss fixture: control frames pass, RPC response frames
+    // are discarded until released. Requests still reach the actual service.
+    async fn response_loss_proxy(
+        upstream: std::net::SocketAddr,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let held = Arc::new(AtomicBool::new(true));
+        let gate = held.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let gate = gate.clone();
+                connections.spawn(async move {
+                    let server=tokio::net::TcpStream::connect(upstream).await.unwrap();
+                    let (mut cr,mut cw)=client.into_split();
+                    let (mut sr,mut sw)=server.into_split();
+                    tokio::select! {
+                        _=tokio::io::copy(&mut cr,&mut sw)=>{},
+                        _=async {
+                            loop {
+                                let mut header=[0;9];
+                                if sr.read_exact(&mut header).await.is_err(){break;}
+                                let len=((header[0] as usize)<<16)|((header[1] as usize)<<8)|header[2] as usize;
+                                assert!(len<=1024*1024,"bounded fixture frame");
+                                let mut body=vec![0;len];
+                                if sr.read_exact(&mut body).await.is_err(){break;}
+                                if gate.load(Ordering::SeqCst) && matches!(header[3],0|1|9){continue;}
+                                if cw.write_all(&header).await.is_err() || cw.write_all(&body).await.is_err(){break;}
+                            }
+                        }=>{}
+                    }
+                });
+            }
+        });
+        (endpoint, held, task)
+    }
+
+    // Trusted immutable-source construction/upload, not a product mutation:
+    // review submission, retry, checking, approval and landing below use tt only.
+    fn owned_fixture_patch(
+        store: &tinytree_store::Store,
+        view: &tinytree_store::ResolvedView,
+        actor: &tinytree_store::ForgeActor,
+        base: [u8; 32],
+        change: u8,
+        name: &str,
+        content: &[u8],
+        now: i64,
+    ) -> [u8; 32] {
+        use tinytree_model as m;
+        let read = |kind, id| {
+            let (_, bytes) = store
+                .read_metadata(
+                    view.repository(),
+                    m::ObjectKey {
+                        kind,
+                        id: m::ObjectId(id),
+                    },
+                )
+                .unwrap();
+            m::decode(&bytes, Default::default()).unwrap()
+        };
+        let m::Object::Commit(mut commit) = read(m::Kind::Commit, base) else {
+            panic!("commit")
+        };
+        let m::Object::Tree(mut root) = read(m::Kind::Tree, commit.root_tree.terms[0].0) else {
+            panic!("root")
+        };
+        let vendor = root
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == "vendor")
+            .unwrap();
+        let m::TreeValue::Tree(vendor_id) = vendor.value else {
+            panic!("vendor")
+        };
+        let m::Object::Tree(mut tree) = read(m::Kind::Tree, vendor_id.0) else {
+            panic!("vendor tree")
+        };
+        let file = m::describe_file(content);
+        store
+            .forge_upload_object(view, actor, &format!("vendor/{name}"), file, content, now)
+            .unwrap();
+        tree.entries.retain(|entry| entry.name != name);
+        tree.entries.push(m::TreeEntry {
+            name: name.into(),
+            value: m::TreeValue::File {
+                id: m::FileId(file.key.id.0),
+                executable: false,
+                size_bytes: content.len() as u64,
+                copy_id: None,
+            },
+        });
+        tree.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let upload = |path: &str, object: m::Object| {
+            let encoded = m::encode(&object, Default::default()).unwrap();
+            store
+                .forge_upload_object(view, actor, path, encoded.descriptor, &encoded.bytes, now)
+                .unwrap();
+            encoded.descriptor.key.id.0
+        };
+        vendor.value = m::TreeValue::Tree(m::TreeId(upload("vendor", m::Object::Tree(tree))));
+        commit.parents = vec![m::CommitId(base)];
+        commit.predecessors = vec![];
+        commit.root_tree = m::TreeMerge {
+            terms: vec![m::TreeId(upload("", m::Object::Tree(root)))],
+            labels: vec![String::new()],
+        };
+        commit.change_id = m::ChangeId([change; 16]);
+        commit.description = format!("owned immutable fixture patch {change}");
+        upload("", m::Object::Commit(commit))
+    }
+    async fn await_prepared(client: &Client, change: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let review = service_value(client, &["review", "show", change, "--json"]);
+            if review["state"] == "prepared" {
+                return review;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "review did not prepare: {review}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    fn approve_and_land(
+        client: &Client,
+        review: &serde_json::Value,
+        key: &str,
+    ) -> serde_json::Value {
+        let change = review["change_id"].as_str().unwrap();
+        let patch = review["patchset_id"].as_str().unwrap();
+        let candidate = review["candidate"]["id"].as_str().unwrap();
+        service_value(
+            client,
+            &[
+                "review",
+                "approve",
+                change,
+                "--patchset",
+                patch,
+                "--candidate",
+                candidate,
+                "--request-id",
+                &format!("approve-{key}"),
+                "--json",
+            ],
+        );
+        let landed = service_value(
+            client,
+            &[
+                "review",
+                "land",
+                change,
+                "--patchset",
+                patch,
+                "--candidate",
+                candidate,
+                "--request-id",
+                &format!("land-{key}"),
+                "--json",
+            ],
+        );
+        assert_eq!(landed["state"], "landed");
+        landed
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_two_account_transform_review_and_retained_pin_survive_origin_gc() {
+        use tinytree_model as m;
+        use tinytree_store::{AccountId, ForgeActor};
+        const OTHER: &str = "public-two-account-beta-token-not-a-secret";
+        const ORIGINAL: &[u8] = b"Original dependency README\nfrozen bytes v1\n";
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let mut limits = tinytree_store::Config::default();
+        limits.max_retention_validation_records = 4096;
+        limits.max_retention_validation_bytes = 8 * 1024 * 1024;
+        limits.max_closure_objects = 8192;
+        limits.max_closure_edges = 32768;
+        limits.max_path_contexts = 8192;
+        limits.max_path_context_bytes = 8 * 1024 * 1024;
+        let store = tinytree_store::Store::open(&store_root, limits).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (config, scratch) = protocol_checker_config(directory.path(), &endpoint);
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            config,
+            vec![],
+            vec![
+                tinytree_server::Principal::new_forge(
+                    "source-owner",
+                    "public-forge-fixture-token-not-a-secret",
+                )
+                .unwrap(),
+                tinytree_server::Principal::new_forge("destination-owner", OTHER).unwrap(),
+                tinytree_server::Principal::new_forge_checker(
+                    "checker",
+                    "public-two-account-checker-token-not-a-secret",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, service, None, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let source = client();
+        let mut destination = client();
+        destination.extra_env.push(("FORGE_OTHER_TOKEN", OTHER));
+        select_account(&source, &endpoint, "upstream", "public", "FORGE_TEST_TOKEN");
+        select_account(
+            &destination,
+            &endpoint,
+            "downstream",
+            "workspace",
+            "FORGE_OTHER_TOKEN",
+        );
+        for (client, key, repo) in [
+            (&source, "create-upstream", "forge-upstream"),
+            (&destination, "create-downstream", "forge-downstream"),
+        ] {
+            let first = service_value(
+                client,
+                &["account", "provision", "--request-id", key, "--json"],
+            );
+            let retried = service_value(
+                client,
+                &["account", "provision", "--request-id", key, "--json"],
+            );
+            assert_eq!(first, retried);
+            assert_eq!(first["monorepo_id"], repo);
+        }
+        let mut repos = store.forge_account_repositories(10).unwrap();
+        repos.sort();
+        assert_eq!(repos, vec!["forge-downstream", "forge-upstream"]);
+        let initial = service_value(&source, &["account", "show", "--json"]);
+        let genesis = fixture_id::<32>(initial["main_revision"].as_str().unwrap());
+        let before = publish_fixture_view(
+            &source,
+            "public",
+            genesis,
+            &["README.md", "pkg"],
+            true,
+            "view-before",
+        );
+        let (imported, original) =
+            imported_source_snapshot(&store, "forge-upstream", genesis, false);
+        let after = publish_fixture_view(
+            &source,
+            "public",
+            imported,
+            &["README.md", "pkg"],
+            true,
+            "view-imported",
+        );
+        let beta = service_value(&destination, &["account", "show", "--json"]);
+        publish_fixture_view(
+            &destination,
+            "workspace",
+            fixture_id::<32>(beta["main_revision"].as_str().unwrap()),
+            &["vendor"],
+            false,
+            "view-destination",
+        );
+        let public = service_value(&source, &["view", "show", "--json"]);
+        assert!(
+            public["readme"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Original dependency")
+        );
+        assert!(!public.to_string().contains("private-origin-only"));
+        let matches = service_value(&source, &["search", "dependency", "--json"]);
+        assert_eq!(matches["complete"], true);
+        assert!(matches.to_string().contains("README.md"));
+        select_account(
+            &destination,
+            &endpoint,
+            "upstream",
+            "public",
+            "FORGE_OTHER_TOKEN",
+        );
+        for args in [
+            vec!["account", "show", "--json"],
+            vec!["view", "read", "private/secret.txt", "--json"],
+        ] {
+            let denied = destination.run(&args);
+            assert!(!denied.status.success());
+            assert!(!String::from_utf8_lossy(&denied.stdout).contains("private-origin-only"));
+        }
+        assert!(service_value(&destination, &["view", "show", "--json"])["readme"].is_object());
+        select_account(
+            &destination,
+            &endpoint,
+            "downstream",
+            "workspace",
+            "FORGE_OTHER_TOKEN",
+        );
+        let plan = destination.home.join("transform.json");
+        fs::write(&plan,serde_json::to_vec(&serde_json::json!({"source_account":"upstream","source_view":"public","source_before_view":before,"source_after_view":after,"spec":{"mappings":[{"source_prefix":"","destination_prefix":"vendor"}]},"change_id":"44".repeat(16),"lineage":[]})).unwrap()).unwrap();
+        let main_before = store
+            .references("forge-downstream", &["main".into()])
+            .unwrap();
+        let proposed = service_value(
+            &destination,
+            &[
+                "transform",
+                "start",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--request-id",
+                "dependency-import",
+                "--json",
+            ],
+        );
+        let retry = service_value(
+            &destination,
+            &[
+                "transform",
+                "start",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--request-id",
+                "dependency-import",
+                "--json",
+            ],
+        );
+        assert_eq!(proposed["transform"]["id"], retry["transform"]["id"]);
+        assert_eq!(
+            proposed["review"]["patchset_id"],
+            retry["review"]["patchset_id"]
+        );
+        assert_eq!(
+            store
+                .references("forge-downstream", &["main".into()])
+                .unwrap(),
+            main_before,
+            "transform proposes a review, never updates main"
+        );
+        let run = proposed["transform"]["id"].as_str().unwrap().to_owned();
+        let change = proposed["review"]["change_id"].as_str().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let review = loop {
+            let review = service_value(&destination, &["review", "show", &change, "--json"]);
+            if review["state"] == "prepared" {
+                break review;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "physical checker did not prepare review: {review}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let patchset = review["patchset_id"].as_str().unwrap();
+        let candidate = review["candidate"]["id"].as_str().unwrap();
+        service_value(
+            &destination,
+            &[
+                "review",
+                "approve",
+                &change,
+                "--patchset",
+                patchset,
+                "--candidate",
+                candidate,
+                "--request-id",
+                "approve-import",
+                "--json",
+            ],
+        );
+        let landed = service_value(
+            &destination,
+            &[
+                "review",
+                "land",
+                &change,
+                "--patchset",
+                patchset,
+                "--candidate",
+                candidate,
+                "--request-id",
+                "land-import",
+                "--json",
+            ],
+        );
+        assert_eq!(landed["state"], "landed");
+        assert_eq!(
+            fs::read_to_string(scratch.join("executions"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "run")
+                .count(),
+            1,
+            "duplicate transform requests must not duplicate checker execution"
+        );
+        assert_ne!(
+            store
+                .references("forge-downstream", &["main".into()])
+                .unwrap(),
+            main_before
+        );
+        assert_eq!(
+            service_value(
+                &destination,
+                &["view", "read", "vendor/README.md", "--json"]
+            )["content"],
+            std::str::from_utf8(ORIGINAL).unwrap()
+        );
+        // Freeze all authored inputs against the same older authorized projection.
+        // No mounted alias is rebound; immutable bytes/receipts are fixture setup.
+        let actor = ForgeActor {
+            principal: "destination-owner".into(),
+        };
+        let account = AccountId("downstream".into());
+        let frozen = store
+            .forge_resolve_view(&account, Some(&actor), "workspace", None)
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let projection = store.forge_project_view(&frozen, now).unwrap();
+        let base = projection.projected_commit;
+        let version = fixture_hex(&projection.view_version.0);
+        let advance = owned_fixture_patch(
+            &store,
+            &frozen,
+            &actor,
+            base,
+            61,
+            "shared.txt",
+            b"independent landed addition\n",
+            now,
+        );
+        let stale = owned_fixture_patch(
+            &store,
+            &frozen,
+            &actor,
+            base,
+            62,
+            "stale.txt",
+            b"stale base independent patch\n",
+            now,
+        );
+        let conflicting = owned_fixture_patch(
+            &store,
+            &frozen,
+            &actor,
+            base,
+            63,
+            "shared.txt",
+            b"competing add/add contents\n",
+            now,
+        );
+        let corrected = owned_fixture_patch(
+            &store,
+            &frozen,
+            &actor,
+            base,
+            63,
+            "corrected.txt",
+            b"explicit correction drops conflicting addition\n",
+            now,
+        );
+        let interrupted = owned_fixture_patch(
+            &store,
+            &frozen,
+            &actor,
+            base,
+            64,
+            "interrupted.txt",
+            b"committed before response loss\n",
+            now,
+        );
+        let submit = |head: [u8; 32], key: &str, expected: Option<&str>| {
+            let head = fixture_hex(&head);
+            let base = fixture_hex(&base);
+            let mut args = vec![
+                "push",
+                "--source-base",
+                &base,
+                "--source-head",
+                &head,
+                "--view-version",
+                &version,
+                "--request-id",
+                key,
+                "--json",
+            ];
+            if let Some(patch) = expected {
+                args.extend(["--expected-patchset", patch]);
+            }
+            service_value(&destination, &args)
+        };
+        submit(advance, "independent-main", None);
+        let independent = await_prepared(&destination, &fixture_hex(&[61; 16])).await;
+        let independent = approve_and_land(&destination, &independent, "independent-main");
+        let advanced_target = independent["candidate"]["head"].clone();
+        // Actual product push from old base must target the independently advanced main.
+        let first_stale = submit(stale, "stale-base-push", None);
+        let prepared = await_prepared(&destination, &fixture_hex(&[62; 16])).await;
+        assert_eq!(prepared["change_id"], fixture_hex(&[62; 16]));
+        assert_eq!(prepared["source_base"], fixture_hex(&base));
+        assert_eq!(prepared["source_head"], fixture_hex(&stale));
+        assert_eq!(prepared["patchset_id"], first_stale["patchset_id"]);
+        assert_eq!(prepared["candidate"]["target"], advanced_target);
+        assert_ne!(prepared["candidate"]["head"], fixture_hex(&stale));
+        assert_eq!(
+            prepared["candidate"]["rewrites"],
+            serde_json::json!([{"old":fixture_hex(&stale),"new":prepared["candidate"]["head"],"change_id":fixture_hex(&[62;16])}])
+        );
+        let replay = submit(stale, "stale-base-push", None);
+        assert_eq!(replay["patchset_id"], prepared["patchset_id"]);
+        let stale_landed = approve_and_land(&destination, &prepared, "stale-base");
+        assert_eq!(
+            stale_landed["projected_rewrites"],
+            serde_json::json!([{"old":fixture_hex(&stale),"new":stale_landed["projected_head"],"change_id":fixture_hex(&[62;16])}])
+        );
+        assert_eq!(
+            service_value(
+                &destination,
+                &["view", "read", "vendor/shared.txt", "--json"]
+            )["content"],
+            "independent landed addition\n"
+        );
+        assert_eq!(
+            service_value(
+                &destination,
+                &["view", "read", "vendor/stale.txt", "--json"]
+            )["content"],
+            "stale base independent patch\n"
+        );
+        submit(conflicting, "conflicting-push", None);
+        let conflict = service_value(
+            &destination,
+            &["review", "show", &fixture_hex(&[63; 16]), "--json"],
+        );
+        assert_eq!(conflict["state"], "conflict");
+        assert_eq!(conflict["source_head"], fixture_hex(&conflicting));
+        let old_patch = conflict["patchset_id"].as_str().unwrap();
+        let retried = submit(conflicting, "conflicting-push", None);
+        assert_eq!(retried["state"], "conflict");
+        assert_eq!(retried["patchset_id"], old_patch);
+        let replacement = submit(corrected, "corrected-push", Some(old_patch));
+        assert_eq!(replacement["change_id"], conflict["change_id"]);
+        assert_ne!(replacement["patchset_id"], old_patch);
+        let corrected_review = await_prepared(&destination, &fixture_hex(&[63; 16])).await;
+        assert_eq!(corrected_review["source_head"], fixture_hex(&corrected));
+        assert_eq!(corrected_review["approvals"], 0);
+        approve_and_land(&destination, &corrected_review, "corrected-push");
+        let history = service_value(
+            &destination,
+            &[
+                "review",
+                "show",
+                &fixture_hex(&[63; 16]),
+                "--patchset",
+                old_patch,
+                "--json",
+            ],
+        );
+        assert_eq!(history["source_head"], fixture_hex(&conflicting));
+        assert_eq!(history["patchset_id"], old_patch);
+        assert_eq!(
+            service_value(
+                &destination,
+                &["view", "read", "vendor/corrected.txt", "--json"]
+            )["content"],
+            "explicit correction drops conflicting addition\n"
+        );
+
+        // Real post-dispatch interruption: the server records the mutation but
+        // the response is withheld; terminate tt, then resume the exact journal.
+        let (proxy, hold, proxy_task) =
+            response_loss_proxy(endpoint.strip_prefix("http://").unwrap().parse().unwrap()).await;
+        select_account(
+            &destination,
+            &proxy,
+            "downstream",
+            "workspace",
+            "FORGE_OTHER_TOKEN",
+        );
+        let interrupted_head = fixture_hex(&interrupted);
+        let base_hex = fixture_hex(&base);
+        let mut killed = destination.spawn(&[
+            "push",
+            "--source-base",
+            &base_hex,
+            "--source-head",
+            &interrupted_head,
+            "--view-version",
+            &version,
+            "--request-id",
+            "lost-response-push",
+            "--json",
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let accepted = loop {
+            if let Some(review) = store
+                .forge_review_operation(&account, &actor, "lost-response-push")
+                .unwrap()
+            {
+                break review;
+            }
+            assert!(
+                killed.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "CLI must remain waiting for its withheld response"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "mutation never dispatched to real service"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(accepted.source_head, interrupted);
+        assert!(killed.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        let pending: serde_json::Value = serde_json::from_str(&destination.success(&[
+            "request",
+            "show",
+            "lost-response-push",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(pending["result"]["request_id"], "lost-response-push");
+        killed.0.as_mut().unwrap().kill().unwrap();
+        killed.0.take().unwrap().wait().unwrap();
+        hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        let resumed = service_value(
+            &destination,
+            &["request", "resume", "lost-response-push", "--json"],
+        );
+        assert_eq!(resumed["patchset_id"], fixture_hex(&accepted.patchset_id));
+        assert_eq!(resumed["source_head"], interrupted_head);
+        assert_eq!(resumed["change_id"], fixture_hex(&[64; 16]));
+        let replay = service_value(
+            &destination,
+            &["request", "resume", "lost-response-push", "--json"],
+        );
+        assert_eq!(replay["patchset_id"], resumed["patchset_id"]);
+        let completed = await_prepared(&destination, &fixture_hex(&[64; 16])).await;
+        assert_eq!(completed["patchset_number"], 1);
+        approve_and_land(&destination, &completed, "lost-response");
+        select_account(
+            &destination,
+            &endpoint,
+            "downstream",
+            "workspace",
+            "FORGE_OTHER_TOKEN",
+        );
+        proxy_task.abort();
+        assert!(proxy_task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            fs::read_to_string(scratch.join("executions"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "run")
+                .count(),
+            5,
+            "one checker execution per accepted candidate, none duplicated by retries or lost response"
+        );
+
+        let first = service_value(
+            &destination,
+            &[
+                "pin",
+                "resolve",
+                &run,
+                "--path",
+                "vendor/README.md",
+                "--max-bytes",
+                "8",
+                "--json",
+            ],
+        );
+        let rest = service_value(
+            &destination,
+            &[
+                "pin",
+                "resolve",
+                &run,
+                "--path",
+                "vendor/README.md",
+                "--offset",
+                "8",
+                "--max-bytes",
+                "65536",
+                "--json",
+            ],
+        );
+        let read_bytes = |value: &serde_json::Value| {
+            value["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u8)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!([read_bytes(&first), read_bytes(&rest)].concat(), ORIGINAL);
+        assert_eq!(rest["eof"], true);
+        let (renamed, _) = imported_source_snapshot(&store, "forge-upstream", genesis, true);
+        publish_fixture_view(
+            &source,
+            "public",
+            renamed,
+            &["README.md", "pkg"],
+            true,
+            "view-renamed",
+        );
+        assert!(
+            service_value(
+                &source,
+                &["view", "read", "pkg/README-renamed.md", "--json"]
+            )["content"]
+                .as_str()
+                .unwrap()
+                .contains("new bytes v2")
+        );
+        for (version, key) in [(&before, "retire-before"), (&after, "retire-imported")] {
+            let account = service_value(&source, &["account", "show", "--json"]);
+            service_value(
+                &source,
+                &[
+                    "view",
+                    "retire",
+                    version,
+                    "--expected-epoch",
+                    &account["policy_epoch"].as_u64().unwrap().to_string(),
+                    "--request-id",
+                    key,
+                    "--json",
+                ],
+            );
+        }
+        // Trusted server maintenance, not a new customer GC endpoint.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        store.gc("forge-upstream", now + 7 * 86400).unwrap();
+        let original_path = store_root
+            .join("repos/forge-upstream/1")
+            .join(fixture_hex(&original.key.id.0));
+        assert!(
+            store
+                .descriptor("forge-upstream", original.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !original_path.exists(),
+            "the original source payload must actually be collected"
+        );
+        let retained = service_value(
+            &destination,
+            &[
+                "pin",
+                "resolve",
+                &run,
+                "--path",
+                "vendor/README.md",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            read_bytes(&retained),
+            ORIGINAL,
+            "old pin never follows the renamed/latest source"
+        );
+        let lineage = service_value(&destination, &["lineage", &run, "--json"]);
+        assert!(lineage["origin"].is_null());
+        let redacted = service_value(&destination, &["transform", "show", &run, "--json"]);
+        assert!(redacted["origin"].is_null());
+        assert!(!redacted.to_string().contains("upstream"));
+        assert!(!redacted.to_string().contains(&after));
+        for args in [
+            vec![
+                "pin",
+                "retire",
+                run.as_str(),
+                "--request-id",
+                "retire-protected",
+                "--json",
+            ],
+            vec![
+                "pin",
+                "resolve",
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "--json",
+            ],
+            vec![
+                "pin",
+                "resolve",
+                run.as_str(),
+                "--path",
+                "missing.txt",
+                "--json",
+            ],
+        ] {
+            let denied = destination.run(&args);
+            assert!(!denied.status.success());
+            let report: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
+            assert_eq!(report["state"], "failed");
+            assert!(report["result"].is_null());
+        }
+        // Temporary retained-body storage fault with exact RAII restore. It is
+        // neither pin unprotection nor a product/source mutation.
+        struct Restore {
+            original: PathBuf,
+            quarantine: PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if self.quarantine.exists() {
+                    fs::rename(&self.quarantine, &self.original).unwrap();
+                }
+            }
+        }
+        let payload = store_root
+            .join("repos/forge-downstream/1")
+            .join(fixture_hex(&original.key.id.0));
+        let quarantine = payload.with_extension("unavailable-fixture");
+        fs::rename(&payload, &quarantine).unwrap();
+        let restore = Restore {
+            original: payload,
+            quarantine,
+        };
+        let unavailable = destination.run(&[
+            "pin",
+            "resolve",
+            &run,
+            "--path",
+            "vendor/README.md",
+            "--json",
+        ]);
+        assert!(!unavailable.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+        assert!(report["result"].is_null());
+        drop(restore);
+        assert_eq!(
+            read_bytes(&service_value(
+                &destination,
+                &[
+                    "pin",
+                    "resolve",
+                    &run,
+                    "--path",
+                    "vendor/README.md",
+                    "--json"
+                ]
+            )),
+            ORIGINAL
+        );
+        // Optional isolated retirement fixture: never reviewed or landed. Only
+        // its exact transform-owned protection is released by maintenance after
+        // proving no review exists. The real landed pin above stays protected.
+        let actor = ForgeActor {
+            principal: "destination-owner".into(),
+        };
+        let alpha = AccountId("upstream".into());
+        let beta = AccountId("downstream".into());
+        let current_source = store
+            .forge_resolve_view(&alpha, Some(&actor), "public", None)
+            .unwrap();
+        let current_destination = store
+            .forge_resolve_view(&beta, Some(&actor), "workspace", None)
+            .unwrap();
+        let signature = m::Signature {
+            name: "Lifecycle Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: m::Timestamp {
+                millis_since_epoch: now * 1000,
+                tz_offset_minutes: 0,
+            },
+        };
+        let standalone = store
+            .forge_prepare_transform(
+                &actor,
+                &tinytree_store::forge_transforms::ForgeTransformRequest {
+                    request_id: "unreferenced-lifecycle-fixture".into(),
+                    before: current_source.clone(),
+                    after: current_source,
+                    destination: current_destination,
+                    spec: tinytree_store::forge_transforms::ForgeTransformSpec {
+                        mappings: vec![tinytree_store::forge_transforms::ForgePathMapping {
+                            source_prefix: "".into(),
+                            destination_prefix: "vendor".into(),
+                        }],
+                    },
+                    change_id: m::ChangeId([91; 16]),
+                    lineage: vec![],
+                },
+                &signature,
+                now,
+            )
+            .unwrap();
+        assert!(
+            store
+                .forge_review(&beta, &actor, m::ChangeId([91; 16]))
+                .is_err()
+        );
+        let owner = format!("transform-{}", fixture_hex(&standalone.id));
+        assert_eq!(
+            standalone
+                .pin
+                .protected_roots
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![owner.clone()]
+        );
+        store
+            .forge_protect_pin(&beta, &actor, standalone.id, &owner, false)
+            .unwrap();
+        let retired = fixture_hex(&standalone.id);
+        service_value(
+            &destination,
+            &[
+                "pin",
+                "retire",
+                &retired,
+                "--request-id",
+                "retire-unreferenced",
+                "--json",
+            ],
+        );
+        let rejected = destination.run(&["pin", "resolve", &retired, "--json"]);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stdout).contains("dependency pin retired"));
+        assert_eq!(
+            read_bytes(&service_value(
+                &destination,
+                &[
+                    "pin",
+                    "resolve",
+                    &run,
+                    "--path",
+                    "vendor/README.md",
+                    "--json"
+                ]
+            )),
+            ORIGINAL
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forge_product_context_does_not_follow_a_symlink() {
+        let client = client();
+        client.success(&[
+            "context",
+            "set",
+            "--server",
+            "http://127.0.0.1:8093",
+            "--account",
+            "example",
+        ]);
+        let path = client.home.join("config/tinytree/context.json");
+        fs::remove_file(&path).unwrap();
+        let secret = client.home.join("do-not-read");
+        fs::write(&secret, b"private-token-value").unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        let failed = client.run(&["context", "show", "--json"]);
+        assert!(!failed.status.success());
+        assert!(!String::from_utf8_lossy(&failed.stdout).contains("private-token-value"));
+        assert_eq!(fs::read(&secret).unwrap(), b"private-token-value");
+    }
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -21,6 +1819,7 @@ struct Client {
     home: PathBuf,
     config: PathBuf,
     empty_path: PathBuf,
+    extra_env: Vec<(&'static str, &'static str)>,
 }
 impl Client {
     fn new() -> Self {
@@ -48,6 +1847,7 @@ impl Client {
             home,
             config,
             empty_path,
+            extra_env: vec![],
         }
     }
     fn spawn(&self, args: &[&str]) -> OwnedChild {
@@ -62,6 +1862,7 @@ impl Client {
             .env("JJ_CONFIG", &self.config)
             .env("PATH", &self.empty_path)
             .env("TERM", "dumb")
+            .envs(self.extra_env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -172,8 +1973,14 @@ fn stock_annotation_filters_unchanged_merge_parents_before_attribution() {
     // transitive through B. Raw first-parent propagation would wrongly pick A.
     assert_eq!(
         client.success(&[
-            "--ignore-working-copy", "file", "annotate", "story.txt", "-r", "@",
-            "-T", "commit.description().first_line() ++ \":\" ++ content",
+            "--ignore-working-copy",
+            "file",
+            "annotate",
+            "story.txt",
+            "-r",
+            "@",
+            "-T",
+            "commit.description().first_line() ++ \":\" ++ content",
         ]),
         "B:x\n",
     );
@@ -225,10 +2032,19 @@ fn stock_annotation_resolves_recursive_bases_and_ordered_octopus_parents() {
             client.success(&["describe", "-m", description]);
             client.success(&["bookmark", "set", &format!("node{index}"), "-r", "@"]);
         }
-        assert_eq!(client.success(&[
-            "--ignore-working-copy", "file", "annotate", "story.txt", "-r", "@",
-            "-T", "commit.description().first_line() ++ \":\" ++ content",
-        ]), case.annotation);
+        assert_eq!(
+            client.success(&[
+                "--ignore-working-copy",
+                "file",
+                "annotate",
+                "story.txt",
+                "-r",
+                "@",
+                "-T",
+                "commit.description().first_line() ++ \":\" ++ content",
+            ]),
+            case.annotation
+        );
     }
 }
 

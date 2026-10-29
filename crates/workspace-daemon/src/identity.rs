@@ -33,13 +33,13 @@ impl Credentials {
         let mut native = std::collections::BTreeMap::new();
         let mut native_ca = std::collections::BTreeMap::new();
         for (alias, repository) in &config.native.repositories {
-            if let Some(remote) = &repository.remote {
-                let value = match &remote.remote.token_env {
+            if let Some(transport) = repository.transport() {
+                let value = match &transport.token_env {
                     Some(name) => credential(name)?,
                     None => None,
                 };
                 native.insert(alias.clone(), value);
-                if let Some(tls) = &remote.remote.tls {
+                if let Some(tls) = &transport.tls {
                     use std::io::Read;
                     let mut bytes = Vec::new();
                     std::fs::File::open(&tls.ca_certificate)
@@ -142,7 +142,7 @@ impl Challenge {
                 .native
                 .repositories
                 .values()
-                .any(|repository| repository.remote.is_some())
+                .any(|repository| repository.is_remote())
             {
                 material["native_credentials"] = serde_json::to_value(&credentials.native)?;
                 let roots: std::collections::BTreeMap<_, _> = credentials

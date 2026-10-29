@@ -10,6 +10,16 @@ let activeSuggestion = -1;
 let generation = 0;
 let requestSequence = 0;
 let controller = null;
+const locationContext = new URLSearchParams(location.search);
+const account = locationContext.get('account') || '';
+const accountMode = Boolean(account);
+const selectedView = () => $('#reference').value.trim();
+const digestHex = (bytes) => Array.isArray(bytes) ? bytes.map((b) => b.toString(16).padStart(2, '0')).join('') : bytes;
+async function forge(operation, payload, signal) {
+  const envelope = await api('forge', { operation, account_id: account, view: selectedView(), request_id: crypto.randomUUID(), payload }, signal);
+  if (envelope.schema_version !== 1 || envelope.account_id !== account || envelope.operation !== operation || envelope.view !== selectedView()) throw new Error('Unexpected view response.');
+  return envelope.result;
+}
 
 function present(input) {
   const bytes = encoder.encode(JSON.stringify(input));
@@ -102,15 +112,16 @@ function showReadme() {
 }
 
 async function openRepository() {
-  const repository = $('#repository').value;
+  const repository = accountMode ? account : $('#repository').value;
   const reference = $('#reference').value.trim();
-  if (!repository || !reference) return;
+  if (!repository || (!accountMode && !reference)) return;
   resetSnapshot();
   const request = beginRequest();
   status('Opening the reference and reading its README…');
   empty('Opening this tree…', 'The README and file suggestions are on their way.');
   try {
-    const data = await api('snapshot', { repository, reference }, request.signal);
+    const data = accountMode ? await forge('resolve_view', {}, request.signal) : await api('snapshot', { repository, reference }, request.signal);
+    if (accountMode) { data.paths_complete = data.complete; data.version = data.view_version; data.revision = digestHex(data.revision); }
     if (!current(request)) return;
     snapshot = data;
     present({ op: 'manifest', paths: data.paths });
@@ -135,6 +146,7 @@ async function connect() {
   const request = beginRequest();
   status('Connecting…');
   try {
+    if (accountMode) { $('#connection').open = false; await openRepository(); return; }
     const data = await api('repositories', {}, request.signal);
     if (!current(request)) return;
     const repositories = Array.isArray(data) ? data : data.repositories;
@@ -212,7 +224,7 @@ async function searchContents(query) {
   $('#document').className = 'results';
   empty('Following that thread…', 'Searching file contents at the selected revision.');
   try {
-    const data = await api('search', { repository: view.repository, revision: view.revision, query }, request.signal);
+    const data = accountMode ? await forge('search', { version: view.version, query, regex: false, limit: 100 }, request.signal) : await api('search', { repository: view.repository, revision: view.revision, query }, request.signal);
     if (!current(request)) return;
     $('#document').className = 'results';
     $('#document').innerHTML = present({ op: 'results', query, matches: data.matches, complete: data.complete }).html;
@@ -236,7 +248,7 @@ async function openFile(path, line = null, anchor = null) {
   $('#document').className = '';
   empty('Opening this file…', path);
   try {
-    const data = await api('file', { repository: view.repository, revision: view.revision, path }, request.signal);
+    const data = accountMode ? await forge('read_file', { version: view.version, path }, request.signal) : await api('file', { repository: view.repository, revision: view.revision, path }, request.signal);
     if (!current(request)) return;
     const markdown = !line && /\.(md|markdown)$/i.test(path);
     $('#document').className = markdown ? 'markdown' : 'source-document';
@@ -302,6 +314,13 @@ $('#document').addEventListener('click', (event) => {
   }
 });
 
+if (accountMode) {
+  const option = document.createElement('option'); option.value = account; option.textContent = account;
+  $('#repository').replaceChildren(option); $('#repository').disabled = true;
+  $('label[for=repository]').textContent = 'Account'; $('label[for=reference]').textContent = 'View';
+  $('#reference').value = locationContext.get('view') || ''; $('#reference').placeholder = 'Default public view';
+  document.title = `${account} · tinytree`;
+}
 try {
   const response = await fetch('/ui/tinytree_ui.wasm', { credentials: 'omit', redirect: 'error' });
   if (!response.ok) throw new Error('The browser module could not be loaded.');

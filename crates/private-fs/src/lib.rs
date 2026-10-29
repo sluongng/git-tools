@@ -499,7 +499,14 @@ impl PrivateDir {
                 let path = self
                     .path
                     .join(format!(".private-{}-{n}.tmp", std::process::id()));
-                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
                     Ok(file) => Some(Ok((path, file))),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
                     Err(e) => Some(Err(e)),

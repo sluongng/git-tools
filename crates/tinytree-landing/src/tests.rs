@@ -94,6 +94,62 @@ fn decoded(candidate: &Candidate, id: [u8; 32]) -> m::Object {
         .expect("generated object");
     m::decode(&object.bytes, m::Limits::default()).unwrap()
 }
+
+#[test]
+fn explicit_mapped_parent_rebases_a_dependent_patch_without_losing_destination_changes() {
+    let mut r = Reader::default();
+    let empty = r.tree(vec![]);
+    let base = r.commit(m::CommitId::ROOT, empty, 1);
+    let parent_tree = r.tree(vec![("a", file(b"a", false))]);
+    let parent = r.commit(base, parent_tree, 2);
+    let destination_tree = r.tree(vec![("d", file(b"destination", false))]);
+    let destination = r.commit(base, destination_tree, 3);
+    let rebased_parent = build(
+        &mut r,
+        request(base, parent, destination),
+        Limits::default(),
+    )
+    .unwrap();
+    for object in &rebased_parent.objects {
+        r.objects
+            .insert(object.descriptor.key, object.bytes.clone());
+    }
+    let child_tree = r.tree(vec![("a", file(b"a", false)), ("b", file(b"child", false))]);
+    let child = r.commit(parent, child_tree, 4);
+    let input = request(parent, child, rebased_parent.head);
+    assert!(
+        build(&mut r, input.clone(), Limits::default()).is_err(),
+        "ordinary build must retain its common-ancestor contract"
+    );
+    let candidate =
+        build_on_mapped_base(&mut r, input, rebased_parent.head, Limits::default()).unwrap();
+    assert_eq!(
+        entries(&candidate, candidate.root_tree)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "d"]
+    );
+    let m::Object::Commit(commit) = decoded(&candidate, candidate.head.0) else {
+        panic!()
+    };
+    assert_eq!(commit.parents, [rebased_parent.head]);
+    assert_eq!(commit.change_id, m::ChangeId([4; 16]));
+    assert_eq!(
+        candidate.rewrites.iter().map(|p| p.old).collect::<Vec<_>>(),
+        [child]
+    );
+    assert!(
+        build_on_mapped_base(
+            &mut r,
+            request(parent, child, destination),
+            destination,
+            Limits::default()
+        )
+        .is_err(),
+        "unrelated logical base must be rejected"
+    );
+}
 fn entries(candidate: &Candidate, id: m::TreeId) -> Vec<m::TreeEntry> {
     let m::Object::Tree(t) = decoded(candidate, id.0) else {
         panic!()
@@ -597,4 +653,51 @@ fn exact_fast_forward_can_preserve_commit_identity_without_new_evolution() {
             change_id: m::ChangeId([2; 16])
         }]
     );
+}
+
+#[test]
+fn projected_directory_deletion_preserves_excluded_descendants_and_canonical_copy_identity() {
+    let mut r = Reader::default();
+    let canonical_directory = r.tree(vec![
+        ("private", file(b"excluded", false)),
+        ("visible", file(b"visible", false)),
+    ]);
+    let canonical_tree = r.tree(vec![("folder", m::TreeValue::Tree(canonical_directory))]);
+    let canonical = r.commit(m::CommitId::ROOT, canonical_tree, 1);
+    let copy = m::CopyId(r.put(m::Object::CopyHistory(m::CopyHistory {
+        current_path: "folder/visible".into(),
+        parents: vec![],
+        salt: vec![1],
+    })));
+    let mut visible = file(b"visible", false);
+    let m::TreeValue::File { copy_id, .. } = &mut visible else {
+        panic!()
+    };
+    *copy_id = Some(copy);
+    let projected_directory = r.tree(vec![("visible", visible)]);
+    let projected_tree = r.tree(vec![("folder", m::TreeValue::Tree(projected_directory))]);
+    let projected = r.commit(m::CommitId::ROOT, projected_tree, 8);
+    let empty = r.tree(vec![]);
+    let source = r.commit(projected, empty, 9);
+    let candidate = build_on_projected_base(
+        &mut r,
+        request(projected, source, canonical),
+        canonical,
+        Limits::default(),
+    )
+    .unwrap();
+    let root = entries(&candidate, candidate.root_tree);
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].name, "folder");
+    let m::TreeValue::Tree(folder) = root[0].value else {
+        panic!()
+    };
+    let retained = entries(&candidate, folder);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].name, "private");
+    assert_eq!(retained[0].value, file(b"excluded", false));
+    let m::Object::Commit(head) = decoded(&candidate, candidate.head.0) else {
+        panic!()
+    };
+    assert_eq!(head.parents, [canonical]);
 }

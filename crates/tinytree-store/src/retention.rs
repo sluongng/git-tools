@@ -426,6 +426,15 @@ impl Inner {
             budget.visit(&physical, &bytes)?;
             let (repo, suffix) = physical_parts(&physical)?;
             let name = std::str::from_utf8(suffix).map_err(|_| Error::Corrupt("reference name"))?;
+            if name.starts_with("_tinytree/forge/views/v1/")
+                || name.starts_with("_tinytree/forge/projections/v1/")
+                || name.starts_with("_tinytree/forge/pins/v1/")
+                || name.starts_with("_tinytree/forge/output/v1/") {
+                let format = view.get(&self.spaces.meta, b"format")?.ok_or(Error::Corrupt("forge format missing"))?;
+                if !super::forge_feature(&format) { return Err(Error::Corrupt("forge root without feature")); }
+                // Account reopen validation verifies exact immutable view/root bindings.
+                continue;
+            }
             if !reserved(name) {
                 continue;
             }
@@ -519,6 +528,12 @@ impl Inner {
             budget.visit(&physical, &bytes)?;
             // The ordinary store-format marker is not repository-scoped.
             if physical.as_ref() == b"format" {
+                continue;
+            }
+            if physical.starts_with(b"forge/") {
+                let format = view.get(&self.spaces.meta, b"format")?.ok_or(Error::Corrupt("forge format missing"))?;
+                if !super::forge_feature(&format) { return Err(Error::Corrupt("forge metadata without feature")); }
+                // Each enabled forge ledger validates its bounded records independently.
                 continue;
             }
             if physical.as_ref() == b"cloud-retirement-activated" {

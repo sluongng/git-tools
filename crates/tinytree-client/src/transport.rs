@@ -93,6 +93,23 @@ impl Client {
             .max_encoding_message_size(16 * 1024);
         self.unary(request, path, Shape::LandingResponse).await
     }
+    pub(crate) async fn forge_call(
+        &mut self,
+        request: Request<tinytree_proto::forge_v1::ForgeCallRequest>,
+    ) -> Result<Response<tinytree_proto::forge_v1::ForgeCallResponse>, Status> {
+        self.decode = tinytree_proto::FORGE_MAX_RESPONSE_BYTES;
+        self.inner = self
+            .inner
+            .clone()
+            .max_decoding_message_size(self.decode)
+            .max_encoding_message_size(tinytree_proto::FORGE_MAX_REQUEST_BYTES);
+        self.unary(
+            request,
+            "/tinytree.forge.v1.Forge/Call",
+            Shape::ForgeResponse,
+        )
+        .await
+    }
     pub(crate) async fn cloud_unary<
         T: Message + Send + 'static,
         U: Message + Default + Send + 'static,
@@ -661,6 +678,7 @@ impl Client {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Shape {
+    ForgeResponse,
     Capabilities,
     FeatureCapability,
     LandingResponse,
@@ -1048,6 +1066,7 @@ fn scan(
         }
     }
     let required = match shape {
+        Shape::ForgeResponse => (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
         Shape::Capabilities => (1 << 1) | (1 << 2) | (1 << 4),
         Shape::FeatureCapability => 1 << 1,
         Shape::LandingResponse => (1 << 1) | (1 << 2) | (1 << 3),
@@ -1141,6 +1160,10 @@ fn rule(shape: Shape, n: u32, l: &Limits) -> Option<(u8, Option<Shape>, usize, u
     let nested = |child| Some((2, Some(child), 1, 0));
     let repeated = |child, count, allocation| Some((2, Some(child), count, allocation));
     match (shape, n) {
+        (Shape::ForgeResponse, 1) => scalar(),
+        (Shape::ForgeResponse, 2 | 4) => text(64),
+        (Shape::ForgeResponse, 3) => text(tinytree_proto::FORGE_MAX_RESPONSE_BYTES),
+        (Shape::ForgeResponse, 5 | 6) => text(128),
         (Shape::LandingResponse, 1) => nested(Shape::LandingJob),
         (Shape::LandingResponse, 2 | 3) => text(128),
         (Shape::LandingJob, 1) => text(32),

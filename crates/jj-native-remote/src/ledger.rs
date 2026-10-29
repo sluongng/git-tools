@@ -1,5 +1,5 @@
 //! Durable admission/retention bookkeeping, never authoritative object storage.
-use crate::{Config, hex, unhex};
+use crate::{hex, unhex, Config};
 mod cloud;
 mod cloud_query;
 pub(crate) mod offload;
@@ -80,6 +80,8 @@ impl Request {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Root {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_candidate: Option<crate::ServerRetainedCandidate>,
     pub head: String,
     pub hold_name: String,
     pub request: Option<Request>,
@@ -109,7 +111,8 @@ pub(crate) struct Receipt {
 impl Root {
     pub fn retained(&self) -> bool {
         (self.pinned || self.complete)
-            && self.generation.is_some_and(|generation| generation > 0)
+            && (self.server_candidate.is_some()
+                || self.generation.is_some_and(|generation| generation > 0))
             && self.request.is_none()
     }
 }
@@ -429,7 +432,7 @@ impl Ledger {
             "native admission ledger authorization identity missing"
         );
         let endpoint = config.remote.endpoint.trim_end_matches('/');
-        let base = blake3::hash(
+        let ordinary_base = blake3::hash(
             serde_json::to_vec(&(
                 endpoint,
                 &config.remote.repository_id,
@@ -439,6 +442,16 @@ impl Ledger {
         )
         .to_hex()
         .to_string();
+        let base = match &config.server_retained_candidate {
+            Some(candidate) => blake3::hash(&serde_json::to_vec(&(
+                "server-retained-candidate-v1",
+                &ordinary_base,
+                candidate,
+            ))?)
+            .to_hex()
+            .to_string(),
+            None => ordinary_base,
+        };
         if let Some(existing) = &existing {
             ensure!(
                 existing.base == base,
@@ -540,14 +553,43 @@ impl Ledger {
             binding,
         })
     }
+    fn check_root(&self, root: &Root) -> Result<()> {
+        if let Some(candidate) = &root.server_candidate {
+            ensure!(
+                self.config.server_retained_candidate.as_ref() == Some(candidate)
+                    && root.head == candidate.head
+                    && root.binding == self.binding.scope
+                    && root.hold_name.is_empty()
+                    && root.generation.is_none()
+                    && root.request.is_none()
+                    && root.receipt.is_none()
+                    && root.receipt_binding.is_none(),
+                "server candidate ledger authority differs"
+            );
+        } else {
+            ensure!(
+                self.config.server_retained_candidate.is_none(),
+                "client retention is unavailable in candidate-only provider"
+            );
+        }
+        Ok(())
+    }
     pub fn root(&self, head: CommitId) -> Result<Option<Root>> {
-        self.get(&self.roots, hex(&head.0).as_bytes())
+        let root: Option<Root> = self.get(&self.roots, hex(&head.0).as_bytes())?;
+        if let Some(root) = &root {
+            self.check_root(root)?;
+        }
+        Ok(root)
     }
     pub fn roots(&self) -> Result<Vec<Root>> {
-        self.list(
+        let roots: Vec<Root> = self.list(
             &self.roots,
             self.config.max_admitted_roots + self.config.max_pending_operations,
-        )
+        )?;
+        for root in &roots {
+            self.check_root(root)?;
+        }
+        Ok(roots)
     }
     pub fn capture_root(&self, head: CommitId, max_bytes: usize) -> Result<Option<Root>> {
         self.check()?;
@@ -608,9 +650,12 @@ impl Ledger {
             .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("native ledger requires recovery"))?;
+        self.check_root(&root)?;
         ensure!(
-            root.generation.is_some_and(|generation| generation > 0) && root.request.is_none(),
-            "native pin lacks a current retention proof"
+            (root.server_candidate.is_some()
+                || root.generation.is_some_and(|generation| generation > 0))
+                && root.request.is_none(),
+            "native pin lacks a retention authority"
         );
         if !self
             .root(CommitId(unhex(&root.head)?))?

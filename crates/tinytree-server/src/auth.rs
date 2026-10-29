@@ -10,6 +10,8 @@ pub struct Principal {
     pub retain: bool,
     pub cloud: bool,
     pub landing_profiles: Vec<String>,
+    forge_only: bool,
+    forge_checker: bool,
     token_hash: [u8; 32],
 }
 impl Principal {
@@ -20,12 +22,39 @@ impl Principal {
         repositories: Vec<String>,
         write: bool,
     ) -> Result<Self, ConfigError> {
-        let id = id.into();
+        Self::build(id.into(), token, repositories, write, false, false)
+    }
+    /// Product users authenticate here but receive no raw native-repository
+    /// capability. Account/view policy is resolved separately for every call.
+    pub fn new_forge(id: impl Into<String>, token: &str) -> Result<Self, ConfigError> {
+        Self::build(id.into(), token, Vec::new(), false, true, false)
+    }
+    /// Trusted check runners may read actual dynamically provisioned account
+    /// repositories. This credential grants no product or raw write authority.
+    pub fn new_forge_checker(id: impl Into<String>, token: &str) -> Result<Self, ConfigError> {
+        Self::build(id.into(), token, Vec::new(), false, false, true)
+    }
+    pub(crate) fn is_forge_checker(&self) -> bool {
+        self.forge_checker
+    }
+    pub(crate) fn is_forge_only(&self) -> bool {
+        self.forge_only
+    }
+    fn build(
+        id: String,
+        token: &str,
+        repositories: Vec<String>,
+        write: bool,
+        forge_only: bool,
+        forge_checker: bool,
+    ) -> Result<Self, ConfigError> {
         if id.is_empty()
             || id.len() > 128
             || !(16..=4096).contains(&token.len())
             || !token.bytes().all(|b| b.is_ascii_graphic())
-            || repositories.is_empty()
+            || (!forge_only && !forge_checker && repositories.is_empty())
+            || ((forge_only || forge_checker) && (!repositories.is_empty() || write))
+            || (forge_only && forge_checker)
             || repositories
                 .iter()
                 .any(|r| tinytree_store::validate_repository_id(r).is_err())
@@ -39,6 +68,8 @@ impl Principal {
             retain: false,
             cloud: false,
             landing_profiles: Vec::new(),
+            forge_only,
+            forge_checker,
             token_hash: *blake3::hash(token.as_bytes()).as_bytes(),
         })
     }
@@ -74,6 +105,15 @@ impl Authorization {
         };
         let mut ids = HashSet::new();
         for principal in principals {
+            if (principal.forge_only || principal.forge_checker)
+                && (!principal.repositories.is_empty()
+                    || principal.write
+                    || principal.retain
+                    || principal.cloud
+                    || !principal.landing_profiles.is_empty())
+            {
+                return Err(ConfigError("exclusive forge principal has raw grants"));
+            }
             if principal.landing_profiles.len() > 32
                 || principal.landing_profiles.iter().any(|p| {
                     p.is_empty()
@@ -116,6 +156,8 @@ impl Authorization {
                 cloud: true,
                 authenticated: false,
                 landing_profiles: Vec::new(),
+                forge_only: false,
+                forge_checker: false,
             });
         }
         let header = metadata
@@ -139,6 +181,8 @@ impl Authorization {
             cloud: p.cloud,
             authenticated: true,
             landing_profiles: p.landing_profiles.clone(),
+            forge_only: p.forge_only,
+            forge_checker: p.forge_checker,
         })
     }
 }
@@ -150,8 +194,23 @@ pub(crate) struct Identity {
     cloud: bool,
     authenticated: bool,
     landing_profiles: Vec<String>,
+    forge_only: bool,
+    forge_checker: bool,
 }
 impl Identity {
+    pub(crate) fn forge_principal(&self) -> Result<&str, Status> {
+        if self.forge_checker {
+            return Err(Status::permission_denied(
+                "forge checker has no product authority",
+            ));
+        }
+        if !self.authenticated {
+            return Err(Status::unauthenticated(
+                "forge identity requires authentication",
+            ));
+        }
+        Ok(&self.id)
+    }
     pub fn landing_owner_hash(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
         hash.update(b"tinytree-landing-owner-v1\0");
@@ -215,8 +274,22 @@ impl Identity {
         }
         Ok(())
     }
+    pub(crate) fn is_forge_checker(&self) -> bool {
+        self.forge_checker
+    }
     pub fn authorize(&self, repo: &str, write: bool) -> Result<(), Status> {
-        if !self.repositories.contains(repo) || (write && !self.write) {
+        if self.forge_checker {
+            let valid = repo
+                .strip_prefix("forge-")
+                .is_some_and(|id| tinytree_store::AccountId(id.into()).validate().is_ok());
+            if !write && valid {
+                return Ok(());
+            }
+            return Err(Status::permission_denied(
+                "forge checker read access denied",
+            ));
+        }
+        if self.forge_only || !self.repositories.contains(repo) || (write && !self.write) {
             return Err(Status::permission_denied("native repository access denied"));
         }
         Ok(())

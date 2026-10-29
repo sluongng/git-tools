@@ -37,7 +37,7 @@ impl Locator {
         Ok(locator)
     }
     fn validate(&self) -> Result<(), io::Error> {
-        if !matches!(self.version, 1 | 2)
+        if !matches!(self.version, 1 | 2 | 3)
             || !self.socket.is_absolute()
             || self.socket.as_os_str().len() > 4096
             || self
@@ -143,11 +143,18 @@ pub(crate) fn locator(path: &Path) -> Result<Locator, Failure> {
 /// retain its recovery roots. Persist this loader fence before external work;
 /// it deliberately remains after the last landing journal has been acknowledged.
 pub(crate) fn require_landing_reader(path: &Path) -> Result<(), Failure> {
+    require_reader_version(path, 2)
+}
+/// Review source roots require the forge-aware collector, including legacy commands.
+pub(crate) fn require_forge_reader(path: &Path) -> Result<(), Failure> {
+    require_reader_version(path, 3)
+}
+fn require_reader_version(path: &Path, version: u32) -> Result<(), Failure> {
     let mut locator = locator(path)?;
-    if locator.version == 2 {
+    if locator.version >= version {
         return Ok(());
     }
-    locator.version = 2;
+    locator.version = version;
     let bytes = toml::to_string(&locator)
         .map_err(|_| io::Error::other("cannot encode native broker locator"))?;
     // jj creates this known backend child under its private repository using

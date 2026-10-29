@@ -3,6 +3,8 @@
 mod client;
 mod command;
 mod config;
+mod forge_io;
+pub use forge_io::{ForgeObjectIo, ForgeProjection, ForgeRemoteConfig};
 pub use command::{CommandGuard, CommandResolver, HostAccessResolver};
 mod control;
 mod control_client;

@@ -3149,11 +3149,13 @@ impl Inner {
         };
         let plan = self.retained_cloud_plan(Some(repo), None, false, &mut scan)?;
         let landing = self.landing_roots(repo)?;
-        if added.is_empty() && plan.versions.is_empty() && landing.is_empty() {
+        let review = self.forge_review_roots(repo)?;
+        if added.is_empty() && plan.versions.is_empty() && landing.is_empty() && review.is_empty() {
             return Ok(None);
         }
         let mut roots = plan.native;
         roots.extend(landing);
+        roots.extend(review);
         roots.insert(tinytree_model::empty_tree().descriptor.key);
         roots.extend(added.iter().copied());
         let changed_key = replacement.map(|(name, _)| key(repo, name.as_bytes()));

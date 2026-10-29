@@ -67,6 +67,9 @@ impl Running {
             Some(index) => service.with_query_index(index).unwrap(),
             None => service,
         };
+        Self::start_service(service).await
+    }
+    async fn start_service(service:RepositoryService)->Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
@@ -942,6 +945,42 @@ async fn capabilities_separate_configured_support_from_authenticated_grants_with
 }
 
 #[tokio::test]
+async fn forge_checker_reads_only_actual_dynamic_accounts_and_never_writes() {
+    const CHECKER:&str="forge-checker-test-token-not-a-secret";
+    const PRODUCT:&str="forge-product-test-token-not-a-secret";
+    let (_directory,store)=setup();
+    store.create_repository("forge-unowned").unwrap();
+    let service=RepositoryService::new(store.clone(),ServiceConfig::default(),vec!["alpha".into(),"beta".into()],vec![Principal::new_forge_checker("checker",CHECKER).unwrap(),Principal::new_forge("product",PRODUCT).unwrap()]).unwrap();
+    let server=Running::start_service(service).await;let mut client=server.client().await;
+    // Account creation after service assembly proves lookup is dynamic, not a
+    // startup repository grant or a prefix-only wildcard.
+    let account=tinytree_store::AccountId("dynamic".into());
+    store.forge_provision_account(&account,&tinytree_store::ForgeActor{principal:"owner".into()}).unwrap();
+    let repo=account.repository_id();
+    let view=client.open_repository(request(p::OpenRepositoryRequest{repository_id:repo.clone(),reference_names:vec!["main".into()]},CHECKER)).await.unwrap().into_inner();
+    let main=view.references[0].commit.clone().unwrap().key.unwrap();
+    let mut metadata=client.batch_read_objects(request(p::BatchReadObjectsRequest{repository_id:repo.clone(),keys:vec![main]},CHECKER)).await.unwrap().into_inner();
+    assert!(metadata.message().await.unwrap().is_some());drop(metadata);
+    let bytes=b"checker fixture content";let descriptor=tinytree_model::describe_file(bytes);store.put(&repo,descriptor,bytes,0).unwrap();
+    let mut file=client.read_file(request(p::ReadFileRequest{repository_id:repo.clone(),native_file_id:descriptor.key.id.0.to_vec()},CHECKER)).await.unwrap().into_inner();
+    let mut read=Vec::new();while let Some(frame)=file.message().await.unwrap(){if let Some(p::file_frame::Frame::Chunk(chunk))=frame.frame{read.extend(chunk.data);}}assert_eq!(read,bytes);drop(file);
+    for repository in ["alpha","forge-unowned","forge-unknown","forge-invalid/name"] {
+        let error=client.open_repository(request(p::OpenRepositoryRequest{repository_id:repository.into(),reference_names:vec![]},CHECKER)).await.unwrap_err();assert_eq!(error.code(),Code::PermissionDenied,"{repository}");
+    }
+    let error=client.open_repository(request(p::OpenRepositoryRequest{repository_id:repo.clone(),reference_names:vec![]},PRODUCT)).await.unwrap_err();assert_eq!(error.code(),Code::PermissionDenied);
+    let uploaded=tinytree_model::describe_file(b"must not install");
+    assert_eq!(upload(&mut client,&repo,CHECKER,uploaded,b"must not install").await.unwrap_err().code(),Code::PermissionDenied);
+    assert!(store.descriptor(&repo,uploaded.key).unwrap().is_none());
+    let error=client.publish_reference(request(p::PublishReferenceRequest{repository_id:repo.clone(),idempotency_key:"checker-denied".into(),reference_name:"draft".into(),expected_generation:0,new_commit:None,staging_leases:vec![]},CHECKER)).await.unwrap_err();assert_eq!(error.code(),Code::PermissionDenied);
+    // Valid credentials do not imply the trusted check runner is a product actor.
+    let channel=Endpoint::from_shared(format!("http://{}",server.address)).unwrap().connect().await.unwrap();
+    let mut forge=tinytree_proto::forge_v1::forge_client::ForgeClient::new(channel);
+    let error=forge.call(request(tinytree_proto::forge_v1::ForgeCallRequest{operation:tinytree_proto::forge_v1::ForgeOperation::ProvisionAccount as i32,account_id:"checker-created".into(),view:String::new(),request_id:"denied".into(),payload_json:b"{}".to_vec()},CHECKER)).await.unwrap_err();assert_eq!(error.code(),Code::PermissionDenied);
+    assert!(!store.forge_has_account_repository("forge-checker-created").unwrap());
+    drop(forge);drop(client);server.stop().await;
+}
+
+#[tokio::test]
 async fn authorization_precedes_scope_existence_and_isolates_native_objects() {
     let (_temporary, store) = setup();
     let server = Running::start(store, ServiceConfig::default()).await;
@@ -1565,6 +1604,8 @@ async fn failed_startup_never_creates_storage_or_runs_gc() {
     config.listen = "127.0.0.1:0".into();
     config.principals = vec![PrincipalConfig {
         id: "missing".into(),
+        forge_only: false,
+            forge_checker: false,
         token_env: format!("TINYTREE_MISSING_{}", uuid::Uuid::new_v4().simple()),
         repositories: vec!["default".into()],
         write: true,
@@ -12782,4 +12823,563 @@ async fn merged_path_graph_resolves_selected_parents_and_retains_page_admission_
         .unwrap();
     drop(client);
     server.stop().await;
+}
+
+
+#[tokio::test]
+async fn forge_account_created_after_start_is_physically_checked_without_automatic_landing() {
+    use tinytree_model::{
+        ChangeId, Commit, FileId, Signature, Timestamp, Tree, TreeEntry, TreeMerge, TreeValue,
+    };
+    use tinytree_store::{
+        AccountId, ForgeActor, ForgeMember, ForgeReviewPushRequest, ForgeViewVisibility,
+        LandingCheckProfile, LandingState, PolicyEpoch, ViewSpec,
+    };
+    let (_temporary, store, mut config, _input, scratch) = checked_landing_setup("pass");
+    let policy = &config.service.landing.checker.as_ref().unwrap().config;
+    let text = std::fs::read_to_string(policy).unwrap().replace(
+        "repositories=[\"alpha\"]",
+        "repositories=[\"alpha\"]\nforge_accounts=true",
+    );
+    std::fs::write(policy, text).unwrap();
+    let runner = tinytree_check_runner::Config::load(policy).unwrap();
+    let profile = LandingCheckProfile {
+        name: "checks".into(),
+        version: runner.profile_version("checks").unwrap(),
+    };
+    config.service.landing.profiles[0].version = profile.version.clone();
+    config.service.landing.forge_profile = Some(profile.name.clone());
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut readiness = running.client().await;
+    readiness
+        .open_repository(request(
+            p::OpenRepositoryRequest {
+                repository_id: "alpha".into(),
+                reference_names: vec![],
+            },
+            ALPHA,
+        ))
+        .await
+        .unwrap();
+    drop(readiness);
+    // Provision after physical dispatch started: no static repository/grant or restart.
+    let account = AccountId("new-review-team".into());
+    let writer = ForgeActor {
+        principal: "forge-writer".into(),
+    };
+    let reviewer = ForgeActor {
+        principal: "forge-reviewer".into(),
+    };
+    store.forge_provision_account(&account, &writer).unwrap();
+    store
+        .forge_set_member(
+            &account,
+            &writer,
+            ForgeMember {
+                principal: reviewer.principal.clone(),
+                can_write: false,
+                can_review: true,
+                is_admin: false,
+                roles: vec![],
+            },
+            PolicyEpoch(1),
+        )
+        .unwrap();
+    let repo = account.repository_id();
+    let base = CommitId(
+        store.references(&repo, &["main".into()]).unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0,
+    );
+    let view = store
+        .forge_publish_view(
+            &account,
+            &writer,
+            ViewSpec {
+                name: "all".into(),
+                root_prefix: "".into(),
+                include_prefixes: vec!["".into()],
+                exclude_prefixes: vec![],
+                visibility: ForgeViewVisibility::Members,
+                revision: base.0,
+                export_allowed: true,
+            },
+            PolicyEpoch(2),
+            false,
+        )
+        .unwrap();
+    let base = CommitId(store.forge_project_view(&view, 0).unwrap().projected_commit);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let file = tinytree_model::describe_file(b"checked content");
+    store
+        .forge_upload_file(&view, &writer, "source.txt", b"checked content", now)
+        .unwrap();
+    let tree = tinytree_model::encode(
+        &Object::Tree(Tree {
+            entries: vec![TreeEntry {
+                name: "source.txt".into(),
+                value: TreeValue::File {
+                    id: FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store
+        .forge_upload_object(&view, &writer, "", tree.descriptor, &tree.bytes, now)
+        .unwrap();
+    let signature = Signature {
+        name: "Review fixture".into(),
+        email: "review@example.invalid".into(),
+        timestamp: Timestamp {
+            millis_since_epoch: now * 1000,
+            tz_offset_minutes: 0,
+        },
+    };
+    let source = tinytree_model::encode(
+        &Object::Commit(Commit {
+            parents: vec![base],
+            predecessors: vec![],
+            root_tree: TreeMerge {
+                terms: vec![TreeId(tree.descriptor.key.id.0)],
+                labels: vec![String::new()],
+            },
+            change_id: ChangeId([19; 16]),
+            description: "review fixture".into(),
+            author: signature.clone(),
+            committer: signature.clone(),
+            secure_signature: None,
+        }),
+        Limits::default(),
+    )
+    .unwrap();
+    store
+        .forge_upload_object(&view, &writer, "", source.descriptor, &source.bytes, now)
+        .unwrap();
+    let review = store
+        .forge_push_review(
+            &account,
+            &writer,
+            &ForgeReviewPushRequest {
+                request_id: "dynamic-check".into(),
+                source_base: base,
+                source_head: CommitId(source.descriptor.key.id.0),
+                view_version: view.version().0,
+                expected_patchset: None,
+                predecessor: None,
+                provenance: None,
+                lineage: vec![],
+                check_profile: profile,
+            },
+            &signature,
+            now,
+        )
+        .unwrap();
+    let candidate = review.candidate.as_ref().unwrap();
+    let handle = store
+        .recover_landing_handle(&repo, candidate.id)
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if handle.status(&store).unwrap().state == LandingState::Checked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        scratch.join("executions").is_file(),
+        "pinned physical checker was invoked"
+    );
+    assert_eq!(
+        store.references(&repo, &["main".into()]).unwrap()[0].generation,
+        1,
+        "check completion never auto-lands a review"
+    );
+    running.stop().await;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    store
+        .forge_approve_review(
+            &account,
+            &reviewer,
+            ChangeId(review.change_id),
+            review.patchset_id,
+            candidate.id,
+            "dynamic-approval",
+            now + 1,
+        )
+        .unwrap();
+    let landed = store
+        .forge_land_review(
+            &account,
+            &writer,
+            ChangeId(review.change_id),
+            review.patchset_id,
+            candidate.id,
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(landed.state, tinytree_store::ForgeReviewState::Landed);
+    assert_eq!(
+        store.references(&repo, &["main".into()]).unwrap()[0]
+            .commit
+            .unwrap()
+            .key
+            .id
+            .0,
+        candidate.head
+    );
+    running.stop().await;
+}
+
+// Real native acceptance only. The manual wrapper supplies declared binaries and
+// explicit operator-owned Bazel/RBE inputs; ordinary RPC fixtures never run this.
+#[cfg(target_os = "linux")]
+mod forge_native_checker_acceptance {
+    use super::*;
+    use anyhow::{Context as _, Result, ensure};
+    use sha2::{Digest as _, Sha256};
+    use std::{
+        fs,
+        io::Read as _,
+        os::unix::fs::{FileTypeExt as _, PermissionsExt as _},
+        path::{Path, PathBuf},
+    };
+    use tinytree_model::{
+        ChangeId, Commit, FileId, Signature, Timestamp, Tree, TreeEntry, TreeMerge, TreeValue,
+    };
+    use tinytree_store::{
+        AccountId, ForgeActor, ForgeMember, ForgeReviewPushRequest, ForgeViewVisibility,
+        LandingCheckProfile, LandingState, PolicyEpoch, ViewSpec,
+    };
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn input(name: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(
+            std::env::var(name).with_context(|| format!("explicit {name} is required"))?,
+        );
+        ensure!(
+            path.is_absolute(),
+            "acceptance runtime paths must be absolute"
+        );
+        Ok(path)
+    }
+    fn pin(path: &Path) -> Result<String> {
+        let mut file = fs::File::open(path)?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "acceptance binary is not a regular file"
+        );
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 65536];
+        loop {
+            let n = file.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&bytes[..n]);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    fn declared(path: Option<&str>, name: &str) -> Result<PathBuf> {
+        Path::new(
+            path.with_context(|| format!("{name} requires the declared manual fixture target"))?,
+        )
+        .canonicalize()
+        .map_err(Into::into)
+    }
+    fn vacant_port() -> Result<u16> {
+        Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port())
+    }
+    fn count(value: &serde_json::Value) -> u64 {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0)
+    }
+    fn remote_execution(bep: &Path) -> Result<u64> {
+        let bytes = fs::read(bep)?;
+        ensure!(bytes.len() <= 64 * 1024 * 1024, "acceptance BEP limit");
+        let mut remote = 0;
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            let event: serde_json::Value = serde_json::from_slice(line)?;
+            if let Some(runners) = event["buildMetrics"]["actionSummary"]["runnerCount"].as_array()
+            {
+                for runner in runners {
+                    if runner["name"].as_str() == Some("remote") {
+                        remote += count(&runner["count"]);
+                    }
+                }
+            }
+        }
+        ensure!(
+            remote > 0,
+            "no physical remote execution recorded (cache-only/local results are not acceptance)"
+        );
+        Ok(remote)
+    }
+    fn completed_receipt(scratch: &Path) -> Result<(tinytree_check_runner::Receipt, PathBuf)> {
+        let mut found = None;
+        for entry in fs::read_dir(scratch)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let journal = path.join("attempt.json");
+            if !journal.is_file() {
+                continue;
+            }
+            let bytes = fs::read(journal)?;
+            ensure!(bytes.len() <= 256 * 1024, "acceptance journal limit");
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if !value["receipt"].is_null() {
+                ensure!(found.is_none(), "multiple physical acceptance attempts");
+                found = Some((serde_json::from_value(value["receipt"].clone())?, path));
+            }
+        }
+        found.context("physical runner receipt is missing")
+    }
+    async fn run() -> Result<()> {
+        ensure!(
+            fs::metadata("/dev/fuse")
+                .context("real Linux /dev/fuse is required")?
+                .file_type()
+                .is_char_device(),
+            "real FUSE character device is required"
+        );
+        let _fuse = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+            .context("native FUSE permission is required")?;
+        let bazel = input("TINYTREE_ACCEPTANCE_BAZEL")?.canonicalize()?;
+        let mut elf = [0; 4];
+        fs::File::open(&bazel)?.read_exact(&mut elf)?;
+        ensure!(
+            &elf == b"\x7fELF",
+            "an actual pinned Bazel ELF is required, not a PATH-discovered launcher"
+        );
+        let rbe = input("TINYTREE_ACCEPTANCE_RBE_SOCKET")?;
+        ensure!(
+            fs::metadata(&rbe)?.file_type().is_socket(),
+            "explicit trusted RBE Unix socket is required"
+        );
+        let evidence = private_fs::PrivateDir::create(input("TINYTREE_ACCEPTANCE_RECEIPTS")?)?;
+        let directory = tempfile::Builder::new()
+            .prefix("native-forge-check-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(evidence.path())?
+            .keep();
+        let operator = private_fs::PrivateDir::create(directory.join("operator"))?;
+        let workspace = declared(option_env!("TINYTREE_ACCEPTANCE_WORKSPACE"), "workspace")?;
+        let runner = declared(option_env!("TINYTREE_ACCEPTANCE_RUNNER"), "check runner")?;
+        let runner_pin = pin(&runner)?;
+        let workspace_pin = pin(&workspace)?;
+        let bazel_pin = pin(&bazel)?;
+        let bounded:tinytree_server::Config=toml::from_str(include_str!("../examples/landing.toml"))?;
+        let store = Store::open(directory.join("server"),bounded.store.materialize(bounded.service.max_metadata_bytes))?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let checker_token = std::env::var("TINYTREE_ACCEPTANCE_CHECKER_TOKEN")
+            .context("manual wrapper must supply the public fixture checker token")?;
+        let daemon = operator.path().join("daemon-template.toml");
+        let scratch=tempfile::Builder::new().prefix("tfc.").permissions(fs::Permissions::from_mode(0o700)).tempdir_in("/tmp")?.keep();
+        let _scratch_owner=private_fs::PrivateDir::open_existing(&scratch)?;
+        fs::write(directory.join("runtime.json"),serde_json::to_vec(&serde_json::json!({"scratch":scratch}))?)?;
+        let policy = operator.path().join("checker.toml");
+        let cache_port = vacant_port()?;
+        let mut git_port = vacant_port()?;
+        while git_port == cache_port {
+            git_port = vacant_port()?;
+        }
+        let daemon_text = format!(
+            r#"state_dir={state:?}
+[cache]
+listen="127.0.0.1:{cache_port}"
+upstream={endpoint:?}
+api_key_env=""
+[git_proxy]
+listen="127.0.0.1:{git_port}"
+[native.workspaces]
+index_mode="legacy"
+[native.repositories.checker_template]
+checker_forge_accounts=true
+[native.repositories.checker_template.remote]
+authorization_profile="native-acceptance-checker"
+[native.repositories.checker_template.remote.remote]
+endpoint={endpoint:?}
+repository_id="checker-template"
+token_env="TINYTREE_ACCEPTANCE_CHECKER_TOKEN"
+"#,
+            state = operator
+                .path()
+                .join("template-state")
+                .to_str()
+                .context("UTF-8 fixture paths required")?
+        );
+        operator.replace("daemon-template.toml",daemon_text.as_bytes())?;
+        let flags: Vec<String> = std::env::var("TINYTREE_ACCEPTANCE_PROFILE_FLAGS_JSON")
+            .ok()
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(flags.len() <= 16, "too many trusted acceptance flags");
+        let policy_text = format!(
+            r#"scratch={scratch:?}
+daemon_config={daemon:?}
+rbe_socket={rbe:?}
+remote_instance_name={instance:?}
+runner_sha256={runner_pin:?}
+workspace_environment=["TINYTREE_ACCEPTANCE_CHECKER_TOKEN"]
+cleanup_timeout_seconds=60
+remote_timeout_seconds=180
+[workspace]
+path={workspace:?}
+sha256={workspace_pin:?}
+[bazel]
+path={bazel:?}
+sha256={bazel_pin:?}
+[[profiles]]
+name="native-acceptance"
+repositories=[]
+forge_accounts=true
+store="checker_template"
+mode="build"
+targets=["//:proof"]
+flags={flags}
+timeout_seconds=300
+force_remote_execution=true
+"#,
+            scratch = scratch.to_str().context("UTF-8 paths required")?,
+            daemon = daemon.to_str().unwrap(),
+            rbe = rbe.to_str().context("UTF-8 RBE socket required")?,
+            instance = std::env::var("TINYTREE_ACCEPTANCE_INSTANCE_NAME").unwrap_or_default(),
+            workspace = workspace.to_str().unwrap(),
+            bazel = bazel.to_str().unwrap(),
+            flags = serde_json::to_string(&flags)?
+        );
+        operator.replace("checker.toml",policy_text.as_bytes())?;
+        let trusted = tinytree_check_runner::Config::load(&policy)?;
+        let profile = LandingCheckProfile {
+            name: "native-acceptance".into(),
+            version: trusted.profile_version("native-acceptance")?,
+        };
+        let mut config = ServiceConfig::default();
+        config.landing.enabled = true;
+        config.landing.forge_profile = Some(profile.name.clone());
+        config.landing.profiles = vec![tinytree_server::LandingProfile {
+            name: profile.name.clone(),
+            version: profile.version.clone(),
+            repositories: vec![],
+        }];
+        config.landing.max_buffered_bytes = 6 * 1024 * 1024 * 1024;
+        config.landing.poll_interval_ms = 50;
+        let mut checker = tinytree_server::LandingCheckerConfig::default();
+        checker.enabled = true;
+        checker.executable = runner;
+        checker.sha256 = runner_pin;
+        checker.config = policy;
+        checker.max_checks = 1;
+        checker.max_checks_per_repository = 1;
+        checker.max_attempts = 1;
+        checker.max_recovery_attempts=2;
+        checker.retry_delay_seconds=1;
+        checker.execution_timeout_seconds = 360;
+        checker.cleanup_grace_seconds = 90;
+        config.landing.checker = Some(checker);
+        let service = RepositoryService::new(
+            store.clone(),
+            config,
+            vec![],
+            vec![Principal::new_forge_checker(
+                "native-checker",
+                &checker_token,
+            )?],
+        )?;
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(serve_tcp(listener, service, None, async {
+            let _ = stopped.await;
+        }));
+        let result=async {
+            let account=AccountId("native-acceptance".into());let writer=ForgeActor{principal:"writer".into()};let reviewer=ForgeActor{principal:"reviewer".into()};
+            store.forge_provision_account(&account,&writer)?;store.forge_set_member(&account,&writer,ForgeMember{principal:reviewer.principal.clone(),can_write:false,can_review:true,is_admin:false,roles:vec![]},PolicyEpoch(1))?;
+            let repo=account.repository_id();let original=store.references(&repo,&["main".into()])?.remove(0);let canonical=CommitId(original.commit.context("genesis missing")?.key.id.0);
+            let view=store.forge_publish_view(&account,&writer,ViewSpec{name:"all".into(),root_prefix:String::new(),include_prefixes:vec![String::new()],exclude_prefixes:vec![],visibility:ForgeViewVisibility::Members,revision:canonical.0,export_allowed:true},PolicyEpoch(2),false)?;
+            let base=CommitId(store.forge_project_view(&view,0)?.projected_commit);
+            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+            let mut entries=Vec::new();
+            let build=br#"genrule(name = "proof", outs = ["checked.txt"], cmd = "echo checked > $@")
+"#;
+            let module=br#"module(name = "native_acceptance")
+"#;
+            for(name,bytes)in[("BUILD.bazel",build.as_slice()),("MODULE.bazel",module.as_slice())] {
+                let d=tinytree_model::describe_file(bytes);store.forge_upload_file(&view,&writer,name,bytes,now)?;
+                entries.push(TreeEntry{name:name.into(),value:TreeValue::File{id:FileId(d.key.id.0),executable:false,size_bytes:d.size_bytes,copy_id:None}});
+            }
+            let tree=tinytree_model::encode(&Object::Tree(Tree{entries}),Limits::default())?;store.forge_upload_object(&view,&writer,"",tree.descriptor,&tree.bytes,now)?;
+            let signature=Signature{name:"Native acceptance".into(),email:"fixture@example.invalid".into(),timestamp:Timestamp{millis_since_epoch:now*1000,tz_offset_minutes:0}};
+            let source=tinytree_model::encode(&Object::Commit(Commit{parents:vec![base],predecessors:vec![],root_tree:TreeMerge{terms:vec![TreeId(tree.descriptor.key.id.0)],labels:vec![String::new()]},change_id:ChangeId([73;16]),description:"Check neutral native candidate".into(),author:signature.clone(),committer:signature.clone(),secure_signature:None}),Limits::default())?;store.forge_upload_object(&view,&writer,"",source.descriptor,&source.bytes,now)?;
+            let review=store.forge_push_review(&account,&writer,&ForgeReviewPushRequest{request_id:"native-physical-check".into(),source_base:base,source_head:CommitId(source.descriptor.key.id.0),view_version:view.version().0,expected_patchset:None,predecessor:None,provenance:None,lineage:vec![],check_profile:profile.clone()},&signature,now)?;
+            let candidate=review.candidate.context("native candidate missing")?;let handle=store.recover_landing_handle(&repo,candidate.id)?.context("native check handle missing")?;
+            tokio::time::timeout(Duration::from_secs(420),async {loop{let status=handle.status(&store)?;match status.state{LandingState::Checked=>return Ok::<_,anyhow::Error>(()),LandingState::Intent|LandingState::Prepared=>(),state=>anyhow::bail!("real native checker did not pass: {state:?}; inspect private fixture evidence")};
+                if let Ok((receipt,_))=completed_receipt(&scratch) {
+                    ensure!(receipt.outcome==tinytree_check_runner::Outcome::Passed,"physical checker returned {:?}/{}; private evidence retained",receipt.outcome,receipt.reason);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }}).await.context("real native checker acceptance timed out")??;
+            ensure!(store.references(&repo,&["main".into()])?[0].generation==original.generation,"physical check auto-landed main");
+            let(receipt,attempt)=completed_receipt(&scratch)?;receipt.validate_for(&receipt.request)?;
+            ensure!(receipt.outcome==tinytree_check_runner::Outcome::Passed&&receipt.cleanup_confirmed,"real checker cleanup/verdict incomplete");
+            ensure!(receipt.request.repository_id==repo&&receipt.request.candidate_commit==hex(&candidate.head)&&receipt.request.root_tree==hex(&candidate.root_tree)&&receipt.request.profile_version==profile.version&&receipt.request.profile_name==profile.name,"physical checker bound the wrong account/candidate/profile");
+            let remote=remote_execution(&attempt.join("bep.jsonl"))?;
+            let evidence=receipt.evidence.as_ref().context("real checker execution evidence missing")?;ensure!(evidence.requested_targets==["//:proof"]&&evidence.execution_log_blake3.is_some()&&evidence.bazel_exit_code==0,"real Bazel evidence incomplete");
+            let landed_now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+            store.forge_approve_review(&account,&reviewer,ChangeId(review.change_id),review.patchset_id,candidate.id,"native-approval",landed_now)?;
+            let landed=store.forge_land_review(&account,&writer,ChangeId(review.change_id),review.patchset_id,candidate.id,landed_now+1)?;ensure!(landed.state==tinytree_store::ForgeReviewState::Landed,"approved physical candidate did not land");
+            ensure!(store.references(&repo,&["main".into()])?[0].commit.context("landed main missing")?.key.id.0==candidate.head,"landed main differs from physically checked candidate");
+            fs::write(directory.join("acceptance.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"account_id":account.0,"candidate":hex(&candidate.head),"profile_version":profile.version,"remote_executions":remote,"receipt":receipt,"landed":true}))?)?;
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        let _ = stop.send(());
+        let shutdown = tokio::time::timeout(Duration::from_secs(120), task)
+            .await
+            .context("native acceptance service cleanup timed out")???;
+        let _ = shutdown;
+        result
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires explicit real Linux/FUSE, pinned Bazel ELF and trusted RBE socket"]
+    async fn actual_account_candidate_is_physically_remote_checked_then_approved_and_landed() {
+        run().await.expect("real native checker acceptance failed; inspect private fixture artifacts; no mock fallback");
+    }
 }

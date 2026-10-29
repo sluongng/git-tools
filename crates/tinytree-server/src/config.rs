@@ -287,7 +287,14 @@ impl StoreConfig {
 pub struct PrincipalConfig {
     pub id: String,
     pub token_env: String,
+    #[serde(default)]
     pub repositories: Vec<String>,
+    /// Account/view-controlled product identity, with no legacy raw RPC access.
+    #[serde(default)]
+    pub forge_only: bool,
+    /// Trusted check-runner credential; dynamic account reads only, no writes.
+    #[serde(default)]
+    pub forge_checker: bool,
     #[serde(default)]
     pub write: bool,
     #[serde(default)]
@@ -360,7 +367,11 @@ impl Config {
         self.service.landing.validate_store_with_checker_history(
             &self.store.materialize(self.service.max_metadata_bytes),
         )?;
-        if self.repositories.is_empty()
+        if (self.repositories.is_empty()
+            && !self
+                .principals
+                .iter()
+                .any(|p| p.forge_only || p.forge_checker))
             || self.repositories.len() > 1024
             || self.gc_interval_seconds > 86400
         {
@@ -390,7 +401,16 @@ impl Config {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 || principal.token_env.as_bytes()[0].is_ascii_digit()
-                || principal.repositories.is_empty()
+                || (!principal.forge_only
+                    && !principal.forge_checker
+                    && principal.repositories.is_empty())
+                || ((principal.forge_only || principal.forge_checker)
+                    && (!principal.repositories.is_empty()
+                        || principal.write
+                        || principal.retain
+                        || principal.cloud
+                        || !principal.landing_profiles.is_empty()))
+                || (principal.forge_only && principal.forge_checker)
                 || principal.repositories.iter().any(|r| !repos.contains(r))
             {
                 return Err(ConfigError("invalid native authorization configuration"));

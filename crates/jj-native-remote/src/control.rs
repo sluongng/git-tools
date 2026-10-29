@@ -1,11 +1,11 @@
 //! Durable remote operations, deliberately separate from local object I/O.
 use crate::{
-    Inner, backend,
+    backend,
     closure::{Closure, ClosureFailure},
     hex, io,
     ledger::{Request, Root},
     provider::RemoteObjectIo,
-    unhex,
+    unhex, Inner,
 };
 use anyhow::{Context, Result, ensure};
 use futures::AsyncReadExt;
@@ -24,10 +24,14 @@ impl std::fmt::Debug for RemoteRepositoryControl {
     }
 }
 #[derive(Clone, Debug)]
+pub enum AdmittedRetention {
+    ClientHold { name: String, generation: u64 },
+    ServerRetainedCandidate { job_id: String },
+}
+#[derive(Clone, Debug)]
 pub struct AdmittedHead {
     pub head: m::CommitId,
-    pub hold_name: String,
-    pub hold_generation: u64,
+    pub retention: AdmittedRetention,
     pub metadata_objects: usize,
     pub public_reference: Option<AdmittedReference>,
     _retained: (),
@@ -194,6 +198,21 @@ impl RemoteRepositoryControl {
         self.inner.ledger.client
     }
     pub(crate) async fn refresh_scope_hold(&self, head: m::CommitId) -> Result<()> {
+        if let Some(candidate) = &self.inner.config.server_retained_candidate {
+            ensure!(
+                candidate.head == hex(&head.0),
+                "candidate-only admission head differs"
+            );
+            let ledger = self.inner.ledger.clone();
+            let root = io::blocking(move || ledger.root(head))
+                .await?
+                .context("candidate admission is absent")?;
+            ensure!(
+                root.ready && root.server_candidate.as_ref() == Some(candidate),
+                "candidate admission is not ready"
+            );
+            return Ok(());
+        }
         let operation = async {
             let client = self.physical_client().await?;
             let root = self.hold(&client, head).await?;
@@ -342,6 +361,9 @@ impl RemoteRepositoryControl {
             head != m::CommitId::ROOT,
             "intrinsic root does not need remote admission"
         );
+        if let Some(candidate) = self.inner.config.server_retained_candidate.clone() {
+            return self.admit_server_candidate(head, candidate).await;
+        }
         let client = self.physical_client().await?;
         let mut root = self.hold(&client, head).await?;
         root.pinned = true;
@@ -364,19 +386,94 @@ impl RemoteRepositoryControl {
         io::blocking(move || ledger.pin(pinned)).await?;
         Ok(AdmittedHead {
             head,
-            hold_name: root.hold_name,
-            hold_generation: root
-                .generation
-                .context("native hold proof missing generation")?,
+            retention: AdmittedRetention::ClientHold {
+                name: root.hold_name,
+                generation: root
+                    .generation
+                    .context("native hold proof missing generation")?,
+            },
             metadata_objects: 1,
             public_reference: None,
             _retained: (),
         })
     }
+    async fn admit_server_candidate(
+        &self,
+        head: m::CommitId,
+        candidate: crate::ServerRetainedCandidate,
+    ) -> Result<AdmittedHead> {
+        ensure!(
+            hex(&head.0) == candidate.head,
+            "candidate-only admission head differs"
+        );
+        let root = Root {
+            head: candidate.head.clone(),
+            hold_name: String::new(),
+            server_candidate: Some(candidate.clone()),
+            request: None,
+            receipt: None,
+            receipt_binding: None,
+            generation: None,
+            binding: self.inner.ledger.binding.scope.clone(),
+            complete: false,
+            pinned: true,
+            ready: false,
+        };
+        let ledger = self.inner.ledger.clone();
+        let saved = root.clone();
+        io::blocking(move || ledger.pin(saved)).await?;
+        let provider = RemoteObjectIo {
+            inner: self.inner.clone(),
+        };
+        let metadata = provider
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Commit,
+                id: m::ObjectId(head.0),
+            })
+            .await
+            .map_err(backend)?;
+        let m::Object::Commit(commit) = metadata.into_object() else {
+            anyhow::bail!("candidate admission requires commit metadata");
+        };
+        ensure!(
+            commit.root_tree.terms.len() == 1
+                && hex(&commit.root_tree.terms[0].0) == candidate.root_tree,
+            "candidate root tree differs from trusted check job"
+        );
+        let metadata = provider
+            .read_metadata(m::ObjectKey {
+                kind: m::Kind::Tree,
+                id: m::ObjectId(commit.root_tree.terms[0].0),
+            })
+            .await
+            .map_err(backend)?;
+        ensure!(
+            matches!(metadata.into_object(), m::Object::Tree(_)),
+            "candidate root is not a tree"
+        );
+        let ledger = self.inner.ledger.clone();
+        let mut ready = root;
+        ready.ready = true;
+        io::blocking(move || ledger.pin(ready)).await?;
+        Ok(AdmittedHead {
+            head,
+            retention: AdmittedRetention::ServerRetainedCandidate {
+                job_id: candidate.job_id,
+            },
+            metadata_objects: 2,
+            public_reference: None,
+            _retained: (),
+        })
+    }
     async fn hold(&self, client: &NativeClient, head: m::CommitId) -> Result<Root> {
+        ensure!(
+            self.inner.config.server_retained_candidate.is_none(),
+            "server-retained candidate provider is read-only"
+        );
         let ledger = self.inner.ledger.clone();
         let existing = io::blocking(move || ledger.root(head)).await?;
         let mut root = existing.unwrap_or(Root {
+            server_candidate: None,
             head: hex(&head.0),
             hold_name: format!(
                 "_tinytree/hold/v1/{}/{}",
@@ -467,6 +564,10 @@ impl RemoteRepositoryControl {
         Ok(root)
     }
     pub async fn publish(&self, request: PublishRequest) -> Result<ConfirmedPublication> {
+        ensure!(
+            self.inner.config.server_retained_candidate.is_none(),
+            "server-retained candidate provider is read-only"
+        );
         let deadline = self.inner.deadline();
         self.run(deadline, self.publish_inner(request, deadline))
             .await

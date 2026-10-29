@@ -12388,3 +12388,37 @@ async fn capture_frontier_requires_a_retained_boundary_and_keeps_cancelled_work_
     assert_eq!(counts.files.load(Ordering::SeqCst), 0);
     server.stop().await;
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn server_retained_candidate_admits_and_reads_with_no_write_or_retention_grant() {
+    let hex=|bytes:&[u8]|bytes.iter().map(|b|format!("{b:02x}")).collect::<String>();
+    let (_serverdir,store,fixture,head)=seed();
+    let counts=Counters::new();
+    let service=RepositoryService::new(store.clone(),ServiceConfig::default(),vec!["example".into()],vec![Principal::new("check-reader",TOKEN,vec!["example".into()],false).unwrap()]).unwrap();
+    let server=Server::start_service(service,counts.clone(),None).await;
+    let root=fixture.objects().iter().find(|o|o.descriptor.key.id.0==head.0).unwrap();
+    let m::Object::Commit(commit)=m::decode(&root.bytes,m::Limits::default()).unwrap() else {panic!()};
+    let mut selected=config(&server);selected.server_retained_candidate=Some(jj_native_remote::ServerRetainedCandidate{job_id:"11".repeat(32),head:hex(&head.0),root_tree:hex(&commit.root_tree.terms[0].0)});
+    let directory=private_dir();let cache=cache(directory.path());
+    let (direct,repo)=local(directory.path(),cache.clone(),selected.clone(),true);
+    let admitted=repo.control.admit_commit(head).await.unwrap();
+    assert!(matches!(admitted.retention,jj_native_remote::AdmittedRetention::ServerRetainedCandidate{job_id} if job_id=="11".repeat(32)));
+    assert_eq!(counts.holds.load(Ordering::SeqCst),0,"readonly admission must not attempt a hold write");
+    assert_eq!(counts.files.load(Ordering::SeqCst),0,"metadata admission remains lazy");
+    assert!(repo.control.admit_commit(m::CommitId([77;32])).await.is_err());
+    read_current_metadata(&repo,head).await;
+    let file=first_file(&fixture);
+    assert_eq!(bytes(repo.io.as_ref(),m::FileId(file.descriptor.key.id.0)).await,file.bytes);
+    assert_eq!(counts.holds.load(Ordering::SeqCst),0);
+    assert!(repo.control.publish(jj_native_remote::PublishRequest{head,reference_name:"forbidden".into(),expected_generation:0,idempotency_key:"readonly-write".into()}).await.is_err());
+    assert_eq!(store.references("example",&["forbidden".into()]).unwrap()[0].generation,0);
+    drop(repo);
+    let reopened=RemoteRepository::open(direct.clone(),cache.clone(),&directory.path().join("ledger"),&directory.path().join("staging"),selected.clone()).unwrap();
+    reopened.control.admit_commit(head).await.unwrap();assert_eq!(counts.holds.load(Ordering::SeqCst),0);drop(reopened);
+    let mut changed=selected.clone();changed.server_retained_candidate.as_mut().unwrap().job_id="22".repeat(32);
+    assert!(RemoteRepository::open(direct.clone(),cache.clone(),&directory.path().join("ledger"),&directory.path().join("staging"),changed).is_err(),"retained authority cannot be rebound to another job");
+    let wrong=private_dir();let mut wrong_config=selected;wrong_config.server_retained_candidate.as_mut().unwrap().root_tree="33".repeat(32);
+    let (_direct,wrong_repo)=local(wrong.path(),cache.clone(),wrong_config,true);assert!(wrong_repo.control.admit_commit(head).await.is_err(),"trusted root mismatch must reject before mount admission");
+    assert_eq!(counts.holds.load(Ordering::SeqCst),0);
+    cache.wait_for_idle().await.unwrap();server.stop().await;
+}

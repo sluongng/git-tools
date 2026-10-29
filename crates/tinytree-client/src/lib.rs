@@ -28,6 +28,7 @@ pub use client::search::{CheckedSearch, CheckedSearchPage};
 pub use config::{Config, ConfigError, Limits, Tls};
 pub use tinytree_proto::PublicationFailureReason;
 pub use tinytree_proto::cloud_v1 as cloud_protocol;
+pub use tinytree_proto::forge_v1 as forge_protocol;
 pub use tinytree_proto::query_v1 as query_protocol;
 pub use tinytree_proto::v1 as protocol;
 pub use verified::{

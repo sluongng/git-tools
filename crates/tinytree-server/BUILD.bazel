@@ -3,6 +3,8 @@ load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
+load("//build_defs:fixture_test.bzl", "fixture_test")
+
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
@@ -115,4 +117,57 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# Compile the actual runner/workspace remotely; only genuine Linux/FUSE/RBE
+# execution is local and explicitly selected. Runtime site settings stay external.
+rust_test(
+    name = "forge_native_checker_fixture",
+    srcs = ["tests/rpc.rs"],
+    compile_data = ["examples/cloud.toml", "examples/landing.toml"],
+    data = [
+        ":checker_fixture",
+        "//crates/tinytree-check-runner:tinytree-check-runner-bin",
+        "//crates/workspace-daemon:workspace",
+    ],
+    rustc_env = {
+        "TINYTREE_CHECKER_FIXTURE": "$(rootpath :checker_fixture)",
+        "TINYTREE_ACCEPTANCE_RUNNER": "$(rootpath //crates/tinytree-check-runner:tinytree-check-runner-bin)",
+        "TINYTREE_ACCEPTANCE_WORKSPACE": "$(rootpath //crates/workspace-daemon:workspace)",
+    },
+    aliases = aliases(),
+    edition = "2024",
+    tags = ["manual"],
+    deps = [":tinytree-server"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "forge_native_checker_acceptance",
+    binary = ":forge_native_checker_fixture",
+    script = "tests/forge-native-checker.sh",
+    binary_env = "TINYTREE_ACCEPTANCE_TEST_BINARY",
+    tags = ["local", "manual"],
+    size = "large",
+    timeout = "long",
+)
+
+# Parent-controlled real browser acceptance. Compilation remains remote; the
+# temporary HTTP provider must share the browser's local loopback namespace.
+rust_test(
+    name = "forge_browser_provider_fixture",
+    aliases = aliases(),
+    crate = ":tinytree-server",
+    edition = "2024",
+    tags = ["manual"],
+    deps = all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "forge_browser_provider_acceptance",
+    binary = ":forge_browser_provider_fixture",
+    script = "tests/forge-browser-provider.sh",
+    binary_env = "TINYTREE_BROWSER_TEST_BINARY",
+    tags = ["local", "manual"],
+    size = "large",
+    timeout = "long",
 )

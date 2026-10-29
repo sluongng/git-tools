@@ -10,6 +10,11 @@ pub use fileset::{FilesetStats, FilesetValidationError, validate_fileset};
 
 // Preserve protobuf package nesting for generated cross-package type paths.
 pub mod tinytree {
+    pub mod forge {
+        pub mod v1 {
+            tonic::include_proto!("tinytree.forge.v1");
+        }
+    }
     pub mod landing {
         pub mod v1 {
             tonic::include_proto!("tinytree.landing.v1");
@@ -30,6 +35,11 @@ pub mod tinytree {
     }
 }
 pub use tinytree::{cloud::v1 as cloud_v1, landing::v1 as landing_v1, query::v1 as query_v1, v1};
+pub use tinytree::forge::v1 as forge_v1;
+
+/// Shared encoded envelope caps, excluding the gRPC framing header.
+pub const FORGE_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub const FORGE_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Optional query admission metadata. This requests heavier resource accounting,
 /// not a query capability or permission.

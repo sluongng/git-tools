@@ -192,7 +192,59 @@ pub fn build(
         generated: HashMap::new(),
         assembling_bytes: 0,
     };
-    builder.build(request)
+    builder.build(request, None, false)
+}
+
+/// Rebase a patch whose source base has an explicitly verified rewritten parent.
+/// The caller must establish the exact source-base -> mapped-base relation from
+/// retained authoritative provenance. A matching ChangeId alone is not authority.
+/// Ordinary build keeps its original common-ancestor requirement unchanged.
+pub fn build_on_mapped_base(
+    reader: &mut impl MetadataReader,
+    request: Request,
+    mapped_base: m::CommitId,
+    limits: Limits,
+) -> Result<Candidate, Error> {
+    limits.validate()?;
+    if request.committer.name.len() > limits.max_field_bytes
+        || request.committer.email.len() > limits.max_field_bytes
+    {
+        return Err(Error::Limit(Budget::MetadataBytes));
+    }
+    let mut builder = Builder {
+        reader,
+        limits,
+        stats: Stats::default(),
+        objects: Vec::new(),
+        generated: HashMap::new(),
+        assembling_bytes: 0,
+    };
+    builder.build(request, Some(mapped_base), false)
+}
+
+/// Rebase from a sanitized snapshot whose canonical baseline was verified by
+/// the caller's trusted projection ledger. Never accept this mapping from clients.
+pub fn build_on_projected_base(
+    reader: &mut impl MetadataReader,
+    request: Request,
+    canonical_base: m::CommitId,
+    limits: Limits,
+) -> Result<Candidate, Error> {
+    limits.validate()?;
+    if request.committer.name.len() > limits.max_field_bytes
+        || request.committer.email.len() > limits.max_field_bytes
+    {
+        return Err(Error::Limit(Budget::MetadataBytes));
+    }
+    let mut builder = Builder {
+        reader,
+        limits,
+        stats: Stats::default(),
+        objects: Vec::new(),
+        generated: HashMap::new(),
+        assembling_bytes: 0,
+    };
+    builder.build(request, Some(canonical_base), true)
 }
 
 struct Builder<'a, R> {
@@ -333,7 +385,12 @@ impl<R: MetadataReader> Builder<'_, R> {
         }
         Ok(key)
     }
-    fn build(&mut self, request: Request) -> Result<Candidate, Error> {
+    fn build(
+        &mut self,
+        request: Request,
+        mapped_base: Option<m::CommitId>,
+        projected: bool,
+    ) -> Result<Candidate, Error> {
         let mut chain = Vec::new();
         let mut seen = HashSet::new();
         let mut changes = HashSet::new();
@@ -367,7 +424,7 @@ impl<R: MetadataReader> Builder<'_, R> {
         let mut visits = 0;
         let mut destination = request.destination_head;
         let mut destination_seen = HashSet::new();
-        while destination != request.source_base {
+        while destination != mapped_base.unwrap_or(request.source_base) {
             charge(&mut visits, 1, self.limits.max_ancestry, Budget::Ancestry)?;
             if destination == m::CommitId::ROOT || !destination_seen.insert(destination) {
                 return Err(Error::Invalid("base is not on destination ancestry"));
@@ -385,6 +442,13 @@ impl<R: MetadataReader> Builder<'_, R> {
             destination = c.parents[0];
         }
         let base = self.commit(request.source_base)?;
+        if let Some(mapped) = mapped_base {
+            if mapped == m::CommitId::ROOT
+                || (!projected && self.commit(mapped)?.change_id != base.change_id)
+            {
+                return Err(Error::Invalid("mapped source base identity"));
+            }
+        }
         if changes.contains(&base.change_id) {
             return Err(Error::Invalid("source ChangeId equals base ChangeId"));
         }
@@ -395,7 +459,15 @@ impl<R: MetadataReader> Builder<'_, R> {
         let mut rewrites = Vec::with_capacity(chain.len());
         for (old, source) in chain {
             let source_tree = Self::root(&source)?;
-            let merged = self.merge(base_tree, source_tree, destination_tree, "", 0)?;
+            let canonical = if projected {
+                Some(Self::root(&self.commit(
+                    mapped_base.ok_or(Error::Invalid("projected baseline"))?,
+                )?)?)
+            } else {
+                None
+            };
+            let merged =
+                self.merge_inner(base_tree, source_tree, destination_tree, "", 0, canonical)?;
             let rewritten = m::Commit {
                 parents: vec![parent],
                 root_tree: m::TreeMerge {
@@ -459,13 +531,14 @@ impl<R: MetadataReader> Builder<'_, R> {
             Budget::OutputBytes,
         )
     }
-    fn merge(
+    fn merge_inner(
         &mut self,
         base: m::TreeId,
         source: m::TreeId,
         dest: m::TreeId,
         path: &str,
         depth: usize,
+        canonical: Option<m::TreeId>,
     ) -> Result<m::TreeId, Error> {
         self.work(1)?;
         if source == base {
@@ -478,6 +551,7 @@ impl<R: MetadataReader> Builder<'_, R> {
             return Err(Error::Limit(Budget::Depth));
         }
         let trees = [self.tree(base)?, self.tree(source)?, self.tree(dest)?];
+        let canonical_tree = canonical.map(|id| self.tree(id)).transpose()?;
         let mut positions = [0usize; 3];
         let mut output = Vec::new();
         // Conservative v1 envelope/entry allowance bounds unfinished parent
@@ -490,9 +564,45 @@ impl<R: MetadataReader> Builder<'_, R> {
                 break;
             };
             self.work(1)?;
-            let values = std::array::from_fn::<_, 3, _>(|i| {
-                entries[i].filter(|e| e.name == name).map(|e| &e.value)
+            let originals = std::array::from_fn::<_, 3, _>(|i| {
+                entries[i]
+                    .filter(|e| e.name == name)
+                    .map(|e| e.value.clone())
             });
+            let mapped = canonical_tree
+                .as_ref()
+                .and_then(|t| {
+                    t.entries
+                        .binary_search_by(|e| e.name.as_str().cmp(name))
+                        .ok()
+                        .map(|i| &t.entries[i])
+                })
+                .map(|e| &e.value);
+            let mut normalized = originals.clone();
+            if let (
+                Some(m::TreeValue::File {
+                    id: a,
+                    executable: ae,
+                    size_bytes: az,
+                    ..
+                }),
+                Some(m::TreeValue::File {
+                    id: b,
+                    executable: be,
+                    size_bytes: bz,
+                    ..
+                }),
+            ) = (&originals[0], mapped)
+            {
+                if a != b || ae != be || az != bz {
+                    return Err(Error::Invalid("projected baseline file mapping"));
+                }
+                normalized[0] = mapped.cloned();
+                if originals[1] == originals[0] {
+                    normalized[1] = mapped.cloned();
+                }
+            }
+            let values = std::array::from_fn::<_, 3, _>(|i| normalized[i].as_ref());
             let child_path = self.path(path, name)?;
             let chosen = if values[1] == values[0] {
                 values[2].cloned()
@@ -504,13 +614,49 @@ impl<R: MetadataReader> Builder<'_, R> {
                 Some(m::TreeValue::Tree(d)),
             ] = values
             {
-                Some(m::TreeValue::Tree(self.merge(
+                Some(m::TreeValue::Tree(self.merge_inner(
                     *b,
                     *s,
                     *d,
                     &child_path,
                     depth + 1,
+                    match mapped {
+                        Some(m::TreeValue::Tree(id)) => Some(*id),
+                        _ => None,
+                    },
                 )?))
+            } else if canonical.is_some()
+                && matches!(values[0], Some(m::TreeValue::Tree(_)) | None)
+                && matches!(values[1], Some(m::TreeValue::Tree(_)) | None)
+                && matches!(values[2], Some(m::TreeValue::Tree(_)))
+            {
+                let empty = m::TreeId(
+                    self.emit(m::Object::Tree(m::Tree {
+                        entries: Vec::new(),
+                    }))?
+                    .id
+                    .0,
+                );
+                let tree_id = |value: Option<&m::TreeValue>| match value {
+                    Some(m::TreeValue::Tree(id)) => *id,
+                    _ => empty,
+                };
+                let merged = self.merge_inner(
+                    tree_id(values[0]),
+                    tree_id(values[1]),
+                    tree_id(values[2]),
+                    &child_path,
+                    depth + 1,
+                    match mapped {
+                        Some(m::TreeValue::Tree(id)) => Some(*id),
+                        _ => Some(empty),
+                    },
+                )?;
+                if self.tree(merged)?.entries.is_empty() {
+                    None
+                } else {
+                    Some(m::TreeValue::Tree(merged))
+                }
             } else {
                 return Err(Error::Conflict { path: child_path });
             };

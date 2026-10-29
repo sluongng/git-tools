@@ -2,6 +2,7 @@
 //! The projected control marker contains an opaque ID, never an admin path.
 //! Only an owner-private registry supplies paths and local transport authority.
 pub mod capture;
+pub mod forge_pending;
 pub mod landing_resolution;
 pub mod remote_state;
 pub mod restore;
@@ -449,6 +450,39 @@ impl Registry {
             .try_lock_exclusive()
             .context("native administration is busy")?;
         self.check_candidate_admin(binding)?;
+        Ok(CandidateAdminRetirement {
+            binding: binding.clone(),
+            registry_path: self.root.path().to_owned(),
+            _registry: registry,
+            _initializer: initializer,
+        })
+    }
+    /// Fence the proven never-provisioned candidate case without adopting any
+    /// external administration. The global lock precedes the initializer lock.
+    pub fn lock_uninitialized_candidate_retirement(
+        &self,
+        binding: &Binding,
+    ) -> Result<CandidateAdminRetirement> {
+        self.validate(binding)?;
+        let registry = self.root.open_existing_file("registry.lock", 4096)?;
+        registry
+            .try_lock_exclusive()
+            .context("native registry is busy")?;
+        let initializer = self
+            .root
+            .open_lock(format!("initialize-{}.lock", binding.id()))?;
+        initializer
+            .try_lock_exclusive()
+            .context("native administration is busy")?;
+        self.check_candidate_admin(binding)?;
+        ensure!(
+            matches!(std::fs::symlink_metadata(self.records.path().join(record_name(&binding.workspace_id))),Err(ref error) if error.kind()==std::io::ErrorKind::NotFound),
+            "candidate registration already exists; preserve it"
+        );
+        ensure!(
+            matches!(std::fs::symlink_metadata(&binding.admin),Err(ref error) if error.kind()==std::io::ErrorKind::NotFound),
+            "candidate administration already exists; preserve it"
+        );
         Ok(CandidateAdminRetirement {
             binding: binding.clone(),
             registry_path: self.root.path().to_owned(),

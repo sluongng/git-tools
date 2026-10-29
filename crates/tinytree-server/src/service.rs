@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::{self, Read},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tinytree_model::{CommitId, Descriptor, Kind, Object, ObjectId, ObjectKey};
@@ -44,6 +44,7 @@ struct Inner {
     auth: Authorization,
     global: Arc<Semaphore>,
     repositories: HashMap<String, Arc<Semaphore>>,
+    forge_repositories: Mutex<HashMap<String, Arc<Semaphore>>>,
     bytes: Arc<Semaphore>,
     continuation_key: [u8; 32],
     #[cfg(test)]
@@ -68,7 +69,10 @@ impl RepositoryService {
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         let unique: HashSet<_> = repositories.iter().collect();
-        if repositories.is_empty()
+        if (repositories.is_empty()
+            && !principals
+                .iter()
+                .any(|p| p.is_forge_only() || p.is_forge_checker()))
             || repositories.len() > 1024
             || unique.len() != repositories.len()
             || repositories
@@ -115,6 +119,7 @@ impl RepositoryService {
                 store,
                 global: Arc::new(Semaphore::new(config.max_inflight)),
                 repositories: repository_limits,
+                forge_repositories: Mutex::new(HashMap::new()),
                 bytes: Arc::new(Semaphore::new(config.max_buffered_bytes)),
                 config,
                 auth,
@@ -142,6 +147,25 @@ impl RepositoryService {
     }
     pub fn landing_grpc_service(&self) -> crate::LandingGrpcService {
         crate::LandingGrpcService::new(self.clone())
+    }
+    pub fn forge_grpc_service(&self) -> crate::ForgeGrpcService {
+        crate::ForgeGrpcService::new(self.clone())
+    }
+    pub(crate) fn forge_store(&self) -> tinytree_store::Store {
+        self.inner.store.clone()
+    }
+    pub(crate) async fn forge_global(
+        &self,
+        deadline: Instant,
+    ) -> Result<OwnedSemaphorePermit, Status> {
+        self.global(deadline).await
+    }
+    pub(crate) async fn forge_memory(
+        &self,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<Arc<OwnedSemaphorePermit>, Status> {
+        self.memory(bytes, deadline).await
     }
     pub(crate) fn landing_host(&self) -> Arc<crate::landing::LandingHost> {
         self.landing.clone()
@@ -306,12 +330,38 @@ impl RepositoryService {
         repo: &str,
         deadline: Instant,
     ) -> Result<OwnedSemaphorePermit, Status> {
-        let gate = self
-            .inner
-            .repositories
-            .get(repo)
-            .ok_or_else(|| Status::not_found("native repository unavailable"))?;
-        acquire(gate.clone(), deadline).await
+        let gate = if let Some(gate) = self.inner.repositories.get(repo) {
+            gate.clone()
+        } else {
+            // Caller has authenticated and checked durable account ownership
+            // before entering this bounded dynamic repository gate.
+            let valid = repo
+                .strip_prefix("forge-")
+                .is_some_and(|id| tinytree_store::AccountId(id.into()).validate().is_ok());
+            if !valid {
+                return Err(Status::not_found("native repository unavailable"));
+            }
+            let mut gates = self
+                .inner
+                .forge_repositories
+                .lock()
+                .map_err(|_| Status::unavailable("native repository admission unavailable"))?;
+            if let Some(gate) = gates.get(repo) {
+                gate.clone()
+            } else {
+                if gates.len() >= 1024 {
+                    return Err(Status::resource_exhausted(
+                        "dynamic account admission limit",
+                    ));
+                }
+                let gate = Arc::new(Semaphore::new(
+                    self.inner.config.max_inflight_per_repository,
+                ));
+                gates.insert(repo.into(), gate.clone());
+                gate
+            }
+        };
+        acquire(gate, deadline).await
     }
     async fn admit(
         &self,
@@ -322,6 +372,27 @@ impl RepositoryService {
     ) -> Result<Arc<Admission>, Status> {
         identity.authorize(repo, write)?;
         let global = self.global(deadline).await?;
+        let global = if identity.is_forge_checker() || !self.inner.repositories.contains_key(repo) {
+            let store = self.inner.store.clone();
+            let repository = repo.to_owned();
+            blocking(deadline, move || {
+                // Keep global admission alive through physical Store lookup even
+                // if the caller times out before that work returns.
+                let global = global;
+                if !store
+                    .forge_has_account_repository(&repository)
+                    .map_err(store_status)?
+                {
+                    return Err(Status::permission_denied(
+                        "forge account repository unavailable",
+                    ));
+                }
+                Ok(global)
+            })
+            .await?
+        } else {
+            global
+        };
         let repository = self.repository(repo, deadline).await?;
         Ok(Arc::new(Admission {
             _global: global,
@@ -474,7 +545,10 @@ impl Repository for RepositoryService {
                         captured,
                         identity.authorize_cloud(&input.repository_id, true).is_ok(),
                     ),
-                    17 => (captured, identity.authorize_cloud(&input.repository_id, true).is_ok()),
+                    17 => (
+                        captured,
+                        identity.authorize_cloud(&input.repository_id, true).is_ok(),
+                    ),
                     9 | 16 => (
                         self.cloud.is_some(),
                         identity
@@ -1267,6 +1341,8 @@ fn publication_wire(
 pub(crate) fn store_status(error: tinytree_store::Error) -> Status {
     use tinytree_store::Error as E;
     match error {
+        E::ForgeAccessDenied => Status::permission_denied("forge access denied"),
+        E::StaleForgePolicy | E::StaleForgeReview => Status::aborted("forge state changed"),
         E::UnknownRepository | E::MissingObject(_) => {
             Status::not_found("native repository or object unavailable")
         }
@@ -1280,18 +1356,40 @@ pub(crate) fn store_status(error: tinytree_store::Error) -> Status {
         E::IdempotencyConflict => {
             Status::already_exists("native idempotency key has another request")
         }
-        E::Limit("object closure") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreObjectClosure.message()),
-        E::Limit("closure edges") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreClosureEdges.message()),
-        E::Limit("closure metadata bytes") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreClosureMetadataBytes.message()),
-        E::Limit("tree path contexts") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathContexts.message()),
-        E::Limit("tree path length") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathLength.message()),
-        E::Limit("tree path context bytes") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreTreePathContextBytes.message()),
+        E::Limit("object closure") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreObjectClosure.message(),
+        ),
+        E::Limit("closure edges") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreClosureEdges.message(),
+        ),
+        E::Limit("closure metadata bytes") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreClosureMetadataBytes.message(),
+        ),
+        E::Limit("tree path contexts") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreTreePathContexts.message(),
+        ),
+        E::Limit("tree path length") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreTreePathLength.message(),
+        ),
+        E::Limit("tree path context bytes") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreTreePathContextBytes.message(),
+        ),
         E::Limit("object size") => Status::resource_exhausted("native store limit: object_size"),
-        E::Limit("staging byte budget") => Status::resource_exhausted("native store limit: staging_byte_budget"),
-        E::Limit("staging upload budget") => Status::resource_exhausted("native store limit: staging_upload_budget"),
-        E::Limit("repository staging bytes") => Status::resource_exhausted("native store limit: repository_staging_bytes"),
-        E::Limit("repository staging objects") => Status::resource_exhausted("native store limit: repository_staging_objects"),
-        E::Limit("repository quota") => Status::resource_exhausted(tinytree_proto::PublicationFailureReason::StoreRepositoryQuota.message()),
+        E::Limit("staging byte budget") => {
+            Status::resource_exhausted("native store limit: staging_byte_budget")
+        }
+        E::Limit("staging upload budget") => {
+            Status::resource_exhausted("native store limit: staging_upload_budget")
+        }
+        E::Limit("repository staging bytes") => {
+            Status::resource_exhausted("native store limit: repository_staging_bytes")
+        }
+        E::Limit("repository staging objects") => {
+            Status::resource_exhausted("native store limit: repository_staging_objects")
+        }
+        E::Limit("repository quota") => Status::resource_exhausted(
+            tinytree_proto::PublicationFailureReason::StoreRepositoryQuota.message(),
+        ),
         E::Limit(_) => Status::resource_exhausted("native store limit exceeded"),
         E::Poisoned => Status::unavailable("native store requires recovery"),
         E::Io(_) | E::Database(_) => Status::internal("native storage operation failed"),
@@ -1516,19 +1614,49 @@ mod graph_tests {
         for (term, expected) in [
             ("object closure", Reason::StoreObjectClosure.message()),
             ("closure edges", Reason::StoreClosureEdges.message()),
-            ("closure metadata bytes", Reason::StoreClosureMetadataBytes.message()),
-            ("tree path contexts", Reason::StoreTreePathContexts.message()),
+            (
+                "closure metadata bytes",
+                Reason::StoreClosureMetadataBytes.message(),
+            ),
+            (
+                "tree path contexts",
+                Reason::StoreTreePathContexts.message(),
+            ),
             ("tree path length", Reason::StoreTreePathLength.message()),
-            ("tree path context bytes", Reason::StoreTreePathContextBytes.message()),
+            (
+                "tree path context bytes",
+                Reason::StoreTreePathContextBytes.message(),
+            ),
             ("repository quota", Reason::StoreRepositoryQuota.message()),
             ("object size", "native store limit: object_size"),
-            ("staging byte budget", "native store limit: staging_byte_budget"),
-            ("staging upload budget", "native store limit: staging_upload_budget"),
-            ("repository staging bytes", "native store limit: repository_staging_bytes"),
-            ("repository staging objects", "native store limit: repository_staging_objects"),
-            ("object closure /private/fixture", "native store limit exceeded"),
-            ("staging byte budget /private/fixture", "native store limit exceeded"),
-            ("private-marker token=not-real", "native store limit exceeded"),
+            (
+                "staging byte budget",
+                "native store limit: staging_byte_budget",
+            ),
+            (
+                "staging upload budget",
+                "native store limit: staging_upload_budget",
+            ),
+            (
+                "repository staging bytes",
+                "native store limit: repository_staging_bytes",
+            ),
+            (
+                "repository staging objects",
+                "native store limit: repository_staging_objects",
+            ),
+            (
+                "object closure /private/fixture",
+                "native store limit exceeded",
+            ),
+            (
+                "staging byte budget /private/fixture",
+                "native store limit exceeded",
+            ),
+            (
+                "private-marker token=not-real",
+                "native store limit exceeded",
+            ),
         ] {
             let error = store_status(tinytree_store::Error::Limit(term));
             assert_eq!(error.code(), tonic::Code::ResourceExhausted);

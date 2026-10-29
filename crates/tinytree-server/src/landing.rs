@@ -38,6 +38,8 @@ pub struct LandingProfile {
 pub struct LandingConfig {
     pub enabled: bool,
     pub profiles: Vec<LandingProfile>,
+    /// Explicit operator-selected profile for provisioned Forge accounts.
+    pub forge_profile: Option<String>,
     pub checker: Option<crate::LandingCheckerConfig>,
     pub local_owner_profiles: Vec<String>,
     pub committer_name: String,
@@ -60,6 +62,7 @@ impl Default for LandingConfig {
         Self {
             enabled: false,
             profiles: Vec::new(),
+            forge_profile: None,
             checker: None,
             local_owner_profiles: Vec::new(),
             committer_name: "Tinytree landing".into(),
@@ -111,7 +114,8 @@ impl LandingConfig {
                 || profile.version.is_empty()
                 || profile.version.len() > 128
                 || profile.version.contains('\0')
-                || profile.repositories.is_empty()
+                || (profile.repositories.is_empty()
+                    && self.forge_profile.as_ref() != Some(&profile.name))
                 || profile.repositories.len() > 128
                 || profile
                     .repositories
@@ -122,6 +126,13 @@ impl LandingConfig {
             {
                 return Err(ConfigError("invalid landing profile"));
             }
+        }
+        if self
+            .forge_profile
+            .as_ref()
+            .is_some_and(|name| !self.profiles.iter().any(|p| &p.name == name))
+        {
+            return Err(ConfigError("unknown Forge landing profile"));
         }
         self.validate_grants(&self.local_owner_profiles)?;
         Ok(())
@@ -327,6 +338,55 @@ impl Drop for Ticket {
     }
 }
 impl LandingHost {
+    pub(crate) fn forge_profile(&self) -> Result<Option<s::LandingCheckProfile>, Status> {
+        if !self.config.enabled
+            || !self
+                .config
+                .checker
+                .as_ref()
+                .is_some_and(|checker| checker.enabled)
+        {
+            return Ok(None);
+        }
+        let Some(name) = &self.config.forge_profile else {
+            return Ok(None);
+        };
+        let profile = self
+            .config
+            .profiles
+            .iter()
+            .find(|p| &p.name == name)
+            .ok_or_else(|| Status::failed_precondition("Forge check profile unavailable"))?;
+        Ok(Some(s::LandingCheckProfile {
+            name: profile.name.clone(),
+            version: profile.version.clone(),
+        }))
+    }
+    fn background_configured(&self, repo: &str, name: &str, version: &str) -> bool {
+        self.config.configured(repo, name, version)
+            || (self
+                .forge_profile()
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.name == name && p.version == version)
+                && self
+                    .store
+                    .forge_account_repositories(1024)
+                    .is_ok_and(|repos| repos.iter().any(|r| r == repo)))
+    }
+    fn background_repositories(&self) -> Result<Vec<String>, Status> {
+        let mut repos = self.repositories.keys().cloned().collect::<Vec<_>>();
+        if self.forge_profile()?.is_some() {
+            repos.extend(
+                self.store
+                    .forge_account_repositories(1024)
+                    .map_err(crate::service::store_status)?,
+            );
+        }
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
+    }
     pub fn new(
         store: s::Store,
         config: LandingConfig,
@@ -357,6 +417,7 @@ impl LandingHost {
             config.profiles.clone(),
             repos,
             config.enabled,
+            config.forge_profile.clone(),
         )?;
         let host = Arc::new(Self {
             calls: Arc::new(Semaphore::new(config.max_inflight)),
@@ -516,14 +577,14 @@ impl LandingHost {
         let wake = self.wake.clone();
         let capacity = self.capacity_changed.clone();
         let interval = Duration::from_millis(self.config.poll_interval_ms);
-        let mut repositories = self.repositories.keys().cloned().collect::<Vec<_>>();
-        repositories.sort();
+
         *worker = Some(tokio::spawn(async move {
             let _control_memory = control_memory;
             let initial = || {
-                repositories
-                    .iter()
-                    .cloned()
+                weak.upgrade()
+                    .and_then(|host| host.background_repositories().ok())
+                    .unwrap_or_default()
+                    .into_iter()
                     .map(|r| (r, None))
                     .collect::<VecDeque<(String, Option<s::LandingScanCursor>)>>()
             };
@@ -547,7 +608,7 @@ impl LandingHost {
                         .map(|now| pending.expires_at <= now)
                         .unwrap_or(true);
                     if due
-                        || !host.config.configured(
+                        || !host.background_configured(
                             repo,
                             &pending.profile.name,
                             &pending.profile.version,
@@ -568,7 +629,7 @@ impl LandingHost {
                                 }
                                 for pending in page.jobs {
                                     if pending.state == s::LandingState::Intent
-                                        && host.config.configured(
+                                        && host.background_configured(
                                             &repo,
                                             &pending.profile.name,
                                             &pending.profile.version,
@@ -679,7 +740,10 @@ impl LandingHost {
         let Ok(work) = self.reserve("Prepare", deadline, false) else {
             return false;
         };
-        if !self.repositories.contains_key(repo) {
+        if !self
+            .background_repositories()
+            .is_ok_and(|repos| repos.iter().any(|r| r == repo))
+        {
             return false;
         }
         preparing.insert(pending.id);

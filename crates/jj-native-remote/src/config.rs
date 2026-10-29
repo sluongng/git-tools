@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
 #[derive(Clone, Deserialize, Serialize)]
@@ -60,6 +60,15 @@ impl QueryLimits {
             .saturating_mul(4)
     }
 }
+/// Exact immutable work already retained by the trusted server check job.
+/// This grants local read admission only, never a client-owned retention hold.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerRetainedCandidate {
+    pub job_id: String,
+    pub head: String,
+    pub root_tree: String,
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -67,6 +76,8 @@ pub struct Config {
     pub remote: tinytree_client::Config,
     /// Trusted broker-selected effective authorization profile, not an RPC field.
     pub authorization_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_retained_candidate: Option<ServerRetainedCandidate>,
     pub closure: ClosureLimits,
     pub query: QueryLimits,
     pub operation_timeout_ms: u64,
@@ -82,6 +93,7 @@ impl Default for Config {
         Self {
             remote: remote_default(),
             authorization_profile: "default".into(),
+            server_retained_candidate: None,
             closure: Default::default(),
             query: Default::default(),
             operation_timeout_ms: 120_000,
@@ -196,6 +208,16 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(candidate) = &self.server_retained_candidate {
+            for id in [&candidate.job_id, &candidate.head, &candidate.root_tree] {
+                let decoded = crate::unhex::<32>(id)?;
+                ensure!(
+                    crate::hex(&decoded) == *id && decoded != [0; 32],
+                    "invalid server-retained candidate binding"
+                );
+            }
+        }
+
         self.remote
             .validate()
             .map_err(|_| anyhow::anyhow!("invalid native remote client configuration"))?;
