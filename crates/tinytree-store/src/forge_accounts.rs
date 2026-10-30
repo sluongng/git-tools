@@ -4,9 +4,7 @@
 //! is a credential, and projected reads never expose canonical tree envelopes.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-use tinytree_model::{
-    ChangeId, Commit, Object, Signature, Timestamp, TreeId, TreeMerge, TreeValue,
-};
+use tinytree_model::{Object, TreeValue};
 
 pub(super) use tinytree_forge_core::accounts::validate_path as valid_path;
 pub use tinytree_forge_core::accounts::{
@@ -478,36 +476,11 @@ impl Store {
         if tx.get(&self.inner.spaces.repos, &repo)?.is_some() {
             return Err(Error::Invalid("unowned forge repository"));
         }
-        let empty = tinytree_model::empty_tree();
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"tinytree-forge-genesis-v1\0");
-        hash.update(account.0.as_bytes());
-        let mut change = [0; 16];
-        change.copy_from_slice(&hash.finalize().as_bytes()[..16]);
-        let signature = Signature {
-            name: "Tinytree".into(),
-            email: "tinytree@users.noreply.github.com".into(),
-            timestamp: Timestamp {
-                millis_since_epoch: 0,
-                tz_offset_minutes: 0,
-            },
-        };
-        let commit = tinytree_model::encode(
-            &Object::Commit(Commit {
-                parents: vec![CommitId::ROOT],
-                predecessors: vec![],
-                root_tree: TreeMerge {
-                    terms: vec![TreeId(empty.descriptor.key.id.0)],
-                    labels: vec![String::new()],
-                },
-                change_id: ChangeId(change),
-                description: "Initialize monorepo".into(),
-                author: signature.clone(),
-                committer: signature,
-                secure_signature: None,
-            }),
-            self.inner.config.model_limits,
-        )?;
+        let tinytree_forge_core::account_commands::Genesis { empty, commit } =
+            tinytree_forge_core::account_commands::genesis(
+                account,
+                self.inner.config.model_limits,
+            )?;
         let directory = self.inner.root.join("repos").join(&repo);
         for kind in [
             Kind::File,
@@ -699,23 +672,16 @@ impl Store {
         member: ForgeMember,
         expected: PolicyEpoch,
     ) -> Result<ForgeAccount> {
-        valid_principal(&member.principal)?;
-        if member.roles.len() > 16 {
-            return Err(Error::Limit("forge member roles"));
-        }
-        for role in &member.roles {
-            valid_name(role)?;
-        }
+        tinytree_forge_core::account_commands::validate_member(&member)?;
         self.inner
             .forge_authorize_in(&*tx, account, actor, ForgeAction::Admin, Some(expected))?;
         let mut record = self.inner.forge_account_in(&*tx, account)?;
-        if member.principal == record.owner {
-            return Err(Error::Invalid("forge owner membership"));
-        }
-        if !record.members.contains_key(&member.principal) && record.members.len() >= MAX_MEMBERS {
-            return Err(Error::Limit("forge members"));
-        }
-        if record.members.get(&member.principal) == Some(&member) {
+        if !tinytree_forge_core::account_commands::member_change(
+            &record.owner,
+            record.members.get(&member.principal),
+            &member,
+            record.members.len(),
+        )? {
             return Ok(record.wire());
         }
         record.members.insert(member.principal.clone(), member);

@@ -66,7 +66,7 @@ export async function hash(value: string): Promise<string> {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 }
-export interface Auth { principal: string; operator: boolean; accounts: string[] }
+export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge' }
 export async function authenticate(request: Request, secret: string | undefined): Promise<Auth> {
   const authorization = request.headers.get('authorization') ?? '';
   if (!authorization.startsWith('Bearer ') || authorization.length > 520) fail(401, 'authentication_required');
@@ -77,16 +77,17 @@ export async function authenticate(request: Request, secret: string | undefined)
   const supplied = await hash(authorization.slice(7));
   let matched: Auth | undefined; const seen = new Set<string>();
   try { for (const raw of principals) {
-    const p = record(raw, ['principal', 'token_sha256', 'accounts', 'operator']);
+    const p = record(raw, ['principal', 'token_sha256', 'accounts', 'operator', 'kind']);
     if (typeof p.principal !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(p.principal)
         || typeof p.operator !== 'boolean' || !Array.isArray(p.accounts) || p.accounts.length > 64
         || typeof p.token_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(p.token_sha256)
+        || (p.kind !== 'raw' && p.kind !== 'forge')
         || seen.has(p.token_sha256)) fail(503, 'principal_configuration_invalid');
     seen.add(p.token_sha256);
     const accounts = p.accounts.map(identifier);
     let difference = 0;
     for (let i = 0; i < supplied.length; i++) difference |= supplied.charCodeAt(i) ^ p.token_sha256.charCodeAt(i);
-    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts };
+    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts, kind: p.kind };
   } } catch { fail(503, 'principal_configuration_invalid'); }
   if (!matched) fail(401, 'authentication_required');
   return matched;

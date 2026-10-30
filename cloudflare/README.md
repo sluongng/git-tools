@@ -2,15 +2,24 @@
 
 This is an opt-in native repository storage service built with Workers,
 SQLite-backed Durable Objects, and R2. It does not proxy to a Linux server.
-The existing `tinytree-server` and its filesystem/Fjall Store remain unchanged
-and remain the implementation for the complete Forge API.
+The existing `tinytree-server` and its filesystem/Fjall Store remain the
+implementation for the complete Forge API.
 
 ## Scope
 
 This backend supports one raw repository per configured account, verified
 immutable native objects, reference generation/head compare-and-set, durable
 request replay, and explicit commit pins. `GET /v1/capabilities` reports the
-supported operations and resource limits and requires authentication.
+supported raw operations and resource limits and requires authentication.
+
+An independently gated `POST /api/v1/forge/call` endpoint supports account
+provisioning, account snapshots and membership changes (operations 1, 2 and 3).
+Set `FORGE_BACKEND=enabled` and use a `kind=forge` identity for that endpoint.
+Account ownership, membership, policy epochs and replay receipts are SQLite
+authority; ordinary Forge operations cannot use raw identities. Provisioning
+requires an operator identity, and an existing unowned raw repository cannot
+be silently adopted. Once Forge owns an account, all raw object/ref/pin routes
+for it are fenced, including operator calls.
 
 It does **not** implement the Forge review, filtered-view, query, transform,
 workspace-backup, or checked-landing APIs. The normal `tt` Forge workflow is
@@ -57,12 +66,15 @@ receipts commit in the same SQLite transaction.
 
 Every request is authenticated against the operator-configured
 `PRINCIPALS_JSON` secret. Each record contains `principal`, `token_sha256`,
-`accounts`, and `operator`; `token_sha256` is the lowercase SHA-256 digest of a
-separately distributed high-entropy bearer token. Account grants authorize raw
-repository reads and writes; `operator` adds provisioning authority only. They are not Forge view permissions. Provisioning requires
+`accounts`, `operator`, and `kind` (`raw` or `forge`); `token_sha256` is the lowercase SHA-256 digest of a
+separately distributed high-entropy bearer token. For raw identities, account
+grants authorize raw repository reads and writes; `operator` adds provisioning
+authority only. For Forge identities, this list is an admission ceiling, not
+membership or view authority: every operation checks the current SQLite policy.
+They are not Forge view permissions. Provisioning requires
 an operator grant, and neither request bodies nor object digests grant access.
 
-Requests are disabled unless `EXPERIMENTAL_RAW_BACKEND` is explicitly set to
+Raw requests are disabled unless `EXPERIMENTAL_RAW_BACKEND` is explicitly set to
 `enabled`. Never put bearer tokens or principal secrets in source, Wrangler
 configuration, or a public bucket. Cloudflare TLS does not replace application
 authorization.

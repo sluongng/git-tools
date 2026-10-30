@@ -2,6 +2,7 @@
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
+use tinytree_client::Transport;
 
 const MAX_BYTES: usize = 16 * 1024;
 
@@ -9,6 +10,8 @@ const MAX_BYTES: usize = 16 * 1024;
 #[serde(deny_unknown_fields)]
 pub(super) struct Context {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "is_grpc")]
+    pub transport: Transport,
     pub server: String,
     pub account_id: String,
     pub view: String,
@@ -19,12 +22,38 @@ pub(super) struct Context {
     pub tls_domain: Option<String>,
 }
 
+fn is_grpc(value: &Transport) -> bool {
+    *value == Transport::Grpc
+}
+
+pub(super) fn transport_parser() -> impl clap::builder::TypedValueParser<Value = Transport> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::PossibleValuesParser::new(["grpc", "forge-https-v1"]).map(|value| {
+        if value == "grpc" {
+            Transport::Grpc
+        } else {
+            Transport::ForgeHttpsV1
+        }
+    })
+}
+
+pub(super) fn transport_name(value: Transport) -> &'static str {
+    match value {
+        Transport::Grpc => "grpc",
+        Transport::ForgeHttpsV1 => "forge-https-v1",
+    }
+}
+
 fn invalid() -> io::Error {
     io::Error::other("invalid Tinytree account context")
 }
 
 impl Context {
     pub fn validate(&self) -> io::Result<()> {
+        self.client_config().map(|_| ())
+    }
+
+    pub fn client_config(&self) -> io::Result<tinytree_client::Config> {
         if self.schema_version != 1
             || !valid_name(&self.account_id)
             || !valid_name(&self.view)
@@ -44,13 +73,8 @@ impl Context {
         {
             return Err(invalid());
         }
-        tonic::transport::Endpoint::from_shared(self.server.clone()).map_err(|_| invalid())?;
-        Ok(())
-    }
-
-    pub fn client_config(&self) -> io::Result<tinytree_client::Config> {
-        self.validate()?;
         let value = tinytree_client::Config {
+            transport: self.transport,
             endpoint: self.server.clone(),
             // The service resolves the account's sole monorepo. This SDK field
             // is only a validated transport configuration, never a wire grant.

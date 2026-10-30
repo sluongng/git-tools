@@ -93,6 +93,9 @@ pub(super) async fn request(
 
 #[derive(clap::Args, Clone, Debug)]
 pub(super) struct LoginArgs {
+    /// Explicit wire protocol; an HTTPS URL does not select the protocol.
+    #[arg(long, default_value = "grpc", value_parser = context::transport_parser())]
+    transport: tinytree_client::Transport,
     #[arg(long)]
     server: String,
     #[arg(long)]
@@ -201,9 +204,22 @@ pub(super) fn id<const N: usize>(value: &str) -> Result<[u8; N], CommandError> {
     Ok(bytes)
 }
 
+// A bound transport envelope is not proof of a valid account snapshot.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountSnapshot {
+    account_id: String,
+    monorepo_id: String,
+    policy_epoch: u64,
+    public_view: Option<[u8; 32]>,
+    main_revision: [u8; 32],
+    main_generation: u64,
+}
+
 pub(super) async fn login(ui: &Ui, machine: bool, args: LoginArgs) -> Result<(), CommandError> {
     let value = Context {
         schema_version: 1,
+        transport: args.transport,
         server: args.server,
         account_id: args.account,
         view: args.view,
@@ -212,7 +228,21 @@ pub(super) async fn login(ui: &Ui, machine: bool, args: LoginArgs) -> Result<(),
         tls_domain: args.tls_domain,
     };
     let reply = rpc::call(&value, Op::GetAccount, json!({}), None, false, None).await?;
-    // A failed login never replaces a previously working account context.
+    let snapshot: AccountSnapshot = serde_json::from_slice(&reply.result_json)
+        .map_err(|_| user_error("invalid Tinytree account snapshot"))?;
+    if reply.state != "complete"
+        || snapshot.account_id != value.account_id
+        || snapshot.monorepo_id != format!("forge-{}", value.account_id)
+        || snapshot.policy_epoch == 0
+        || snapshot.main_generation == 0
+        || snapshot.main_revision == [0; 32]
+        || snapshot.public_view == Some([0; 32])
+    {
+        return Err(user_error("invalid Tinytree account snapshot"));
+    }
+    // Decode and bind the expected account before writing the context. A failed
+    // login, including malformed semantic data in a valid transport envelope,
+    // never replaces a previously working account context.
     value
         .save(&context::create().map_err(user_error)?)
         .map_err(user_error)?;

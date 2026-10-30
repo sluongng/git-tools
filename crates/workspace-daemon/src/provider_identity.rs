@@ -907,6 +907,52 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn transport_change_cannot_reuse_an_enrolled_provider_identity() -> Result<()> {
+        let mut fixture = Fixture::old(4096).await?;
+        assert_eq!(fixture.selected()?, fixture.old);
+        let record = fixture
+            .config
+            .state_dir
+            .join("native-workspaces")
+            .join(fixture.binding.id())
+            .join("workspace.json");
+        let before = fs::read(&record)?;
+        let configured = fixture
+            .config
+            .native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap();
+        configured.remote.transport = tinytree_client::Transport::ForgeHttpsV1;
+        assert!(
+            fixture.selected().is_err(),
+            "same endpoint and alias do not grant cross-protocol enrollment"
+        );
+        assert_eq!(
+            fs::read(&record)?,
+            before,
+            "failed identity validation must not rewrite enrollment"
+        );
+        fixture
+            .config
+            .native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .remote
+            .transport = tinytree_client::Transport::Grpc;
+        assert_eq!(fixture.selected()?, fixture.old);
+        assert_eq!(fs::read(&record)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compatibility_never_accepts_other_security_or_custom_policy_changes() -> Result<()> {
         let mut fixture = Fixture::old(256).await?;
         fixture

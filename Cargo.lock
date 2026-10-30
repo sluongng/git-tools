@@ -5688,10 +5688,12 @@ dependencies = [
 name = "tinytree-cloudflare"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "tempfile",
  "tinytree-forge-core",
+ "tinytree-landing",
  "tinytree-model",
  "tinytree-store",
 ]
@@ -5869,6 +5871,7 @@ dependencies = [
  "tinytree-check-runner",
  "tinytree-cloud",
  "tinytree-fixture",
+ "tinytree-forge-core",
  "tinytree-index",
  "tinytree-model",
  "tinytree-proto",

@@ -5,7 +5,7 @@ use tinytree_model::{
     ChangeId, Commit, CommitId, CopyHistory, CopyId, Descriptor, FileId, Kind, Limits, Object,
     Signature, SymlinkId, Timestamp, Tree, TreeEntry, TreeId, TreeMerge, TreeValue,
 };
-use tinytree_store::{Config, Error, PublishRequest, Reference, Store};
+use tinytree_store::{AccountId, Config, Error, ForgeAccountMutation, ForgeActor, ForgeMember, PolicyEpoch, PublishRequest, Reference, Store};
 
 const REPOSITORY: &str = "forge-example";
 
@@ -233,7 +233,15 @@ fn main() {
         reference(&store.references(REPOSITORY, &["main".into()]).unwrap()[0]),
         after
     );
+    let account = AccountId("forge-demo".into());
+    let owner = ForgeActor { principal: "forge-owner".into() };
+    let provisioned = store.forge_mutate_account(&account, &owner, "provision-owner", ForgeAccountMutation::Provision).unwrap();
+    let member = ForgeMember { principal: "forge-member".into(), can_write: true, can_review: true, is_admin: true, roles: vec!["reviewer".into()] };
+    let added = store.forge_mutate_account(&account, &owner, "add-member", ForgeAccountMutation::SetMember { member: member.clone(), expected_epoch: PolicyEpoch(1) }).unwrap();
+    let unchanged = store.forge_mutate_account(&account, &owner, "same-member", ForgeAccountMutation::SetMember { member: member.clone(), expected_epoch: PolicyEpoch(2) }).unwrap();
+    let revoked = store.forge_mutate_account(&account, &owner, "revoke-admin", ForgeAccountMutation::SetMember { member: ForgeMember { is_admin: false, ..member }, expected_epoch: PolicyEpoch(2) }).unwrap();
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
+        "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),
         "next":reference(&next_result.reference),"historical_replay":reference(&historical_replay.reference),
         "after_refusals":after,"refusals":refused,"reopen":true}});

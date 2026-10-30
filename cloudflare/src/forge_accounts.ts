@@ -1,0 +1,179 @@
+/** Account/member/replay authority. The embedding authenticates every call and
+ * binds this host to exactly one account Durable Object. R2 contains bytes only. */
+import { normalizeForgeAccountCommand, type ForgeCall, type Descriptor } from './core';
+import { fail } from './protocol';
+
+export interface ForgeMember {
+  principal: string;
+  can_write: boolean;
+  can_review: boolean;
+  is_admin: boolean;
+  roles: string[];
+}
+export interface CanonicalAccountObject extends Descriptor { bytes: number[] }
+export interface AccountCommand {
+  operation: 1 | 2 | 3;
+  fingerprint: string | null;
+  member?: ForgeMember;
+  expected_epoch?: number;
+  genesis?: { head: string; objects: CanonicalAccountObject[] };
+}
+export interface ForgeAccountHost {
+  /** Trusted current authenticated values, not fields extracted from JSON. */
+  accountId: string;
+  principal: string;
+  canProvision: boolean;
+  sql: SqlStorage;
+  transactionSync<T>(callback: () => T): T;
+  /** Verify native canonical bytes and confirm durable R2 puts; no SQL claim. */
+  stageGenesis(objects: CanonicalAccountObject[]): Promise<void>;
+  /** Same SQL transaction: reject an existing unowned raw repository, and claim
+   * repository + staged object descriptors + canonical main generation 1. */
+  claimRepositoryInTx(accountId: string, objects: CanonicalAccountObject[], head: string): void;
+  /** Read authoritative canonical main from the same SQL transaction. */
+  currentMainInTx(): { head: string; generation: number };
+}
+interface AccountRow {
+  account_id: string;
+  owner: string;
+  policy_epoch: number;
+  public_view: string | null;
+}
+interface MemberRow { value: string }
+interface ReceiptRow { fingerprint: string; result: string }
+const MAX_MEMBERS = 64;
+const MAX_RECEIPTS = 4096;
+const encoder = new TextEncoder();
+
+/** Raw-route fencing without an actor or schema creation. Any account row
+ * disables raw authority; a missing table means this DO has not been claimed. */
+export function hasForgeAccount(sql: SqlStorage): boolean {
+  if ([...sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='forge_account'")].length === 0) return false;
+  return [...sql.exec('SELECT 1 FROM forge_account WHERE singleton=1')].length !== 0;
+}
+
+export class ForgeAccounts {
+  constructor(private readonly host: ForgeAccountHost) {
+    for (const statement of [
+      'CREATE TABLE IF NOT EXISTS forge_account (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account_id TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, policy_epoch INTEGER NOT NULL CHECK(policy_epoch>=1), public_view TEXT)',
+      'CREATE TABLE IF NOT EXISTS forge_members (account_id TEXT NOT NULL, principal TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(account_id,principal))',
+      'CREATE TABLE IF NOT EXISTS forge_account_receipts (account_id TEXT NOT NULL, principal TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(account_id,principal,request_id))',
+    ]) host.sql.exec(statement);
+  }
+  private one<T>(query: string, ...bindings: (string | number | null)[]): T | undefined {
+    return [...this.host.sql.exec(query, ...bindings)][0] as T | undefined;
+  }
+  private accountInTx(): AccountRow | undefined {
+    const row = this.one<AccountRow>('SELECT account_id,owner,policy_epoch,public_view FROM forge_account WHERE singleton=1');
+    if (row && row.account_id !== this.host.accountId) fail(403, 'permission_denied');
+    return row;
+  }
+  /** Host-side fencing only, not an authorization grant or public operation. */
+  hasAccountInTx(): boolean { return this.accountInTx() !== undefined; }
+  private authorizeInTx(admin: boolean): AccountRow {
+    const row = this.accountInTx();
+    if (!row) fail(403, 'permission_denied');
+    if (row.owner === this.host.principal) return row;
+    const member = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, this.host.principal);
+    if (!member || (admin && !(JSON.parse(member.value) as ForgeMember).is_admin)) fail(403, 'permission_denied');
+    return row;
+  }
+  private wire(row: AccountRow): Record<string, unknown> {
+    return { account_id: row.account_id, monorepo_id: `forge-${row.account_id}`, policy_epoch: row.policy_epoch,
+      public_view: row.public_view === null ? null : JSON.parse(row.public_view) };
+  }
+  private snapshot(row: AccountRow): Record<string, unknown> {
+    const main = this.host.currentMainInTx();
+    if (!/^[0-9a-f]{64}$/.test(main.head) || main.head === '0'.repeat(64)
+        || !Number.isSafeInteger(main.generation) || main.generation < 1) fail(503, 'failed_precondition');
+    return { ...this.wire(row), main_revision: Array.from(main.head.match(/../g)!, byte => parseInt(byte, 16)), main_generation: main.generation };
+  }
+  private replayInTx(requestId: string, fingerprint: string): unknown | undefined {
+    const receipt = this.one<ReceiptRow>('SELECT fingerprint,result FROM forge_account_receipts WHERE account_id=? AND principal=? AND request_id=?', this.host.accountId, this.host.principal, requestId);
+    if (!receipt) return undefined;
+    if (receipt.fingerprint !== fingerprint) fail(400, 'invalid_argument');
+    return JSON.parse(receipt.result);
+  }
+  private finishInTx(requestId: string, fingerprint: string, result: unknown): unknown {
+    const count = this.one<{ n: number }>('SELECT COUNT(*) AS n FROM forge_account_receipts WHERE account_id=?', this.host.accountId)!;
+    if (Number(count.n) >= MAX_RECEIPTS) fail(429, 'resource_exhausted');
+    const encoded = JSON.stringify(result);
+    if (encoder.encode(encoded).byteLength > 64 * 1024) fail(413, 'resource_exhausted');
+    this.host.sql.exec('INSERT INTO forge_account_receipts(account_id,principal,request_id,fingerprint,result) VALUES(?,?,?,?,?)', this.host.accountId, this.host.principal, requestId, fingerprint, encoded);
+    return result;
+  }
+  async handle(call: ForgeCall): Promise<{ state: 'complete'; result: unknown }> {
+    if (call.account_id !== this.host.accountId) fail(403, 'permission_denied');
+    if (encoder.encode(this.host.principal).byteLength < 1 || encoder.encode(this.host.principal).byteLength > 128
+        || new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(encoder.encode(this.host.principal)) !== this.host.principal
+        || /[\u0000-\u001f\u007f-\u009f]/u.test(this.host.principal)) fail(401, 'unauthenticated');
+    if (![1, 2, 3].includes(call.operation)) fail(501, 'unimplemented');
+    let command: AccountCommand;
+    try { command = normalizeForgeAccountCommand({ account_id: call.account_id, operation: call.operation, view: call.view, payload_json: call.payload_json }); }
+    catch (error) {
+      if (error instanceof Error && (error.message.startsWith('forge limit:') || error.message.endsWith('limit'))) fail(413, 'resource_exhausted');
+      fail(400, 'invalid_argument');
+    }
+    if (command.operation !== call.operation) fail(503, 'failed_precondition');
+    if (command.operation === 2) {
+      return this.host.transactionSync(() => ({ state: 'complete', result: this.snapshot(this.authorizeInTx(false)) }));
+    }
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(call.request_id)) fail(400, 'invalid_argument');
+    const fingerprint = command.fingerprint;
+    if (typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(fingerprint)) fail(503, 'failed_precondition');
+    if (command.operation === 1) {
+      if (!this.host.canProvision) fail(403, 'permission_denied');
+      // Check ownership and authorization before even historical replay. A new
+      // request against an existing account returns its current snapshot.
+      const early = this.host.transactionSync(() => {
+        const row = this.accountInTx();
+        if (row && row.owner !== this.host.principal) fail(403, 'permission_denied');
+        const replay = this.replayInTx(call.request_id, fingerprint);
+        if (replay !== undefined) return replay;
+        if (row) return this.finishInTx(call.request_id, fingerprint, this.snapshot(row));
+        return undefined;
+      });
+      if (early !== undefined) return { state: 'complete', result: early };
+      const genesis = command.genesis;
+      if (!genesis) fail(503, 'failed_precondition');
+      await this.host.stageGenesis(genesis.objects);
+      return this.host.transactionSync(() => {
+        if (!this.host.canProvision) fail(403, 'permission_denied');
+        let row = this.accountInTx();
+        if (row && row.owner !== this.host.principal) fail(403, 'permission_denied');
+        const replay = this.replayInTx(call.request_id, fingerprint);
+        if (replay !== undefined) return { state: 'complete', result: replay };
+        if (!row) {
+          this.host.claimRepositoryInTx(this.host.accountId, genesis.objects, genesis.head);
+          this.host.sql.exec('INSERT INTO forge_account(singleton,account_id,owner,policy_epoch,public_view) VALUES(1,?,?,1,NULL)', this.host.accountId, this.host.principal);
+          row = this.accountInTx()!;
+        }
+        return { state: 'complete', result: this.finishInTx(call.request_id, fingerprint, this.snapshot(row)) };
+      });
+    }
+    return this.host.transactionSync(() => {
+      const row = this.authorizeInTx(true);
+      // Current admin authorization precedes historical replay, but the old
+      // expected epoch does not invalidate a previously committed receipt.
+      const replay = this.replayInTx(call.request_id, fingerprint);
+      if (replay !== undefined) return { state: 'complete', result: replay };
+      if (command.expected_epoch !== row.policy_epoch) fail(409, 'aborted');
+      const member = command.member;
+      if (!member) fail(503, 'failed_precondition');
+      if (member.principal === row.owner) fail(400, 'invalid_argument');
+      const current = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, member.principal);
+      const encoded = JSON.stringify(member);
+      if (!current) {
+        const count = this.one<{ n: number }>('SELECT COUNT(*) AS n FROM forge_members WHERE account_id=?', row.account_id)!;
+        if (Number(count.n) >= MAX_MEMBERS) fail(429, 'resource_exhausted');
+      }
+      if (current?.value !== encoded) {
+        if (!Number.isSafeInteger(row.policy_epoch) || row.policy_epoch >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
+        this.host.sql.exec('INSERT INTO forge_members(account_id,principal,value) VALUES(?,?,?) ON CONFLICT(account_id,principal) DO UPDATE SET value=excluded.value', row.account_id, member.principal, encoded);
+        this.host.sql.exec('UPDATE forge_account SET policy_epoch=policy_epoch+1 WHERE singleton=1');
+        row.policy_epoch++;
+      }
+      return { state: 'complete', result: this.finishInTx(call.request_id, fingerprint, this.wire(row)) };
+    });
+  }
+}

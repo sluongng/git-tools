@@ -11,6 +11,8 @@ interface CoreExports {
   tt_validate_closure(pointer: number, length: number): number;
   tt_forge_validate_view(pointer: number, length: number): number;
   tt_forge_parse_call(pointer: number, length: number): number;
+  tt_forge_account_command(pointer: number, length: number): number;
+  tt_forge_build_candidate(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -60,4 +62,16 @@ export function parseForgeCall(bytes: Uint8Array): ForgeCall {
 export function validateForgeView(account_id: string, spec: unknown): { view_version: string; spec: unknown } {
   const bytes = encoder.encode(JSON.stringify({ account_id, spec }));
   return invoke(bytes, pointer => core.tt_forge_validate_view(pointer, bytes.byteLength)) as { view_version: string; spec: unknown };
+}
+
+/** Strict account command normalization; the DO still authenticates and owns policy. */
+export function normalizeForgeAccountCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'payload_json'>): import('./forge_accounts').AccountCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_account_command(pointer, bytes.byteLength)) as import('./forge_accounts').AccountCommand;
+}
+
+/** Internal server-selected context only; never forward a product payload here. */
+export function buildForgeCandidate(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_build_candidate(pointer, bytes.byteLength));
 }

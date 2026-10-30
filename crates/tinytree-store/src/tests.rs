@@ -258,6 +258,12 @@ fn forge_projection_excludes_private_objects_and_uploads_are_actor_path_epoch_bo
     let (_,tree_bytes)=store.read_metadata(view.repository(),ObjectKey{kind:Kind::Tree,id:ObjectId(projected.projected_tree)}).unwrap();
     let Object::Tree(tree_payload)=tinytree_model::decode(&tree_bytes,Limits::default()).unwrap()else{panic!("not a tree")};
     let (source_file,source_size,source_copy)=tree_payload.entries.iter().find_map(|e|if e.name=="source.rs"{if let TreeValue::File{id,size_bytes,copy_id:Some(copy),..}=e.value{Some((id,size_bytes,copy))}else{None}}else{None}).unwrap();
+    // Captured from the native Store builder before the shared-core extraction.
+    assert_eq!(projected.projected_commit, [193, 128, 130, 77, 26, 39, 133, 114, 29, 38, 247, 228, 226, 62, 32, 30, 55, 159, 185, 107, 79, 169, 173, 110, 100, 68, 197, 75, 89, 251, 112, 231]);
+    assert_eq!(projected.projected_tree, [55, 82, 200, 186, 190, 207, 9, 210, 91, 172, 23, 106, 76, 248, 231, 158, 211, 242, 178, 72, 81, 67, 138, 77, 196, 124, 10, 246, 43, 10, 204, 93]);
+    assert_eq!(reviewed.projected_commit, [188, 155, 231, 129, 127, 191, 198, 171, 192, 78, 67, 94, 146, 132, 209, 109, 26, 142, 194, 32, 144, 198, 63, 23, 59, 68, 63, 188, 141, 212, 94, 196]);
+    assert_eq!(reviewed.projected_tree, [196, 185, 133, 161, 202, 57, 165, 153, 209, 89, 66, 210, 145, 93, 64, 19, 105, 201, 22, 50, 125, 227, 141, 120, 20, 147, 18, 243, 2, 69, 147, 166]);
+    assert_eq!(source_copy.0, [73, 132, 231, 136, 25, 24, 205, 214, 190, 186, 148, 209, 131, 22, 120, 233, 228, 226, 84, 24, 27, 170, 180, 152, 183, 176, 2, 30, 134, 249, 255, 29]);
     let origin={let _gate=store.inner.lock().unwrap();store.inner.forge_projected_copy_origin_in(&store.inner.db.read_tx(),&view,source_copy).unwrap()};
     assert_eq!(origin.canonical_revision,revision.0);assert_eq!(origin.canonical_path,"source.rs");assert_eq!(origin.canonical_copy,None);
     let copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"renamed.rs".into(),parents:vec![source_copy],salt:vec![1]}),Limits::default()).unwrap();

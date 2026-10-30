@@ -1,9 +1,11 @@
 //! Canonical Forge policy and review rules without repository storage or process
 //! dependencies. Embeddings own authentication and atomic publication authority.
 pub mod accounts;
+pub mod account_commands;
 pub mod check;
 pub mod identity;
 pub mod review;
+pub mod projection;
 pub mod wire;
 
 pub type Result<T> = std::result::Result<T, Error>;

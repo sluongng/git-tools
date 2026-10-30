@@ -1,11 +1,14 @@
 import { inspect, validateClosure, type Descriptor, type Inspection, type ObjectKey } from './core';
 import { authenticate, body, digest, fail, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
+import { forgeReply, protectForge, readForgeCall } from './forge';
+import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace;
   OBJECTS: R2Bucket;
   PRINCIPALS_JSON: string;
   EXPERIMENTAL_RAW_BACKEND: string;
+  FORGE_BACKEND?: string;
 }
 type Row = Record<string, string | number | null>;
 const MAX_OBJECT = 1024 * 1024;
@@ -45,9 +48,21 @@ function nativeInspect(kind: number, bytes: Uint8Array): Inspection {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (new URL(request.url).pathname.startsWith('/api/v1/forge/')) {
+      return protectForge(async () => {
+        if (env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
+        const auth = await authenticate(request, env.PRINCIPALS_JSON);
+        if (auth.kind !== 'forge') fail(403, 'permission_denied');
+        const { call, bytes } = await readForgeCall(request);
+        if (!auth.accounts.includes(call.account_id)) fail(403, 'permission_denied');
+        const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
+        return env.REPOSITORIES.get(id).fetch(new Request(request, { body: bytes }));
+      });
+    }
     return protect(async () => {
       if (env.EXPERIMENTAL_RAW_BACKEND !== 'enabled') fail(503, 'experimental_backend_disabled');
       const auth = await authenticate(request, env.PRINCIPALS_JSON);
+      if (auth.kind !== 'raw') fail(403, 'raw_identity_required');
       const parsed = route(request);
       if (parsed.operation === 'capabilities') return json(capabilities);
       if (!auth.accounts.includes(parsed.account!)) fail(403, 'account_access_denied');
@@ -75,9 +90,12 @@ export class AccountRepository {
   async fetch(request: Request): Promise<Response> {
     // Includes R2 awaits: two admitted uploads cannot oversubscribe durable quota,
     // and reads never observe an uncommitted payload. Eviction preserves SQL intents.
-    if (this.active >= 16) return json({ error: 'account_admission_limit' }, 429);
+    const forge = new URL(request.url).pathname.startsWith('/api/v1/forge/');
+    if (this.active >= 16) return forge
+      ? json({ version: 1, error: { code: 'resource_exhausted', message: 'account_admission_limit' } }, 429)
+      : json({ error: 'account_admission_limit' }, 429);
     this.active++;
-    const work = this.tail.then(() => protect(() => this.handle(request))).finally(() => { this.active--; });
+    const work = this.tail.then(() => forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request))).finally(() => { this.active--; });
     this.tail = work.then(() => undefined, () => undefined);
     return work;
   }
@@ -106,8 +124,12 @@ export class AccountRepository {
     // Re-derive identity for every call; neither request JSON nor a cached grant
     // can impersonate a principal. The DO binding itself is not a public route.
     const auth = await authenticate(request, this.env.PRINCIPALS_JSON);
+    if (auth.kind !== 'raw') fail(403, 'raw_identity_required');
     const parsed = route(request); const account = parsed.account!;
     if (!account || !auth.accounts.includes(account)) fail(403, 'account_access_denied');
+    // No raw canonical read, upload, ref or pin operation may bypass Forge
+    // policy, even for an operator or a formerly raw account grant.
+    if (hasForgeAccount(this.sql)) fail(403, 'forge_managed_account');
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (repository && repository.account !== account) fail(403, 'account_binding_mismatch');
     if (parsed.operation === 'repository' && parsed.parts.length === 0) {
@@ -159,6 +181,73 @@ export class AccountRepository {
     if (parsed.operation === 'refs' && parsed.parts[0] === 'cas') return this.cas(request, account, auth);
     if (parsed.operation === 'pins' && ['create', 'release'].includes(parsed.parts[0])) return this.pin(request, account, auth, parsed.parts[0]);
     fail(501, 'unsupported_operation');
+  }
+  private async handleForge(request: Request): Promise<Response> {
+    if (this.env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
+    const auth = await authenticate(request, this.env.PRINCIPALS_JSON);
+    if (auth.kind !== 'forge') fail(403, 'permission_denied');
+    const { call } = await readForgeCall(request);
+    if (!auth.accounts.includes(call.account_id)) fail(403, 'permission_denied');
+    const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+    if (repository && repository.account !== call.account_id) fail(403, 'permission_denied');
+    // This host is per request. Never cache an actor/grant on the DO instance.
+    const staged = new Set<string>();
+    const api = new ForgeAccounts({
+      accountId: call.account_id, principal: auth.principal, canProvision: auth.operator,
+      sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      stageGenesis: objects => this.stageGenesis(call.account_id, objects, staged),
+      claimRepositoryInTx: (account, objects, head) => {
+        if (account !== call.account_id || this.one('SELECT account FROM repository WHERE singleton=1')
+            || this.one('SELECT name FROM refs LIMIT 1')) fail(400, 'failed_precondition');
+        if (objects.length !== 2 || !objects.some(o => o.kind === 3 && o.id === head)) fail(503, 'unavailable');
+        for (const object of objects) {
+          const key = `${object.kind}/${object.id}`;
+          const row = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
+          if (!staged.has(key) || !row || Number(row.size) !== object.size_bytes) fail(503, 'unavailable');
+          this.sql.exec('UPDATE objects SET visible=1 WHERE kind=? AND id=?', object.kind, object.id);
+        }
+        this.sql.exec('INSERT INTO repository(singleton,account) VALUES(1,?)', account);
+        this.sql.exec('INSERT INTO refs(name,generation,head) VALUES(\'main\',1,?)', head);
+      },
+      currentMainInTx: () => {
+        const main = this.one('SELECT generation,head FROM refs WHERE name=\'main\'');
+        if (!main) fail(503, 'unavailable');
+        return { head: String(main.head), generation: Number(main.generation) };
+      },
+    });
+    const result = await api.handle(call);
+    return forgeReply(call, result.state, result.result);
+  }
+  private async stageGenesis(account: string, objects: CanonicalAccountObject[], staged: Set<string>): Promise<void> {
+    if (this.one('SELECT account FROM repository WHERE singleton=1')) fail(400, 'failed_precondition');
+    if (objects.length !== 2 || objects[0].kind !== 2 || objects[1].kind !== 3) fail(503, 'unavailable');
+    const prepared = objects.map(object => {
+      const bytes = Uint8Array.from(object.bytes);
+      if (bytes.byteLength > MAX_METADATA) fail(429, 'resource_exhausted');
+      const inspection = nativeInspect(object.kind, bytes);
+      sameDescriptor(object, inspection);
+      return { object, bytes, inspection };
+    });
+    try { validateClosure({ kind: 3, id: objects[1].id }, objects); } catch { fail(503, 'unavailable'); }
+    this.ctx.storage.transactionSync(() => {
+      for (const { object, inspection } of prepared) {
+        const existing = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
+        if (existing) {
+          if (Number(existing.size) !== object.size_bytes) fail(503, 'unavailable');
+          continue;
+        }
+        const usage = this.one('SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes FROM objects')!;
+        if (Number(usage.n) >= MAX_OBJECTS || Number(usage.bytes) + object.size_bytes > MAX_ACCOUNT_BYTES) fail(429, 'resource_exhausted');
+        this.sql.exec('INSERT INTO objects(kind,id,size,inspection,visible) VALUES(?,?,?,?,0)', object.kind, object.id, object.size_bytes, JSON.stringify(inspection));
+      }
+    });
+    // A crash leaves only invisible durable reservations. A retry confirms fresh
+    // canonical R2 puts; only the final account transaction makes them visible.
+    for (const { object, bytes } of prepared) {
+      const written = await this.env.OBJECTS.put(r2key(account, object), bytes);
+      if (!written || written.size !== bytes.byteLength) fail(503, 'unavailable');
+      staged.add(`${object.kind}/${object.id}`);
+    }
   }
   private async put(request: Request, account: string, auth: Auth, key: ObjectKey): Promise<Response> {
     const id = requestId(request.headers.get('x-tinytree-request-id'));

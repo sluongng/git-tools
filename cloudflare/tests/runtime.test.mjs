@@ -47,17 +47,33 @@ test('actual RustWasm shares native Forge view identities and strict HTTP framin
 });
 
 const principals = () => [
-  { principal: 'operator-a', token_sha256: sha(tokenA), accounts: [fixture.account], operator: true },
-  { principal: 'operator-b', token_sha256: sha(tokenB), accounts: ['other'], operator: true },
-  { principal: 'member-a', token_sha256: sha(member), accounts: [fixture.account], operator: false },
+  { principal: 'operator-a', token_sha256: sha(tokenA), accounts: [fixture.account], operator: true, kind: 'raw' },
+  { principal: 'operator-b', token_sha256: sha(tokenB), accounts: ['other'], operator: true, kind: 'raw' },
+  { principal: 'member-a', token_sha256: sha(member), accounts: [fixture.account], operator: false, kind: 'raw' },
 ];
 
-function options(persist, { fault, config = principals() } = {}) {
+function options(persist, { fault, config = principals(), forge = false } = {}) {
   const modules = [{ type: 'ESModule', path: bundle }, { type: 'CompiledWasm', path: wasm }];
   if (fault) {
     // Test-only transport fault around the REAL R2 binding: after-write failure
     // leaves a genuine stored orphan, not an in-memory fake bucket.
-    const entry = `import worker, {AccountRepository as Base} from './${path.basename(bundle)}';
+    const entry = fault === 'sql-receipt' ? `import worker, {AccountRepository as Base} from './${path.basename(bundle)}';
+      export default worker;
+      export class AccountRepository extends Base {
+        constructor(ctx, env) {
+          const bind = (target, key) => { const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value; };
+          const sql = new Proxy(ctx.storage.sql, { get(target, key) {
+            if (key === 'exec') return (query, ...args) => {
+              if (query.startsWith('INSERT INTO forge_account_receipts')) throw new Error('deliberate receipt transaction failure');
+              return target.exec(query, ...args);
+            };
+            return bind(target, key);
+          }});
+          const storage = new Proxy(ctx.storage, { get(target, key) { return key === 'sql' ? sql : bind(target, key); }});
+          const state = new Proxy(ctx, { get(target, key) { return key === 'storage' ? storage : bind(target, key); }});
+          super(state, env);
+        }
+      }` : `import worker, {AccountRepository as Base} from './${path.basename(bundle)}';
       export default worker;
       export class AccountRepository extends Base {
         constructor(ctx, env) {
@@ -77,7 +93,7 @@ function options(persist, { fault, config = principals() } = {}) {
     modules, compatibilityDate: '2026-07-08',
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
     r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(persist, 'do'), r2Persist: path.join(persist, 'r2'),
-    bindings: { PRINCIPALS_JSON: JSON.stringify(config), EXPERIMENTAL_RAW_BACKEND: 'enabled' },
+    bindings: { PRINCIPALS_JSON: JSON.stringify(config), EXPERIMENTAL_RAW_BACKEND: 'enabled', FORGE_BACKEND: forge ? 'enabled' : 'disabled' },
   };
 }
 async function call(mf, account, operation, value, { token = tokenA, method = 'POST' } = {}) {
@@ -107,6 +123,90 @@ function cas(id, expected, object) {
 function nativeReference(result) { return { name: result.name, generation: result.generation, head: result.head }; }
 const getObject = (mf, object, token = tokenA, account = fixture.account) => mf.dispatchFetch(
   `https://repository.invalid/v1/accounts/${account}/objects/${object.kind}/${object.id}`, { headers: { authorization: `Bearer ${token}` } });
+
+test('Forge HTTP account authority matches native Store and fences raw access across reload and staging failures', async t => {
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-forge-account-'));
+  const owner = 'forge-owner-runtime-token';
+  const memberToken = 'forge-member-runtime-token';
+  const other = 'forge-other-runtime-token';
+  const raw = 'forge-raw-runtime-token';
+  const account = fixture.forge.account_id;
+  const allowed = [account, 'legacy', 'r2-recovery', 'sql-recovery'];
+  const config = [
+    { principal: 'forge-owner', token_sha256: sha(owner), accounts: allowed, operator: true, kind: 'forge' },
+    { principal: 'forge-member', token_sha256: sha(memberToken), accounts: allowed, operator: false, kind: 'forge' },
+    { principal: 'forge-other', token_sha256: sha(other), accounts: allowed, operator: true, kind: 'forge' },
+    { principal: 'raw-owner', token_sha256: sha(raw), accounts: allowed, operator: true, kind: 'raw' },
+  ];
+  let mf = new Miniflare(options(persist, { config, forge: true }));
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const envelope = (operation, payload, request_id, selectedAccount = account) => ({
+    version: 1, operation, account_id: selectedAccount, view: 'public', request_id,
+    payload_json: typeof payload === 'string' ? payload : JSON.stringify(payload),
+  });
+  const callForge = (operation, payload = {}, requestId = '', { token = owner, selectedAccount = account } = {}) => mf.dispatchFetch(
+    'https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(envelope(operation, payload, requestId, selectedAccount)) });
+  const forgeValue = async (response, status = 200, code) => {
+    const result = await response.json();
+    assert.equal(response.status, status, JSON.stringify(result)); assert.equal(result.version, 1);
+    if (status !== 200) { if (code) assert.equal(result.error.code, code); return result; }
+    assert.equal(result.view, 'public'); assert.equal(result.state, 'complete');
+    return JSON.parse(result.result_json);
+  };
+  await forgeValue(await callForge(1, {}, 'member-create', { token: memberToken }), 403, 'permission_denied');
+  await forgeValue(await callForge(1, {}, 'wrong-kind', { token: raw }), 403, 'permission_denied');
+  const provisioned = await forgeValue(await callForge(1, {}, 'provision-owner'));
+  assert.deepEqual(provisioned, fixture.forge.provisioned);
+  assert.deepEqual(await forgeValue(await callForge(1, {}, 'provision-owner')), provisioned);
+  assert.deepEqual(await forgeValue(await callForge(2)), provisioned);
+  await forgeValue(await callForge(2, {}, '', { token: memberToken }), 403, 'permission_denied');
+  await forgeValue(await callForge(1, {}, 'steal-owner', { token: other }), 403, 'permission_denied');
+  const member = { principal: 'forge-member', can_write: true, can_review: true, is_admin: true, roles: ['reviewer'] };
+  const mutation = { member, expected_epoch: 1 };
+  assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added);
+  assert.deepEqual(await forgeValue(await callForge(3, { member, expected_epoch: 2 }, 'same-member')), fixture.forge.unchanged);
+  // Same request ID belongs to a different principal: it must not replay the
+  // owner's receipt and hide this actor's stale expected epoch.
+  await forgeValue(await callForge(3, mutation, 'same-member', { token: memberToken }), 409, 'aborted');
+  assert.deepEqual(await forgeValue(await callForge(3, { member, expected_epoch: 2 }, 'member-self-noop', { token: memberToken })), fixture.forge.unchanged);
+  await forgeValue(await callForge(3, { ...mutation, expected_epoch: 2 }, 'add-member'), 400, 'invalid_argument');
+  await forgeValue(await callForge(3, { member: { ...member, principal: 'forge-owner' }, expected_epoch: 2 }, 'change-owner'), 400, 'invalid_argument');
+  const duplicate = '{"member":' + JSON.stringify(member) + ',"expected_epoch":2,"expected_epoch":2}';
+  await forgeValue(await callForge(3, duplicate, 'ambiguous-member'), 400, 'invalid_argument');
+  assert.deepEqual(await forgeValue(await callForge(3, { member: { ...member, is_admin: false }, expected_epoch: 2 }, 'revoke-admin')), fixture.forge.revoked);
+  await forgeValue(await callForge(3, { member, expected_epoch: 2 }, 'member-self-noop', { token: memberToken }), 403, 'permission_denied');
+  assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added, 'historical receipt never reapplies membership');
+  assert.equal((await forgeValue(await callForge(2))).policy_epoch, 3);
+  await forgeValue(await callForge(20, {}, 'unsupported-review'), 501, 'unimplemented');
+  const malformed = { ...envelope(1, {}, 'actor-injection'), actor: 'forge-owner' };
+  await forgeValue(await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${owner}`, 'content-type': 'application/json' }, body: JSON.stringify(malformed) }), 400, 'invalid_argument');
+  for (const [operation, payload, method] of [
+    ['repository', {}, 'GET'], ['refs/read', { names: ['main'] }, 'POST'],
+    ['refs/cas', { request_id: 'raw-bypass', name: 'main', expected_generation: 1, expected_head: null, head: '1'.repeat(64) }, 'POST'],
+    ['pins/create', { request_id: 'raw-pin', name: 'hidden', head: '1'.repeat(64) }, 'POST'],
+    [`objects/3/${Buffer.from(provisioned.main_revision).toString('hex')}`, {}, 'GET'],
+  ]) assert.equal((await call(mf, account, operation, payload, { token: raw, method })).status, 403, operation);
+  assert.equal((await call(mf, 'legacy', 'repository', { request_id: 'forge-token-raw' }, { token: owner })).status, 403);
+  await value(await call(mf, 'legacy', 'repository', { request_id: 'raw-legacy' }, { token: raw }));
+  await forgeValue(await callForge(1, {}, 'adopt-legacy', { selectedAccount: 'legacy' }), 400, 'failed_precondition');
+  await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true }));
+  assert.equal((await forgeValue(await callForge(2))).policy_epoch, 3);
+  assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added);
+  for (const [fault, selectedAccount] of [['after', 'r2-recovery'], ['sql-receipt', 'sql-recovery']]) {
+    await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true, fault }));
+    await forgeValue(await callForge(1, {}, 'recover-provision', { selectedAccount }), 503, 'unavailable');
+    await forgeValue(await callForge(2, {}, '', { selectedAccount }), 403, 'permission_denied');
+    assert.equal((await call(mf, selectedAccount, 'repository', {}, { token: raw, method: 'GET' })).status, 404, 'no partial SQL claim');
+    const bucket = await mf.getR2Bucket('OBJECTS');
+    assert.ok((await bucket.list({ prefix: `native/v1/${selectedAccount}/` })).objects.length > 0, 'real staged R2 orphan');
+    await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true }));
+    const recovered = await forgeValue(await callForge(1, {}, 'recover-provision', { selectedAccount }));
+    assert.equal(recovered.main_generation, 1); assert.equal(recovered.policy_epoch, 1);
+    assert.deepEqual(await forgeValue(await callForge(1, {}, 'recover-provision', { selectedAccount })), recovered);
+    assert.equal((await call(mf, selectedAccount, 'refs/read', { names: ['main'] }, { token: raw })).status, 403);
+  }
+});
 
 test('actual SQLite DO and R2 conform to native Store CAS, immutable bytes, reload and retained pins', async t => {
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-cloudflare-'));

@@ -90,6 +90,9 @@ enum ContextCommand {
     Show,
     /// Persist routing context. The service still authenticates every request.
     Set {
+        /// Explicit wire protocol; an HTTPS URL does not select the protocol.
+        #[arg(long, default_value = "grpc", value_parser = context::transport_parser())]
+        transport: tinytree_client::Transport,
         #[arg(long)]
         server: String,
         #[arg(long)]
@@ -180,6 +183,7 @@ async fn run(ui: &mut Ui, command: &CommandHelper, args: Command) -> Result<(), 
                         .map_err(user_error)?
                 }
                 ContextCommand::Set {
+                    transport,
                     server,
                     account,
                     view,
@@ -189,6 +193,7 @@ async fn run(ui: &mut Ui, command: &CommandHelper, args: Command) -> Result<(), 
                 } => {
                     let value = context::Context {
                         schema_version: 1,
+                        transport,
                         server,
                         account_id: account,
                         view,
@@ -207,10 +212,11 @@ async fn run(ui: &mut Ui, command: &CommandHelper, args: Command) -> Result<(), 
             } else {
                 writeln!(
                     ui.stdout(),
-                    "Account: {}\nView: {}\nServer: {}",
+                    "Account: {}\nView: {}\nServer: {}\nTransport: {}",
                     value.account_id,
                     value.view,
-                    value.server
+                    value.server,
+                    context::transport_name(value.transport)
                 )?;
                 Ok(())
             }

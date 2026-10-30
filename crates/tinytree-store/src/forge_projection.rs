@@ -1,10 +1,7 @@
 //! Sanitized native workspace artifacts and actor-owned file upload receipts.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-use tinytree_model::{
-    ChangeId, Commit, CopyHistory, CopyId, FileId, Object, Signature, SymlinkId, Timestamp, Tree,
-    TreeEntry, TreeId, TreeMerge, TreeValue,
-};
+use tinytree_model::{ChangeId, CopyId, Object, TreeId, TreeValue};
 const PREFIX: &[u8] = b"forge/projections/v1/";
 const RETIRED: &[u8] = b"forge/projection-retired/v1/";
 const UPLOAD: &[u8] = b"forge/uploads/v1/";
@@ -13,16 +10,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeProjection {
-    pub account_id: AccountId,
-    pub view_version: ViewVersion,
-    pub policy_epoch: PolicyEpoch,
-    pub canonical_revision: [u8; 32],
-    pub projected_commit: [u8; 32],
-    pub projected_tree: [u8; 32],
+pub use tinytree_forge_core::projection::{ForgeCopyOrigin, ForgeProjection};
+use tinytree_forge_core::projection::{
+    ProjectionContext, ProjectionError, ReviewProjection, SelectedEntry, SelectedValue,
+    build_projection,
+};
+
+impl From<ProjectionError> for Error {
+    fn from(error: ProjectionError) -> Self {
+        match error {
+            ProjectionError::Invalid(reason) => Self::Invalid(reason),
+            ProjectionError::Limit(reason) => Self::Limit(reason),
+            ProjectionError::Model(error) => Self::Model(error),
+        }
+    }
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectionRecord {
@@ -30,15 +33,6 @@ struct ProjectionRecord {
     binding: ForgeProjection,
     objects: Vec<(u8, [u8; 32])>,
     copies: Vec<ForgeCopyOrigin>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeCopyOrigin {
-    pub projected_copy: [u8; 32],
-    pub canonical_revision: [u8; 32],
-    pub canonical_path: String,
-    pub canonical_copy: Option<[u8; 32]>,
-    pub file: [u8; 32],
 }
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 fn validate_catalog(record: &ProjectionRecord) -> Result<()> {
@@ -124,14 +118,28 @@ struct UploadRecord {
     descriptor: StoredDescriptor,
     expires_at: i64,
 }
+fn projection_context(
+    view: &ResolvedView,
+    canonical: CommitId,
+    review: Option<(ChangeId, CommitId)>,
+) -> ProjectionContext {
+    ProjectionContext {
+        account_id: view.account().clone(),
+        view_version: view.version(),
+        policy_epoch: view.epoch(),
+        canonical_revision: canonical,
+        review: review.map(|(change_id, projected_parent)| ReviewProjection {
+            change_id,
+            projected_parent,
+        }),
+    }
+}
 fn projection_key(view: &ResolvedView) -> Vec<u8> {
-    format!(
-        "forge/projections/v1/{}/{}/{}",
-        view.account().0,
-        hex(&view.version().0),
-        view.epoch().0
-    )
-    .into_bytes()
+    tinytree_forge_core::projection::projection_key(&projection_context(
+        view,
+        view.revision(),
+        None,
+    ))
 }
 fn reference(binding: &ForgeProjection) -> String {
     format!(
@@ -182,51 +190,6 @@ fn upload_key(view: &ResolvedView, actor: &ForgeActor, path: &str, id: [u8; 32])
     )
     .into_bytes()
 }
-#[derive(Default)]
-struct Directory {
-    files: BTreeMap<String, TreeValue>,
-    directories: BTreeMap<String, Directory>,
-}
-impl Directory {
-    fn insert(&mut self, path: &str, value: TreeValue) -> Result<()> {
-        if let Some((head, tail)) = path.split_once('/') {
-            if self.files.contains_key(head) {
-                return Err(Error::Invalid("forge projected path collision"));
-            }
-            self.directories
-                .entry(head.into())
-                .or_default()
-                .insert(tail, value)
-        } else {
-            if self.directories.contains_key(path)
-                || self.files.insert(path.into(), value).is_some()
-            {
-                return Err(Error::Invalid("forge projected path collision"));
-            }
-            Ok(())
-        }
-    }
-    fn write(self, store: &Store, repository: &str, now: i64) -> Result<TreeId> {
-        let mut entries = self.files;
-        for (name, directory) in self.directories {
-            entries.insert(
-                name,
-                TreeValue::Tree(directory.write(store, repository, now)?),
-            );
-        }
-        let object = tinytree_model::encode(
-            &Object::Tree(Tree {
-                entries: entries
-                    .into_iter()
-                    .map(|(name, value)| TreeEntry { name, value })
-                    .collect(),
-            }),
-            store.inner.config.model_limits,
-        )?;
-        store.put(repository, object.descriptor, &object.bytes, now)?;
-        Ok(TreeId(object.descriptor.key.id.0))
-    }
-}
 impl Store {
     /// Materialize only the authorized projection, retaining canonical path names.
     /// Canonical parents, descriptions, signatures and copy ancestry are absent.
@@ -264,18 +227,8 @@ impl Store {
         now: i64,
     ) -> Result<ForgeProjection> {
         self.forge_check_view(view)?;
-        let pk = match review {
-            None => projection_key(view),
-            Some((change, parent)) => format!(
-                "{}/review/{}/{}/{}",
-                String::from_utf8(projection_key(view))
-                    .map_err(|_| Error::Corrupt("forge projection key"))?,
-                hex(&canonical.0),
-                hex(&change.0),
-                hex(&parent.0)
-            )
-            .into_bytes(),
-        };
+        let context = projection_context(view, canonical, review);
+        let pk = tinytree_forge_core::projection::projection_key(&context);
         {
             let _gate = self.inner.lock_read()?;
             let tx = self.inner.db.read_tx();
@@ -285,40 +238,13 @@ impl Store {
             }
         }
         let files = self.forge_view_files(&view.at_revision(canonical), 10_000)?;
-        let mut directory = Directory::default();
-        let mut copies = Vec::new();
+        let mut selected = Vec::with_capacity(files.len());
         for file in files {
             let value = match file.descriptor.key.kind {
-                Kind::File => {
-                    let mut salt = blake3::Hasher::new();
-                    salt.update(b"tinytree-projected-copy-v1\0");
-                    salt.update(&pk);
-                    salt.update(file.canonical_path.as_bytes());
-                    salt.update(&canonical.0);
-                    salt.update(&file.descriptor.key.id.0);
-                    let copy = tinytree_model::encode(
-                        &Object::CopyHistory(CopyHistory {
-                            current_path: file.canonical_path.clone(),
-                            parents: vec![],
-                            salt: salt.finalize().as_bytes().to_vec(),
-                        }),
-                        self.inner.config.model_limits,
-                    )?;
-                    self.put(view.repository(), copy.descriptor, &copy.bytes, now)?;
-                    copies.push(ForgeCopyOrigin {
-                        projected_copy: copy.descriptor.key.id.0,
-                        canonical_revision: canonical.0,
-                        canonical_path: file.canonical_path.clone(),
-                        canonical_copy: file.copy_id,
-                        file: file.descriptor.key.id.0,
-                    });
-                    TreeValue::File {
-                        id: FileId(file.descriptor.key.id.0),
-                        executable: file.executable,
-                        size_bytes: file.descriptor.size_bytes,
-                        copy_id: Some(CopyId(copy.descriptor.key.id.0)),
-                    }
-                }
+                Kind::File => SelectedValue::File {
+                    executable: file.executable,
+                    canonical_copy: file.copy_id,
+                },
                 Kind::Symlink => {
                     let (_, bytes) = self.read_metadata(view.repository(), file.descriptor.key)?;
                     let target =
@@ -326,48 +252,37 @@ impl Store {
                             Object::Symlink(target) => target,
                             _ => return Err(Error::Corrupt("forge symlink type")),
                         };
-                    TreeValue::Symlink {
-                        id: SymlinkId(file.descriptor.key.id.0),
+                    SelectedValue::Symlink {
                         target_bytes: target.len() as u64,
                     }
                 }
                 _ => return Err(Error::Invalid("forge projected entry kind")),
             };
-            directory.insert(&file.canonical_path, value)?;
+            selected.push(SelectedEntry {
+                canonical_path: file.canonical_path,
+                descriptor: file.descriptor,
+                value,
+            });
         }
-        let root = directory.write(self, view.repository(), now)?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"tinytree-forge-projection-v1\0");
-        hasher.update(&pk);
-        hasher.update(&root.0);
-        let digest = hasher.finalize();
-        let mut change = [0; 16];
-        change.copy_from_slice(&digest.as_bytes()[..16]);
-        let signature = Signature {
-            name: "Tinytree".into(),
-            email: "tinytree@users.noreply.github.com".into(),
-            timestamp: Timestamp {
-                millis_since_epoch: 0,
-                tz_offset_minutes: 0,
-            },
-        };
-        let object = tinytree_model::encode(
-            &Object::Commit(Commit {
-                parents: vec![review.map(|(_, parent)| parent).unwrap_or(CommitId::ROOT)],
-                predecessors: vec![],
-                root_tree: TreeMerge {
-                    terms: vec![root],
-                    labels: vec![String::new()],
-                },
-                change_id: review.map(|(change, _)| change).unwrap_or(ChangeId(change)),
-                description: "Projected workspace".into(),
-                author: signature.clone(),
-                committer: signature,
-                secure_signature: None,
-            }),
-            self.inner.config.model_limits,
-        )?;
-        self.put(view.repository(), object.descriptor, &object.bytes, now)?;
+        let built = build_projection(&context, selected, self.inner.config.model_limits)?;
+        if built.record_key != pk {
+            return Err(Error::Corrupt("forge projection key"));
+        }
+        let descriptor = built
+            .objects
+            .last()
+            .ok_or(Error::Corrupt("forge projection commit"))?
+            .descriptor;
+        if descriptor.key.kind != Kind::Commit
+            || descriptor.key.id.0 != built.binding.projected_commit
+        {
+            return Err(Error::Corrupt("forge projection commit"));
+        }
+        for object in built.objects {
+            self.put(view.repository(), object.descriptor, &object.bytes, now)?;
+        }
+        let binding = built.binding;
+        let copies = built.copies;
         let _gate = self.inner.lock()?;
         let mut tx = self
             .inner
@@ -387,9 +302,9 @@ impl Store {
         if count >= MAX_PROJECTIONS {
             return Err(Error::Limit("forge projections"));
         }
-        let closure =
-            self.inner
-                .closure(view.repository(), [object.descriptor.key], true, false)?;
+        let closure = self
+            .inner
+            .closure(view.repository(), [descriptor.key], true, false)?;
         let mut objects: Vec<_> = closure
             .into_iter()
             .map(|k| (k.kind as u8, k.id.0))
@@ -398,20 +313,12 @@ impl Store {
         if objects.len() > 30_002 {
             return Err(Error::Limit("forge projected closure"));
         }
-        let binding = ForgeProjection {
-            account_id: view.account().clone(),
-            view_version: view.version(),
-            policy_epoch: view.epoch(),
-            canonical_revision: canonical.0,
-            projected_commit: object.descriptor.key.id.0,
-            projected_tree: root.0,
-        };
         tx.insert(
             &self.inner.spaces.refs,
             key(view.repository(), reference(&binding).as_bytes()),
             encode(&StoredReference {
                 generation: 1,
-                commit: Some(object.descriptor.into()),
+                commit: Some(descriptor.into()),
             })?,
         );
         tx.insert(

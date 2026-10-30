@@ -3,6 +3,8 @@
 //! verified, durable byte receipts; this API cannot authenticate an external CAS.
 use serde::Deserialize;
 mod forge;
+mod accounts;
+mod landing;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -387,6 +389,14 @@ pub extern "C" fn tt_forge_parse_call(ptr: *const u8, len: usize) -> u32 {
             .map_err(|error| error.to_string())?;
         serde_json::to_value(envelope).map_err(|_| "forge envelope encoding".to_string())
     })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_account_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, accounts::normalize)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_build_candidate(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, landing::build_candidate)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

@@ -4,10 +4,9 @@
 //! from authenticated transport identity, never from a JSON principal field.
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest};
 use tinytree_proto::forge_v1;
-use tinytree_store::{
-    AccountId, ForgeAction, ForgeActor, ForgeMember, PolicyEpoch, ViewSpec, ViewVersion,
-};
+use tinytree_store::{AccountId, ForgeAction, ForgeActor, PolicyEpoch, ViewSpec, ViewVersion};
 use tinytree_store::{ResolvedView, Store};
 use tonic::Status;
 
@@ -18,17 +17,8 @@ const MAX_MATCHES: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyRequest {}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RetireViewRequest {
     version: [u8; 32],
-    expected_epoch: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SetMemberRequest {
-    member: ForgeMember,
     expected_epoch: u64,
 }
 #[derive(Deserialize)]

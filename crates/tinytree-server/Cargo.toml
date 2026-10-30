@@ -29,6 +29,7 @@ serde_json = "1"
 tinytree-annotate = { path = "../tinytree-annotate" }
 tinytree-cloud = { path = "../tinytree-cloud" }
 tinytree-check-runner = { path = "../tinytree-check-runner" }
+tinytree-forge-core = { path = "../tinytree-forge-core" }
 tinytree-search = { path = "../tinytree-search" }
 tinytree-model = { path = "../tinytree-model" }
 tinytree-index = { path = "../tinytree-index" }

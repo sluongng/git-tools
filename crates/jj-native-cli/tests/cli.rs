@@ -43,6 +43,7 @@ mod forge_product {
         let path = client.home.join("config/tinytree/context.json");
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, result["result"]);
+        assert!(saved.get("transport").is_none(), "default gRPC encoding stays unchanged");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -51,6 +52,235 @@ mod forge_product {
                 0o600
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_explicit_http_context_binds_login_and_saved_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Transport assertion fixture; canonical account semantics are covered
+        // by the existing real Store/service workflow in this same suite.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    result = listener.accept() => result.unwrap(),
+                    _ = &mut stopped => break,
+                };
+                let received = received.clone();
+                connections.spawn(async move {
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).await.unwrap();
+                        headers.push(byte[0]);
+                        assert!(headers.len() < 16384);
+                    }
+                    let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+                    assert!(headers.starts_with("post /api/v1/forge/call http/1.1\r\n"));
+                    assert!(headers.contains("authorization: bearer public-forge-fixture-token-not-a-secret\r\n"));
+                    let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                    assert!(size < 2 * 1024 * 1024);
+                    let mut bytes = vec![0; size];
+                    socket.read_exact(&mut bytes).await.unwrap();
+                    let input: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(input["version"], 1);
+                    assert_eq!(input["view"], "public");
+                    assert_eq!(input["payload_json"], "{}");
+                    received.lock().unwrap().push(input.clone());
+                    let denied = input["account_id"] == "missing";
+                    let result = match input["account_id"].as_str().unwrap() {
+                        "malformed" => "not-json".to_owned(),
+                        "invalid-shape" => "{}".to_owned(),
+                        requested => {
+                            let account = if requested == "wrong-account" { "other" } else { requested };
+                            serde_json::json!({"account_id":account,"monorepo_id":format!("forge-{account}"),"policy_epoch":1,"public_view":null,"main_revision":vec![1u8;32],"main_generation":1}).to_string()
+                        }
+                    };
+                    let output = if denied {
+                        serde_json::json!({"version":1,"error":{"code":"permission_denied","message":"fixture account denied"}})
+                    } else {
+                        serde_json::json!({"version":1,"operation":input["operation"],"account_id":input["account_id"],"view":input["view"],"request_id":input["request_id"],"state":"complete","result_json":result})
+                    };
+                    let output = serde_json::to_vec(&output).unwrap();
+                    socket.write_all(format!("HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",if denied {403}else{200},output.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&output).await.unwrap();
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.unwrap();
+            }
+        });
+        let client = client();
+        let logged_in = service_value(
+            &client,
+            &[
+                "login",
+                "--transport",
+                "forge-https-v1",
+                "--server",
+                &endpoint,
+                "--account",
+                "example",
+                "--token-env",
+                "FORGE_TEST_TOKEN",
+                "--json",
+            ],
+        );
+        assert_eq!(logged_in["account_id"], "example");
+        let context_path = client.home.join("config/tinytree/context.json");
+        let context_bytes = fs::read(&context_path).unwrap();
+        let context: serde_json::Value = serde_json::from_slice(&context_bytes).unwrap();
+        assert_eq!(context["transport"], "forge_https_v1");
+        assert_eq!(context["token_env"], "FORGE_TEST_TOKEN");
+        assert!(!String::from_utf8_lossy(&context_bytes).contains("public-forge-fixture-token"));
+        assert!(
+            client
+                .success(&["context", "show"])
+                .contains("Transport: forge-https-v1")
+        );
+        assert_eq!(
+            service_value(&client, &["account", "show", "--json"])["account_id"],
+            "example"
+        );
+        let provision = service_value(
+            &client,
+            &[
+                "account",
+                "provision",
+                "--request-id",
+                "http-provision",
+                "--json",
+            ],
+        );
+        let pending_path = client
+            .home
+            .join("config/tinytree/requests/request-http-provision.json");
+        let pending_bytes = fs::read(&pending_path).unwrap();
+        let pending: serde_json::Value = serde_json::from_slice(&pending_bytes).unwrap();
+        assert_eq!(pending["context"]["transport"], "forge_https_v1");
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        // Same endpoint/account/key with another protocol is a different intent.
+        client.success(&[
+            "context",
+            "set",
+            "--transport",
+            "grpc",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+        ]);
+        let rebound = client.run(&["request", "resume", "http-provision", "--json"]);
+        assert!(!rebound.status.success());
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            3,
+            "context mismatch must fail before dispatch"
+        );
+        assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+        let grpc: serde_json::Value =
+            serde_json::from_slice(&fs::read(&context_path).unwrap()).unwrap();
+        assert!(
+            grpc.get("transport").is_none(),
+            "retain existing default-gRPC scope hash encoding"
+        );
+        client.success(&[
+            "context",
+            "set",
+            "--transport",
+            "forge-https-v1",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+        ]);
+        assert_eq!(
+            service_value(&client, &["request", "resume", "http-provision", "--json"]),
+            provision
+        );
+        assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+        let before = fs::read(&context_path).unwrap();
+        assert!(
+            !client
+                .run(&[
+                    "login",
+                    "--transport",
+                    "forge-https-v1",
+                    "--server",
+                    &endpoint,
+                    "--account",
+                    "missing",
+                    "--token-env",
+                    "FORGE_TEST_TOKEN",
+                    "--json"
+                ])
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read(&context_path).unwrap(),
+            before,
+            "failed HTTP login preserves context"
+        );
+        assert!(
+            !client
+                .run(&[
+                    "context",
+                    "set",
+                    "--transport",
+                    "https",
+                    "--server",
+                    &endpoint,
+                    "--account",
+                    "example"
+                ])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read(&context_path).unwrap(), before);
+        // Valid transport bindings cannot make malformed or another account's
+        // semantic snapshot into a successfully persisted login.
+        for account in ["malformed", "invalid-shape", "wrong-account"] {
+            let rejected = client.run(&[
+                "login",
+                "--transport",
+                "forge-https-v1",
+                "--server",
+                &endpoint,
+                "--account",
+                account,
+                "--token-env",
+                "FORGE_TEST_TOKEN",
+                "--json",
+            ]);
+            assert!(
+                !rejected.status.success(),
+                "invalid login snapshot: {account}"
+            );
+            assert_eq!(
+                fs::read(&context_path).unwrap(),
+                before,
+                "invalid snapshot must preserve the previous context: {account}"
+            );
+        }
+        let received = requests.lock().unwrap();
+        assert_eq!(received.len(), 8);
+        assert_eq!(
+            received[2], received[3],
+            "resume uses the exact HTTP mutation envelope"
+        );
+        drop(received);
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[test]
