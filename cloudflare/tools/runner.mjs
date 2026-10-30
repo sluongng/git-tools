@@ -26,6 +26,8 @@ try {
       TINYTREE_TT_BINARY: resolve(tt),
       TINYTREE_CLOSURE_HARNESS_BUNDLE: resolve(directory, "closure-harness/worker.mjs"),
       TINYTREE_CLOSURE_HARNESS_WASM: resolve(directory, "closure-harness/core.wasm"),
+      TINYTREE_PROJECTION_HARNESS_BUNDLE: resolve(directory, "projection-harness/worker.mjs"),
+      TINYTREE_PROJECTION_HARNESS_WASM: resolve(directory, "projection-harness/core.wasm"),
     },
   });
   process.exitCode = await new Promise((done, reject) => {

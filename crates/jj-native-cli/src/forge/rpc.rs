@@ -94,7 +94,12 @@ async fn call_inner(
     })?;
     // SDK verifies the exact operation/account/view/replay binding and caps
     // decoding before returning an authenticated control-plane assertion.
-    client.forge_call(input).await.map_err(|status| {
+    let result = if operation == f::ForgeOperation::ResolveView {
+        client.forge_resolve_view(input).await
+    } else {
+        client.forge_call(input).await
+    };
+    result.map_err(|status| {
         user_error(CallError {
             status,
             request_id: saved_key,

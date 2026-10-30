@@ -5656,6 +5656,7 @@ dependencies = [
  "tempfile",
  "tinytree-cloud",
  "tinytree-fixture",
+ "tinytree-forge-core",
  "tinytree-index",
  "tinytree-model",
  "tinytree-proto",

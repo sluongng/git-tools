@@ -200,7 +200,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public, 'historical view replay never changes current policy');
   assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
   assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
-  await forgeValue(await callForge(6), 501, 'unimplemented');
+  await forgeValue(await callForge(8, { query: 'fixture', regex: false, limit: 10 }), 501, 'unimplemented');
   await forgeValue(await callForge(20, {}, 'unsupported-review'), 501, 'unimplemented');
   const malformed = { ...envelope(1, {}, 'actor-injection'), actor: 'forge-owner' };
   await forgeValue(await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${owner}`, 'content-type': 'application/json' }, body: JSON.stringify(malformed) }), 400, 'invalid_argument');
@@ -604,4 +604,178 @@ test('internal ClosureJobs rechecks SQL epoch after an admitted R2 read without 
   await harness.invoke('release-read');
   assert.equal((await pending).error, 'permission_denied');
   assert.deepEqual(jobTables(await harness.invoke('inspect')), jobTables(before));
+});
+
+// Test-only source import installs a verified root receipt, never main. Every
+// view mutation, projection continuation and read below uses production HTTP.
+async function projectionRuntime(t) {
+  const entry = process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE;
+  const core = process.env.TINYTREE_PROJECTION_HARNESS_WASM;
+  assert.ok(entry && core && fixture.projection, 'declared projection harness/native oracle required');
+  const source = fixture.projection;
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-projection-runtime-'));
+  const token = 'wide-projection-owner-fixture';
+  const config = [{ principal: source.owner, token_sha256: sha(token), accounts: [source.account_id], operator: true, kind: 'forge' }];
+  const configuration = {
+    host: '127.0.0.1', port: 0,
+    modules: [{ type: 'ESModule', path: entry }, { type: 'CompiledWasm', path: core }],
+    compatibilityDate: '2026-07-08',
+    durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
+    r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(persist, 'do'), r2Persist: path.join(persist, 'r2'),
+    bindings: { PRINCIPALS_JSON: JSON.stringify(config), FORGE_BACKEND: 'enabled', EXPERIMENTAL_RAW_BACKEND: 'disabled' },
+  };
+  const state = { mf: new Miniflare(configuration) };
+  const address = await state.mf.ready;
+  assert.equal(address.hostname, '127.0.0.1');
+  t.after(async () => { await state.mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const call = async (operation, payload = {}, { id = '', auth = token, view = 'public' } = {}) => {
+    const response = await state.mf.dispatchFetch('https://projection.invalid/api/v1/forge/call', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(auth === null ? {} : { authorization: `Bearer ${auth}` }) },
+      body: JSON.stringify({ version: 1, operation, account_id: source.account_id, view, request_id: id, payload_json: JSON.stringify(payload) }),
+    });
+    const envelope = await response.json();
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const success = async (operation, payload, options) => {
+    const result = await call(operation, payload, options);
+    assert.equal(result.status, 200, JSON.stringify(result)); return result;
+  };
+  const control = async (action, payload) => {
+    const response = await state.mf.dispatchFetch(`https://projection.invalid/__fixture/${action}?account=${source.account_id}`, { method: 'POST', body: JSON.stringify(payload ?? {}) });
+    const value = await response.json(); assert.equal(response.status, 200, JSON.stringify(value)); return value;
+  };
+  await success(1, {}, { id: 'wide-provision' });
+  const before = (await success(2)).value;
+  await control('seed', { objects: source.objects, root: source.root });
+  assert.deepEqual((await success(2)).value, before, 'trusted fixture import must not mutate protected main');
+  const published = await success(4, { spec: source.spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'wide-view' });
+  assert.deepEqual(published.value, source.published);
+  const showWithCli = async version => {
+    const tt = process.env.TINYTREE_TT_BINARY;
+    assert.ok(tt, 'declared production tt executable required');
+    const root = path.join(persist, 'projection-cli');
+    const home = path.join(root, 'home');
+    const cwd = path.join(root, 'workspace');
+    const emptyPath = path.join(root, 'no-programs');
+    await Promise.all([home, cwd, emptyPath].map(directory => mkdir(directory, { recursive: true, mode: 0o700 })));
+    const jjConfig = path.join(root, 'jj.toml');
+    await writeFile(jjConfig, '[user]\nname="Runtime Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
+    const env = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: jjConfig, PATH: emptyPath, TERM: 'dumb', TT_PROJECTION_TOKEN: token };
+    const execute = promisify(execFile);
+    const command = async args => {
+      const output = await execute(tt, ['--no-pager', '--color=never', ...args, '--json'], {
+        cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024,
+      });
+      const report = JSON.parse(output.stdout);
+      assert.equal(report.schema_version, 1);
+      return report;
+    };
+    const selected = await command(['context', 'set', '--transport', 'forge-https-v1', '--server', address.origin, '--account', source.account_id, '--view', 'public', '--token-env', 'TT_PROJECTION_TOKEN']);
+    assert.equal(selected.state, 'configured');
+    const shown = await command(['view', 'show', '--version', Buffer.from(version).toString('hex')]);
+    assert.equal(shown.state, 'complete');
+    const saved = await readFile(path.join(home, 'config/tinytree/context.json'));
+    assert.equal(JSON.parse(saved).transport, 'forge_https_v1');
+    assert.ok(!saved.includes(token));
+    return shown.result.value;
+  };
+  return { source, call, success, control, showWithCli,
+    reload: async () => { await state.mf.dispose(); state.mf = new Miniflare({ ...configuration, port: Number(address.port) }); await state.mf.ready; },
+    keys: async () => (await (await state.mf.getR2Bucket('OBJECTS')).list()).objects.map(object => object.key).sort(),
+  };
+}
+function continuation(reply) { return { version: reply.value.view_version, progress: reply.value.progress }; }
+
+test('production Forge projection pages >512 paths, persists pinned progress and serves only ready sanitized public closure', async t => {
+  const h = await projectionRuntime(t);
+  const first = await h.success(6);
+  assert.equal(first.envelope.state, 'pending');
+  assert.equal(first.value.projected_commit, undefined, 'pending is not a partial snapshot');
+  const version = first.value.view_version;
+  const deniedBeforeReady = await h.call(7, { version, path: 'README.md' });
+  assert.equal(deniedBeforeReady.status, 400);
+  assert.equal(deniedBeforeReady.envelope.error.code, 'failed_precondition');
+  const input = continuation(first);
+  const advanced = await h.success(6, input);
+  assert.equal(advanced.envelope.state, 'pending');
+  const beforeReplay = await h.control('inspect');
+  assert.deepEqual(await h.success(6, input), advanced, 'lost ACK with stale generation returns current status without advancing');
+  assert.deepEqual(await h.control('inspect'), beforeReplay);
+  await h.reload();
+  // Anonymous and authenticated callers share the same view-tagged work, but
+  // each request still traverses the actual production policy checker.
+  let ready = await h.success(6, { version }, { auth: null });
+  assert.equal(ready.envelope.state, 'pending', 'actual tt must drive remaining cold preparation, not a warm snapshot');
+  assert.equal(ready.value.progress.job_id, first.value.progress.job_id);
+  const cliSnapshot = await h.showWithCli(version);
+  const expectedCli = { ...h.source.expected_snapshot };
+  for (const field of ['view_version', 'revision', 'projected_commit', 'projected_tree']) expectedCli[field] = Buffer.from(expectedCli[field]).toString('hex');
+  assert.deepEqual(cliSnapshot, expectedCli, 'actual tt HTTPS continuation workflow matches native Store snapshot');
+  // The earlier Node continuation is now stale, and must resolve exact readiness
+  // without creating another job or switching the pinned immutable version.
+  ready = await h.success(6, continuation(ready), { auth: null });
+  assert.equal(ready.envelope.state, 'complete');
+  assert.deepEqual(ready.value, h.source.expected_snapshot);
+  assert.equal(ready.value.paths.length, 701);
+  assert.ok(ready.value.readme.content.startsWith('\ufeff'), 'native BOM FILE text must remain exact');
+  const readme = (await h.success(7, { version, path: 'README.md' }, { auth: null })).value;
+  assert.equal(readme.content, ready.value.readme.content);
+  const file = h.source.readme;
+  const descriptor = (await h.success(9, { version, kind: 1, id: Array.from(Buffer.from(file.id, 'hex')), max_bytes: 0 }, { auth: null })).value;
+  assert.deepEqual(descriptor.data, []); assert.equal(descriptor.size_bytes, file.bytes.length);
+  const ranged = (await h.success(9, { version, kind: 1, id: Array.from(Buffer.from(file.id, 'hex')), offset: 1, max_bytes: 7 }, { auth: null })).value;
+  assert.deepEqual(ranged.data, file.bytes.slice(1, 8)); assert.equal(ranged.offset, 1);
+  for (const object of [h.source.root, h.source.private_file]) {
+    const denied = await h.call(9, { version, kind: object.kind, id: Array.from(Buffer.from(object.id, 'hex')), max_bytes: 0 });
+    assert.equal(denied.status, 403); assert.equal(denied.envelope.error.code, 'permission_denied');
+  }
+  await h.reload();
+  assert.deepEqual((await h.success(6, { version }, { auth: null })).value, ready.value);
+  const invalidToken = await h.call(6, { version }, { auth: 'invalid-not-anonymous' });
+  assert.equal(invalidToken.status, 401);
+  await h.success(4, { spec: { ...h.source.spec, visibility: { kind: 'members' } }, expected_epoch: 2, make_default: false, follow_main: false }, { id: 'lock-public' });
+  for (const operation of [6, 7, 9]) {
+    const payload = operation === 6 ? { version } : operation === 7 ? { version, path: 'README.md' } : { version, kind: 1, id: Array.from(Buffer.from(file.id, 'hex')), max_bytes: 0 };
+    const denied = await h.call(operation, payload, { auth: null });
+    assert.equal(denied.status, 403, 'warm SQL catalogs must not bypass changed visibility');
+  }
+});
+
+test('production projection preparation reclaims obsolete epoch plans beyond active-job cap without deleting canonical storage', async t => {
+  const h = await projectionRuntime(t);
+  const sourceKeys = await h.keys();
+  const catalogCount = (await h.control('inspect')).objects;
+  let epoch = 2;
+  const oldJobs = [];
+  for (let ordinal = 0; ordinal < 10; ordinal++) {
+    let pending = await h.success(6);
+    assert.equal(pending.envelope.state, 'pending');
+    // Reach a genuine persisted native build plan, stopping before staging.
+    for (let calls = 0; calls < 20; calls++) {
+      const state = await h.control('inspect');
+      if (state.projection_plan_chunks[0].count > 0) break;
+      pending = await h.success(6, continuation(pending));
+      assert.equal(pending.envelope.state, 'pending');
+    }
+    const staged = await h.control('inspect');
+    assert.ok(staged.projection_plan_chunks[0].count > 0, 'interruption must retain a real plan to reclaim');
+    oldJobs.push(pending.value.progress.job_id);
+    await h.success(4, { spec: { ...h.source.spec, exclude_prefixes: ['private', `file-${ordinal.toString().padStart(4, '0')}.txt`] }, expected_epoch: epoch, make_default: true, follow_main: false }, { id: `epoch-view-${ordinal}` });
+    epoch++;
+    const stale = await h.call(6, continuation(pending));
+    assert.equal(stale.status, 409); assert.equal(stale.envelope.error.code, 'aborted');
+  }
+  const next = await h.success(6);
+  assert.equal(next.envelope.state, 'pending', 'eleventh preparation remains admitted after >8 interruptions');
+  const cleaned = await h.control('inspect');
+  for (const id of oldJobs) assert.equal(cleaned.projection_jobs.find(job => job.id === id).phase, 'obsolete');
+  assert.equal(cleaned.projection_plan_chunks[0].count, 0);
+  assert.equal(cleaned.projection_selected[0].count, 0);
+  assert.equal(cleaned.projection_outputs[0].count, 0);
+  assert.equal(cleaned.projection_frontier[0].count, 1, 'only the new exact root frontier remains');
+  for (const [key, value] of Object.entries(cleaned.projection_usage[0])) {
+    if (typeof value === 'number') assert.ok(value >= 0, `${key} cannot underflow`);
+  }
+  assert.deepEqual(cleaned.objects, catalogCount);
+  assert.deepEqual(await h.keys(), sourceKeys, 'epoch cleanup is preparation GC, not payload/catalog/source GC');
 });

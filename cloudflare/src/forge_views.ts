@@ -3,6 +3,7 @@
  * Graph retention and projection/read/search are separate owned modules. */
 import { fail } from './protocol';
 import type { ForgeCall } from './core';
+import type { ProjectionProgress } from './forge_projection';
 
 type NativeId = number[];
 export interface ViewSpec {
@@ -29,7 +30,7 @@ interface Normalized {
   operation: 4 | 5 | 6 | 11; fingerprint: string | null;
   publish?: { spec: ViewSpec; version: NativeId; expected_epoch: number; make_default: boolean; follow_main: boolean };
   retire?: { version: NativeId; expected_epoch: number };
-  selection?: { version: NativeId | null };
+  selection?: { version: NativeId | null; progress: ProjectionProgress | null };
 }
 export interface ViewCore {
   normalize(input: { account_id: string; operation: number; view: string; payload_json: string }): Normalized;
@@ -140,13 +141,13 @@ export class ForgeViews {
   }
   /** Read host calls this inside its resolve transaction, then performs actual
    * projection/README assembly. The returned handle never becomes RPC JSON. */
-  resolveCallInTx(call: ForgeCall): ResolvedView {
+  resolveCallInTx(call: ForgeCall): { view: ResolvedView; progress: ProjectionProgress | null } {
     if (call.account_id !== this.host.accountId || call.operation !== 6) fail(400, 'invalid_argument');
     let command: Normalized;
     try { command = this.host.core.normalize({ account_id: call.account_id, operation: call.operation, view: call.view, payload_json: call.payload_json }); }
     catch { fail(400, 'invalid_argument'); }
     if (command.operation !== 6 || !command.selection) fail(503, 'failed_precondition');
-    return this.resolveInTx(call.view, command.selection.version ?? undefined);
+    return { view: this.resolveInTx(call.view, command.selection.version ?? undefined), progress: command.selection.progress ?? null };
   }
   /** Every R2 continuation must use this before returning bytes. Re-resolve the
    * actual current named pointer; a follow-main change alone does not bump ACL. */

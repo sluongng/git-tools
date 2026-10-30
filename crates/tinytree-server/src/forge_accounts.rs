@@ -4,7 +4,7 @@
 //! from authenticated transport identity, never from a JSON principal field.
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest, PublishViewRequest, RetireViewRequest, ResolveViewRequest};
+use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest, PublishViewRequest, RetireViewRequest, ResolveViewRequest, ReadFileRequest, ReadObjectRequest};
 use tinytree_proto::forge_v1;
 use tinytree_store::{AccountId, ForgeAction, ForgeActor, PolicyEpoch, ViewSpec, ViewVersion};
 use tinytree_store::{ResolvedView, Store};
@@ -15,21 +15,6 @@ const MAX_FILE: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 const MAX_MATCHES: usize = 100;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObjectRequest {
-    #[serde(default)]
-    version: Option<[u8; 32]>,
-    kind: u8,
-    id: [u8; 32],
-    #[serde(default)]
-    offset: u64,
-    #[serde(default = "chunk_size")]
-    max_bytes: usize,
-}
-fn chunk_size() -> usize {
-    64 * 1024
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteRequest {
@@ -156,13 +141,16 @@ pub(crate) fn account_call(
         }
         Op::ResolveView => {
             let input: ResolveViewRequest = payload(bytes)?;
+            if input.progress.is_some() {
+                return Err(Status::invalid_argument("view preparation progress is not supported by this backend"));
+            }
             let resolved = store
                 .forge_resolve_view(account, actor, view, input.version.map(ViewVersion))
                 .map_err(crate::service::store_status)?;
             value(api.snapshot(&resolved)?)?
         }
         Op::ReadFile => {
-            let input: ForgeFileRequest = payload(bytes)?;
+            let input: ReadFileRequest = payload(bytes)?;
             let resolved = store
                 .forge_resolve_view(account, actor, view, input.version.map(ViewVersion))
                 .map_err(crate::service::store_status)?;
@@ -176,7 +164,7 @@ pub(crate) fn account_call(
             value(api.search(&resolved, &input)?)?
         }
         Op::ReadObject => {
-            let input: ObjectRequest = payload(bytes)?;
+            let input: ReadObjectRequest = payload(bytes)?;
             let kind = tinytree_model::Kind::try_from(input.kind)
                 .map_err(|_| Status::invalid_argument("invalid forge object kind"))?;
             let resolved = store
@@ -288,13 +276,6 @@ pub struct ForgeFileResponse {
     pub context: ForgeViewDescription,
     #[serde(flatten)]
     pub file: ForgeTextFile,
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeFileRequest {
-    #[serde(default)]
-    pub version: Option<[u8; 32]>,
-    pub path: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

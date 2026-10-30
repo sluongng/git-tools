@@ -67,28 +67,39 @@ export async function hash(value: string): Promise<string> {
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 }
 export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge' }
-export async function authenticate(request: Request, secret: string | undefined): Promise<Auth> {
-  const authorization = request.headers.get('authorization') ?? '';
-  if (!authorization.startsWith('Bearer ') || authorization.length > 520) fail(401, 'authentication_required');
+interface Principal extends Auth { token_sha256: string }
+function configuredPrincipals(secret: string | undefined): Principal[] {
   if (!secret || secret.length > 32 * 1024) fail(503, 'principal_configuration_invalid');
   let principals: unknown;
   try { principals = JSON.parse(secret); } catch { fail(503, 'principal_configuration_invalid'); }
   if (!Array.isArray(principals) || principals.length < 1 || principals.length > 32) fail(503, 'principal_configuration_invalid');
-  const supplied = await hash(authorization.slice(7));
-  let matched: Auth | undefined; const seen = new Set<string>();
+  const seen = new Set<string>(); const result: Principal[] = [];
   try { for (const raw of principals) {
     const p = record(raw, ['principal', 'token_sha256', 'accounts', 'operator', 'kind']);
     if (typeof p.principal !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(p.principal)
         || typeof p.operator !== 'boolean' || !Array.isArray(p.accounts) || p.accounts.length > 64
         || typeof p.token_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(p.token_sha256)
-        || (p.kind !== 'raw' && p.kind !== 'forge')
-        || seen.has(p.token_sha256)) fail(503, 'principal_configuration_invalid');
+        || (p.kind !== 'raw' && p.kind !== 'forge') || seen.has(p.token_sha256)) fail(503, 'principal_configuration_invalid');
     seen.add(p.token_sha256);
-    const accounts = p.accounts.map(identifier);
+    result.push({ principal: p.principal, operator: p.operator, accounts: p.accounts.map(identifier), kind: p.kind, token_sha256: p.token_sha256 });
+  } } catch { fail(503, 'principal_configuration_invalid'); }
+  return result;
+}
+/** Finite configured-account admission only, never public visibility or access.
+ * Anonymous unknown names must not allocate arbitrary account SQLite objects. */
+export function admitsForgeAccount(secret: string | undefined, account: string): boolean {
+  return configuredPrincipals(secret).some(p => p.kind === 'forge' && p.accounts.includes(account));
+}
+export async function authenticate(request: Request, secret: string | undefined): Promise<Auth> {
+  const authorization = request.headers.get('authorization') ?? '';
+  if (!authorization.startsWith('Bearer ') || authorization.length > 520) fail(401, 'authentication_required');
+  const principals = configuredPrincipals(secret);
+  const supplied = await hash(authorization.slice(7)); let matched: Auth | undefined;
+  for (const p of principals) {
     let difference = 0;
     for (let i = 0; i < supplied.length; i++) difference |= supplied.charCodeAt(i) ^ p.token_sha256.charCodeAt(i);
-    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts, kind: p.kind };
-  } } catch { fail(503, 'principal_configuration_invalid'); }
+    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts: p.accounts, kind: p.kind };
+  }
   if (!matched) fail(401, 'authentication_required');
   return matched;
 }

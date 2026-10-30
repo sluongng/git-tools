@@ -43,7 +43,48 @@ pub struct RetireViewRequest {
 pub struct ResolveViewRequest {
     #[serde(default)]
     pub version: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ProjectionProgress>,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionProgress {
+    pub job_id: String,
+    pub expected_generation: u64,
+}
+/// A pending selection is a bounded control assertion, never an object or
+/// continuing authorization proof. Clients pin it for the same preparation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveViewPending {
+    pub account_id: String,
+    pub view: String,
+    pub view_version: [u8; 32],
+    pub revision: [u8; 32],
+    pub policy_epoch: u64,
+    pub root_prefix: String,
+    pub progress: ProjectionProgress,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFileRequest {
+    #[serde(default)]
+    pub version: Option<[u8; 32]>,
+    pub path: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadObjectRequest {
+    #[serde(default)]
+    pub version: Option<[u8; 32]>,
+    pub kind: u8,
+    pub id: [u8; 32],
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "object_chunk_size")]
+    pub max_bytes: usize,
+}
+fn object_chunk_size() -> usize { 64 * 1024 }
 
 pub fn validate_member(member: &ForgeMember) -> Result<()> {
     validate_principal(&member.principal)?;

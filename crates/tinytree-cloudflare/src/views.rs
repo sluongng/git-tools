@@ -86,7 +86,14 @@ pub fn normalize_view_command(input: &[u8]) -> Result<Value, String> {
         }
         6 => {
             let p: ResolveViewRequest = parse(payload)?;
-            Ok(json!({"operation":6,"fingerprint":null,"selection":{"version":p.version}}))
+            if let Some(progress) = &p.progress {
+                let bytes = progress.job_id.as_bytes();
+                if p.version.is_none() || progress.expected_generation > MAX_SAFE
+                    || bytes.len() != 36 || !bytes.iter().enumerate().all(|(i,b)| if matches!(i,8|13|18|23) { *b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(b) }) {
+                    return Err("invalid projection continuation".into());
+                }
+            }
+            Ok(json!({"operation":6,"fingerprint":null,"selection":{"version":p.version,"progress":p.progress}}))
         }
         11 => {
             let p: RetireViewRequest = parse(payload)?;

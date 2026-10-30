@@ -21,6 +21,7 @@ interface CoreExports {
   tt_forge_view_paths(pointer: number, length: number): number;
   tt_forge_advance_view(pointer: number, length: number): number;
   tt_forge_search_file(pointer: number, length: number): number;
+  tt_forge_read_command(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -103,6 +104,12 @@ export function closureStep(input: unknown): unknown {
 export function searchForgeFile(input: unknown): unknown {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_search_file(pointer, bytes.byteLength));
+}
+
+/** Strict public read selectors only; SQL-resolved policy/catalog owns access. */
+export function normalizeForgeReadCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'payload_json'>): import('./forge_reads').ReadCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_read_command(pointer, bytes.byteLength)) as import('./forge_reads').ReadCommand;
 }
 
 /** Pure canonical policy helpers. Only SQL-derived context/grants may reach the

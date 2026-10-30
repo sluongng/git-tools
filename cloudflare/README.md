@@ -15,6 +15,8 @@ supported raw operations and resource limits and requires authentication.
 An independently gated `POST /api/v1/forge/call` endpoint supports account
 provisioning, account snapshots and membership changes (operations 1, 2 and 3),
 plus view publication, discovery and retirement (operations 4, 5 and 11).
+Prepared snapshots, README/file previews and scoped object ranges are available
+through operations 6, 7 and 9.
 Set `FORGE_BACKEND=enabled` and use a `kind=forge` identity for that endpoint.
 Account ownership, membership, policy epochs and replay receipts are SQLite
 authority; ordinary Forge operations cannot use raw identities. Provisioning
@@ -24,11 +26,19 @@ for it are fenced, including operator calls.
 
 View definitions use the native version identity, current membership policy and
 durable replay rules. Publication requires an already validated canonical root;
-this is not an arbitrary-digest import path. Public anonymous ingress and the
-projection/read/search presentation are not connected yet. Recording a public
-view does not make canonical objects or ancestry publicly readable.
+this is not an arbitrary-digest import path. Anonymous reads are admitted only
+for configured Forge accounts and still require current public-view policy.
+Invalid supplied credentials never become anonymous access. Public reads expose
+only the exact sanitized projection, not canonical objects, ancestry or private
+copy origins.
 
-It does **not** implement the Forge review, filtered-view reads, query, transform,
+Cold snapshots return bounded pending progress, pinned to an immutable view and
+current policy epoch. The SDK and `tt view show` continue that same preparation;
+there is no unnamed/latest restart or local fallback. Use the explicit
+`forge-https-v1` transport when selecting a CLI context. Account/view publication
+does not register a local workspace provider automatically.
+
+It does **not** implement the Forge review, code-search, query, transform,
 workspace-backup, or checked-landing APIs. The normal `tt` Forge workflow is
 not yet supported by this target. Unsupported operations fail explicitly;
 there is no fallback to the local backend. Do not expose it as an equivalent
@@ -63,7 +73,10 @@ reference/replay results using the existing local Store. These tests do not
 establish deployed provider durability, availability, latency, or billing.
 The declared `tt` binary also exercises account commands against the actual
 workerd endpoint and resumes an exact completed intent after SQLite/R2 restart;
-this does not establish the full workspace or checked-landing workflow.
+it drives cold preparation of a native-generated 701-path view and verifies the
+native snapshot. Separate storage/projection cases cover revocation, scoped
+ranges, closure progress and rollback. These do not establish the full native
+workspace, deployed browser or checked-landing workflow.
 
 ## Authority and authentication
 

@@ -8,6 +8,8 @@ pub(crate) mod history;
 pub(crate) mod landing;
 #[path = "forge.rs"]
 pub(crate) mod forge;
+#[path = "forge_resolve.rs"]
+mod forge_resolve;
 #[path = "query.rs"]
 pub(crate) mod query;
 #[path = "search.rs"]

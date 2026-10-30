@@ -106,7 +106,7 @@ impl ForgeObjectIo {
             None => NativeClient::connect(config.client.clone()).await?,
         };
         let reply = client
-            .forge_call(f::ForgeCallRequest {
+            .forge_resolve_view(f::ForgeCallRequest {
                 operation: f::ForgeOperation::ResolveView as i32,
                 account_id: config.account_id.clone(),
                 view: config.view.clone(),

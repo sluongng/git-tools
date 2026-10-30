@@ -1,8 +1,12 @@
-import { inspect, validateClosure, forgeViewCore, type Descriptor, type Inspection, type ObjectKey } from './core';
-import { authenticate, body, digest, fail, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
+import { inspect, validateClosure, forgeViewCore, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
+import { authenticate, admitsForgeAccount, body, digest, fail, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
 import { forgeReply, protectForge, readForgeCall } from './forge';
 import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
 import { ForgeViews } from './forge_views';
+import { ForgeProjections } from './forge_projection';
+import { ForgeReads } from './forge_reads';
+import { ForgeStorage } from './forge_storage';
+import { ClosureJobs } from './closure_jobs';
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace;
@@ -40,6 +44,25 @@ function objectKey(parts: string[]): ObjectKey {
   return { kind: Number(parts[0]), id: digest(parts[1]) };
 }
 function r2key(account: string, key: ObjectKey): string { return `native/v1/${account}/${key.kind}/${key.id}`; }
+function nativeId(bytes: number[]): string {
+  if (!Array.isArray(bytes) || bytes.length !== 32 || !bytes.every(b => Number.isInteger(b) && b >= 0 && b < 256)) fail(503, 'failed_precondition');
+  return bytes.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+/** Admission only. Both ingress and DO call this independently; optional auth
+ * never downgrades an invalid supplied credential to an anonymous reader. */
+async function admitForge(request: Request, env: Env): Promise<{ auth: Auth | null; call: ForgeCall; bytes: Uint8Array }> {
+  if (env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
+  const auth = request.headers.has('authorization') ? await authenticate(request, env.PRINCIPALS_JSON) : null;
+  if (auth && auth.kind !== 'forge') fail(403, 'permission_denied');
+  const framed = await readForgeCall(request);
+  if (auth) {
+    if (!auth.accounts.includes(framed.call.account_id)) fail(403, 'permission_denied');
+  } else {
+    if (![5, 6, 7, 8, 9].includes(framed.call.operation)) fail(401, 'unauthenticated');
+    if (!admitsForgeAccount(env.PRINCIPALS_JSON, framed.call.account_id)) fail(403, 'permission_denied');
+  }
+  return { auth, ...framed };
+}
 function sameDescriptor(expected: Descriptor, actual: Descriptor): void {
   if (expected.kind !== actual.kind || expected.id !== actual.id || expected.size_bytes !== actual.size_bytes || actual.format_version !== 1) fail(400, 'native_descriptor_mismatch');
 }
@@ -51,11 +74,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (new URL(request.url).pathname.startsWith('/api/v1/forge/')) {
       return protectForge(async () => {
-        if (env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
-        const auth = await authenticate(request, env.PRINCIPALS_JSON);
-        if (auth.kind !== 'forge') fail(403, 'permission_denied');
-        const { call, bytes } = await readForgeCall(request);
-        if (!auth.accounts.includes(call.account_id)) fail(403, 'permission_denied');
+        const { call, bytes } = await admitForge(request, env);
         const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
         return env.REPOSITORIES.get(id).fetch(new Request(request, { body: bytes }));
       });
@@ -186,19 +205,17 @@ export class AccountRepository {
     fail(501, 'unsupported_operation');
   }
   private async handleForge(request: Request): Promise<Response> {
-    if (this.env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
-    const auth = await authenticate(request, this.env.PRINCIPALS_JSON);
-    if (auth.kind !== 'forge') fail(403, 'permission_denied');
-    const { call } = await readForgeCall(request);
-    if (!auth.accounts.includes(call.account_id)) fail(403, 'permission_denied');
+    const { auth, call } = await admitForge(request, this.env);
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (repository && repository.account !== call.account_id) fail(403, 'permission_denied');
     // This host is per request. Never cache an actor/grant on the DO instance.
     const staged = new Set<string>();
+    const confirmations = new Map<string, unknown>();
+    const storage = new ForgeStorage({ accountId: call.account_id, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
     const api = new ForgeAccounts({
-      accountId: call.account_id, principal: auth.principal, canProvision: auth.operator,
+      accountId: call.account_id, principal: auth?.principal ?? null, canProvision: auth?.operator ?? false,
       sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
-      stageGenesis: objects => this.stageGenesis(call.account_id, objects, staged),
+      stageGenesis: objects => this.stageGenesis(call.account_id, objects, staged, storage, confirmations),
       claimRepositoryInTx: (account, objects, head) => {
         if (account !== call.account_id || this.one('SELECT account FROM repository WHERE singleton=1')
             || this.one('SELECT name FROM refs LIMIT 1')) fail(400, 'failed_precondition');
@@ -207,7 +224,7 @@ export class AccountRepository {
           const key = `${object.kind}/${object.id}`;
           const row = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
           if (!staged.has(key) || !row || Number(row.size) !== object.size_bytes) fail(503, 'unavailable');
-          this.sql.exec('UPDATE objects SET visible=1 WHERE kind=? AND id=?', object.kind, object.id);
+          storage.confirmInTx('genesis', 'genesis', object, confirmations.get(key));
         }
         this.sql.exec('INSERT INTO repository(singleton,account) VALUES(1,?)', account);
         this.sql.exec('INSERT INTO refs(name,generation,head) VALUES(\'main\',1,?)', head);
@@ -223,65 +240,100 @@ export class AccountRepository {
       },
     });
     let result;
-    if ([4, 5, 11].includes(call.operation)) {
-      const requireCanonicalRootInTx = (head: string): void => {
-        if (!this.one('SELECT id FROM objects WHERE kind=3 AND id=? AND visible=1', head)) fail(403, 'permission_denied');
-        if (!this.one('SELECT id FROM forge_validated_roots WHERE kind=3 AND id=?', head)) fail(400, 'failed_precondition');
-      };
-      const views = new ForgeViews({
-        accountId: call.account_id, principal: auth.principal, sql: this.sql, core: forgeViewCore,
+    if ([4, 5, 6, 7, 9, 11].includes(call.operation)) {
+      const services = this.forgeServices(call.account_id, auth?.principal ?? null, api, storage);
+      if ([4, 5, 11].includes(call.operation)) result = await services.views.handle(call);
+      else result = await new ForgeReads({
+        accountId: call.account_id, sql: this.sql, views: services.views, projections: services.projections,
         transactionSync: callback => this.ctx.storage.transactionSync(callback),
-        policySnapshotInTx: () => api.policySnapshotInTx(), requireAdminInTx: () => api.requireAdminInTx(),
-        replayInTx: (id, fingerprint) => api.replayInTx(id, fingerprint),
-        finishInTx: (id, fingerprint, value) => api.finishInTx(id, fingerprint, value),
-        bumpEpochInTx: expected => api.bumpEpochInTx(expected),
-        setPublicViewInTx: version => api.setPublicViewInTx(version),
-        accountWireInTx: () => api.accountWireInTx(),
-        currentMainInTx: () => { const row = this.one('SELECT head,generation FROM refs WHERE name=\'main\''); if (!row) fail(503, 'failed_precondition'); return { head: String(row.head), generation: Number(row.generation) }; },
-        requireCanonicalRootInTx,
-        retainViewRootInTx: (version, head) => {
-          requireCanonicalRootInTx(head);
-          this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'view\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', version, head);
-        },
-        releaseViewRootsInTx: version => {
-          // Projection retention will be added by its own ledger, never by an
-          // account-wide object deletion or a digest-only read allowance.
-          this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'view\' AND owner_id=?', version);
-        },
-      });
-      result = await views.handle(call);
-    } else result = await api.handle(call);
+        readVerifiedObject: key => storage.readVerifiedObject(key),
+        readRange: (descriptor, offset, length) => storage.readRange(descriptor, offset, length),
+      }).handle(call);
+    } else if (call.operation === 8) fail(501, 'unimplemented');
+    else result = await api.handle(call);
     return forgeReply(call, result.state, result.result);
   }
-  private async stageGenesis(account: string, objects: CanonicalAccountObject[], staged: Set<string>): Promise<void> {
+  private forgeServices(account: string, principal: string | null, api: ForgeAccounts, storage: ForgeStorage): { views: ForgeViews; projections: ForgeProjections } {
+    const requireCanonicalRootInTx = (head: string): void => {
+      if (!storage.describeInTx({ kind: 3, id: head })) fail(403, 'permission_denied');
+      if (!this.one('SELECT id FROM forge_validated_roots WHERE kind=3 AND id=?', head)) fail(400, 'failed_precondition');
+    };
+    const views = new ForgeViews({
+      accountId: account, principal, sql: this.sql, core: forgeViewCore,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      policySnapshotInTx: () => api.policySnapshotInTx(), requireAdminInTx: () => api.requireAdminInTx(),
+      replayInTx: (id, fingerprint) => api.replayInTx(id, fingerprint),
+      finishInTx: (id, fingerprint, result) => api.finishInTx(id, fingerprint, result),
+      bumpEpochInTx: expected => api.bumpEpochInTx(expected),
+      setPublicViewInTx: version => api.setPublicViewInTx(version),
+      accountWireInTx: () => api.accountWireInTx(),
+      currentMainInTx: () => {
+        const row = this.one('SELECT head,generation FROM refs WHERE name=\'main\'');
+        if (!row) fail(503, 'failed_precondition');
+        return { head: String(row.head), generation: Number(row.generation) };
+      },
+      requireCanonicalRootInTx,
+      retainViewRootInTx: (version, head) => {
+        requireCanonicalRootInTx(head);
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'view\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', version, head);
+      },
+      releaseViewRootsInTx: version => {
+        this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'view\' AND owner_id=?', version);
+        this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'projection\' AND owner_id IN(SELECT id FROM projection_catalogs WHERE version=?)', version);
+        this.sql.exec('UPDATE projection_catalogs SET retired=1 WHERE version=?', version);
+      },
+    });
+    const confirmations = new Map<string, unknown>();
+    const projections = new ForgeProjections({
+      accountId: account, principal, sql: this.sql, views,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      requireSourceRootInTx: view => {
+        views.checkInTx(view);
+        const version = nativeId(view.description.view_version), head = nativeId(view.description.revision);
+        requireCanonicalRootInTx(head);
+        if (!this.one('SELECT 1 FROM forge_retained_roots WHERE owner_kind=\'view\' AND owner_id=? AND kind=3 AND id=? AND active=1', version, head)) fail(403, 'permission_denied');
+      },
+      describeObjectInTx: key => storage.describeInTx(key),
+      readVerifiedObject: key => storage.readVerifiedObject(key),
+      reserveGeneratedInTx: (job, descriptor) => storage.reserveInTx('projection', job, descriptor),
+      putVerifiedGenerated: async (descriptor, bytes) => { confirmations.set(`${descriptor.kind}/${descriptor.id}`, await storage.stage(descriptor, bytes)); },
+      confirmGeneratedInTx: (job, descriptor) => storage.confirmInTx('projection', job, descriptor, confirmations.get(`${descriptor.kind}/${descriptor.id}`)),
+      closureForProjection: (view, binding, attach) => {
+        views.checkInTx(view);
+        if (binding.account_id !== account || binding.identity.kind !== 'view' || binding.identity.view_version !== nativeId(view.description.view_version)
+            || binding.policy_epoch !== view.description.policy_epoch || binding.purpose !== 'projection-prepare') fail(403, 'permission_denied');
+        const expected = Object.freeze({ version: binding.identity.view_version, epoch: binding.policy_epoch, purpose: binding.purpose, publication: binding.publication });
+        return new ClosureJobs({
+          binding, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
+          authorizeCurrentInTx: selected => {
+            views.checkInTx(view);
+            if (selected.account_id !== account || selected.identity.kind !== 'view' || selected.identity.view_version !== expected.version
+                || selected.policy_epoch !== expected.epoch || selected.purpose !== expected.purpose || selected.publication !== expected.publication) fail(403, 'permission_denied');
+          },
+          describeObjectInTx: key => storage.describeInTx(key),
+          readVerifiedObject: key => storage.readVerifiedObject(key),
+          attachRootInTx: (_binding, root, job) => { if (root.kind !== 3) fail(400, 'failed_precondition'); return attach(job); },
+        });
+      },
+      retainProjectionRootInTx: (projection, head, proofJob) => {
+        const proof = this.one('SELECT root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', proofJob);
+        if (!proof || proof.root_kind !== 3 || proof.root_id !== head || proof.phase !== 'ready'
+            || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
+        this.sql.exec('INSERT OR IGNORE INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-closure-v1', job_id: proofJob, root: head }));
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'projection\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', projection, head);
+      },
+    });
+    return { views, projections };
+  }
+  private async stageGenesis(account: string, objects: CanonicalAccountObject[], staged: Set<string>, storage: ForgeStorage, confirmations: Map<string, unknown>): Promise<void> {
     if (this.one('SELECT account FROM repository WHERE singleton=1')) fail(400, 'failed_precondition');
     if (objects.length !== 2 || objects[0].kind !== 2 || objects[1].kind !== 3) fail(503, 'unavailable');
-    const prepared = objects.map(object => {
-      const bytes = Uint8Array.from(object.bytes);
-      if (bytes.byteLength > MAX_METADATA) fail(429, 'resource_exhausted');
-      const inspection = nativeInspect(object.kind, bytes);
-      sameDescriptor(object, inspection);
-      return { object, bytes, inspection };
-    });
     try { validateClosure({ kind: 3, id: objects[1].id }, objects); } catch { fail(503, 'unavailable'); }
-    this.ctx.storage.transactionSync(() => {
-      for (const { object, inspection } of prepared) {
-        const existing = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
-        if (existing) {
-          if (Number(existing.size) !== object.size_bytes) fail(503, 'unavailable');
-          continue;
-        }
-        const usage = this.one('SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes FROM objects')!;
-        if (Number(usage.n) >= MAX_OBJECTS || Number(usage.bytes) + object.size_bytes > MAX_ACCOUNT_BYTES) fail(429, 'resource_exhausted');
-        this.sql.exec('INSERT INTO objects(kind,id,size,inspection,visible) VALUES(?,?,?,?,0)', object.kind, object.id, object.size_bytes, JSON.stringify(inspection));
-      }
-    });
-    // A crash leaves only invisible durable reservations. A retry confirms fresh
-    // canonical R2 puts; only the final account transaction makes them visible.
-    for (const { object, bytes } of prepared) {
-      const written = await this.env.OBJECTS.put(r2key(account, object), bytes);
-      if (!written || written.size !== bytes.byteLength) fail(503, 'unavailable');
-      staged.add(`${object.kind}/${object.id}`);
+    for (const object of objects) {
+      this.ctx.storage.transactionSync(() => storage.reserveInTx('genesis', 'genesis', object));
+      const key = `${object.kind}/${object.id}`;
+      confirmations.set(key, await storage.stage(object, Uint8Array.from(object.bytes)));
+      staged.add(key);
     }
   }
   private async put(request: Request, account: string, auth: Auth, key: ObjectKey): Promise<Response> {

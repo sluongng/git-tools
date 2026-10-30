@@ -30,6 +30,7 @@ enum ForgeReplyMode {
     OtherAccount,
     OtherView,
     OtherRequest,
+    ResolveComplete,
 }
 
 #[derive(Clone)]
@@ -66,6 +67,10 @@ impl tinytree_client::forge_protocol::forge_server::Forge for ForgeTransportFixt
         };
         match self.mode {
             ForgeReplyMode::RetryExact => {}
+            ForgeReplyMode::ResolveComplete => {
+                response.state = "complete".into();
+                response.result_json = serde_json::to_vec(&resolve_snapshot()).unwrap();
+            }
             ForgeReplyMode::OtherAccount => response.account_id = "other".into(),
             ForgeReplyMode::OtherView => response.view = "other".into(),
             ForgeReplyMode::OtherRequest => response.request_id = "other".into(),
@@ -124,6 +129,11 @@ enum ForgeHttpMode {
     EncodedResponseLimit,
     ChunkedResponseLimit,
     SlowBody,
+    ResolvePending,
+    ResolveChanged,
+    ResolveStuck,
+    ResolveComplete,
+    ResolveInvalid,
 }
 async fn forge_http_fixture(
     mode: ForgeHttpMode,
@@ -174,6 +184,20 @@ async fn forge_http_fixture(
                     ForgeHttpMode::ExtraField=>reply["unexpected"]=serde_json::json!(true),
                     _=>{},
                 }
+                if matches!(mode, ForgeHttpMode::ResolvePending | ForgeHttpMode::ResolveChanged | ForgeHttpMode::ResolveStuck | ForgeHttpMode::ResolveComplete | ForgeHttpMode::ResolveInvalid) {
+                    reply["state"] = serde_json::json!("pending");
+                    let generation = if call >= 4 { 1 } else { 0 };
+                    let mut value = serde_json::json!({"account_id":"alpha","view":"public","view_version":vec![1u8;32],"revision":vec![2u8;32],"policy_epoch":1,"root_prefix":"","progress":{"job_id":"12345678-1234-4234-8234-123456789abc","expected_generation":generation}});
+                    if matches!(mode, ForgeHttpMode::ResolveChanged) && call > 1 { value["policy_epoch"] = serde_json::json!(2); }
+                    if matches!(mode, ForgeHttpMode::ResolveComplete) || (matches!(mode, ForgeHttpMode::ResolvePending) && call >= 5) {
+                        value = resolve_snapshot(); reply["state"] = serde_json::json!("complete");
+                    }
+                    if matches!(mode, ForgeHttpMode::ResolveInvalid) { value["progress"]["job_id"] = serde_json::json!("not-a-job-id"); }
+                    reply["result_json"] = serde_json::json!(value.to_string());
+                    if matches!(mode, ForgeHttpMode::ResolvePending) && call == 2 {
+                        status=503; reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost continuation acknowledgement"}});
+                    }
+                }
                 let body=serde_json::to_vec(&reply).unwrap();
                 if matches!(mode,ForgeHttpMode::ChunkedResponseLimit) {
                     socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
@@ -201,13 +225,59 @@ async fn forge_http_fixture(
         compression: false,
         ..Default::default()
     };
-    if matches!(mode, ForgeHttpMode::SlowBody) {
+    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck) {
         config.rpc.operation_timeout_ms = 80;
         config.rpc.rpc_timeout_ms = 80;
         config.rpc.connect_timeout_ms = 50;
     }
     let client = NativeClient::connect(config).await.unwrap();
     (client, inputs, stop, task)
+}
+fn resolve_snapshot() -> serde_json::Value {
+    serde_json::json!({"account_id":"alpha","view":"public","view_version":vec![1u8;32],"revision":vec![2u8;32],"policy_epoch":1,"root_prefix":"","projected_commit":vec![3u8;32],"projected_tree":vec![4u8;32],"paths":["README.md"],"readme":null,"readme_error":null,"complete":true})
+}
+#[tokio::test]
+async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_shares_one_deadline() {
+    for (mode, expected) in [
+        (ForgeHttpMode::ResolvePending, None),
+        (ForgeHttpMode::ResolveComplete, None),
+        (ForgeHttpMode::ResolveChanged, Some(Code::Aborted)),
+        (ForgeHttpMode::ResolveInvalid, Some(Code::DataLoss)),
+        (ForgeHttpMode::ResolveStuck, Some(Code::DeadlineExceeded)),
+    ] {
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        let mut input = forge_http_input();
+        input.operation = tinytree_client::forge_protocol::ForgeOperation::ResolveView as i32;
+        input.payload_json = b"{}".to_vec();
+        let result = client.forge_resolve_view(input).await;
+        assert_eq!(result.as_ref().err().map(Status::code), expected, "{mode:?}");
+        if let Ok(reply) = result {
+            assert_eq!(reply.state, "complete");
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&reply.result_json).unwrap(), resolve_snapshot());
+        }
+        let seen = inputs.lock().unwrap().clone();
+        if matches!(mode, ForgeHttpMode::ResolvePending) {
+            assert_eq!(seen.len(), 5);
+            assert_eq!(seen[1], seen[2], "transport retry must replay exact pinned continuation");
+            assert_eq!(seen[2], seen[3], "stale generation reply must not restart selection");
+            for request in &seen[1..] {
+                let body: serde_json::Value = serde_json::from_str(request["payload_json"].as_str().unwrap()).unwrap();
+                assert_eq!(body["version"], serde_json::json!(vec![1u8;32]));
+                assert_eq!(body["progress"]["job_id"], "12345678-1234-4234-8234-123456789abc");
+            }
+            assert_eq!(serde_json::from_str::<serde_json::Value>(seen[4]["payload_json"].as_str().unwrap()).unwrap()["progress"]["expected_generation"], 1);
+        }
+        if matches!(mode, ForgeHttpMode::ResolveComplete) { assert_eq!(seen.len(), 1); }
+        if matches!(mode, ForgeHttpMode::ResolveStuck) { assert!(seen.len() < 16); }
+        stop.send(()).unwrap(); task.await.unwrap();
+    }
+    let (client, fixture, stop, task) = forge_transport_fixture(ForgeReplyMode::ResolveComplete).await;
+    let mut input = forge_http_input();
+    input.operation = tinytree_client::forge_protocol::ForgeOperation::ResolveView as i32;
+    input.payload_json = b"{}".to_vec();
+    assert_eq!(client.forge_resolve_view(input).await.unwrap().state, "complete");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "local gRPC complete needs no continuation");
+    stop.send(()).unwrap(); task.await.unwrap();
 }
 fn forge_http_input() -> tinytree_client::forge_protocol::ForgeCallRequest {
     tinytree_client::forge_protocol::ForgeCallRequest {

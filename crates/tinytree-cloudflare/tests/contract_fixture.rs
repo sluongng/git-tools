@@ -38,6 +38,45 @@ fn failure(result: tinytree_store::Result<tinytree_store::Publication>) -> &'sta
     }
 }
 
+// Separate wide projection oracle; existing raw/closure fixtures stay unchanged.
+fn projection_fixture(store: &Store) -> Value {
+    let account = AccountId("forge-wide".into());
+    let owner = ForgeActor { principal: "forge-owner".into() };
+    store.forge_mutate_account(&account, &owner, "wide-provision", ForgeAccountMutation::Provision).unwrap();
+    let repository = account.repository_id();
+    let mut objects = Vec::new();
+    let mut put = |object: Option<Object>, body: &[u8]| {
+        let (descriptor, bytes) = if let Some(object) = object {
+            let encoded = tinytree_model::encode(&object, Limits::default()).unwrap();
+            (encoded.descriptor, encoded.bytes)
+        } else { (tinytree_model::describe_file(body), body.to_vec()) };
+        store.put(&repository, descriptor, &bytes, 0).unwrap();
+        objects.push(json!({"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes}));
+        descriptor
+    };
+    let readme_bytes = "\u{feff}# Wide tree\nNative BOM README\n".as_bytes();
+    let readme = put(None, readme_bytes);
+    let secret = put(None, b"private fixture bytes never projected\n");
+    let private_tree = put(Some(Object::Tree(Tree { entries: vec![TreeEntry { name: "secret.txt".into(), value: TreeValue::File { id: FileId(secret.key.id.0), executable: false, size_bytes: secret.size_bytes, copy_id: None } }] })), &[]);
+    let mut entries = vec![TreeEntry { name: "README.md".into(), value: TreeValue::File { id: FileId(readme.key.id.0), executable: false, size_bytes: readme.size_bytes, copy_id: None } }];
+    for ordinal in 0..700 {
+        let file = put(None, format!("Public fixture file {ordinal}\n").as_bytes());
+        entries.push(TreeEntry { name: format!("file-{ordinal:04}.txt"), value: TreeValue::File { id: FileId(file.key.id.0), executable: false, size_bytes: file.size_bytes, copy_id: None } });
+    }
+    entries.push(TreeEntry { name: "private".into(), value: TreeValue::Tree(TreeId(private_tree.key.id.0)) });
+    let tree = put(Some(Object::Tree(Tree { entries })), &[]);
+    let person = Signature { name: "Fixture".into(), email: "fixture@example.invalid".into(), timestamp: Timestamp { millis_since_epoch: 0, tz_offset_minutes: 0 } };
+    let root = put(Some(Object::Commit(Commit { parents: vec![CommitId::ROOT], predecessors: vec![], root_tree: TreeMerge { terms: vec![TreeId(tree.key.id.0)], labels: vec![String::new()] }, change_id: ChangeId([91;16]), description: "Wide projection fixture".into(), author: person.clone(), committer: person, secure_signature: None })), &[]);
+    let spec = ViewSpec { name: "public".into(), root_prefix: String::new(), include_prefixes: vec![String::new()], exclude_prefixes: vec!["private".into()], visibility: ForgeViewVisibility::Public, revision: root.key.id.0, export_allowed: false };
+    let published = store.forge_mutate_account(&account, &owner, "wide-view", ForgeAccountMutation::PublishView { spec: spec.clone(), expected_epoch: PolicyEpoch(1), make_default: true, follow_main: false }).unwrap();
+    let view = store.forge_resolve_view(&account, Some(&owner), "public", None).unwrap();
+    let files = store.forge_view_files(&view, 1000).unwrap();
+    let projection = store.forge_project_view(&view, 0).unwrap();
+    let readme_content = String::from_utf8(store.forge_read_view_file(&view, "README.md", 65536).unwrap()).unwrap();
+    let snapshot = json!({"account_id":account.0,"view":view.name(),"view_version":view.version().0,"revision":view.revision().0,"policy_epoch":view.epoch().0,"root_prefix":view.root_prefix(),"projected_commit":projection.projected_commit,"projected_tree":projection.projected_tree,"paths":files.into_iter().map(|f|f.path).collect::<Vec<_>>(),"readme":{"path":"README.md","content":readme_content},"readme_error":null,"complete":true});
+    json!({"account_id":account.0,"owner":owner.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
+}
+
 fn main() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), Config::default()).unwrap();
@@ -262,7 +301,9 @@ fn main() {
         history.push(json!({"kind":encoded.descriptor.key.kind as u8,"id":hex(&encoded.descriptor.key.id.0),"size_bytes":encoded.descriptor.size_bytes,"format_version":encoded.descriptor.format_version,"bytes":encoded.bytes}));
     }
     let history_publication = store.publish(REPOSITORY, &publish("closure-history", 2, history_head), 4).unwrap();
+    let projection_fixture = projection_fixture(&store);
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
+        "projection":projection_fixture,
         "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
         "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),
