@@ -1,10 +1,12 @@
 /** Immutable review preparation. Private drafts are not admitted patchsets;
- * candidate construction is not a check verdict. This module never writes main. */
+ * candidate construction is not a check verdict. Main publication is delegated
+ * only from the synchronous, fully revalidated landing transaction. */
 import { inspect, buildForgeCandidate, normalizeForgeReviewCommand, deriveForgeReviewIdentity, formatForgeReview, reviewAdmission, type Descriptor, type ObjectKey, type ForgeCall } from './core';
 import { ClosureJobs, type ClosureBinding } from './closure_jobs';
 import type { ForgeViews, ResolvedView } from './forge_views';
 import type { ForgeProjections, ReviewProjectionSource } from './forge_projection';
 import { fail, hash, Failure } from './protocol';
+import { checkStatusInTx, sameCheckCandidate, type ReviewCheckCandidate, type CheckProfile } from './forge_checks';
 
 export interface ForgeReviewsHost {
   accountId: string; principal: string; sql: SqlStorage; views: ForgeViews; projections: ForgeProjections;
@@ -23,6 +25,12 @@ export interface ForgeReviewsHost {
   stageGenerated(descriptor: Descriptor, bytes: Uint8Array): Promise<unknown>;
   confirmGeneratedInTx(attemptId: string, descriptor: Descriptor, confirmation: unknown): void;
   retainCandidateInTx(attemptId: string, root: ObjectKey, proofJob: string): void;
+  /** Revalidate the exact accepted Request/receipt/hash against the CURRENT
+   * execution policy. A historical Passed row alone is not a landing grant. */
+  requireAcceptedCheckPolicyInTx(candidate: Readonly<ReviewCheckCandidate>): void;
+  /** Must compare exact main head AND generation, retain candidate, and advance
+   * following views inside the caller's existing SQL transaction. No awaits. */
+  publishMainInTx?(input: { target_head: string; target_generation: number; head: string; root_tree: string; candidate_id: string; proof_job: string }): void;
 }
 interface Profile { name: string; version: string }
 interface Person { name: string; email: string; millis_since_epoch: number; tz_offset_minutes: number }
@@ -92,6 +100,8 @@ export class ForgeReviews {
       'CREATE TABLE IF NOT EXISTS review_requirements(owner TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(owner,ordinal))',
       'CREATE TABLE IF NOT EXISTS review_plan(owner TEXT NOT NULL,ordinal INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(owner,ordinal))',
       'CREATE TABLE IF NOT EXISTS review_decisions(account TEXT NOT NULL,change_id TEXT NOT NULL,patchset TEXT NOT NULL,candidate TEXT NOT NULL,principal TEXT NOT NULL,decision TEXT NOT NULL,epoch INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(change_id,ordinal))',
+      'CREATE TABLE IF NOT EXISTS review_landings(patchset TEXT PRIMARY KEY,account TEXT NOT NULL,candidate TEXT NOT NULL,head TEXT NOT NULL,landed_at INTEGER NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS review_parent_cert(candidate TEXT PRIMARY KEY,head TEXT NOT NULL,parent TEXT NOT NULL,root_tree TEXT NOT NULL,plan_hash TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS review_comments(account TEXT NOT NULL,change_id TEXT NOT NULL,patchset TEXT NOT NULL,author TEXT NOT NULL,body TEXT NOT NULL,path TEXT,created_at INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(change_id,ordinal))',
     ]) host.sql.exec(sql);
     host.sql.exec('INSERT OR IGNORE INTO review_usage(singleton,account,rows,bytes) VALUES(1,?,0,0)', host.accountId);
@@ -256,6 +266,7 @@ export class ForgeReviews {
       if (row.authority_until <= this.now()) fail(403, 'permission_denied');
       const access = this.host.authorizeInTx('write', row.epoch);
       const old = this.one<Change>('SELECT * FROM review_changes WHERE id=?', changeId);
+      if (old && this.one('SELECT 1 FROM review_landings WHERE patchset=?', old.current_patchset)) fail(400, 'failed_precondition');
       if (old && (old.account !== this.host.accountId || (old.owner !== row.principal && !access.is_admin))) fail(403, 'permission_denied');
       if ((old?.current_patchset ?? null) !== (intent.expected_patchset === null ? null : hex(intent.expected_patchset))) fail(400, 'failed_precondition');
       const ordinal = old ? old.version + 1 : 1; if (ordinal > 64) fail(429, 'resource_exhausted');
@@ -313,10 +324,12 @@ export class ForgeReviews {
     if (intent.predecessor) {
       const parent = this.patchset(hex(intent.predecessor.change_id, 16), hex(intent.predecessor.patchset_id));
       if (parent.source_head !== p.source_base) fail(400, 'failed_precondition');
-      const attempt = this.latest(parent); if (!attempt || !attempt.candidate || attempt.publication_generation === null || attempt.target !== main.head || attempt.target_generation !== main.generation || this.now() >= attempt.expires_at) fail(400, 'failed_precondition');
+      const attempt = this.latest(parent), landed = this.one<{ candidate: string; head: string }>('SELECT candidate,head FROM review_landings WHERE patchset=?', parent.id);
+      if (!attempt || !attempt.candidate || attempt.publication_generation === null || (!landed && (attempt.target !== main.head || attempt.target_generation !== main.generation || this.now() >= attempt.expires_at))) fail(400, 'failed_precondition');
       const candidate = JSON.parse(attempt.candidate) as { head: string };
       this.host.requireRetainedClosureInTx({ kind: 3, id: candidate.head });
-      return { build: candidate.head, mapped: candidate.head };
+      if (landed && (landed.candidate !== attempt.id || landed.head !== candidate.head)) fail(503, 'unavailable');
+      return { build: landed ? main.head : candidate.head, mapped: candidate.head };
     }
     if (p.source_mode === 'projected') {
       const relation = this.host.projections.canonicalForProjectedBaseInTx(view, p.source_base);
@@ -329,6 +342,7 @@ export class ForgeReviews {
   private startAttempt(p: Patchset): Attempt | undefined {
     return this.host.transactionSync(() => {
       this.host.authorizeInTx('write'); const view = this.readable(p);
+      if (this.one('SELECT 1 FROM review_landings WHERE patchset=?', p.id)) return undefined;
       if (this.change(p.change_id).current_patchset !== p.id) return undefined;
       this.host.authorizeInTx('write', p.epoch);
       if (view.description.policy_epoch !== p.epoch) fail(409, 'aborted');
@@ -389,6 +403,11 @@ export class ForgeReviews {
       this.host.transactionSync(() => {
         this.attemptCurrent(p, a!); this.charge(Math.ceil(bytes.length / CHUNK), bytes.length);
         for (let offset = 0; offset < bytes.length; offset += CHUNK) this.host.sql.exec('INSERT INTO review_plan(owner,ordinal,data) VALUES(?,?,?)', a!.id, offset / CHUNK, bytes.slice(offset, offset + CHUNK).buffer);
+        const head = plan.objects.find(object => object.kind === 3 && object.id === plan.head);
+        if (!head) fail(503, 'unavailable');
+        const info = inspect(3, decode(head)) as unknown as Descriptor & { commit: { parents: string[]; root_trees: string[] } };
+        if (info.commit.parents.length !== 1 || info.commit.parents[0] !== a!.build_target || info.commit.root_trees.length !== 1 || info.commit.root_trees[0] !== plan.root_tree) fail(503, 'unavailable');
+        this.charge(1, 512); this.host.sql.exec('INSERT INTO review_parent_cert(candidate,head,parent,root_tree,plan_hash) VALUES(?,?,?,?,?)', a!.id, plan.head, a!.build_target, plan.root_tree, digest);
         a!.plan_hash = digest; a!.plan_bytes = bytes.length; a!.phase = 'stage'; this.saveAttempt(a!);
       }); return;
     }
@@ -575,9 +594,36 @@ export class ForgeReviews {
           candidate = { id: array(a.id), head: array(raw.head), root_tree: array(raw.root_tree), target: array(a.target), target_generation: a.target_generation,
             rewrites: raw.rewrites.map(r => ({ old: array(r.old), new: array(r.new), change_id: array(r.change_id) })) };
           if (view.description.policy_epoch === p.epoch) approvals = this.approvals(p, a);
+          if (state === 'checks_pending' && !this.one('SELECT 1 FROM review_landings WHERE patchset=?', p.id)) {
+            try {
+              const selected = this.checkCandidateInTx(p.change_id, p.id, a.id);
+              const checked = checkStatusInTx(this.host.sql, p.account, selected, this.now());
+              if (checked.state === 'failed') state = 'check_failed';
+              if (checked.state === 'passed') {
+                try {
+                  this.host.requireAcceptedCheckPolicyInTx(selected);
+                  state = approvals > 0 ? 'ready_to_land' : 'prepared';
+                } catch (error) {
+                  if (!(error instanceof Failure) || !((error.status === 400 && error.code === 'failed_precondition') || (error.status === 409 && error.code === 'aborted'))) throw error;
+                  // An old accepted verdict is historical evidence, not a
+                  // current-policy readiness claim or renewed check grant.
+                  state = 'checks_pending';
+                }
+              }
+            } catch (error) {
+              // A sanitized result may still be preparing; no lease/result
+              // becomes readable before it is published. Profile/main changes
+              // are stale, not an implicit fresh candidate/check.
+              if (error instanceof Failure && error.status === 400 && error.code === 'failed_precondition') { /* pending */ }
+              else if (error instanceof Failure && error.status === 409) state = 'stale';
+              else throw error;
+            }
+          }
         }
       }
       if (!a && view.description.policy_epoch !== p.epoch) state = 'stale';
+      const landed = this.one<{ candidate: string }>('SELECT candidate FROM review_landings WHERE patchset=?', p.id);
+      if (landed) { if (!a || landed.candidate !== a.id) fail(503, 'unavailable'); state = 'landed'; }
       // Match native confidentiality: comments belong to this exact immutable
       // patchset and policy epoch, and optional paths remain currently allowed.
       const comments = view.description.policy_epoch !== p.epoch ? [] : this.rows<{ author: string; patchset: string; body: string; path: string | null; created_at: number }>('SELECT author,patchset,body,path,created_at FROM review_comments WHERE account=? AND change_id=? AND patchset=? ORDER BY ordinal LIMIT 129', p.account, p.change_id, p.id);
@@ -605,6 +651,87 @@ export class ForgeReviews {
       return { state: formatted.state, result: formatted.value };
     });
   }
+  /** Trusted preparer-scoped eligibility. The checker is never substituted for
+   * this SQL-derived member; parent constructs this host for p.principal. */
+  checkCandidateInTx(change: string, patchset: string, candidateId: string): ReviewCheckCandidate {
+    const p = this.patchset(change, patchset), a = this.latest(p), main = this.host.currentMainInTx();
+    if (this.change(change).current_patchset !== p.id || !a || a.id !== candidateId || a.phase !== 'checks_pending'
+        || !a.candidate || a.publication_generation === null || this.one('SELECT 1 FROM review_landings WHERE patchset=?', p.id)
+        || a.principal !== p.principal || this.now() >= a.expires_at
+        || a.target !== main.head || a.target_generation !== main.generation) fail(409, 'aborted');
+    this.host.authorizeInTx('write', p.epoch, p.principal); const view = this.readable(p);
+    if (view.description.policy_epoch !== p.epoch) fail(409, 'aborted');
+    const config = this.host.reviewConfiguration(), frozen = JSON.parse(p.profile) as Profile;
+    if (!config || config.profile.name !== frozen.name || config.profile.version !== frozen.version) fail(409, 'aborted');
+    const raw = JSON.parse(a.candidate) as { head: string; root_tree: string };
+    const cert = this.one<{ head: string; parent: string; root_tree: string; plan_hash: string }>('SELECT * FROM review_parent_cert WHERE candidate=?', a.id);
+    if (!cert || cert.head !== raw.head || cert.parent !== a.build_target || cert.root_tree !== raw.root_tree || cert.plan_hash !== a.plan_hash) fail(503, 'unavailable');
+    const source = this.reviewProjectionSourceInTx(change, p.id, a.id);
+    requireReviewProjectionSourceInTx(this.host, view, source);
+    const projection = this.host.projections.readyReviewInTx(view, source); if (!projection) fail(400, 'failed_precondition');
+    return { scope: { account_id: p.account, view_version: p.version, policy_epoch: p.epoch, change_id: p.change_id, patchset_id: p.id,
+      candidate_id: a.id, target_head: a.target, target_generation: a.target_generation, publication_generation: a.publication_generation },
+      head: raw.head, root_tree: raw.root_tree, profile: frozen, expires_at: a.expires_at, preparer: p.principal, view_name: p.view_name, safe_projection_id: projection.catalog_id };
+  }
+  requireCheckCandidateInTx(candidate: Readonly<ReviewCheckCandidate>): void {
+    requireReviewCheckCandidateInTx(this.host.sql, this.host.accountId, candidate);
+    if (!sameCheckCandidate(candidate, this.checkCandidateInTx(candidate.scope.change_id, candidate.scope.patchset_id, candidate.scope.candidate_id))) fail(409, 'aborted');
+  }
+  private land(call: ForgeCall, intent: Extract<ReviewCommand, { operation: 'land' }>['intent']): Patchset {
+    return this.host.transactionSync(() => {
+      this.host.authorizeInTx('write');
+      const changeId = hex(intent.change_id, 16), patchsetId = hex(intent.patchset_id), candidateId = hex(intent.candidate_id);
+      const fingerprint = (deriveForgeReviewIdentity({ kind: 'land', change_id: changeId, patchset_id: patchsetId, candidate_id: candidateId }) as { fingerprint: string }).fingerprint;
+      const replay = this.operation(this.host.principal, call.request_id);
+      if (replay) {
+        if (replay.kind !== 'land' || replay.fingerprint !== fingerprint || replay.patchset_id !== patchsetId || replay.change_id !== changeId) fail(409, 'already_exists');
+        const p = this.patchset(changeId, patchsetId); this.readable(p, call.view);
+        const landed = this.one<{ candidate: string }>('SELECT candidate FROM review_landings WHERE patchset=?', p.id);
+        if (landed?.candidate !== candidateId) fail(503, 'unavailable'); return p;
+      }
+      const p = this.patchset(changeId, patchsetId), view = this.readable(p, call.view);
+      this.host.authorizeInTx('write', p.epoch);
+      if (view.description.policy_epoch !== p.epoch || !this.host.publishMainInTx || this.one('SELECT 1 FROM review_landings WHERE patchset=?', p.id)) fail(400, 'failed_precondition');
+      const main = this.host.currentMainInTx(), pending: { p: Patchset; a: Attempt; raw: { head: string; root_tree: string } }[] = [], seen = new Set<string>();
+      let current = p, child: Attempt | undefined;
+      for (;;) {
+        if (seen.has(current.change_id) || seen.size >= 64) fail(400, 'failed_precondition'); seen.add(current.change_id);
+        if (this.change(current.change_id).current_patchset !== current.id) fail(400, 'failed_precondition');
+        const a = this.latest(current); if (!a || !a.candidate || a.phase !== 'checks_pending' || a.publication_generation === null || (current.id === p.id && a.id !== candidateId)) fail(400, 'failed_precondition');
+        const raw = JSON.parse(a.candidate) as { head: string; root_tree: string };
+        const historical = this.one<{ candidate: string; head: string }>('SELECT candidate,head FROM review_landings WHERE patchset=?', current.id);
+        if (child && child.mapped_base !== raw.head) fail(400, 'failed_precondition');
+        if (historical) { if (historical.candidate !== a.id || historical.head !== raw.head) fail(503, 'unavailable'); break; }
+        const currentView = this.readable(current);
+        this.host.authorizeInTx('write', current.epoch, current.principal);
+        if (currentView.description.policy_epoch !== current.epoch || this.now() >= a.expires_at || a.target !== main.head || a.target_generation !== main.generation
+            || current.profile !== p.profile || (child && child.build_target !== raw.head)) fail(400, 'failed_precondition');
+        // Eligibility is preparer-scoped; do not impersonate that preparer in
+        // reads. The explicit subject check above and exact SQL/path/catalog
+        // checks here are equivalent without changing the caller's identity.
+        const source = this.reviewProjectionSourceInTx(current.change_id, current.id, a.id);
+        requireReviewProjectionSourceInTx(this.host, currentView, source);
+        const projection = this.host.projections.readyReviewInTx(currentView, source); if (!projection) fail(400, 'failed_precondition');
+        const config = this.host.reviewConfiguration(), frozen = JSON.parse(current.profile) as Profile;
+        if (!config || config.profile.name !== frozen.name || config.profile.version !== frozen.version) fail(400, 'failed_precondition');
+        const cert = this.one<{ head: string; parent: string; root_tree: string; plan_hash: string }>('SELECT * FROM review_parent_cert WHERE candidate=?', a.id);
+        if (!cert || cert.head !== raw.head || cert.parent !== a.build_target || cert.root_tree !== raw.root_tree || cert.plan_hash !== a.plan_hash) fail(503, 'unavailable');
+        const candidate: ReviewCheckCandidate = { scope: { account_id: current.account, view_version: current.version, policy_epoch: current.epoch, change_id: current.change_id,
+          patchset_id: current.id, candidate_id: a.id, target_head: a.target, target_generation: a.target_generation, publication_generation: a.publication_generation }, head: raw.head, root_tree: raw.root_tree,
+          profile: frozen, expires_at: a.expires_at, preparer: current.principal, view_name: current.view_name, safe_projection_id: projection.catalog_id };
+        if (checkStatusInTx(this.host.sql, current.account, candidate, this.now()).state !== 'passed' || this.approvals(current, a) === 0) fail(400, 'failed_precondition');
+        this.host.requireAcceptedCheckPolicyInTx(candidate);
+        pending.push({ p: current, a, raw }); child = a;
+        const dependency = (JSON.parse(current.intent) as PushIntent).predecessor;
+        if (!dependency) { if (a.build_target !== main.head) fail(400, 'failed_precondition'); break; }
+        current = this.patchset(hex(dependency.change_id, 16), hex(dependency.patchset_id));
+      }
+      const first = pending[0]; if (!first || !first.a.integrity_job) fail(400, 'failed_precondition');
+      this.host.publishMainInTx({ target_head: main.head, target_generation: main.generation, head: first.raw.head, root_tree: first.raw.root_tree, candidate_id: first.a.id, proof_job: first.a.integrity_job });
+      for (const item of pending) { this.charge(1, 512); this.host.sql.exec('INSERT INTO review_landings(patchset,account,candidate,head,landed_at) VALUES(?,?,?,?,?)', item.p.id, item.p.account, item.a.id, item.raw.head, this.now()); }
+      this.recordDecisionOperation(call, 'land', fingerprint, p); return p;
+    });
+  }
   private recordDecisionOperation(call: ForgeCall, kind: string, fingerprint: string, p: Patchset): void {
     if (this.one<{ n: number }>('SELECT COUNT(*) AS n FROM review_operations')!.n >= 4096) fail(429, 'resource_exhausted');
     const identity = deriveForgeReviewIdentity({ kind: 'operation', principal: this.host.principal, request_id: call.request_id }) as { operation_id: string };
@@ -627,6 +754,7 @@ export class ForgeReviews {
         const original = this.patchset(replay.change_id, replay.patchset_id); this.readable(original, call.view); return original;
       }
       const p = this.patchset(change, patchset), view = this.readable(p, call.view);
+      if (this.one('SELECT 1 FROM review_landings WHERE patchset=?', p.id)) fail(400, 'failed_precondition');
       this.host.authorizeInTx(intent.kind === 'vote' ? 'review' : 'read', p.epoch);
       if (view.description.policy_epoch !== p.epoch) fail(400, 'failed_precondition');
       if (intent.kind === 'comment') {
@@ -654,7 +782,7 @@ export class ForgeReviews {
     let command: ReviewCommand;
     try { command = normalizeForgeReviewCommand({ account_id: call.account_id, operation: call.operation, view: call.view, request_id: call.request_id, payload_json: call.payload_json }) as ReviewCommand; }
     catch (error) { if (error instanceof Error && error.message.startsWith('resource_exhausted:')) fail(429, 'resource_exhausted'); fail(400, 'invalid_argument'); }
-    if (command.operation === 'land') { this.host.transactionSync(() => this.host.authorizeInTx('write')); fail(400, 'failed_precondition'); }
+    if (command.operation === 'land') return this.reply(this.land(call, command.intent), call.view);
     if (command.operation === 'push') {
       let operation = this.begin(call, command.intent);
       if (operation.phase === 'admission') {
@@ -862,4 +990,27 @@ export function requireReviewProjectionSourceInTx(host: Pick<ForgeReviewsHost, '
     const answers = host.views.pathsAllowedInTx(view, paths).paths;
     if (answers.length !== paths.length || answers.some((answer, index) => answer.path !== paths[index] || !answer.allowed)) fail(403, 'permission_denied');
   }
+}
+
+/** Query candidates without borrowing a checker identity as a Forge member.
+ * Each returned preparer must be independently reauthorized by the host before
+ * the class method derives the complete eligible binding. */
+export function reviewCheckSelectionsInTx(sql: SqlStorage, account: string, profile: CheckProfile, limit: number, offset = 0): { change_id: string; patchset_id: string; candidate_id: string; preparer: string }[] {
+  if (!safe(limit, 32) || limit === 0 || !safe(offset, 1024)) fail(400, 'invalid_argument');
+  if (![...sql.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_attempts'")].length) return [];
+  return [...sql.exec("SELECT p.change_id,p.id AS patchset_id,a.id AS candidate_id,p.principal AS preparer FROM review_patchsets p JOIN review_changes c ON c.current_patchset=p.id JOIN review_attempts a ON a.patchset=p.id WHERE p.account=? AND a.account=? AND a.phase='checks_pending' AND a.candidate IS NOT NULL AND a.publication_generation IS NOT NULL AND json_extract(p.profile,'$.name')=? AND json_extract(p.profile,'$.version')=? AND NOT EXISTS(SELECT 1 FROM review_attempts newer WHERE newer.patchset=p.id AND newer.ordinal>a.ordinal) AND NOT EXISTS(SELECT 1 FROM review_landings l WHERE l.patchset=p.id) ORDER BY a.rowid LIMIT ? OFFSET ?", account, account, profile.name, profile.version, limit, offset)] as unknown as { change_id: string; patchset_id: string; candidate_id: string; preparer: string }[];
+}
+/** Integrity lookup only. Parent MUST then reauthorize the SQL-derived saved
+ * preparer/view/changed paths and ready projection under current policy. */
+export function requireReviewCheckCandidateInTx(sql: SqlStorage, account: string, candidate: Readonly<ReviewCheckCandidate>): void {
+  const s = candidate.scope;
+  const p = [...sql.exec('SELECT p.*,c.current_patchset FROM review_patchsets p JOIN review_changes c ON c.id=p.change_id WHERE p.id=? AND p.change_id=?', s.patchset_id, s.change_id)][0] as unknown as Patchset & { current_patchset: string } | undefined;
+  const a = [...sql.exec('SELECT * FROM review_attempts WHERE id=? AND patchset=?', s.candidate_id, s.patchset_id)][0] as unknown as Attempt | undefined;
+  if (!p || !a || account !== s.account_id || p.account !== account || a.account !== account || p.current_patchset !== p.id || p.version !== s.view_version || p.epoch !== s.policy_epoch
+      || p.principal !== candidate.preparer || p.view_name !== candidate.view_name || a.principal !== p.principal || a.target !== s.target_head || a.target_generation !== s.target_generation
+      || a.publication_generation !== s.publication_generation || a.phase !== 'checks_pending' || !a.candidate || a.expires_at !== candidate.expires_at
+      || [...sql.exec('SELECT 1 FROM review_attempts WHERE patchset=? AND ordinal>? LIMIT 1', p.id, a.ordinal)].length
+      || [...sql.exec('SELECT 1 FROM review_landings WHERE patchset=?', p.id)].length) fail(409, 'aborted');
+  const raw = JSON.parse(a.candidate) as { head: string; root_tree: string }, profile = JSON.parse(p.profile) as Profile;
+  if (raw.head !== candidate.head || raw.root_tree !== candidate.root_tree || profile.name !== candidate.profile.name || profile.version !== candidate.profile.version) fail(409, 'aborted');
 }

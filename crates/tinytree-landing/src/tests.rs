@@ -149,6 +149,31 @@ fn explicit_mapped_parent_rebases_a_dependent_patch_without_losing_destination_c
         .is_err(),
         "unrelated logical base must be rejected"
     );
+    let authored_folder = r.tree(vec![("a", file(b"original", false))]);
+    let authored_tree = r.tree(vec![("folder", m::TreeValue::Tree(authored_folder))]);
+    let authored_parent = r.commit(base, authored_tree, 5);
+    let rewritten_folder = r.tree(vec![
+        ("a", file(b"concurrent", false)),
+        ("d", file(b"added", false)),
+    ]);
+    let rewritten_tree = r.tree(vec![("folder", m::TreeValue::Tree(rewritten_folder))]);
+    let rewritten_parent = r.commit(destination, rewritten_tree, 5);
+    let removed = r.commit(authored_parent, empty, 6);
+    assert!(
+        matches!(build_on_mapped_base(&mut r,
+        request(authored_parent, removed, rewritten_parent), rewritten_parent, Limits::default()),
+        Err(Error::Conflict { path }) if path == "folder"),
+        "rewritten mapping must not enable projected directory-deletion fallback"
+    );
+    let overlapping_folder = r.tree(vec![("a", file(b"child", false))]);
+    let overlapping_tree = r.tree(vec![("folder", m::TreeValue::Tree(overlapping_folder))]);
+    let overlapping_child = r.commit(authored_parent, overlapping_tree, 7);
+    assert!(
+        matches!(build_on_mapped_base(&mut r,
+        request(authored_parent, overlapping_child, rewritten_parent), rewritten_parent, Limits::default()),
+        Err(Error::Conflict { path }) if path == "folder/a"),
+        "non-equivalent rewritten FILEs use ordinary conflict semantics, not projection-invalid errors"
+    );
 }
 fn entries(candidate: &Candidate, id: m::TreeId) -> Vec<m::TreeEntry> {
     let m::Object::Tree(t) = decoded(candidate, id.0) else {
@@ -700,4 +725,146 @@ fn projected_directory_deletion_preserves_excluded_descendants_and_canonical_cop
         panic!()
     };
     assert_eq!(head.parents, [canonical]);
+}
+
+#[test]
+fn projected_same_path_edits_preserve_bytes_mode_and_canonical_copy_identity() {
+    for has_canonical_copy in [false, true] {
+        let mut reader = Reader::default();
+        let canonical_copy = has_canonical_copy.then(|| {
+            m::CopyId(reader.put(m::Object::CopyHistory(m::CopyHistory {
+                current_path: "source".into(),
+                parents: vec![],
+                salt: vec![1],
+            })))
+        });
+        let mut original = file(b"original", false);
+        let m::TreeValue::File { copy_id, .. } = &mut original else {
+            panic!()
+        };
+        *copy_id = canonical_copy;
+        let canonical_tree = reader.tree(vec![("source", original)]);
+        let canonical = reader.commit(m::CommitId::ROOT, canonical_tree, 1);
+        let seed = m::CopyId(reader.put(m::Object::CopyHistory(m::CopyHistory {
+            current_path: "source".into(),
+            parents: vec![],
+            salt: vec![2],
+        })));
+        let mut visible = file(b"original", false);
+        let m::TreeValue::File { copy_id, .. } = &mut visible else {
+            panic!()
+        };
+        *copy_id = Some(seed);
+        let projected_tree = reader.tree(vec![("source", visible)]);
+        let projected = reader.commit(m::CommitId::ROOT, projected_tree, 8);
+        let mut edited = file(b"edited bytes", true);
+        let m::TreeValue::File { copy_id, .. } = &mut edited else {
+            panic!()
+        };
+        *copy_id = Some(seed);
+        let source_tree = reader.tree(vec![("source", edited)]);
+        let source = reader.commit(projected, source_tree, 9);
+        // A concurrent disjoint main change must survive the projected rebase.
+        let mut destination_file = file(b"original", false);
+        let m::TreeValue::File { copy_id, .. } = &mut destination_file else {
+            panic!()
+        };
+        *copy_id = canonical_copy;
+        let destination_tree = reader.tree(vec![
+            ("other", file(b"independent", false)),
+            ("source", destination_file),
+        ]);
+        let destination = reader.commit(canonical, destination_tree, 2);
+        let candidate = build_on_projected_base(
+            &mut reader,
+            request(projected, source, destination),
+            canonical,
+            Limits::default(),
+        )
+        .unwrap();
+        let actual = entries(&candidate, candidate.root_tree);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].value, file(b"independent", false));
+        let mut expected = file(b"edited bytes", true);
+        let m::TreeValue::File { copy_id, .. } = &mut expected else {
+            panic!()
+        };
+        *copy_id = canonical_copy;
+        assert_eq!(
+            actual[1].value, expected,
+            "canonical copy present: {has_canonical_copy}"
+        );
+        assert_eq!(candidate.rewrites[0].change_id, m::ChangeId([9; 16]));
+        let m::Object::Commit(head) = decoded(&candidate, candidate.head.0) else {
+            panic!()
+        };
+        assert_eq!(head.parents, vec![destination]);
+        for object in &candidate.objects {
+            reader
+                .objects
+                .insert(object.descriptor.key, object.bytes.clone());
+        }
+        let mut second_edit = file(b"second edit", false);
+        let m::TreeValue::File { copy_id, .. } = &mut second_edit else {
+            panic!()
+        };
+        *copy_id = Some(seed);
+        let child_tree = reader.tree(vec![("source", second_edit)]);
+        let child = reader.commit(source, child_tree, 10);
+        let mapped_child = build_on_mapped_base(
+            &mut reader,
+            request(source, child, candidate.head),
+            candidate.head,
+            Limits::default(),
+        )
+        .unwrap();
+        let child_entries = entries(&mapped_child, mapped_child.root_tree);
+        assert_eq!(child_entries[0].value, file(b"independent", false));
+        let mut expected_child = file(b"second edit", false);
+        let m::TreeValue::File { copy_id, .. } = &mut expected_child else {
+            panic!()
+        };
+        *copy_id = canonical_copy;
+        assert_eq!(child_entries[1].value, expected_child);
+        assert_eq!(mapped_child.rewrites[0].change_id, m::ChangeId([10; 16]));
+        let m::Object::Commit(child_head) = decoded(&mapped_child, mapped_child.head.0) else {
+            panic!()
+        };
+        assert_eq!(child_head.parents, vec![candidate.head]);
+        let mut overlapping = file(b"overlapping main edit", true);
+        let m::TreeValue::File { copy_id, .. } = &mut overlapping else {
+            panic!()
+        };
+        *copy_id = canonical_copy;
+        let overlapping_tree = reader.tree(vec![
+            ("other", file(b"independent", false)),
+            ("source", overlapping),
+        ]);
+        let advanced = reader.commit(candidate.head, overlapping_tree, 11);
+        assert!(
+            matches!(build_on_mapped_base(&mut reader,
+            request(source, child, advanced), candidate.head, Limits::default()),
+            Err(Error::Conflict { path }) if path == "source"),
+            "copy normalization must not hide a real overlapping content edit"
+        );
+        let mut moved = file(b"edited bytes", true);
+        let m::TreeValue::File { copy_id, .. } = &mut moved else {
+            panic!()
+        };
+        *copy_id = Some(seed);
+        let moved_tree = reader.tree(vec![("target", moved)]);
+        let moved_source = reader.commit(projected, moved_tree, 10);
+        assert!(
+            matches!(
+                build_on_projected_base(
+                    &mut reader,
+                    request(projected, moved_source, destination),
+                    canonical,
+                    Limits::default()
+                ),
+                Err(Error::Invalid("copy history current path"))
+            ),
+            "moving a retained seed to a new path is not an ordinary edit"
+        );
+    }
 }

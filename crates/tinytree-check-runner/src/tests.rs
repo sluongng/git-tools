@@ -275,12 +275,16 @@ async fn unavailable_attempt_replays_and_capacity_fails_closed() {
     let pin = format!("{:x}", Sha256::digest(fs::read(&fixture).unwrap()));
     let mut config: Config = toml::from_str(include_str!("../example.toml")).unwrap();
     config.scratch = directory.path().join("checks");
-    config.daemon_config = directory.path().join("daemon.toml");
-    fs::write(&config.daemon_config, b"# private fixture\n").unwrap();
-    config.workspace = Binary {
+    config.daemon_config = Some(directory.path().join("daemon.toml"));
+    fs::write(
+        config.daemon_config.as_ref().unwrap(),
+        b"# private fixture\n",
+    )
+    .unwrap();
+    config.workspace = Some(Binary {
         path: fixture.clone(),
         sha256: pin.clone(),
-    };
+    });
     config.bazel = Binary {
         path: fixture,
         sha256: pin,
@@ -435,12 +439,16 @@ async fn dropping_a_check_handle_cancels_without_releasing_live_ownership() {
     let pin = format!("{:x}", Sha256::digest(fs::read(&fixture).unwrap()));
     let mut config: Config = toml::from_str(include_str!("../example.toml")).unwrap();
     config.scratch = directory.path().join("checks");
-    config.daemon_config = directory.path().join("daemon.toml");
-    fs::write(&config.daemon_config, b"# blocking fixture\n").unwrap();
-    config.workspace = Binary {
+    config.daemon_config = Some(directory.path().join("daemon.toml"));
+    fs::write(
+        config.daemon_config.as_ref().unwrap(),
+        b"# blocking fixture\n",
+    )
+    .unwrap();
+    config.workspace = Some(Binary {
         path: fixture.clone(),
         sha256: pin.clone(),
-    };
+    });
     config.bazel = Binary {
         path: fixture,
         sha256: pin,
@@ -541,4 +549,103 @@ max_file_bytes=4096
         runner::derived_daemon(&config, &request, root.path(), template).unwrap(),
         template
     );
+}
+
+#[test]
+fn explicit_snapshot_mode_pins_policy_without_changing_native_profile_preimage() {
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+    // This is the original native configuration's serialized field order. A
+    // source-backend addition must not reidentify unchanged native consumers.
+    #[derive(Serialize)]
+    struct NativeConfig<'a> {
+        scratch: &'a Path,
+        daemon_config: &'a Path,
+        rbe_socket: &'a Path,
+        runner_sha256: &'a str,
+        remote_instance_name: &'a str,
+        workspace: &'a Binary,
+        bazel: &'a Binary,
+        tools: &'a BTreeMap<String, Binary>,
+        profiles: &'a [Profile],
+        workspace_environment: &'a [String],
+        cleanup_timeout_seconds: u64,
+        remote_timeout_seconds: u64,
+        max_log_bytes: u64,
+        max_bep_bytes: u64,
+        max_execution_log_bytes: u64,
+        max_attempts: usize,
+    }
+    let native: Config = toml::from_str(include_str!("../example.toml")).unwrap();
+    let old = NativeConfig {
+        scratch: &native.scratch,
+        daemon_config: native.daemon_config.as_deref().unwrap(),
+        rbe_socket: &native.rbe_socket,
+        runner_sha256: &native.runner_sha256,
+        remote_instance_name: &native.remote_instance_name,
+        workspace: native.workspace.as_ref().unwrap(),
+        bazel: &native.bazel,
+        tools: &native.tools,
+        profiles: &native.profiles,
+        workspace_environment: &native.workspace_environment,
+        cleanup_timeout_seconds: native.cleanup_timeout_seconds,
+        remote_timeout_seconds: native.remote_timeout_seconds,
+        max_log_bytes: native.max_log_bytes,
+        max_bep_bytes: native.max_bep_bytes,
+        max_execution_log_bytes: native.max_execution_log_bytes,
+        max_attempts: native.max_attempts,
+    };
+    assert_eq!(
+        serde_json::to_vec(&native).unwrap(),
+        serde_json::to_vec(&old).unwrap()
+    );
+    let daemon = b"immutable native configuration";
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tinytree-check-profile-v1\0");
+    hash.update(&serde_json::to_vec(&(&old, &native.profiles[0])).unwrap());
+    hash.update(blake3::hash(daemon).as_bytes());
+    let original_version = hash.finalize().to_hex().to_string();
+    assert_eq!(
+        native.profile_version_for_daemon("unit", daemon).unwrap(),
+        original_version
+    );
+
+    let mut snapshot = native.clone();
+    snapshot.daemon_config = None;
+    snapshot.workspace = None;
+    snapshot.workspace_environment.clear();
+    snapshot.https_snapshot = Some(config::HttpsSnapshotConfig {
+        origin: "https://checker.example.test".into(),
+        credential_environment: "TT_CHECKER_TOKEN".into(),
+        readonly_helper: native.bazel.clone(),
+        limits: tinytree_forge_core::checker::SnapshotLimits::default(),
+    });
+    snapshot.validate().unwrap();
+    let version = snapshot.profile_version("unit").unwrap();
+    assert_ne!(version, original_version);
+    assert!(snapshot.profile_version_for_daemon("unit", daemon).is_err());
+    let mut changed = snapshot.clone();
+    changed
+        .https_snapshot
+        .as_mut()
+        .unwrap()
+        .readonly_helper
+        .sha256 = "12".repeat(32);
+    assert_ne!(changed.profile_version("unit").unwrap(), version);
+    let mut changed = snapshot.clone();
+    changed.https_snapshot.as_mut().unwrap().limits.max_entries /= 2;
+    assert_ne!(changed.profile_version("unit").unwrap(), version);
+    let mut mixed = snapshot.clone();
+    mixed.workspace = native.workspace.clone();
+    assert!(
+        mixed.validate().is_err(),
+        "new source cannot inherit native management authority"
+    );
+    let mut invalid = snapshot;
+    invalid
+        .https_snapshot
+        .as_mut()
+        .unwrap()
+        .credential_environment = "PATH".into();
+    assert!(invalid.validate().is_err());
 }

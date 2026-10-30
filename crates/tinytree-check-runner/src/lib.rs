@@ -4,9 +4,15 @@ mod bep;
 mod config;
 mod process;
 mod runner;
+mod prepared_source;
+pub mod candidate_http;
+pub mod source;
+pub mod snapshot_linux;
+mod remote;
 
-pub use config::{Binary, Config, Mode, Profile};
-pub use runner::{RunningCheck, recover, run, start};
+pub use config::{Binary, Config, HttpsSnapshotConfig, Mode, Profile};
+pub use runner::{RunningCheck, recover, run, start, run_leased, start_leased};
+pub use remote::{RemoteReport, run_remote, recover_remote};
 
 pub use tinytree_forge_core::check::{
     Evidence, MAX_RECEIPT_BYTES, MAX_REQUEST_BYTES, Outcome, Receipt, Request,

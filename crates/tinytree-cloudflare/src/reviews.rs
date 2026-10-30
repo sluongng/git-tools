@@ -93,6 +93,11 @@ enum Identity {
         payload_json: String,
         attempt: usize,
     },
+    Land {
+        change_id: String,
+        patchset_id: String,
+        candidate_id: String,
+    },
     Vote {
         change_id: String,
         patchset_id: String,
@@ -184,6 +189,19 @@ pub fn derive_identity(input: &[u8]) -> Result<Value, String> {
             result["operation_id"] =
                 json!(crate::hex(&identity::operation_id(&principal, &request_id)));
             Ok(result)
+        }
+        Identity::Land {
+            change_id,
+            patchset_id,
+            candidate_id,
+        } => {
+            let fingerprint = identity::land_fingerprint(
+                ChangeId(id(&change_id)?),
+                id(&patchset_id)?,
+                id(&candidate_id)?,
+            )
+            .map_err(error)?;
+            Ok(json!({"fingerprint":crate::hex(&fingerprint)}))
         }
         Identity::Vote {
             change_id,

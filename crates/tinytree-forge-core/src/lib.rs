@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod account_commands;
 pub mod check;
+pub mod checker;
 pub mod identity;
 pub mod review;
 pub mod review_commands;

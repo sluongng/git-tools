@@ -16,6 +16,24 @@ struct Cli {
 enum Operation {
     Run,
     Recover,
+    /// Execute only the candidate selected by this exact saved remote claim.
+    RunRemote {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        claim_id: String,
+    },
+    /// Reconcile saved custody/results; never rerun an interrupted check.
+    RecoverRemote {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        claim_id: String,
+    },
     ProfileVersion {
         #[arg(long)]
         profile: String,
@@ -40,8 +58,6 @@ async fn main() -> std::process::ExitCode {
             println!("{}", config.profile_version(&profile)?);
             return Ok::<_, anyhow::Error>(());
         }
-        let bytes = read_request()?;
-        let request = Request::decode(&bytes)?;
         let (sender, receiver) = tokio::sync::watch::channel(false);
         #[cfg(unix)]
         let _signal = tokio::spawn(async move {
@@ -55,10 +71,38 @@ async fn main() -> std::process::ExitCode {
         });
         #[cfg(not(unix))]
         let _sender = sender;
+        if let Operation::RunRemote {
+            account,
+            profile,
+            claim_id,
+        }
+        | Operation::RecoverRemote {
+            account,
+            profile,
+            claim_id,
+        } = &cli.command
+        {
+            let report = if matches!(cli.command, Operation::RunRemote { .. }) {
+                tinytree_check_runner::run_remote(&config, account, profile, claim_id, receiver)
+                    .await?
+            } else {
+                tinytree_check_runner::recover_remote(&config, account, profile, claim_id, receiver)
+                    .await?
+            };
+            let bytes = serde_json::to_vec(&report)?;
+            anyhow::ensure!(bytes.len() <= 1024 * 1024, "remote report exceeds budget");
+            let mut output = std::io::stdout().lock();
+            output.write_all(&bytes)?;
+            output.write_all(b"\n")?;
+            return Ok(());
+        }
+        let bytes = read_request()?;
+        let request = Request::decode(&bytes)?;
         let receipt = match cli.command {
             Operation::Run => tinytree_check_runner::run(&config, request, receiver).await?,
             Operation::Recover => tinytree_check_runner::recover(&config, request).await?,
             Operation::ProfileVersion { .. } => unreachable!(),
+            Operation::RunRemote { .. } | Operation::RecoverRemote { .. } => unreachable!(),
         };
         let mut output = std::io::stdout().lock();
         output.write_all(&receipt.encode()?)?;

@@ -1,4 +1,4 @@
-import { inspect, validateClosure, forgeViewCore, normalizeForgeAccountCommand, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
+import { inspect, validateClosure, forgeViewCore, normalizeForgeAccountCommand, validateCheckerReceipt, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
 import { authenticate, admitsForgeAccount, body, digest, fail, Failure, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
 import { forgeReply, protectForge, readForgeCall } from './forge';
 import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
@@ -11,7 +11,9 @@ import { BootstrapImports } from './bootstrap_import';
 import { ForgeSearch } from './forge_search';
 import { staticUi } from './static_ui';
 import { ForgeUploads, requireOwnedUploadInTx } from './forge_uploads';
-import { ForgeReviews, requireReviewProjectionSourceInTx } from './forge_reviews';
+import { ForgeReviews, requireReviewProjectionSourceInTx, reviewCheckSelectionsInTx, requireReviewCheckCandidateInTx } from './forge_reviews';
+import { ForgeChecks, type CheckProfile, type ExecutionPolicy, type ReviewCheckCandidate } from './forge_checks';
+import { CHECKER_ROUTE, admitChecker, checkerReply, protectChecker, requireCheckerProfile } from './checker';
 
 interface Env {
   ASSETS?: Fetcher;
@@ -21,6 +23,8 @@ interface Env {
   EXPERIMENTAL_RAW_BACKEND: string;
   FORGE_BACKEND?: string;
   FORGE_REVIEW_CONFIG_JSON?: string;
+  FORGE_CHECK_POLICY_JSON?: string;
+  CHECKERS_JSON?: string;
 }
 type Row = Record<string, string | number | null>;
 const MAX_OBJECT = 1024 * 1024;
@@ -82,6 +86,13 @@ export default {
     const presentation = await staticUi(request, env.ASSETS);
     if (presentation) return presentation;
     const path = new URL(request.url).pathname;
+    if (path === CHECKER_ROUTE) {
+      return protectChecker(async () => {
+        const { call, bytes } = await admitChecker(request, env);
+        const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
+        return env.REPOSITORIES.get(id).fetch(new Request(request, { body: bytes }));
+      });
+    }
     if (path === '/api/v1/forge/call') {
       return protectForge(async () => {
         const { call, bytes } = await admitForge(request, env);
@@ -124,11 +135,13 @@ export class AccountRepository {
     // Includes R2 awaits: two admitted uploads cannot oversubscribe durable quota,
     // and reads never observe an uncommitted payload. Eviction preserves SQL intents.
     const forge = new URL(request.url).pathname.startsWith('/api/v1/forge/');
+    const checker = new URL(request.url).pathname === CHECKER_ROUTE;
+    if (this.active >= 16 && checker) return json({ schema: 1, error: { code: 'resource_exhausted' } }, 429);
     if (this.active >= 16) return forge
       ? json({ version: 1, error: { code: 'resource_exhausted', message: 'account_admission_limit' } }, 429)
       : json({ error: 'account_admission_limit' }, 429);
     this.active++;
-    const work = this.tail.then(() => forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request))).finally(() => { this.active--; });
+    const work = this.tail.then(() => checker ? protectChecker(() => this.handleChecker(request)) : forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request))).finally(() => { this.active--; });
     this.tail = work.then(() => undefined, () => undefined);
     return work;
   }
@@ -215,41 +228,67 @@ export class AccountRepository {
     if (parsed.operation === 'pins' && ['create', 'release'].includes(parsed.parts[0])) return this.pin(request, account, auth, parsed.parts[0]);
     fail(501, 'unsupported_operation');
   }
+  private async handleChecker(request: Request): Promise<Response> {
+    const { auth, call } = await admitChecker(request, this.env);
+    const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+    if (!repository || repository.account !== call.account_id || !hasForgeAccount(this.sql)) fail(403, 'permission_denied');
+    const account = call.account_id;
+    const storage = new ForgeStorage({ accountId: account, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
+    // Only SQL-derived preparers reach this factory. A checker grant is never
+    // substituted for membership; each current-authority check remains in SQL.
+    const subjects = new Map<string, ForgeReviews>();
+    const forPreparer = (principal: string): ForgeReviews => {
+      let reviews = subjects.get(principal);
+      if (!reviews) {
+        const api = this.forgeAccounts(account, principal, false, storage);
+        const { views, projections } = this.forgeServices(account, principal, api, storage);
+        reviews = this.forgeReviews(account, principal, api, storage, views, projections); subjects.set(principal, reviews);
+      }
+      return reviews;
+    };
+    this.sql.exec('CREATE TABLE IF NOT EXISTS check_selection_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),position INTEGER NOT NULL)');
+    this.sql.exec('INSERT OR IGNORE INTO check_selection_cursor(singleton,position) VALUES(1,0)');
+    const checks = new ForgeChecks({ accountId: account, principal: auth.principal, sql: this.sql,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback), nowSeconds: () => Math.floor(Date.now() / 1000),
+      authorizeCheckerInTx: profile => requireCheckerProfile(this.env.CHECKERS_JSON, auth, account, profile),
+      executionPolicy: profile => this.executionPolicy(profile),
+      eligibleCandidatesInTx: (profile, limit) => {
+        const cursor = Number(this.one('SELECT position FROM check_selection_cursor WHERE singleton=1')!.position);
+        if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > 1024 || limit < 1 || limit > 32) fail(500, 'data_loss');
+        let offset = cursor, selections = reviewCheckSelectionsInTx(this.sql, account, profile, limit, offset);
+        if (!selections.length && offset !== 0) { offset = 0; selections = reviewCheckSelectionsInTx(this.sql, account, profile, limit, 0); }
+        this.sql.exec('UPDATE check_selection_cursor SET position=? WHERE singleton=1', selections.length < limit ? 0 : Math.min(1024, offset + selections.length));
+        const result: ReviewCheckCandidate[] = [];
+        for (const selected of selections) {
+          try { result.push(forPreparer(selected.preparer).checkCandidateInTx(selected.change_id, selected.patchset_id, selected.candidate_id)); }
+          catch (error) {
+            if (!(error instanceof Failure) || !([403, 409].includes(error.status) || (error.status === 400 && error.code === 'failed_precondition'))) throw error;
+          }
+        }
+        return result;
+      },
+      recheckCandidateInTx: candidate => {
+        requireReviewCheckCandidateInTx(this.sql, account, candidate);
+        forPreparer(candidate.preparer).requireCheckCandidateInTx(candidate);
+      },
+      describeObjectInTx: key => storage.describeInTx(key), readVerifiedObject: key => storage.readVerifiedObject(key),
+      retainCheckInTx: (lease, root) => {
+        if (root.kind !== 3) fail(400, 'failed_precondition'); this.retainedForgeClosureInTx(account, storage, root);
+        this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('checker',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", lease, root.kind, root.id);
+      },
+      releaseCheckInTx: (lease, root) => {
+        this.sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='checker' AND owner_id=? AND kind=? AND id=?", lease, root.kind, root.id);
+      },
+    });
+    return checkerReply(call, await checks.handle(call));
+  }
   private async handleForge(request: Request): Promise<Response> {
     const { auth, call } = await admitForge(request, this.env);
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (repository && repository.account !== call.account_id) fail(403, 'permission_denied');
     // This host is per request. Never cache an actor/grant on the DO instance.
-    const staged = new Set<string>();
-    const confirmations = new Map<string, unknown>();
     const storage = new ForgeStorage({ accountId: call.account_id, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
-    const api = new ForgeAccounts({
-      accountId: call.account_id, principal: auth?.principal ?? null, canProvision: auth?.operator ?? false,
-      sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
-      stageGenesis: objects => this.stageGenesis(call.account_id, objects, staged, storage, confirmations),
-      claimRepositoryInTx: (account, objects, head) => {
-        if (account !== call.account_id || this.one('SELECT account FROM repository WHERE singleton=1')
-            || this.one('SELECT name FROM refs LIMIT 1')) fail(400, 'failed_precondition');
-        if (objects.length !== 2 || !objects.some(o => o.kind === 3 && o.id === head)) fail(503, 'unavailable');
-        for (const object of objects) {
-          const key = `${object.kind}/${object.id}`;
-          const row = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
-          if (!staged.has(key) || !row || Number(row.size) !== object.size_bytes) fail(503, 'unavailable');
-          storage.confirmInTx('genesis', 'genesis', object, confirmations.get(key));
-        }
-        this.sql.exec('INSERT INTO repository(singleton,account) VALUES(1,?)', account);
-        this.sql.exec('INSERT INTO refs(name,generation,head) VALUES(\'main\',1,?)', head);
-        // stageGenesis checked this exact complete native closure and confirmed
-        // both durable puts. Installing proof/root is atomic with the account.
-        this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-genesis-v1', root: head }));
-        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1)', head);
-      },
-      currentMainInTx: () => {
-        const main = this.one('SELECT generation,head FROM refs WHERE name=\'main\'');
-        if (!main) fail(503, 'unavailable');
-        return { head: String(main.head), generation: Number(main.generation) };
-      },
-    });
+    const api = this.forgeAccounts(call.account_id, auth?.principal ?? null, auth?.operator ?? false, storage);
     let result;
     if ([20, 21, 22, 23, 24].includes(call.operation)) {
       if (!auth) fail(401, 'unauthenticated');
@@ -302,6 +341,37 @@ export class AccountRepository {
       result = await this.bootstrapImports(call.account_id, auth.principal, api, storage).handle(call);
     } else result = await api.handle(call);
     return forgeReply(call, result.state, result.result);
+  }
+  private forgeAccounts(accountId: string, principal: string | null, canProvision: boolean, storage: ForgeStorage): ForgeAccounts {
+    const staged = new Set<string>();
+    const confirmations = new Map<string, unknown>();
+    return new ForgeAccounts({
+      accountId: accountId, principal: principal, canProvision: canProvision,
+      sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      stageGenesis: objects => this.stageGenesis(accountId, objects, staged, storage, confirmations),
+      claimRepositoryInTx: (account, objects, head) => {
+        if (account !== accountId || this.one('SELECT account FROM repository WHERE singleton=1')
+            || this.one('SELECT name FROM refs LIMIT 1')) fail(400, 'failed_precondition');
+        if (objects.length !== 2 || !objects.some(o => o.kind === 3 && o.id === head)) fail(503, 'unavailable');
+        for (const object of objects) {
+          const key = `${object.kind}/${object.id}`;
+          const row = this.one('SELECT size FROM objects WHERE kind=? AND id=?', object.kind, object.id);
+          if (!staged.has(key) || !row || Number(row.size) !== object.size_bytes) fail(503, 'unavailable');
+          storage.confirmInTx('genesis', 'genesis', object, confirmations.get(key));
+        }
+        this.sql.exec('INSERT INTO repository(singleton,account) VALUES(1,?)', account);
+        this.sql.exec('INSERT INTO refs(name,generation,head) VALUES(\'main\',1,?)', head);
+        // stageGenesis checked this exact complete native closure and confirmed
+        // both durable puts. Installing proof/root is atomic with the account.
+        this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-genesis-v1', root: head }));
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1)', head);
+      },
+      currentMainInTx: () => {
+        const main = this.one('SELECT generation,head FROM refs WHERE name=\'main\'');
+        if (!main) fail(503, 'unavailable');
+        return { head: String(main.head), generation: Number(main.generation) };
+      },
+    });
   }
   private bootstrapImports(account: string, principal: string, api: ForgeAccounts, storage: ForgeStorage): BootstrapImports {
     // These services are request-scoped and initialized before publication's
@@ -487,6 +557,7 @@ export class AccountRepository {
         if (!main) fail(503, 'unavailable'); return { head: String(main.head), generation: Number(main.generation) };
       },
       reviewConfiguration: () => this.reviewConfiguration(),
+      requireAcceptedCheckPolicyInTx: candidate => this.requireAcceptedCheckPolicyInTx(account, candidate.scope.candidate_id, candidate.head, candidate.root_tree, candidate.profile),
       describeObjectInTx: key => storage.describeInTx(key), readVerifiedObject: key => storage.readVerifiedObject(key),
       requireOwnedCommitInTx: (view, descriptor, now) => {
         if (descriptor.kind !== 3) fail(403, 'permission_denied');
@@ -521,7 +592,53 @@ export class AccountRepository {
           JSON.stringify({ validator: 'native-closure-v1', root: root.id, job_id: proofJob }));
         this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('review-candidate',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", attempt, root.kind, root.id);
       },
+      publishMainInTx: input => {
+        api.authorityInTx('write');
+        if (!Number.isSafeInteger(input.target_generation) || input.target_generation < 1 || input.target_generation >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
+        this.requireAcceptedCheckPolicyInTx(account, input.candidate_id, input.head, input.root_tree, this.reviewConfiguration()?.profile);
+        const proof = this.one('SELECT account,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', input.proof_job);
+        if (!proof || proof.account !== account || proof.root_kind !== 3 || proof.root_id !== input.head || !['ready', 'published'].includes(String(proof.phase))
+            || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
+        this.retainedForgeClosureInTx(account, storage, { kind: 3, id: input.head });
+        const changed = this.one("UPDATE refs SET head=?,generation=generation+1 WHERE name='main' AND head=? AND generation=? RETURNING head,generation", input.head, input.target_head, input.target_generation);
+        if (!changed) fail(409, 'aborted');
+        this.sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='main' AND owner_id='main'");
+        this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('main','main',3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", input.head);
+        views.advanceFollowingViewsInTx(input.head);
+        api.sealBootstrapInTx(input.head, null, input.proof_job);
+      },
     });
+  }
+  private requireAcceptedCheckPolicyInTx(account: string, candidate: string, head: string, rootTree: string, profile: CheckProfile | undefined): void {
+    const policy = this.executionPolicy(profile);
+    if (!policy) fail(400, 'failed_precondition');
+    const accepted = this.one("SELECT receipt,digest,accepted_until FROM check_leases WHERE account=? AND phase='completed' AND json_extract(candidate,'$.scope.candidate_id')=? AND json_extract(receipt,'$.outcome')='passed' ORDER BY rowid DESC LIMIT 1", account, candidate);
+    if (!accepted || Number(accepted.accepted_until) <= Math.floor(Date.now() / 1000)) fail(400, 'failed_precondition');
+    let receipt: { request: { job_id: string; candidate_commit: string; root_tree: string } };
+    try { receipt = JSON.parse(String(accepted.receipt)); } catch { fail(500, 'data_loss'); }
+    if (!receipt?.request || receipt.request.job_id !== candidate || receipt.request.candidate_commit !== head || receipt.request.root_tree !== rootTree) fail(400, 'failed_precondition');
+    let verified: { receipt_digest: string };
+    try { verified = validateCheckerReceipt({ request: receipt.request, receipt, policy }); } catch { fail(400, 'failed_precondition'); }
+    if (verified.receipt_digest !== accepted.digest) fail(500, 'data_loss');
+  }
+  private executionPolicy(profile: CheckProfile | undefined): ExecutionPolicy | null {
+    const raw = this.env.FORGE_CHECK_POLICY_JSON;
+    if (!raw || !profile) return null;
+    if (new TextEncoder().encode(raw).byteLength > 16 * 1024) fail(400, 'failed_precondition');
+    let value: ExecutionPolicy;
+    try { value = JSON.parse(raw); } catch { fail(400, 'failed_precondition'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'profile,targets,test'
+        || !value.profile || Object.keys(value.profile).sort().join(',') !== 'name,version'
+        || typeof value.profile.name !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(value.profile.name)
+        || typeof value.profile.version !== 'string' || !/^[0-9a-f]{64}$/.test(value.profile.version)
+        || typeof value.test !== 'boolean' || !Array.isArray(value.targets) || !value.targets.length || value.targets.length > 128
+        || value.targets.some(target => typeof target !== 'string' || !target.startsWith('//') || !target.includes(':') || target.includes('...')
+          || /[\s*?\u0000]/u.test(target) || ['all', 'all-targets', ''].includes(target.split(':').at(-1)!))
+        || new Set(value.targets).size !== value.targets.length || value.targets.join('').length > 8192) fail(400, 'failed_precondition');
+    const selected = this.reviewConfiguration()?.profile;
+    if (!selected || value.profile.name !== selected.name || value.profile.version !== selected.version
+        || value.profile.name !== profile.name || value.profile.version !== profile.version) return null;
+    return value;
   }
   private reviewConfiguration(): { profile: { name: string; version: string }; committer: { name: string; email: string } } | null {
     const raw = this.env.FORGE_REVIEW_CONFIG_JSON;

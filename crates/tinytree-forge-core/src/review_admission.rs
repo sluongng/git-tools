@@ -372,10 +372,36 @@ pub fn entry_requirements<R: MetadataReader>(
                 copy_id,
                 ..
             } => {
-                if copy_id.is_some() && !targets.contains(path.as_str()) {
-                    return Err(AdmissionError::Invalid(
-                        "review copy requires explicit lineage",
-                    ));
+                if let Some(copy) = copy_id {
+                    if !targets.contains(path.as_str()) {
+                        // Editing bytes or mode does not create a new copy edge.
+                        // Retention is exact same-path identity, never similarity.
+                        if !matches!(before.get(path), Some(TreeValue::File {
+                            copy_id: Some(previous), ..
+                        }) if previous == copy)
+                        {
+                            return Err(AdmissionError::Invalid(
+                                "review copy requires explicit lineage",
+                            ));
+                        }
+                        let Object::CopyHistory(history) =
+                            walk.object(key(Kind::CopyHistory, copy.0))?
+                        else {
+                            return Err(AdmissionError::Invalid("review copy history"));
+                        };
+                        if history.current_path != *path {
+                            return Err(AdmissionError::Invalid("review retained copy path"));
+                        }
+                        push(
+                            &mut out,
+                            Requirement::Entry {
+                                canonical_path: path.clone(),
+                                key: Key::new(key(Kind::CopyHistory, copy.0)),
+                                expected_size: None,
+                            },
+                            limits,
+                        )?;
+                    }
                 }
                 push(
                     &mut out,
@@ -623,6 +649,104 @@ mod tests {
         assert!(matches!(
             analyze(&mut reader, &input, small),
             Err(AdmissionError::Limit(_))
+        ));
+    }
+    #[test]
+    fn same_path_edits_retain_exact_copy_identity_without_fabricating_a_copy_edge() {
+        let mut reader = Reader(BTreeMap::new());
+        let old = model::describe_file(b"old");
+        let edited = model::describe_file(b"edited bytes");
+        let retained = CopyId(reader.put(Object::CopyHistory(CopyHistory {
+            current_path: "source".into(),
+            parents: vec![],
+            salt: vec![1],
+        })));
+        let before = reader.tree(vec![TreeEntry {
+            name: "source".into(),
+            value: TreeValue::File {
+                id: FileId(old.key.id.0),
+                size_bytes: old.size_bytes,
+                executable: false,
+                copy_id: Some(retained),
+            },
+        }]);
+        let changed = |path: &str, copy| TreeEntry {
+            name: path.into(),
+            value: TreeValue::File {
+                id: FileId(edited.key.id.0),
+                size_bytes: edited.size_bytes,
+                executable: true,
+                copy_id: Some(copy),
+            },
+        };
+        let after = reader.tree(vec![changed("source", retained)]);
+        let base = reader.commit(before, CommitId::ROOT);
+        let head = reader.commit(after, base);
+        let mut input = Input {
+            source_base: base,
+            source_head: head,
+            lineage: vec![],
+        };
+        let facts = analyze(&mut reader, &input, Limits::default()).unwrap();
+        for kind in [Kind::File, Kind::CopyHistory] {
+            assert!(
+                facts
+                    .requirements
+                    .iter()
+                    .any(|r| matches!(r, Requirement::Entry {
+                canonical_path, key, ..
+            } if canonical_path == "source" && key.kind == kind as u8)),
+                "retained identity still needs current scoped copy and edited FILE authority"
+            );
+        }
+        assert!(
+            !facts
+                .requirements
+                .iter()
+                .any(|r| matches!(r, Requirement::CopyOrigin { .. })),
+            "an ordinary edit does not assert a new cross-path lineage edge"
+        );
+        let spoof = CopyId(reader.put(Object::CopyHistory(CopyHistory {
+            current_path: "source".into(),
+            parents: vec![],
+            salt: vec![2],
+        })));
+        for (name, entry) in [
+            ("replaced identity", changed("source", spoof)),
+            ("moved identity", changed("target", retained)),
+        ] {
+            let tree = reader.tree(vec![entry]);
+            input.source_head = reader.commit(tree, base);
+            assert!(
+                matches!(
+                    analyze(&mut reader, &input, Limits::default()),
+                    Err(AdmissionError::Invalid(
+                        "review copy requires explicit lineage"
+                    ))
+                ),
+                "{name}"
+            );
+        }
+        let misplaced = CopyId(reader.put(Object::CopyHistory(CopyHistory {
+            current_path: "different-path".into(),
+            parents: vec![],
+            salt: vec![3],
+        })));
+        let bad_before = reader.tree(vec![TreeEntry {
+            name: "source".into(),
+            value: TreeValue::File {
+                id: FileId(old.key.id.0),
+                size_bytes: old.size_bytes,
+                executable: false,
+                copy_id: Some(misplaced),
+            },
+        }]);
+        let bad_after = reader.tree(vec![changed("source", misplaced)]);
+        input.source_base = reader.commit(bad_before, CommitId::ROOT);
+        input.source_head = reader.commit(bad_after, input.source_base);
+        assert!(matches!(
+            analyze(&mut reader, &input, Limits::default()),
+            Err(AdmissionError::Invalid("review retained copy path"))
         ));
     }
 }

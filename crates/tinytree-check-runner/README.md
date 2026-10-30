@@ -43,3 +43,62 @@ compact log, but success cannot. Configuration rotation can use retained cleanup
 policy; unavailable rotated credentials and uncertain/live process groups still
 require operator recovery. Keep the Tokio runtime alive and cancel/drain retained
 `RunningCheck` handles when embedding the library.
+
+## HTTPS candidate snapshots
+
+The alternative HTTPS source mode is an execution-only client of the Forge
+checker endpoint. It needs no local repository server, daemon configuration or
+workspace binary. Omit `daemon_config` and `workspace`, and configure
+`[https_snapshot]` with `origin`, `credential_environment`, a pinned
+`[https_snapshot.readonly_helper]` binary and `[https_snapshot.limits]`.
+Keep the common pinned Bazel, runner, scratch, execution-only proxy and exact
+profile settings. Use an HTTPS origin; HTTP is accepted only on loopback for
+local acceptance. Resolve the credential through its environment-variable
+reference; never put its value in the snapshot, profile flags or execution
+environment. The service grants the dedicated checker identity an exact account
+and profile independently from Forge user membership.
+
+Build the helper with
+`bazel build --config=rbe //crates/tinytree-check-runner:readonly_snapshot_helper`.
+After installing the pinned binaries, calculate the profile version and configure
+that same version and target policy on the service. The backend selection,
+helper pin, limits and forced batch execution enter the profile identity.
+Unchanged native configurations retain their existing profile identity.
+
+```sh
+tinytree-check-runner --config CONFIG run-remote \
+  --account ACCOUNT --profile PROFILE --claim-id SAVED_CLAIM
+tinytree-check-runner --config CONFIG recover-remote \
+  --account ACCOUNT --profile PROFILE --claim-id SAVED_CLAIM
+```
+
+Keep the same saved claim for retries and recovery. The controller persists its
+claim, execution intent and result outbox in a private sibling of scratch;
+heartbeat uncertainty cancels execution. Recovery cleans the owned attempt and
+reconciles the saved result; it never downloads a fresh candidate or reruns Bazel.
+An accepted result acknowledgement can be recovered without another execution.
+Missing cleanup tools, rotated access or uncertain process ownership fail closed
+and can require operator recovery. Preserve the original scratch and control
+journals rather than deleting them or treating lease expiry as cleanup.
+
+The materializer verifies native COMMIT/TREE coverage and streamed leaf hashes.
+The Linux helper copies into an independent bounded tmpfs, remounts its
+superblock readonly, drops capabilities and runs Bazel in a child PID namespace.
+Bazel uses `--batch`, disabled rc files and `--lockfile_mode=off`; no persistent
+server is allowed. The helper verifies source identity before and after execution
+and records namespace teardown. Current snapshot policy rejects absolute symlinks
+and targets containing `..`, including otherwise in-tree parent-relative links.
+This remains a trusted-source check facility, not a hostile-code sandbox.
+
+Explicit Linux acceptance uses the declared fixture, Worker, runner, helper and
+pinned Bazel executable:
+
+```sh
+bazel test --config=rbe //cloudflare:checker_acceptance \
+  --test_env=TT_CHECKER_ACCEPT_RBE_SOCKET --test_output=all
+```
+
+Set that environment variable to an existing execution-only Unix proxy socket.
+The target executes locally for real kernel isolation, while compilation and
+the sealed Bazel test use remote execution. Its production-workerd evidence is
+not a deployed-provider acceptance result.

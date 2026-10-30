@@ -30,12 +30,48 @@ interface CoreExports {
   tt_forge_review_identity(pointer: number, length: number): number;
   tt_forge_review_format(pointer: number, length: number): number;
   tt_forge_review_admission(pointer: number, length: number): number;
+  tt_checker_parse_call(pointer: number, length: number): number;
+  tt_checker_fingerprint(pointer: number, length: number): number;
+  tt_checker_lease_binding(pointer: number, length: number): number;
+  tt_checker_request(pointer: number, length: number): number;
+  tt_checker_receipt(pointer: number, length: number): number;
+  tt_checker_snapshot_page(pointer: number, length: number): number;
+  tt_checker_manifest_step(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
 const core = new WebAssembly.Instance(coreModule, {}).exports as unknown as CoreExports;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+
+/** Strict dedicated checker framing; authentication and leases remain SQL-owned. */
+export function parseCheckerCall(bytes: Uint8Array): unknown {
+  return invoke(bytes, pointer => core.tt_checker_parse_call(pointer, bytes.byteLength));
+}
+export function checkerCommandFingerprint(input: unknown): { fingerprint: string } {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_fingerprint(pointer, bytes.byteLength)) as { fingerprint: string };
+}
+export function checkerLeaseBinding(input: unknown): { binding: string } {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_lease_binding(pointer, bytes.byteLength)) as { binding: string };
+}
+export function deriveCheckerRequest(input: unknown): { workspace_id: string } {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_request(pointer, bytes.byteLength)) as { workspace_id: string };
+}
+export function validateCheckerReceipt(input: unknown): { receipt_digest: string } {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_receipt(pointer, bytes.byteLength)) as { receipt_digest: string };
+}
+export function checkerSnapshotPage(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_snapshot_page(pointer, bytes.byteLength));
+}
+export function checkerManifestStep(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_checker_manifest_step(pointer, bytes.byteLength));
+}
 
 function invoke(bytes: Uint8Array, command: (pointer: number) => number): unknown {
   if (bytes.byteLength > 8 * 1024 * 1024) throw new Error('native validation input limit');

@@ -8,6 +8,16 @@ bazel_dep(name = "rules_rs", version = "0.1.0")
 bazel_dep(name = "llvm", version = "0.8.25")
 bazel_dep(name = "platforms", version = "1.1.0")
 
+# Pinned executable for explicit Linux checker/kernel acceptance, not host PATH.
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+http_file(
+    name = "checker_bazel_linux_x86_64",
+    urls = ["https://releases.bazel.build/9.2.0/release/bazel-9.2.0-linux-x86_64"],
+    sha256 = "7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694",
+    executable = True,
+    downloaded_file_path = "bazel",
+)
+
 # Git's macOS fsmonitor uses CoreServices and its framework dependencies, outside
 # LLVM's minimal SDK defaults.
 osx = use_extension("@llvm//extensions:osx.bzl", "osx")

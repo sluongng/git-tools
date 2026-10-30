@@ -712,7 +712,135 @@ fn search_fixture(store: &Store) -> Value {
     json!({"account_id":account.0,"owner":owner.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"expected_hits":expected_hits,"expected_skipped_files":{"binary":skipped_binary,"oversized":0},"late_match_path":"zzmatch.txt","readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes.as_slice()},"private_file":{"kind":1,"id":hex(&secret.key.id.0)},"filler_file":{"kind":1,"id":hex(&filler.key.id.0),"size_bytes":filler.size_bytes,"format_version":filler.format_version}})
 }
 
+
+// Disposable, genuinely executable Bazel repository for the trusted checker
+// process acceptance. This fixture supplies bytes/identities, never a verdict.
+fn checker_fixture(store: &Store, profile_version: &str) -> Value {
+    let account = AccountId("forge-check".into());
+    let actor = ForgeActor { principal: "check-owner".into() };
+    store.forge_mutate_account(&account, &actor, "checker-provision", ForgeAccountMutation::Provision).unwrap();
+    let repository = account.repository_id();
+    let mut objects = Vec::new();
+    let mut put = |value: Option<Object>, body: &[u8]| {
+        let (descriptor, bytes) = match value {
+            Some(value) => { let encoded = tinytree_model::encode(&value, Limits::default()).unwrap(); (encoded.descriptor, encoded.bytes) }
+            None => (tinytree_model::describe_file(body), body.to_vec()),
+        };
+        store.put(&repository, descriptor, &bytes, 0).unwrap();
+        objects.push(json!({"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes}));
+        descriptor
+    };
+    let rule = br##"def _smoke(ctx):
+    executable = ctx.actions.declare_file(ctx.label.name + ".sh")
+    ctx.actions.write(executable, """#!/bin/sh
+set -eu
+[ -z "${TT_CHECKER_TOKEN+x}" ] || exit 97
+[ -z "${TT_FORGE_TOKEN+x}" ] || exit 98
+IFS= read -r code < "$TEST_SRCDIR/$TEST_WORKSPACE/status.txt"
+exit "$code"
+""", is_executable = True)
+    return [DefaultInfo(executable = executable, runfiles = ctx.runfiles(files = [ctx.file.src]))]
+
+smoke_test = rule(implementation = _smoke, attrs = {"src": attr.label(allow_single_file = True)}, test = True)
+"##;
+    let files: Vec<(&str, &[u8])> = vec![
+        ("BUILD.bazel", b"load(\":smoke.bzl\", \"smoke_test\")\nsmoke_test(name = \"smoke\", src = \"status.txt\")\n"),
+        ("MODULE.bazel", b"module(name = \"checker_fixture\", version = \"0.0.0\")\n"),
+        ("README.md", b"# Disposable checked source\nActual Bazel test execution, not a synthetic verdict.\n"),
+        ("smoke.bzl", rule), ("status.txt", b"0\n"),
+    ];
+    let mut canonical = Tree { entries: files.into_iter().map(|(name, body)| {
+        let descriptor = put(None, body);
+        TreeEntry { name: name.into(), value: TreeValue::File { id: FileId(descriptor.key.id.0), size_bytes: descriptor.size_bytes, executable: false, copy_id: None } }
+    }).collect() };
+    let secret = put(None, b"excluded canonical checker fixture bytes\n");
+    let private = put(Some(Object::Tree(Tree { entries: vec![TreeEntry { name: "secret.txt".into(), value: TreeValue::File { id: FileId(secret.key.id.0), size_bytes: secret.size_bytes, executable: false, copy_id: None } }] })), &[]);
+    canonical.entries.push(TreeEntry { name: "private".into(), value: TreeValue::Tree(TreeId(private.key.id.0)) });
+    canonical.entries.sort_by(|a,b| a.name.cmp(&b.name));
+    let tree = put(Some(Object::Tree(canonical.clone())), &[]);
+    let signature = Signature { name: "Checker Fixture".into(), email: "fixture@example.invalid".into(), timestamp: Timestamp { millis_since_epoch: 0, tz_offset_minutes: 0 } };
+    let source = Commit { parents: vec![CommitId::ROOT], predecessors: vec![], root_tree: TreeMerge { terms: vec![TreeId(tree.key.id.0)], labels: vec![String::new()] }, change_id: ChangeId([150;16]), description: "Disposable checker source".into(), author: signature.clone(), committer: signature, secure_signature: None };
+    let root = put(Some(Object::Commit(source)), &[]);
+    drop(put);
+    let spec = ViewSpec { name: "public".into(), root_prefix: String::new(), include_prefixes: vec![String::new()], exclude_prefixes: vec!["private".into()], visibility: ForgeViewVisibility::Public, revision: root.key.id.0, export_allowed: false };
+    store.forge_mutate_account(&account, &actor, "checker-view", ForgeAccountMutation::PublishView { spec: spec.clone(), expected_epoch: PolicyEpoch(1), make_default: true, follow_main: false }).unwrap();
+    let view = store.forge_resolve_view(&account, Some(&actor), "public", None).unwrap();
+    let projection = store.forge_project_view(&view, 0).unwrap();
+    let (_, bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey { kind: Kind::Tree, id: tinytree_model::ObjectId(projection.projected_tree) }).unwrap();
+    let Object::Tree(projected_tree) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("checker projected tree") };
+    let (_, bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey { kind: Kind::Commit, id: tinytree_model::ObjectId(projection.projected_commit) }).unwrap();
+    let Object::Commit(projected_commit) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("checker projected commit") };
+    let profile = tinytree_store::LandingCheckProfile { name: "checks".into(), version: profile_version.into() };
+    let mut reviews = Vec::new();
+    let mut cancellation = None;
+    let mut expected = canonical;
+    for (label, path, body, change) in [("positive", "receipt.txt", b"real checked source receipt\n".as_slice(), 151), ("negative", "status.txt", b"1\n".as_slice(), 152)] {
+        let file = tinytree_model::describe_file(body);
+        let mut selected = projected_tree.clone();
+        if let Some(entry) = selected.entries.iter_mut().find(|entry| entry.name == path) {
+            let TreeValue::File { id, size_bytes, .. } = &mut entry.value else { panic!("checker edit is a regular FILE") };
+            *id = FileId(file.key.id.0); *size_bytes = file.size_bytes;
+        } else { selected.entries.push(TreeEntry { name: path.into(), value: TreeValue::File { id: FileId(file.key.id.0), size_bytes: file.size_bytes, executable: false, copy_id: None } }); }
+        selected.entries.sort_by(|a,b| a.name.cmp(&b.name));
+        let tree = tinytree_model::encode(&Object::Tree(selected), Limits::default()).unwrap();
+        let mut commit = projected_commit.clone();
+        commit.parents = vec![CommitId(projection.projected_commit)]; commit.predecessors.clear();
+        commit.root_tree.terms = vec![TreeId(tree.descriptor.key.id.0)]; commit.change_id = ChangeId([change;16]); commit.description = format!("Actual {label} Bazel check");
+        let mut cancellation_commit = commit.clone();
+        cancellation_commit.description = "Metadata-only cancellation acceptance amendment".into();
+        let commit = tinytree_model::encode(&Object::Commit(commit), Limits::default()).unwrap();
+        let mut uploads = Vec::new();
+        for (path, descriptor, bytes) in [(path, file, body.to_vec()), ("", tree.descriptor, tree.bytes), ("", commit.descriptor, commit.bytes)] {
+            let request_id = format!("checker-{label}-upload-{}", descriptor.key.kind as u8);
+            let begun = store.forge_begin_upload(&view, &actor, &request_id, path, descriptor, 0).unwrap();
+            let mut offset = 0;
+            for chunk in bytes.chunks(65536) { store.forge_append_upload(&account, &actor, "public", begun.session_id, offset, chunk, 0).unwrap(); offset += chunk.len() as u64; }
+            let finished = store.forge_finalize_upload(&account, &actor, "public", begun.session_id, 0).unwrap();
+            assert!(finished.receipt.is_some());
+            uploads.push(json!({"path":path,"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes,"request_id":request_id}));
+        }
+        let request = tinytree_store::ForgeReviewPushRequest { request_id: format!("checker-{label}-push"), source_base: CommitId(projection.projected_commit), source_head: CommitId(commit.descriptor.key.id.0), view_version: view.version().0, expected_patchset: None, predecessor: None, provenance: None, lineage: vec![], check_profile: profile.clone() };
+        let review = store.forge_push_review(&account, &actor, &request, &projected_commit.committer, 1).unwrap();
+        if let Some(entry) = expected.entries.iter_mut().find(|entry| entry.name == path) {
+            entry.value = TreeValue::File { id: FileId(file.key.id.0), size_bytes: file.size_bytes, executable: false, copy_id: None };
+        } else { expected.entries.push(TreeEntry { name: path.into(), value: TreeValue::File { id: FileId(file.key.id.0), size_bytes: file.size_bytes, executable: false, copy_id: None } }); }
+        expected.entries.sort_by(|a,b| a.name.cmp(&b.name));
+        let expected = tinytree_model::encode(&Object::Tree(expected.clone()), Limits::default()).unwrap();
+        reviews.push(json!({"label":label,"objects":uploads,"request_id":request.request_id,"change_id":hex(&[change;16]),"patchset_id":hex(&review.patchset_id),"expected_canonical_tree":hex(&expected.descriptor.key.id.0),"push":{"source_base":hex(&projection.projected_commit),"source_head":hex(&request.source_head.0),"view_version":hex(&view.version().0),"expected_patchset":null,"predecessor":null,"provenance":null,"lineage":[]},"native_admission_only":true}));
+        if label == "negative" {
+            // Same logical change/tree: only immutable commit metadata changes.
+            // This is an explicit failed-patchset amendment, not a lease retry
+            // on an ineligible already-Failed candidate or a synthetic busy test.
+            let amended = tinytree_model::encode(&Object::Commit(cancellation_commit), Limits::default()).unwrap();
+            let request_id = "checker-cancellation-upload-3";
+            let begun = store.forge_begin_upload(&view, &actor, request_id, "", amended.descriptor, 0).unwrap();
+            let mut offset = 0;
+            for chunk in amended.bytes.chunks(65536) { store.forge_append_upload(&account, &actor, "public", begun.session_id, offset, chunk, 0).unwrap(); offset += chunk.len() as u64; }
+            assert!(store.forge_finalize_upload(&account, &actor, "public", begun.session_id, 0).unwrap().receipt.is_some());
+            let amendment = tinytree_store::ForgeReviewPushRequest { request_id: "checker-cancellation-push".into(), source_base: request.source_base,
+                source_head: CommitId(amended.descriptor.key.id.0), view_version: request.view_version, expected_patchset: Some(review.patchset_id),
+                predecessor: None, provenance: None, lineage: vec![], check_profile: profile.clone() };
+            let admitted = store.forge_push_review(&account, &actor, &amendment, &projected_commit.committer, 1).unwrap();
+            assert_eq!(admitted.change_id, review.change_id); assert_ne!(admitted.patchset_id, review.patchset_id);
+            cancellation = Some(json!({"label":"cancellation","metadata_only":true,"objects":[{"path":"","kind":3,"id":hex(&amended.descriptor.key.id.0),"size_bytes":amended.descriptor.size_bytes,"format_version":amended.descriptor.format_version,"bytes":amended.bytes,"request_id":request_id}],
+                "request_id":amendment.request_id,"change_id":hex(&[change;16]),"patchset_id":hex(&admitted.patchset_id),"expected_canonical_tree":hex(&expected.descriptor.key.id.0),
+                "push":{"source_base":hex(&amendment.source_base.0),"source_head":hex(&amendment.source_head.0),"view_version":hex(&amendment.view_version),"expected_patchset":hex(&review.patchset_id),"predecessor":null,"provenance":null,"lineage":[]}}));
+        }
+    }
+    json!({"account_id":account.0,"owner":actor.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"view_version":view.version().0,"projected_base":hex(&projection.projected_commit),"profile":profile,"private_file":{"kind":1,"id":hex(&secret.key.id.0)},"reviews":reviews,"cancellation":cancellation.unwrap()})
+}
+
 fn main() {
+    let mut arguments = std::env::args().skip(1);
+    let checker_profile = match arguments.next() {
+        None => hex(&tinytree_model::file_id(b"checker-acceptance-default-profile").0),
+        Some(argument) => {
+            assert_eq!(argument, "--checker-profile-version", "unknown fixture argument");
+            let value = arguments.next().expect("checker profile version required");
+            assert!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "invalid checker profile version");
+            assert!(arguments.next().is_none(), "unexpected fixture arguments"); value
+        }
+    };
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), Config::default()).unwrap();
     store.create_repository(REPOSITORY).unwrap();
@@ -939,10 +1067,12 @@ fn main() {
     let projection_fixture = projection_fixture(&store);
     let bootstrap_fixture = bootstrap_fixture(&store);
     let search_fixture = search_fixture(&store);
+    let checker_fixture = checker_fixture(&store, &checker_profile);
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
         "projection":projection_fixture,
         "bootstrap":bootstrap_fixture,
         "search":search_fixture,
+        "checker":checker_fixture,
         "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
         "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),

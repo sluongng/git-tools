@@ -132,6 +132,32 @@ js_test(
     timeout = "moderate",
 )
 
+# Real Linux namespace and remote-execution acceptance, selected explicitly.
+js_test(
+    name = "checker_acceptance",
+    entry_point = "tools/checker-acceptance.mjs",
+    no_copy_to_bin = ["@checker_bazel_linux_x86_64//file"],
+    args = [
+        "$(rootpath //crates/tinytree-cloudflare:contract_fixture)",
+        "$(rootpath //crates/tinytree-check-runner:tinytree-check-runner-bin)",
+        "$(rootpath //crates/tinytree-check-runner:readonly_snapshot_helper)",
+        "$(rootpath @checker_bazel_linux_x86_64//file)",
+        "cloudflare/worker.mjs",
+        "cloudflare/core.wasm",
+    ],
+    data = [
+        ":worker",
+        ":node_modules/miniflare",
+        "//crates/tinytree-cloudflare:contract_fixture",
+        "//crates/tinytree-check-runner:tinytree-check-runner-bin",
+        "//crates/tinytree-check-runner:readonly_snapshot_helper",
+        "@checker_bazel_linux_x86_64//file",
+    ],
+    tags = ["local", "manual"],
+    target_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    timeout = "long",
+)
+
 # Explicit local interactive acceptance, never a deployed Worker entrypoint.
 js_binary(
     name = "browser_fixture",

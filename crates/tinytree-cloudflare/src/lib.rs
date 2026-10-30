@@ -14,6 +14,7 @@ mod imports;
 mod uploads;
 mod reviews;
 mod review_admission;
+mod checker;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -474,6 +475,34 @@ pub extern "C" fn tt_forge_review_format(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_review_admission(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, review_admission::analyze)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_parse_call(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::parse_call)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_fingerprint(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::fingerprint)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_lease_binding(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::lease_binding)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_request(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::derive_request)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_receipt(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::receipt)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_snapshot_page(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::snapshot_page)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_checker_manifest_step(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, checker::manifest_step)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

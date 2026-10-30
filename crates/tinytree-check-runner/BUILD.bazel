@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -42,4 +43,30 @@ rust_binary(
     srcs = ["tests/process_fixture.rs"],
     edition = "2024",
     deps = ["@crates//:libc"],
+)
+
+rust_binary(
+    name = "readonly_snapshot_helper",
+    srcs = ["tools/readonly_snapshot.rs"],
+    edition = "2024",
+    aliases = aliases(),
+    deps = [":tinytree-check-runner"] + all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "snapshot_acceptance",
+    testonly = True,
+    srcs = ["tools/snapshot_acceptance.rs"],
+    edition = "2024",
+    aliases = aliases(),
+    data = [":readonly_snapshot_helper"],
+    rustc_env = {"SNAPSHOT_HELPER": "$(rootpath :readonly_snapshot_helper)"},
+    deps = [":tinytree-check-runner"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+fixture_test(
+    name = "readonly_snapshot_tests",
+    binary = ":snapshot_acceptance",
+    tags = ["local", "manual"],
+    target_compatible_with = ["@platforms//os:linux"],
 )

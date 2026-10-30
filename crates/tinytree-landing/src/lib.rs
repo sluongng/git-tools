@@ -247,6 +247,28 @@ pub fn build_on_projected_base(
     builder.build(request, Some(canonical_base), true)
 }
 
+#[derive(Clone, Copy)]
+enum BaselineMapping {
+    Projected(m::TreeId),
+    Rewritten(m::TreeId),
+}
+impl BaselineMapping {
+    fn tree(self) -> m::TreeId {
+        match self {
+            Self::Projected(tree) | Self::Rewritten(tree) => tree,
+        }
+    }
+    fn at(self, tree: m::TreeId) -> Self {
+        match self {
+            Self::Projected(_) => Self::Projected(tree),
+            Self::Rewritten(_) => Self::Rewritten(tree),
+        }
+    }
+    fn is_projected(self) -> bool {
+        matches!(self, Self::Projected(_))
+    }
+}
+
 struct Builder<'a, R> {
     reader: &'a mut R,
     limits: Limits,
@@ -442,13 +464,18 @@ impl<R: MetadataReader> Builder<'_, R> {
             destination = c.parents[0];
         }
         let base = self.commit(request.source_base)?;
-        if let Some(mapped) = mapped_base {
-            if mapped == m::CommitId::ROOT
-                || (!projected && self.commit(mapped)?.change_id != base.change_id)
-            {
+        let mapped_tree = if let Some(mapped) = mapped_base {
+            if mapped == m::CommitId::ROOT {
                 return Err(Error::Invalid("mapped source base identity"));
             }
-        }
+            let rewritten_base = self.commit(mapped)?;
+            if !projected && rewritten_base.change_id != base.change_id {
+                return Err(Error::Invalid("mapped source base identity"));
+            }
+            Some(Self::root(&rewritten_base)?)
+        } else {
+            None
+        };
         if changes.contains(&base.change_id) {
             return Err(Error::Invalid("source ChangeId equals base ChangeId"));
         }
@@ -457,17 +484,20 @@ impl<R: MetadataReader> Builder<'_, R> {
         let mut destination_tree = Self::root(&destination)?;
         let mut parent = request.destination_head;
         let mut rewrites = Vec::with_capacity(chain.len());
+        let mut mapping = mapped_tree.map(|tree| {
+            if projected {
+                BaselineMapping::Projected(tree)
+            } else {
+                BaselineMapping::Rewritten(tree)
+            }
+        });
         for (old, source) in chain {
             let source_tree = Self::root(&source)?;
-            let canonical = if projected {
-                Some(Self::root(&self.commit(
-                    mapped_base.ok_or(Error::Invalid("projected baseline"))?,
-                )?)?)
-            } else {
-                None
-            };
             let merged =
-                self.merge_inner(base_tree, source_tree, destination_tree, "", 0, canonical)?;
+                self.merge_inner(base_tree, source_tree, destination_tree, "", 0, mapping)?;
+            // Subsequent source commits map to their exact rewritten predecessor,
+            // not back to the initial sanitized projection's baseline.
+            mapping = mapping.map(|_| BaselineMapping::Rewritten(merged));
             let rewritten = m::Commit {
                 parents: vec![parent],
                 root_tree: m::TreeMerge {
@@ -538,7 +568,7 @@ impl<R: MetadataReader> Builder<'_, R> {
         dest: m::TreeId,
         path: &str,
         depth: usize,
-        canonical: Option<m::TreeId>,
+        mapping: Option<BaselineMapping>,
     ) -> Result<m::TreeId, Error> {
         self.work(1)?;
         if source == base {
@@ -551,7 +581,7 @@ impl<R: MetadataReader> Builder<'_, R> {
             return Err(Error::Limit(Budget::Depth));
         }
         let trees = [self.tree(base)?, self.tree(source)?, self.tree(dest)?];
-        let canonical_tree = canonical.map(|id| self.tree(id)).transpose()?;
+        let canonical_tree = mapping.map(|m| self.tree(m.tree())).transpose()?;
         let mut positions = [0usize; 3];
         let mut output = Vec::new();
         // Conservative v1 envelope/entry allowance bounds unfinished parent
@@ -584,23 +614,32 @@ impl<R: MetadataReader> Builder<'_, R> {
                     id: a,
                     executable: ae,
                     size_bytes: az,
-                    ..
+                    copy_id: projected_copy,
                 }),
                 Some(m::TreeValue::File {
                     id: b,
                     executable: be,
                     size_bytes: bz,
-                    ..
+                    copy_id: canonical_copy,
                 }),
             ) = (&originals[0], mapped)
             {
-                if a != b || ae != be || az != bz {
+                if a == b && ae == be && az == bz {
+                    normalized[0] = mapped.cloned();
+                    if originals[1] == originals[0] {
+                        normalized[1] = mapped.cloned();
+                    } else if let Some(m::TreeValue::File { copy_id, .. }) = &mut normalized[1] {
+                        // A same-path edit retains the baseline identity. Translate
+                        // only that identity, preserving submitted bytes and mode.
+                        if *copy_id == *projected_copy {
+                            *copy_id = *canonical_copy;
+                        }
+                    }
+                } else if mapping.is_some_and(BaselineMapping::is_projected) {
                     return Err(Error::Invalid("projected baseline file mapping"));
                 }
-                normalized[0] = mapped.cloned();
-                if originals[1] == originals[0] {
-                    normalized[1] = mapped.cloned();
-                }
+                // A rewritten predecessor may contain concurrent content/mode
+                // changes. Non-equivalent FILEs retain ordinary three-way rules.
             }
             let values = std::array::from_fn::<_, 3, _>(|i| normalized[i].as_ref());
             let child_path = self.path(path, name)?;
@@ -621,11 +660,11 @@ impl<R: MetadataReader> Builder<'_, R> {
                     &child_path,
                     depth + 1,
                     match mapped {
-                        Some(m::TreeValue::Tree(id)) => Some(*id),
+                        Some(m::TreeValue::Tree(id)) => mapping.map(|m| m.at(*id)),
                         _ => None,
                     },
                 )?))
-            } else if canonical.is_some()
+            } else if mapping.is_some_and(BaselineMapping::is_projected)
                 && matches!(values[0], Some(m::TreeValue::Tree(_)) | None)
                 && matches!(values[1], Some(m::TreeValue::Tree(_)) | None)
                 && matches!(values[2], Some(m::TreeValue::Tree(_)))
@@ -648,8 +687,8 @@ impl<R: MetadataReader> Builder<'_, R> {
                     &child_path,
                     depth + 1,
                     match mapped {
-                        Some(m::TreeValue::Tree(id)) => Some(*id),
-                        _ => Some(empty),
+                        Some(m::TreeValue::Tree(id)) => mapping.map(|m| m.at(*id)),
+                        _ => mapping.map(|m| m.at(empty)),
                     },
                 )?;
                 if self.tree(merged)?.entries.is_empty() {

@@ -1,4 +1,6 @@
-use crate::{bep, process, Config, Evidence, Mode, Outcome, Receipt, Request};
+use crate::candidate_http::CandidateClient;
+use crate::prepared_source::PreparedSource;
+use crate::{Config, Evidence, Mode, Outcome, Receipt, Request, bep, process};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use private_fs::PrivateDir;
@@ -11,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tinytree_forge_core::checker::CheckerLease;
 use tokio::{process::Command, sync::watch, time::Instant};
 
 #[derive(Serialize, Deserialize)]
@@ -23,6 +26,8 @@ struct Journal {
     mount_attempted: bool,
     cleanup_sequence: u32,
     receipt: Option<Receipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease: Option<CheckerLease>,
 }
 fn forge_repository(config: &Config, request: &Request) -> Result<bool> {
     let profile = config.profile(&request.profile_name)?;
@@ -262,6 +267,7 @@ impl Attempt {
             mount_attempted: false,
             cleanup_sequence: 0,
             receipt: None,
+            lease: None,
         });
         ensure!(
             journal.schema == 1
@@ -358,10 +364,18 @@ impl Attempt {
         Ok(result["report"].clone())
     }
     fn prepare(&self, config: &Config) -> Result<()> {
-        for name in ["home", "temporary", "tools", "source"] {
+        for name in ["home", "temporary", "tools"] {
             PrivateDir::create(self.path(name))?;
         }
-        let mut binaries = vec![(&config.workspace, "workspace"), (&config.bazel, "bazel")];
+        if config.https_snapshot.is_none() {
+            PrivateDir::create(self.path("source"))?;
+        }
+        let mut binaries = vec![(&config.bazel, "bazel")];
+        if let Some(snapshot) = &config.https_snapshot {
+            binaries.push((&snapshot.readonly_helper, "readonly-snapshot"));
+        } else {
+            binaries.push((config.native_workspace()?, "workspace"));
+        }
         binaries.extend(
             config
                 .tools
@@ -389,7 +403,15 @@ impl Attempt {
             }
             .verify()?;
         }
-        let bytes = crate::config::read_config(&config.daemon_config)?;
+        if config.https_snapshot.is_some() {
+            ensure!(
+                config.profile_version(&self.journal.request.profile_name)?
+                    == self.journal.request.profile_version,
+                "profile changed during attempt setup"
+            );
+            return Ok(());
+        }
+        let bytes = crate::config::read_config(config.native_daemon()?)?;
         ensure!(
             config.profile_version_for_daemon(&self.journal.request.profile_name, &bytes)?
                 == self.journal.request.profile_version,
@@ -434,6 +456,37 @@ impl Drop for RunningCheck {
 pub fn start(
     config: Config,
     request: Request,
+    cancellation: watch::Receiver<bool>,
+) -> RunningCheck {
+    start_owned(config, request, None, cancellation)
+}
+pub fn start_leased(
+    config: Config,
+    lease: CheckerLease,
+    client: CandidateClient,
+    cancellation: watch::Receiver<bool>,
+) -> RunningCheck {
+    start_owned(
+        config,
+        lease.request.clone(),
+        Some((lease, client)),
+        cancellation,
+    )
+}
+pub async fn run_leased(
+    config: &Config,
+    lease: CheckerLease,
+    client: CandidateClient,
+    cancellation: watch::Receiver<bool>,
+) -> Result<Receipt> {
+    start_leased(config.clone(), lease, client, cancellation)
+        .wait()
+        .await
+}
+fn start_owned(
+    config: Config,
+    request: Request,
+    leased: Option<(CheckerLease, CandidateClient)>,
     mut cancellation: watch::Receiver<bool>,
 ) -> RunningCheck {
     let (sender, receiver) = watch::channel(*cancellation.borrow());
@@ -451,7 +504,7 @@ pub fn start(
                 }
             }
         });
-        let result = run_owned(&config, request, receiver).await;
+        let result = run_owned(&config, request, leased, receiver).await;
         bridge.abort();
         result
     });
@@ -477,11 +530,44 @@ pub async fn recover(config: &Config, request: Request) -> Result<Receipt> {
 async fn run_owned(
     config: &Config,
     request: Request,
+    leased: Option<(CheckerLease, CandidateClient)>,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Receipt> {
     #[cfg(not(target_os = "linux"))]
     anyhow::bail!("native immutable check execution requires Linux acceptance");
+    ensure!(
+        config.https_snapshot.is_some() == leased.is_some(),
+        "source backend requires its exact execution authority"
+    );
+    if let Some((_, client)) = &leased {
+        let snapshot = config
+            .https_snapshot
+            .as_ref()
+            .context("snapshot source is unavailable")?;
+        ensure!(
+            client.matches_config(&snapshot.origin, &snapshot.credential_environment),
+            "checker transport differs from frozen source configuration"
+        );
+    }
     let mut attempt = Attempt::open(config, &request, false)?;
+    if let Some((lease, _)) = &leased {
+        lease.validate()?;
+        ensure!(lease.request == request, "lease request differs");
+        if let Some(original) = &attempt.journal.lease {
+            ensure!(
+                original.immutable_binding()? == lease.immutable_binding()?,
+                "attempt lease binding differs"
+            );
+        } else {
+            ensure!(
+                !attempt.journal.mount_attempted && !attempt.path("tools").exists(),
+                "incomplete source requires recovery"
+            );
+            attempt.journal.lease = Some(lease.clone());
+            attempt.save()?;
+        }
+    }
+
     if let Some(receipt) = &attempt.journal.receipt {
         return Ok(receipt.clone());
     }
@@ -500,63 +586,82 @@ async fn run_owned(
         ensure!(!*cancelled.borrow(), "check cancelled before mount");
         attempt.journal.mount_attempted = true;
         attempt.save()?;
-        let root = attempt.path("source");
-        let root_string = root.to_str().context("invalid source path")?;
-        let mounted = attempt
-            .control_cancellable(
-                &[
-                    "native-candidate-mount",
-                    root_string,
-                    "--store",
-                    store,
-                    "--commit",
-                    &request.candidate_commit,
-                    "--workspace-id",
-                    &attempt.journal.workspace_id,
-                ],
-                "mount",
-                remaining(deadline)?,
-                Some(&mut cancelled),
+        let mut arguments = startup(&attempt);
+        if config.https_snapshot.is_some() {
+            arguments.insert(0, "--batch".into());
+        }
+        arguments.push(profile.mode.command().into());
+        arguments.extend(profile.targets.clone());
+        arguments.extend(profile_flags(&attempt, &profile.flags)?);
+        arguments.extend(build_flags(config, &attempt, profile));
+        let prepared = if let Some((lease, client)) = &leased {
+            PreparedSource::https(
+                config,
+                &request,
+                lease,
+                client,
+                attempt.root.path(),
+                &mut cancelled,
+                deadline,
+                arguments.clone(),
             )
-            .await?;
-        ensure!(
-            mounted["binding"]["root"].as_str() == Some(root_string)
-                && mounted["binding"]["repository"].as_str() == Some(store),
-            "mounted binding differs"
-        );
-        let proof = attempt
-            .control_cancellable(
-                &[
-                    "native-candidate-inspect",
-                    "--workspace-id",
-                    &attempt.journal.workspace_id,
-                    "--commit",
-                    &request.candidate_commit,
-                ],
-                "inspect",
-                remaining(deadline)?,
-                Some(&mut cancelled),
-            )
-            .await?;
-        validate_proof(
-            &proof,
-            &request,
-            &attempt.journal.workspace_id,
-            &root,
-            store,
-        )?;
-        require_readonly_mount(&root, &attempt.journal.workspace_id)?;
-        let mut command = attempt.command(&attempt.path("tools/bazel"), false);
-        command
-            .current_dir(&root)
-            .args(startup(&attempt))
-            .arg(profile.mode.command())
-            .args(&profile.targets)
-            .args(profile_flags(&attempt, &profile.flags)?);
-        command.args(build_flags(config, &attempt, profile));
+            .await?
+        } else {
+            let root = attempt.path("source");
+            let root_string = root.to_str().context("invalid source path")?;
+            let mounted = attempt
+                .control_cancellable(
+                    &[
+                        "native-candidate-mount",
+                        root_string,
+                        "--store",
+                        store,
+                        "--commit",
+                        &request.candidate_commit,
+                        "--workspace-id",
+                        &attempt.journal.workspace_id,
+                    ],
+                    "mount",
+                    remaining(deadline)?,
+                    Some(&mut cancelled),
+                )
+                .await?;
+            ensure!(
+                mounted["binding"]["root"].as_str() == Some(root_string)
+                    && mounted["binding"]["repository"].as_str() == Some(store),
+                "mounted binding differs"
+            );
+            let proof = attempt
+                .control_cancellable(
+                    &[
+                        "native-candidate-inspect",
+                        "--workspace-id",
+                        &attempt.journal.workspace_id,
+                        "--commit",
+                        &request.candidate_commit,
+                    ],
+                    "inspect",
+                    remaining(deadline)?,
+                    Some(&mut cancelled),
+                )
+                .await?;
+            validate_proof(
+                &proof,
+                &request,
+                &attempt.journal.workspace_id,
+                &root,
+                store,
+            )?;
+            require_readonly_mount(&root, &attempt.journal.workspace_id)?;
+            PreparedSource::native(root)
+        };
+        let (program, args, working_directory) =
+            prepared.execution(attempt.root.path(), arguments)?;
+        let mut command = attempt.command(&program, false);
+        command.current_dir(working_directory).args(args);
         let stdout = attempt.path("build.stdout");
         let stderr = attempt.path("build.stderr");
-        let limits = [
+        let mut limits = vec![
             (stdout.clone(), config.max_log_bytes),
             (stderr.clone(), config.max_log_bytes),
             (attempt.path("bep.jsonl"), config.max_bep_bytes),
@@ -565,6 +670,9 @@ async fn run_owned(
                 config.max_execution_log_bytes,
             ),
         ];
+        if config.https_snapshot.is_some() {
+            limits.push((attempt.path("snapshot-proof.json"), 65536));
+        }
         let status = process::execute(
             command,
             &stdout,
@@ -582,28 +690,32 @@ async fn run_owned(
             config.max_bep_bytes,
             config.max_execution_log_bytes,
         )?;
-        require_readonly_mount(&root, &attempt.journal.workspace_id)?;
-        let after = attempt
-            .control_cancellable(
-                &[
-                    "native-candidate-inspect",
-                    "--workspace-id",
-                    &attempt.journal.workspace_id,
-                    "--commit",
-                    &request.candidate_commit,
-                ],
-                "inspect-after",
-                remaining(deadline)?,
-                Some(&mut cancelled),
-            )
-            .await?;
-        validate_proof(
-            &after,
-            &request,
-            &attempt.journal.workspace_id,
-            &root,
-            store,
-        )?;
+        prepared.verify_completed(status)?;
+        if config.https_snapshot.is_none() {
+            let root = attempt.path("source");
+            require_readonly_mount(&root, &attempt.journal.workspace_id)?;
+            let after = attempt
+                .control_cancellable(
+                    &[
+                        "native-candidate-inspect",
+                        "--workspace-id",
+                        &attempt.journal.workspace_id,
+                        "--commit",
+                        &request.candidate_commit,
+                    ],
+                    "inspect-after",
+                    remaining(deadline)?,
+                    Some(&mut cancelled),
+                )
+                .await?;
+            validate_proof(
+                &after,
+                &request,
+                &attempt.journal.workspace_id,
+                &root,
+                store,
+            )?;
+        }
         ensure!(!*cancelled.borrow(), "check cancelled before verdict");
         outcome = if completion.success {
             Outcome::Passed
@@ -663,6 +775,57 @@ async fn recover_owned(config: &Config, request: Request) -> Result<Receipt> {
             return Ok(receipt.clone());
         }
     }
+    if attempt.journal.config.https_snapshot.is_some() {
+        let frozen = attempt.journal.config.clone();
+        let lease = attempt
+            .journal
+            .lease
+            .as_ref()
+            .context("snapshot recovery lease is missing")?;
+        lease.validate()?;
+        ensure!(
+            lease.request == request
+                && frozen.profile_version(&request.profile_name)? == request.profile_version,
+            "snapshot recovery binding differs"
+        );
+        for (name, binary) in [
+            ("bazel", &frozen.bazel),
+            (
+                "readonly-snapshot",
+                &frozen.https_snapshot.as_ref().unwrap().readonly_helper,
+            ),
+        ] {
+            crate::Binary {
+                path: attempt.path(&format!("tools/{name}")),
+                sha256: binary.sha256.clone(),
+            }
+            .verify()?;
+        }
+        let cleanup_name = attempt.next_cleanup()?;
+        let cleanup_confirmed = cleanup(&frozen, &attempt, &cleanup_name).await.is_ok();
+        let receipt = Receipt {
+            schema: 1,
+            request,
+            workspace_id: attempt.journal.workspace_id.clone(),
+            outcome: Outcome::Unavailable,
+            reason: if cleanup_confirmed {
+                "recovered_without_verdict"
+            } else {
+                "cleanup_required"
+            }
+            .into(),
+            cleanup_confirmed,
+            evidence: attempt
+                .journal
+                .receipt
+                .as_ref()
+                .and_then(|r| r.evidence.clone()),
+        };
+        receipt.validate_for(&receipt.request)?;
+        attempt.journal.receipt = Some(receipt.clone());
+        attempt.save()?;
+        return Ok(receipt);
+    }
     ensure!(
         attempt.path("tools/workspace").is_file() && attempt.path("tools/bazel").is_file(),
         "incomplete setup requires operator inspection"
@@ -690,7 +853,7 @@ async fn recover_owned(config: &Config, request: Request) -> Result<Receipt> {
     );
     crate::Binary {
         path: attempt.path("tools/workspace"),
-        sha256: config.workspace.sha256.clone(),
+        sha256: config.native_workspace()?.sha256.clone(),
     }
     .verify()?;
     crate::Binary {
@@ -727,6 +890,9 @@ async fn cleanup(config: &Config, attempt: &Attempt, prefix: &str) -> Result<()>
     process::require_quiescent(attempt.root.path())?;
     let timeout = Duration::from_secs(config.cleanup_timeout_seconds);
     let mut command = attempt.command(&attempt.path("tools/bazel"), false);
+    if config.https_snapshot.is_some() {
+        command.arg("--batch");
+    }
     command.args(startup(attempt)).arg("shutdown");
     let stdout = attempt.path(&format!("{prefix}-shutdown.stdout"));
     let stderr = attempt.path(&format!("{prefix}-shutdown.stderr"));
@@ -740,6 +906,15 @@ async fn cleanup(config: &Config, attempt: &Attempt, prefix: &str) -> Result<()>
         "Bazel shutdown is not confirmed; retain source"
     );
     process::require_quiescent(attempt.root.path())?;
+    if config.https_snapshot.is_some() {
+        ensure!(
+            mount(&attempt.path("source"))?.is_none()
+                && mount(&attempt.path("source-staging"))?.is_none(),
+            "unexpected snapshot mount remains"
+        );
+        crate::prepared_source::cleanup_snapshot(attempt.root.path())?;
+        return Ok(());
+    }
     // Source retirement requires confirmed server and process quiescence.
     let unmount = if attempt.journal.mount_attempted && mount(&attempt.path("source"))?.is_some() {
         attempt

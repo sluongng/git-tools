@@ -45,12 +45,14 @@ preparation, exact-candidate decisions and comments. Large source admission retu
 bounded `admission_pending` progress before reserving a patchset; the SDK and CLI
 continue the original saved intent. Candidate construction uses the shared native
 rebase engine, and published result reads use a separate sanitized projection.
-Preparation does not execute checks: successful candidates remain `checks_pending`.
-Operation 24 refuses landing until authenticated checker execution and atomic
-checked publication are implemented. Approval votes alone never make a candidate
-ready or publish it.
+Preparation does not execute checks: successful candidates remain `checks_pending`
+until a separately authenticated execution-only checker returns the exact
+physical receipt. Operation 24 atomically publishes only a current candidate
+with a fresh accepted passing check, required approvals, verified closure and
+matching main head and generation. Dependent candidates must satisfy the same
+obligations. Approval votes alone never publish a change.
 
-Query, transforms, workspace backup and checked landing remain unsupported. The
+General queries, transforms and workspace backup remain unsupported. The
 complete `tt` Forge workflow is not yet supported by this target. Unsupported
 operations fail explicitly; there is no fallback to the local backend. Do not
 expose it as an equivalent public Forge service or switch an existing account
@@ -115,6 +117,23 @@ lowercase hexadecimal `version`) and `committer` (`name` and `email`). Public
 requests cannot select these trusted fields. The version must identify the
 intended immutable check profile; configuring it does not run a checker or
 provide a check receipt. Missing configuration refuses submission.
+
+The separate `POST /api/v1/checker/call` endpoint uses `CHECKERS_JSON`, not Forge
+membership or raw identities. Each record contains `principal`, `token_sha256`,
+`accounts` and exact `profiles` (`name` and `version`). The checker can claim only
+server-selected candidates for its granted account/profile, read their current
+snapshot, renew custody and deliver results. It cannot approve or land changes,
+read arbitrary objects, or access canonical ancestry and copy-origin payloads.
+`FORGE_CHECK_POLICY_JSON` freezes `profile`, exact `targets` and the `test`
+boolean; it must agree with the selected review profile. Missing or changed
+policy cannot turn an old receipt into a passing current check.
+
+The Linux [check runner](../crates/tinytree-check-runner/README.md) downloads and
+independently verifies the candidate, executes pinned Bazel against a readonly
+snapshot, and delivers a result only after cleanup. Expiry is not cleanup:
+uncertain execution custody and retained roots require explicit recovery.
+Result acceptance does not publish main; operation 24 performs that separate
+transaction. This is operator-trusted execution, not hostile-tenant isolation.
 
 Raw requests are disabled unless `EXPERIMENTAL_RAW_BACKEND` is explicitly set to
 `enabled`. Never put bearer tokens or principal secrets in source, Wrangler

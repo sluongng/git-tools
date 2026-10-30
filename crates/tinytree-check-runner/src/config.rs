@@ -80,16 +80,30 @@ fn default_timeout() -> u64 {
     1800
 }
 
+/// Explicit execution-only source mode. Secret values are never configuration.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpsSnapshotConfig {
+    pub origin: String,
+    pub credential_environment: String,
+    pub readonly_helper: Binary,
+    pub limits: tinytree_forge_core::checker::SnapshotLimits,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub scratch: PathBuf,
-    pub daemon_config: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_config: Option<PathBuf>,
     pub rbe_socket: PathBuf,
     pub runner_sha256: String,
     #[serde(default)]
     pub remote_instance_name: String,
-    pub workspace: Binary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Binary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_snapshot: Option<HttpsSnapshotConfig>,
     pub bazel: Binary,
     #[serde(default)]
     pub tools: BTreeMap<String, Binary>,
@@ -137,21 +151,45 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
-        for path in [
-            &self.scratch,
-            &self.daemon_config,
-            &self.rbe_socket,
-            &self.workspace.path,
-            &self.bazel.path,
-        ] {
+        for path in [&self.scratch, &self.rbe_socket, &self.bazel.path] {
             absolute(path)?;
         }
         ensure!(
-            hex_id(&self.workspace.sha256)
-                && hex_id(&self.bazel.sha256)
-                && hex_id(&self.runner_sha256),
+            hex_id(&self.bazel.sha256) && hex_id(&self.runner_sha256),
             "invalid binary pin"
         );
+        if let Some(snapshot) = &self.https_snapshot {
+            ensure!(
+                self.daemon_config.is_none()
+                    && self.workspace.is_none()
+                    && self.workspace_environment.is_empty(),
+                "snapshot mode cannot inherit native management authority"
+            );
+            crate::candidate_http::validate_origin(&snapshot.origin)?;
+            ensure!(
+                name(&snapshot.credential_environment)
+                    && !snapshot.credential_environment.as_bytes()[0].is_ascii_digit()
+                    && !snapshot.credential_environment.contains(['-', '.'])
+                    && !snapshot.credential_environment.starts_with("LD_")
+                    && !snapshot.credential_environment.starts_with("DYLD_")
+                    && !matches!(
+                        snapshot.credential_environment.as_str(),
+                        "PATH" | "HOME" | "TMPDIR" | "XDG_CONFIG_HOME" | "BASH_ENV" | "ENV"
+                    ),
+                "invalid snapshot credential reference"
+            );
+            absolute(&snapshot.readonly_helper.path)?;
+            ensure!(
+                hex_id(&snapshot.readonly_helper.sha256),
+                "invalid snapshot helper pin"
+            );
+            snapshot.limits.validate()?;
+        } else {
+            absolute(self.native_daemon()?)?;
+            let workspace = self.native_workspace()?;
+            absolute(&workspace.path)?;
+            ensure!(hex_id(&workspace.sha256), "invalid workspace pin");
+        }
         ensure!(
             (1..=128).contains(&self.profiles.len())
                 && (1..=300).contains(&self.cleanup_timeout_seconds)
@@ -200,6 +238,7 @@ impl Config {
             ensure!(
                 crate::name(name)
                     && !matches!(name.as_str(), "workspace" | "bazel")
+                    && (self.https_snapshot.is_none() || name != "readonly-snapshot")
                     && hex_id(&binary.sha256),
                 "invalid profile tool"
             );
@@ -257,10 +296,43 @@ impl Config {
     /// command policy require a new frozen server profile version.
     pub fn profile_version(&self, name: &str) -> Result<String> {
         self.validate()?;
-        let daemon = read_config(&self.daemon_config)?;
+        if self.https_snapshot.is_some() {
+            let profile = self.profile(name)?;
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"tinytree-check-https-snapshot-profile-v1\0");
+            hash.update(&serde_json::to_vec(&(
+                self,
+                profile,
+                "bazel_batch_readonly_tmpfs_v1",
+            ))?);
+            return Ok(hash.finalize().to_hex().to_string());
+        }
+        let daemon = read_config(self.native_daemon()?)?;
         self.profile_version_for_daemon(name, &daemon)
     }
+    pub(crate) fn native_daemon(&self) -> Result<&Path> {
+        ensure!(
+            self.https_snapshot.is_none(),
+            "native source is not configured"
+        );
+        self.daemon_config
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("native daemon configuration is required"))
+    }
+    pub(crate) fn native_workspace(&self) -> Result<&Binary> {
+        ensure!(
+            self.https_snapshot.is_none(),
+            "native source is not configured"
+        );
+        self.workspace
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native workspace executable is required"))
+    }
     pub(crate) fn profile_version_for_daemon(&self, name: &str, daemon: &[u8]) -> Result<String> {
+        ensure!(
+            self.https_snapshot.is_none(),
+            "snapshot profiles do not use daemon configuration"
+        );
         let profile = self.profile(name)?;
         let mut hash = blake3::Hasher::new();
         hash.update(b"tinytree-check-profile-v1\0");

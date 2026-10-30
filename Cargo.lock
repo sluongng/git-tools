@@ -5628,11 +5628,13 @@ dependencies = [
  "fs2",
  "libc",
  "private-fs",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tinytree-forge-core",
+ "tinytree-model",
  "tokio",
  "toml",
 ]
