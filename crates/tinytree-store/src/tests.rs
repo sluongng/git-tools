@@ -12213,6 +12213,22 @@ fn forge_review_projected_base_and_owned_upload_rebase_without_exposing_canonica
         &[("visible.txt", b"visible")],
         5,
     );
+    // The storage-independent admission API consumes these same native bytes;
+    // it returns requirements, not a substitute upload or ACL grant.
+    struct AdmissionReader<'a> { store: &'a Store, repo: String }
+    impl tinytree_forge_core::review_admission::MetadataReader for AdmissionReader<'_> {
+        fn read(&mut self, key: ObjectKey) -> std::result::Result<(Descriptor, Vec<u8>), tinytree_forge_core::review_admission::ReadError> {
+            self.store.read_metadata(&self.repo, key).map_err(|_| tinytree_forge_core::review_admission::ReadError::Unavailable)
+        }
+    }
+    let facts = tinytree_forge_core::review_admission::analyze(
+        &mut AdmissionReader {store:&store,repo:account.repository_id()},
+        &tinytree_forge_core::review_admission::Input {source_base:projected,source_head:head,lineage:vec![]},
+        tinytree_forge_core::review_admission::Limits::default(),
+    ).unwrap();
+    assert!(facts.requirements.iter().any(|requirement| matches!(requirement,
+        tinytree_forge_core::review_admission::Requirement::Entry {canonical_path,key,..}
+        if canonical_path == "visible.txt" && key.kind == Kind::File as u8)));
     let review = store
         .forge_push_review(
             &account,
@@ -12223,6 +12239,7 @@ fn forge_review_projected_base_and_owned_upload_rebase_without_exposing_canonica
         )
         .unwrap();
     assert!(review.candidate.is_some());
+    assert_eq!(facts.change_id, review.change_id);
     assert_eq!(review.source_base, projection.projected_commit);
     assert_ne!(
         review.candidate.unwrap().target,

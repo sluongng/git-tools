@@ -10,6 +10,8 @@ pub(crate) mod landing;
 pub(crate) mod forge;
 #[path = "forge_resolve.rs"]
 mod forge_resolve;
+#[path = "forge_review.rs"]
+mod forge_review;
 #[path = "query.rs"]
 pub(crate) mod query;
 #[path = "search.rs"]

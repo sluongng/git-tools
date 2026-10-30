@@ -2,7 +2,7 @@
 //! Authentication identities come from the trusted service, never request JSON.
 use super::*;
 use crate::forge_accounts::{AccountId, ForgeAction, ForgeActor, PolicyEpoch, ViewVersion};
-use tinytree_model::{ChangeId, Commit, Object, Signature, Timestamp, TreeId, TreeValue};
+use tinytree_model::{ChangeId, Commit, Object, Signature, Timestamp, TreeId};
 
 const CHANGES: &[u8] = b"forge/reviews/v1/";
 const REQUESTS: &[u8] = b"forge/review-requests/v1/";
@@ -12,8 +12,49 @@ const MAX_ATTEMPTS: usize = 8;
 const MAX_DECISIONS: usize = 128;
 const MAX_COMMENTS: usize = 128;
 
-pub use tinytree_forge_core::review::*;
 use tinytree_forge_core::identity;
+pub use tinytree_forge_core::review::*;
+
+use tinytree_forge_core::review_admission::{self as admission, AdmissionError};
+impl From<AdmissionError> for Error {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::Missing { key } => Self::MissingObject(key),
+            AdmissionError::Unavailable { .. } => Self::Corrupt("review metadata unavailable"),
+            AdmissionError::Invalid(reason) => Self::Invalid(reason),
+            AdmissionError::Limit(reason) => Self::Limit(reason),
+            AdmissionError::Model(error) => Self::Model(error),
+        }
+    }
+}
+struct ReviewMetadata<'a> {
+    inner: &'a Inner,
+    repo: &'a str,
+}
+impl admission::MetadataReader for ReviewMetadata<'_> {
+    fn read(
+        &mut self,
+        key: ObjectKey,
+    ) -> std::result::Result<(Descriptor, Vec<u8>), admission::ReadError> {
+        let descriptor = self
+            .inner
+            .descriptor(self.repo, key)
+            .map_err(|_| admission::ReadError::Unavailable)?
+            .ok_or(admission::ReadError::Missing)?;
+        if descriptor.size_bytes > self.inner.config.model_limits.max_object_bytes as u64 {
+            return Err(admission::ReadError::Limit);
+        }
+        let file = self
+            .inner
+            .open_backing(self.repo, descriptor)
+            .map_err(|_| admission::ReadError::Unavailable)?;
+        let mut bytes = Vec::new();
+        file.take(self.inner.config.model_limits.max_object_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| admission::ReadError::Unavailable)?;
+        Ok((descriptor, bytes))
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +165,11 @@ fn binding_key(repo: &str, job: [u8; 32]) -> Vec<u8> {
     scoped(BINDINGS, repo, &job)
 }
 fn operation_key(account: &AccountId, actor: &ForgeActor, request: &str) -> Vec<u8> {
-    scoped(REQUESTS, &account.0, &identity::operation_id(&actor.principal, request))
+    scoped(
+        REQUESTS,
+        &account.0,
+        &identity::operation_id(&actor.principal, request),
+    )
 }
 fn object(id: [u8; 32]) -> ObjectKey {
     ObjectKey {
@@ -321,6 +366,15 @@ impl Inner {
         }
         Ok(c.root_tree.terms[0])
     }
+    fn review_admission_limits(&self) -> admission::Limits {
+        admission::Limits {
+            model: self.config.model_limits,
+            max_work: self.config.max_closure_edges,
+            max_contexts: self.config.max_path_contexts,
+            max_metadata_bytes: self.config.landing.max_validation_metadata_bytes,
+            ..admission::Limits::default()
+        }
+    }
     fn review_changed_paths(
         &self,
         repo: &str,
@@ -328,130 +382,16 @@ impl Inner {
         head: TreeId,
         allow: impl Fn(&str) -> bool,
     ) -> Result<()> {
-        let mut pending = vec![(
-            String::new(),
-            Some(TreeValue::Tree(base)),
-            Some(TreeValue::Tree(head)),
-        )];
-        let mut work = 0usize;
-        let mut metadata_bytes = 0u64;
-        while let Some((path, before, after)) = pending.pop() {
-            work += 1;
-            if work > self.config.max_closure_edges || pending.len() > self.config.max_path_contexts
-            {
-                return Err(Error::Limit("review changed paths"));
-            }
-            if before == after {
-                continue;
-            }
-            if matches!(before, Some(TreeValue::Tree(_)))
-                || matches!(after, Some(TreeValue::Tree(_)))
-            {
-                let mut entries = std::collections::BTreeMap::<
-                    String,
-                    (Option<TreeValue>, Option<TreeValue>),
-                >::new();
-                for (old, value) in [(true, before.as_ref()), (false, after.as_ref())] {
-                    if let Some(TreeValue::Tree(id)) = value {
-                        let key = ObjectKey {
-                            kind: Kind::Tree,
-                            id: ObjectId(id.0),
-                        };
-                        let d = self
-                            .descriptor(repo, key)?
-                            .ok_or(Error::MissingObject(key))?;
-                        metadata_bytes = metadata_bytes
-                            .checked_add(d.size_bytes)
-                            .ok_or(Error::Limit("review metadata"))?;
-                        if metadata_bytes > self.config.landing.max_validation_metadata_bytes {
-                            return Err(Error::Limit("review metadata"));
-                        }
-                        let Object::Tree(tree) = self.metadata(repo, d)? else {
-                            return Err(Error::Corrupt("review tree kind"));
-                        };
-                        for e in tree.entries {
-                            let slot = entries.entry(e.name).or_default();
-                            if old {
-                                slot.0 = Some(e.value);
-                            } else {
-                                slot.1 = Some(e.value);
-                            }
-                        }
-                    } else if value.is_some() && !allow(&path) {
-                        return Err(Error::ForgeAccessDenied);
-                    }
-                }
-                if entries.is_empty() && !path.is_empty() && !allow(&path) {
-                    return Err(Error::ForgeAccessDenied);
-                }
-                for (name, (a, b)) in entries {
-                    let next = if path.is_empty() {
-                        name
-                    } else {
-                        format!("{path}/{name}")
-                    };
-                    if next.len() > self.config.model_limits.max_path_bytes {
-                        return Err(Error::Limit("review path"));
-                    }
-                    pending.push((next, a, b));
-                }
-            } else if !allow(&path) {
-                return Err(Error::ForgeAccessDenied);
-            }
+        let paths = admission::changed_paths(
+            &mut ReviewMetadata { inner: self, repo },
+            base,
+            head,
+            self.review_admission_limits(),
+        )?;
+        if paths.iter().any(|path| !allow(path)) {
+            return Err(Error::ForgeAccessDenied);
         }
         Ok(())
-    }
-
-    fn review_tree_files(
-        &self,
-        repo: &str,
-        root: TreeId,
-    ) -> Result<std::collections::BTreeMap<String, TreeValue>> {
-        let mut stack = vec![(String::new(), root)];
-        let mut files = std::collections::BTreeMap::new();
-        let mut work = 0usize;
-        let mut bytes = 0u64;
-        while let Some((prefix, id)) = stack.pop() {
-            let key = ObjectKey {
-                kind: Kind::Tree,
-                id: ObjectId(id.0),
-            };
-            let descriptor = self
-                .descriptor(repo, key)?
-                .ok_or(Error::MissingObject(key))?;
-            bytes = bytes
-                .checked_add(descriptor.size_bytes)
-                .ok_or(Error::Limit("review metadata"))?;
-            if bytes > self.config.landing.max_validation_metadata_bytes {
-                return Err(Error::Limit("review metadata"));
-            }
-            let Object::Tree(tree) = self.metadata(repo, descriptor)? else {
-                return Err(Error::Corrupt("review tree"));
-            };
-            for entry in tree.entries {
-                work += 1;
-                if work > self.config.max_closure_edges
-                    || stack.len() > self.config.max_path_contexts
-                {
-                    return Err(Error::Limit("review files"));
-                }
-                let path = if prefix.is_empty() {
-                    entry.name
-                } else {
-                    format!("{prefix}/{}", entry.name)
-                };
-                if path.len() > self.config.model_limits.max_path_bytes {
-                    return Err(Error::Limit("review path"));
-                }
-                match entry.value {
-                    TreeValue::Tree(child) => stack.push((path, child)),
-                    value => {
-                        files.insert(path, value);
-                    }
-                }
-            }
-        }
-        Ok(files)
     }
     fn review_validate_files(
         &self,
@@ -463,125 +403,82 @@ impl Inner {
         hints: &[ForgeReviewLineageHint],
         now: i64,
     ) -> Result<()> {
-        if hints.len() > 128 {
-            return Err(Error::Limit("review lineage"));
-        }
-        let before = self.review_tree_files(view.repository(), base)?;
-        let after = self.review_tree_files(view.repository(), head)?;
-        let mut targets = HashSet::new();
-        for hint in hints {
-            if hint.source_path == hint.target_path
-                || !targets.insert(hint.target_path.as_str())
-                || !view.allows_path(&hint.source_path)
-                || !view.allows_path(&hint.target_path)
-                || before.contains_key(&hint.target_path)
-            {
-                return Err(Error::Invalid("review lineage endpoints"));
-            }
-            let Some(TreeValue::File {
-                id: source,
-                size_bytes: source_size,
-                copy_id: source_copy,
-                ..
-            }) = before.get(&hint.source_path)
-            else {
-                return Err(Error::Invalid("review lineage source"));
-            };
-            let Some(TreeValue::File {
-                id: target,
-                size_bytes: target_size,
-                copy_id: target_copy,
-                ..
-            }) = after.get(&hint.target_path)
-            else {
-                return Err(Error::Invalid("review lineage target"));
-            };
-            if target_copy.is_none() && (source != target || source_size != target_size) {
-                return Err(Error::Invalid("review lineage content identity"));
-            }
-            match hint.operation {
-                ForgeReviewLineageOperation::Rename if after.contains_key(&hint.source_path) => {
-                    return Err(Error::Invalid("review rename retained source"));
-                }
-                ForgeReviewLineageOperation::Copy
-                    if !matches!(after.get(&hint.source_path), Some(TreeValue::File { .. })) =>
-                {
-                    return Err(Error::Invalid("review copy changed source"));
-                }
-                _ => {}
-            }
-            if let Some(copy) = target_copy {
-                self.forge_validate_copy_in(db, view, actor, &hint.target_path, *copy, now)?;
-                let source_copy = source_copy.ok_or(Error::Invalid("review native copy source"))?;
-                match self.forge_projected_copy_origin_in(db, view, source_copy) {
-                    Ok(origin)
-                        if origin.canonical_path == hint.source_path && origin.file == source.0 => {
+        let requirements = admission::entry_requirements(
+            &mut ReviewMetadata {
+                inner: self,
+                repo: view.repository(),
+            },
+            base,
+            head,
+            hints,
+            self.review_admission_limits(),
+        )?;
+        for requirement in requirements {
+            match requirement {
+                admission::Requirement::Path { canonical_path } => {
+                    if !view.allows_path(&canonical_path) {
+                        return Err(Error::ForgeAccessDenied);
                     }
-                    Ok(_) => return Err(Error::Invalid("review projected copy origin")),
-                    Err(Error::ForgeAccessDenied) => self.forge_validate_copy_in(
-                        db,
-                        view,
-                        actor,
-                        &hint.source_path,
-                        source_copy,
-                        now,
-                    )?,
-                    Err(error) => return Err(error),
                 }
-                let key = ObjectKey {
-                    kind: Kind::CopyHistory,
-                    id: ObjectId(copy.0),
-                };
-                let descriptor = self
-                    .descriptor(view.repository(), key)?
-                    .ok_or(Error::MissingObject(key))?;
-                let Object::CopyHistory(history) = self.metadata(view.repository(), descriptor)?
-                else {
-                    return Err(Error::Corrupt("review copy history"));
-                };
-                if history.current_path != hint.target_path || history.parents != vec![source_copy]
-                {
-                    return Err(Error::Invalid("review native copy relation"));
-                }
-            }
-        }
-        for (path, value) in &after {
-            if before.get(path) == Some(value) {
-                continue;
-            }
-            match value {
-                TreeValue::File {
-                    id,
-                    size_bytes,
-                    copy_id,
-                    ..
+                admission::Requirement::Entry {
+                    canonical_path,
+                    key,
+                    expected_size,
                 } => {
-                    if copy_id.is_some() && !targets.contains(path.as_str()) {
-                        return Err(Error::Invalid("review copy requires explicit lineage"));
-                    }
-                    let key = ObjectKey {
-                        kind: Kind::File,
-                        id: ObjectId(id.0),
-                    };
+                    let key = key.object_key()?;
                     let descriptor = self
                         .descriptor(view.repository(), key)?
                         .ok_or(Error::MissingObject(key))?;
-                    if descriptor.size_bytes != *size_bytes {
+                    if expected_size.is_some_and(|size| size != descriptor.size_bytes) {
                         return Err(Error::Invalid("review file size"));
                     }
-                    self.forge_validate_file_in(db, view, actor, path, descriptor, now)?;
+                    if key.kind == Kind::CopyHistory {
+                        self.forge_validate_copy_in(
+                            db,
+                            view,
+                            actor,
+                            &canonical_path,
+                            tinytree_model::CopyId(key.id.0),
+                            now,
+                        )?;
+                    } else {
+                        self.forge_validate_entry_in(
+                            db,
+                            view,
+                            actor,
+                            &canonical_path,
+                            descriptor,
+                            now,
+                        )?;
+                    }
                 }
-                TreeValue::Symlink { id, .. } => {
-                    let key = ObjectKey {
-                        kind: Kind::Symlink,
-                        id: ObjectId(id.0),
-                    };
-                    let descriptor = self
-                        .descriptor(view.repository(), key)?
-                        .ok_or(Error::MissingObject(key))?;
-                    self.forge_validate_entry_in(db, view, actor, path, descriptor, now)?;
+                admission::Requirement::CopyOrigin {
+                    canonical_path,
+                    copy_id,
+                    file_id,
+                } => {
+                    let key = tinytree_forge_core::upload_scope::Key {
+                        kind: Kind::CopyHistory as u8,
+                        id: copy_id,
+                    }
+                    .object_key()?;
+                    let copy = tinytree_model::CopyId(key.id.0);
+                    match self.forge_projected_copy_origin_in(db, view, copy) {
+                        Ok(origin)
+                            if origin.canonical_path == canonical_path
+                                && hex(&origin.file) == file_id => {}
+                        Ok(_) => return Err(Error::Invalid("review projected copy origin")),
+                        Err(Error::ForgeAccessDenied) => self.forge_validate_copy_in(
+                            db,
+                            view,
+                            actor,
+                            &canonical_path,
+                            copy,
+                            now,
+                        )?,
+                        Err(error) => return Err(error),
+                    }
                 }
-                _ => return Err(Error::Invalid("unsupported review entry")),
             }
         }
         Ok(())
@@ -842,7 +739,8 @@ impl Store {
                 if record.patchsets.len() >= MAX_PATCHSETS {
                     return Err(Error::Limit("review patchsets"));
                 }
-                let id = identity::patchset_id(account, ChangeId(change), fingerprint, access.epoch);
+                let id =
+                    identity::patchset_id(account, ChangeId(change), fingerprint, access.epoch);
                 record.patchsets.push(Patchset {
                     id,
                     epoch: access.epoch.0,

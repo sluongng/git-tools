@@ -6,6 +6,13 @@ import type { ClosureBinding, ClosureJobs } from './closure_jobs';
 import type { ForgeViews, ResolvedView, ViewDescription } from './forge_views';
 import { fail, hash } from './protocol';
 
+/** Trusted immutable ledger selection; never accepted from public request JSON. */
+export interface ReviewProjectionSource {
+  account_id: string; view_name: string; view_version: string;
+  review_epoch: number; projection_epoch: number; change_id: string;
+  patchset_id: string; candidate_id: string; attempt_generation: number;
+  canonical_head: string; projected_parent: string;
+}
 export interface ProjectionHost {
   readonly accountId: string;
   readonly principal: string | null;
@@ -15,6 +22,7 @@ export interface ProjectionHost {
   /** Exact view-owned canonical root + authoritative complete proof, not a hash
    * or a raw visible flag. Called under the same current-policy transaction. */
   requireSourceRootInTx(view: ResolvedView): void;
+  requireReviewSourceInTx?(view: ResolvedView, source: Readonly<ReviewProjectionSource>): void;
   describeObjectInTx(key: ObjectKey): Descriptor | undefined;
   readVerifiedObject(key: ObjectKey): Promise<{ descriptor: Descriptor; bytes: Uint8Array }>;
   /** Reserve durable Forge quota including failed/uncertain writes BEFORE R2. */
@@ -26,7 +34,7 @@ export interface ProjectionHost {
    * time. Binding identity is a view tag, not a synthesized member principal.
    * attachInTx is invoked inside ClosureJobs.publish's existing SQL transaction. */
   closureForProjection(view: ResolvedView, binding: ClosureBinding,
-    attachInTx: (proofJobId: string) => unknown): ClosureJobs;
+    attachInTx: (proofJobId: string) => unknown, authorizeCurrentInTx?: () => void): ClosureJobs;
   retainProjectionRootInTx(projectionId: string, head: string, proofJobId: string): void;
 }
 export interface ProjectionProgress { job_id: string; expected_generation: number }
@@ -51,7 +59,7 @@ export interface ProjectionPath {
 }
 interface Job {
   id: string; account: string; identity: string; name: string; version: string;
-  epoch: number; revision: string; description: string; phase: Phase; generation: number;
+  epoch: number; revision: string; selection_revision: string; purpose: 'baseline' | 'review'; source: string; description: string; phase: Phase; generation: number;
   selected: number; contexts: number; entries_seen: number; path_bytes: number;
   metadata_bytes: number; traversal_path_bytes: number; output_cursor: number; output_count: number;
   plan_hash: string | null; plan_bytes: number; closure_job: string | null;
@@ -64,13 +72,13 @@ interface Selected {
   symlink_data: ArrayBuffer | null;
 }
 interface Generated extends Descriptor { bytes_base64: string }
-interface Origin {
+export interface ProjectionCopyOrigin {
   projected_copy: number[]; canonical_revision: number[]; canonical_path: string;
   canonical_copy: number[] | null; file: number[];
 }
 interface Plan {
   state: 'ready'; record_key: string; binding: ProjectionBinding;
-  objects: Generated[]; private_copy_origins: Origin[];
+  objects: Generated[]; private_copy_origins: ProjectionCopyOrigin[];
 }
 interface Catalog { id: string; binding: string; proof_job: string; retired: number }
 interface Native extends Inspection {
@@ -132,15 +140,18 @@ export class ForgeProjections {
   constructor(private readonly host: ProjectionHost) {
     for (const statement of [
       'CREATE TABLE IF NOT EXISTS projection_usage(singleton INTEGER PRIMARY KEY CHECK(singleton=1),account TEXT NOT NULL,frontier_rows INTEGER NOT NULL DEFAULT 0,selected_rows INTEGER NOT NULL DEFAULT 0,path_bytes INTEGER NOT NULL DEFAULT 0,catalog_path_bytes INTEGER NOT NULL DEFAULT 0)',
-      'CREATE TABLE IF NOT EXISTS projection_jobs(id TEXT PRIMARY KEY,account TEXT NOT NULL,identity TEXT NOT NULL,name TEXT NOT NULL,version TEXT NOT NULL,epoch INTEGER NOT NULL,revision TEXT NOT NULL,description TEXT NOT NULL,phase TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,selected INTEGER NOT NULL DEFAULT 0,contexts INTEGER NOT NULL DEFAULT 0,entries_seen INTEGER NOT NULL DEFAULT 0,path_bytes INTEGER NOT NULL DEFAULT 0,metadata_bytes INTEGER NOT NULL DEFAULT 0,traversal_path_bytes INTEGER NOT NULL DEFAULT 0,output_cursor INTEGER NOT NULL DEFAULT 0,output_count INTEGER NOT NULL DEFAULT 0,plan_hash TEXT,plan_bytes INTEGER NOT NULL DEFAULT 0,closure_job TEXT,error TEXT,result TEXT,UNIQUE(account,version,epoch,revision))',
+      'CREATE TABLE IF NOT EXISTS projection_jobs(id TEXT PRIMARY KEY,account TEXT NOT NULL,identity TEXT NOT NULL,name TEXT NOT NULL,version TEXT NOT NULL,epoch INTEGER NOT NULL,revision TEXT NOT NULL,selection_revision TEXT NOT NULL,purpose TEXT NOT NULL,source TEXT NOT NULL,description TEXT NOT NULL,phase TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,selected INTEGER NOT NULL DEFAULT 0,contexts INTEGER NOT NULL DEFAULT 0,entries_seen INTEGER NOT NULL DEFAULT 0,path_bytes INTEGER NOT NULL DEFAULT 0,metadata_bytes INTEGER NOT NULL DEFAULT 0,traversal_path_bytes INTEGER NOT NULL DEFAULT 0,output_cursor INTEGER NOT NULL DEFAULT 0,output_count INTEGER NOT NULL DEFAULT 0,plan_hash TEXT,plan_bytes INTEGER NOT NULL DEFAULT 0,closure_job TEXT,error TEXT,result TEXT,UNIQUE(account,version,epoch,purpose,source))',
       'CREATE TABLE IF NOT EXISTS projection_frontier(job TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,prefix TEXT NOT NULL,depth INTEGER NOT NULL,position INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job,kind,id,prefix))',
       'CREATE TABLE IF NOT EXISTS projection_selected(job TEXT NOT NULL,canonical_path TEXT NOT NULL,relative_path TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,executable INTEGER NOT NULL,canonical_copy TEXT,target_bytes INTEGER,symlink_data BLOB,PRIMARY KEY(job,canonical_path))',
       'CREATE TABLE IF NOT EXISTS projection_plan_chunks(job TEXT NOT NULL,ordinal INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(job,ordinal))',
       'CREATE TABLE IF NOT EXISTS projection_outputs(job TEXT NOT NULL,ordinal INTEGER NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,confirmed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job,ordinal))',
-      'CREATE TABLE IF NOT EXISTS projection_catalogs(id TEXT PRIMARY KEY,account TEXT NOT NULL,version TEXT NOT NULL,epoch INTEGER NOT NULL,revision TEXT NOT NULL,binding TEXT NOT NULL,proof_job TEXT NOT NULL,retired INTEGER NOT NULL DEFAULT 0,UNIQUE(account,version,epoch,revision))',
+      'CREATE TABLE IF NOT EXISTS projection_catalogs(id TEXT PRIMARY KEY,account TEXT NOT NULL,version TEXT NOT NULL,epoch INTEGER NOT NULL,revision TEXT NOT NULL,binding TEXT NOT NULL,proof_job TEXT NOT NULL,retired INTEGER NOT NULL DEFAULT 0,purpose TEXT NOT NULL,parent TEXT NOT NULL,projected_commit TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS projection_members(projection TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,PRIMARY KEY(projection,kind,id))',
       'CREATE TABLE IF NOT EXISTS projection_paths(projection TEXT NOT NULL,canonical_path TEXT NOT NULL,relative_path TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,size INTEGER NOT NULL,executable INTEGER NOT NULL,target_bytes INTEGER,PRIMARY KEY(projection,canonical_path))',
-      'CREATE TABLE IF NOT EXISTS projection_private_origins(projection TEXT NOT NULL,canonical_path TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(projection,canonical_path))',
+      'CREATE TABLE IF NOT EXISTS projection_private_origins(projection TEXT NOT NULL,canonical_path TEXT NOT NULL,projected_copy TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(projection,canonical_path))',
+      'CREATE INDEX IF NOT EXISTS projection_relations ON projection_catalogs(account,version,epoch,projected_commit,retired)',
+      'CREATE INDEX IF NOT EXISTS projection_copy_lookup ON projection_private_origins(projected_copy,projection)',
+      'CREATE INDEX IF NOT EXISTS projection_member_lookup ON projection_members(kind,id,projection)',
     ]) host.sql.exec(statement);
     host.sql.exec('INSERT OR IGNORE INTO projection_usage(singleton,account) VALUES(1,?)',host.accountId);
   }
@@ -160,10 +171,58 @@ export class ForgeProjections {
     const d = this.check(view); if (!uuid(id)) fail(400, 'invalid_argument');
     const job = this.one<Job>('SELECT * FROM projection_jobs WHERE id=?', id);
     if (!job || job.account !== this.host.accountId || job.version !== hex(d.view_version) || job.name !== d.view) fail(403, 'permission_denied');
-    if (job.phase === 'obsolete' || job.epoch !== d.policy_epoch || job.revision !== hex(d.revision)) fail(409, 'aborted');
+    if (job.phase === 'obsolete' || job.epoch !== d.policy_epoch || job.selection_revision !== hex(d.revision)) fail(409, 'aborted');
+    if (job.purpose === 'review') this.reviewSourceInTx(view, job);
+    else if (job.purpose !== 'baseline' || job.source !== '' || job.revision !== job.selection_revision) fail(503, 'failed_precondition');
     if (job.identity !== JSON.stringify({ kind: 'view', view_version: job.version }) || !safe(job.generation) || !safe(job.selected, MAX_SELECTED) || !safe(job.output_cursor, MAX_OUTPUTS) || !safe(job.output_count, MAX_OUTPUTS)) fail(503, 'failed_precondition');
     if (generation !== undefined && (!safe(generation) || generation !== job.generation)) fail(409, 'aborted');
     return job;
+  }
+  private source(view: ResolvedView, input: Readonly<ReviewProjectionSource>): ReviewProjectionSource {
+    if (!input || typeof input !== 'object' || Object.keys(input).sort().join(',') !== 'account_id,attempt_generation,candidate_id,canonical_head,change_id,patchset_id,projected_parent,projection_epoch,review_epoch,view_name,view_version') fail(400,'invalid_argument');
+    const source: ReviewProjectionSource = {account_id:input.account_id,view_name:input.view_name,view_version:input.view_version,review_epoch:input.review_epoch,projection_epoch:input.projection_epoch,change_id:input.change_id,patchset_id:input.patchset_id,candidate_id:input.candidate_id,attempt_generation:input.attempt_generation,canonical_head:input.canonical_head,projected_parent:input.projected_parent};
+    const d=this.check(view);
+    if(source.account_id!==this.host.accountId||source.view_name!==d.view||source.view_version!==hex(d.view_version)||source.projection_epoch!==d.policy_epoch||!safe(source.review_epoch)||source.review_epoch<1||!safe(source.attempt_generation)||!/^([0-9a-f]{32})$/.test(source.change_id)||![source.patchset_id,source.candidate_id,source.canonical_head,source.projected_parent].every(id=>typeof id==='string'&&/^[0-9a-f]{64}$/.test(id))||source.projected_parent===ROOT) fail(400,'invalid_argument');
+    if(!this.host.requireReviewSourceInTx) fail(503,'failed_precondition');
+    this.host.requireReviewSourceInTx(view,Object.freeze(source));
+    // A ledger-selected parent must itself have an exact current sanitized
+    // relation. Availability of an arbitrary canonical COMMIT is not enough.
+    if(!this.catalogForProjectedInTx(view,source.projected_parent)) fail(403,'permission_denied');
+    return source;
+  }
+  private reviewSourceInTx(view:ResolvedView,job:Job):ReviewProjectionSource {
+    let value:ReviewProjectionSource;try{value=JSON.parse(job.source);}catch{throw new Invalid();}
+    const source=this.source(view,value);
+    if(JSON.stringify(source)!==job.source||source.canonical_head!==job.revision) throw new Invalid();
+    return source;
+  }
+  private recordKey(job:Job):string {
+    const base=`forge/projections/v1/${job.account}/${job.version}/${job.epoch}`;
+    if(job.purpose==='baseline') return base;
+    const source=JSON.parse(job.source) as ReviewProjectionSource;
+    return `${base}/review/${job.revision}/${source.change_id}/${source.projected_parent}`;
+  }
+  startReviewResult(view:ResolvedView,input:Readonly<ReviewProjectionSource>):ProjectionStatus {
+    return this.host.transactionSync(()=>{
+      const source=this.source(view,input),d=this.check(view),encoded=JSON.stringify(source);
+      this.obsoleteInTx(d.policy_epoch);
+      const old=this.one<Job>("SELECT * FROM projection_jobs WHERE account=? AND version=? AND epoch=? AND purpose='review' AND source=?",this.host.accountId,source.view_version,source.projection_epoch,encoded);
+      if(old) return this.report(this.load(view,old.id));
+      if(Number(this.one<{n:number}>('SELECT COUNT(*) AS n FROM projection_jobs')!.n)>=MAX_JOBS||Number(this.one<{n:number}>("SELECT COUNT(*) AS n FROM projection_jobs WHERE phase NOT IN('ready','limit','obsolete')")!.n)>=MAX_ACTIVE) fail(429,'resource_exhausted');
+      const id=crypto.randomUUID(),identity=JSON.stringify({kind:'view',view_version:source.view_version});
+      this.host.sql.exec("INSERT INTO projection_jobs(id,account,identity,name,version,epoch,revision,selection_revision,purpose,source,description,phase) VALUES(?,?,?,?,?,?,?,?,'review',?,?,'select')",id,this.host.accountId,identity,d.view,source.view_version,d.policy_epoch,source.canonical_head,hex(d.revision),encoded,JSON.stringify(d));
+      const job=this.load(view,id);this.enqueue(job,{kind:3,id:source.canonical_head},'',0);this.save(job);return this.report(job);
+    });
+  }
+  statusReviewResult(view:ResolvedView,input:Readonly<ReviewProjectionSource>,jobId:string):ProjectionStatus {
+    return this.host.transactionSync(()=>{const source=this.source(view,input),job=this.load(view,jobId);if(job.purpose!=='review'||job.source!==JSON.stringify(source)) fail(403,'permission_denied');return this.report(job);});
+  }
+  async advanceReviewResult(view:ResolvedView,input:Readonly<ReviewProjectionSource>,progress:ProjectionProgress):Promise<ProjectionStatus> {
+    this.statusReviewResult(view,input,progress.job_id);
+    return this.advanceJob(view,progress);
+  }
+  async advance(view:ResolvedView,progress:ProjectionProgress):Promise<ProjectionStatus> {
+    this.status(view,progress.job_id);return this.advanceJob(view,progress);
   }
   private save(job: Job): void {
     if (!safe(job.generation, Number.MAX_SAFE_INTEGER - 1)) throw new Limit('generation');
@@ -234,15 +293,16 @@ export class ForgeProjections {
     return this.host.transactionSync(() => {
       const d = this.check(view); const version = hex(d.view_version), revision = hex(d.revision);
       this.obsoleteInTx(d.policy_epoch);
-      const old = this.one<Job>('SELECT * FROM projection_jobs WHERE account=? AND version=? AND epoch=? AND revision=?', this.host.accountId, version, d.policy_epoch, revision);
+      const old = this.one<Job>("SELECT * FROM projection_jobs WHERE account=? AND version=? AND epoch=? AND purpose='baseline' AND source=''", this.host.accountId, version, d.policy_epoch);
       if (old) return this.report(this.load(view, old.id));
       if (Number(this.one<{n:number}>('SELECT COUNT(*) AS n FROM projection_jobs')!.n) >= MAX_JOBS || Number(this.one<{n:number}>("SELECT COUNT(*) AS n FROM projection_jobs WHERE phase NOT IN('ready','limit','obsolete')")!.n) >= MAX_ACTIVE) fail(429, 'resource_exhausted');
       const id = crypto.randomUUID(); const identity = JSON.stringify({kind:'view',view_version:version});
-      this.host.sql.exec('INSERT INTO projection_jobs(id,account,identity,name,version,epoch,revision,description,phase) VALUES(?,?,?,?,?,?,?,?,\'select\')', id, this.host.accountId, identity, d.view, version, d.policy_epoch, revision, JSON.stringify(d));
+      this.host.sql.exec("INSERT INTO projection_jobs(id,account,identity,name,version,epoch,revision,selection_revision,purpose,source,description,phase) VALUES(?,?,?,?,?,?,?,?,'baseline','',?,'select')", id, this.host.accountId, identity, d.view, version, d.policy_epoch, revision, revision, JSON.stringify(d));
       const job = this.load(view, id); this.enqueue(job, {kind:3,id:revision}, '', 0); this.save(job); return this.report(job);
     });
   }
-  status(view: ResolvedView, jobId: string): ProjectionStatus { return this.host.transactionSync(() => this.report(this.load(view, jobId))); }
+  private currentStatus(view: ResolvedView, jobId: string): ProjectionStatus { return this.host.transactionSync(() => this.report(this.load(view, jobId))); }
+  status(view: ResolvedView, jobId: string): ProjectionStatus { return this.host.transactionSync(() => {const job=this.load(view,jobId);if(job.purpose!=='baseline') fail(403,'permission_denied');return this.report(job);}); }
   private enqueue(job: Job, object: ObjectKey, prefix: string, depth: number): void {
     if (!key(object) || !safe(depth,64) || encoder.encode(prefix).length > 4096) throw new Limit('tree_depth');
     if (this.one('SELECT 1 FROM projection_frontier WHERE job=? AND kind=? AND id=? AND prefix=?',job.id,object.kind,object.id,prefix)) return;
@@ -335,13 +395,13 @@ export class ForgeProjections {
         this.save(current);return current;
       });
     }
-    return this.status(view,job.id);
+    return this.currentStatus(view,job.id);
   }
   private validatePlan(job:Job, value:unknown):Plan {
     if(!value||typeof value!=='object') throw new Invalid(); const plan=value as Plan;
     if(plan.state!=='ready'||!plan.binding||!Array.isArray(plan.objects)||plan.objects.length<2||plan.objects.length>MAX_OUTPUTS||!Array.isArray(plan.private_copy_origins)||plan.private_copy_origins.length>MAX_SELECTED) throw new Invalid();
     const b=plan.binding;
-    if(b.account_id!==job.account||hex(b.view_version)!==job.version||b.policy_epoch!==job.epoch||hex(b.canonical_revision)!==job.revision||plan.record_key!==`forge/projections/v1/${job.account}/${job.version}/${job.epoch}`) throw new Invalid();
+    if(b.account_id!==job.account||hex(b.view_version)!==job.version||b.policy_epoch!==job.epoch||hex(b.canonical_revision)!==job.revision||plan.record_key!==this.recordKey(job)) throw new Invalid();
     const head=hex(b.projected_commit),root=hex(b.projected_tree); const keys=new Set<string>();let commits=0;
     for(const object of plan.objects) {
       if(!key(object)||![2,3,5].includes(object.kind)||object.format_version!==1||!safe(object.size_bytes)||typeof object.bytes_base64!=='string') throw new Invalid();
@@ -377,7 +437,7 @@ export class ForgeProjections {
         return {canonical_path:row.canonical_path,...d,value};
       });
     });
-    let value:unknown;try {value=buildForgeProjection({schema:1,context:{account_id:job.account,view_version:job.version,policy_epoch:job.epoch,canonical_revision:job.revision,review:null},entries:selected});}catch{throw new Invalid();}
+    let value:unknown;try {value=buildForgeProjection({schema:1,context:{account_id:job.account,view_version:job.version,policy_epoch:job.epoch,canonical_revision:job.revision,review:job.purpose==='review'?{change_id:JSON.parse(job.source).change_id,projected_parent:JSON.parse(job.source).projected_parent}:null},entries:selected});}catch{throw new Invalid();}
     const candidate=value as {state?:string;budget?:string};
     if(candidate?.state==='limit') throw new Limit(typeof candidate.budget==='string'?candidate.budget:'builder');
     const plan=this.host.transactionSync(() => {this.load(view,job.id,job.generation);return this.validatePlan(job,value);});
@@ -410,7 +470,7 @@ export class ForgeProjections {
     while(job.output_cursor<job.output_count&&written<16&&Date.now()<deadline) {
       const object=plan.objects[job.output_cursor];const d=descriptor(object);if(bytes+d.size_bytes>256*1024) break;
       const body=decode(object.bytes_base64,d.size_bytes);let native:Native;try{native=inspect(d.kind,body) as Native;}catch{throw new Invalid();}if(!same(d,native)) throw new Invalid();
-      if(d.kind===3&&(!native.commit||native.commit.parents.length!==1||native.commit.parents[0]!==ROOT||native.commit.predecessors.length!==0||native.commit.root_trees.length!==1||native.commit.root_trees[0]!==hex(plan.binding.projected_tree))) throw new Invalid();
+      if(d.kind===3&&(!native.commit||native.commit.parents.length!==1||native.commit.parents[0]!==(job.purpose==='review'?JSON.parse(job.source).projected_parent:ROOT)||native.commit.predecessors.length!==0||native.commit.root_trees.length!==1||native.commit.root_trees[0]!==hex(plan.binding.projected_tree))) throw new Invalid();
       if(d.kind===5&&(!native.copy_history||native.copy_history.parents.length!==0)) throw new Invalid();
       this.host.transactionSync(() => {
         const current=this.load(view,job.id,job.generation);if(current.phase!=='stage'||current.output_cursor!==job.output_cursor) fail(409,'aborted');
@@ -429,12 +489,12 @@ export class ForgeProjections {
         current.output_cursor++;current.error=null;if(current.output_cursor===current.output_count) current.phase='closure';this.save(current);return current;
       });written++;bytes+=d.size_bytes;
     }
-    return this.status(view,job.id);
+    return this.currentStatus(view,job.id);
   }
   private closureBinding(job:Job,plan:Plan):ClosureBinding {
     if(!job.plan_hash) throw new Invalid();
-    return {account_id:job.account,identity:{kind:'view',view_version:job.version},policy_epoch:job.epoch,purpose:'projection-prepare',
-      publication:JSON.stringify([job.version,job.epoch,job.revision,job.plan_hash,plan.record_key,hex(plan.binding.projected_commit)])};
+    return {account_id:job.account,identity:{kind:'view',view_version:job.version},policy_epoch:job.epoch,purpose:job.purpose==='review'?'review-projection-prepare':'projection-prepare',
+      publication:JSON.stringify([job.version,job.epoch,job.revision,job.plan_hash,plan.record_key,hex(plan.binding.projected_commit),...(job.purpose==='review'?[JSON.parse(job.source)]:[])])};
   }
   /** Called ONLY inside ClosureJobs.publish's existing SQL transaction. */
   private publishInTx(view:ResolvedView,expected:Job,plan:Plan,proofId:string):unknown {
@@ -451,7 +511,20 @@ export class ForgeProjections {
     const nodes=this.one<{n:number;bad:number}>('SELECT COUNT(*) AS n,COALESCE(SUM(CASE WHEN done<>1 OR size IS NULL OR size<0 OR kind<1 OR kind>5 THEN 1 ELSE 0 END),0) AS bad FROM closure_nodes WHERE job=?',proofId)!;
     if(nodes.n!==proof.nodes||nodes.bad!==0) throw new Invalid();
     const expectedKeys=new Set([...plan.objects.map(object=>`${object.kind}/${object.id}`),...selected.map(path=>`${path.kind}/${path.id}`)]);
-    if(nodes.n!==expectedKeys.size) throw new Invalid(); // Baseline parent is intrinsic ROOT; no other closure members are legal.
+    let expectedCount=expectedKeys.size;
+    if(job.purpose==='review') {
+      const source=this.reviewSourceInTx(view,job),parent=this.catalogForProjectedInTx(view,source.projected_parent);
+      if(!parent) fail(403,'permission_denied');
+      const count=this.one<{n:number}>('SELECT COUNT(*) AS n FROM projection_members WHERE projection=?',parent.catalog_id)!.n;
+      if(!safe(count,MAX_ACCOUNT_ROWS)||count===0) throw new Invalid();
+      expectedCount=count;
+      for(const object of expectedKeys) {
+        const slash=object.indexOf('/'),kind=Number(object.slice(0,slash)),id=object.slice(slash+1);
+        if(!this.one('SELECT 1 FROM projection_members WHERE projection=? AND kind=? AND id=?',parent.catalog_id,kind,id)) expectedCount++;
+      }
+      if(this.one('SELECT 1 FROM projection_members m WHERE m.projection=? AND NOT EXISTS(SELECT 1 FROM closure_nodes n WHERE n.job=? AND n.kind=m.kind AND n.id=m.id AND n.done=1 AND n.size=m.size) LIMIT 1',parent.catalog_id,proofId)) throw new Invalid();
+    }
+    if(nodes.n!==expectedCount) throw new Invalid();
     for(const object of plan.objects) if(!this.one('SELECT 1 FROM closure_nodes WHERE job=? AND kind=? AND id=? AND done=1 AND size=?',proofId,object.kind,object.id,object.size_bytes)) throw new Invalid();
     const outputs=this.one<{n:number}>('SELECT COUNT(*) AS n FROM projection_outputs WHERE job=? AND confirmed=1',job.id)!;
     if(outputs.n!==job.output_count) throw new Invalid();
@@ -463,12 +536,12 @@ export class ForgeProjections {
       const usage=this.usage();const members=Number(this.one<{n:number}>('SELECT COUNT(*) AS n FROM projection_members')!.n);
       if(members+nodes.n>MAX_ACCOUNT_ROWS||usage.catalog_path_bytes+job.path_bytes>MAX_ACCOUNT_PATH_BYTES) fail(429,'resource_exhausted');
       this.host.sql.exec('UPDATE projection_usage SET catalog_path_bytes=catalog_path_bytes+? WHERE singleton=1',job.path_bytes);
-      this.host.sql.exec('INSERT INTO projection_catalogs(id,account,version,epoch,revision,binding,proof_job,retired) VALUES(?,?,?,?,?,?,?,0)',plan.record_key,job.account,job.version,job.epoch,job.revision,JSON.stringify(plan.binding),proofId);
+      this.host.sql.exec('INSERT INTO projection_catalogs(id,account,version,epoch,revision,binding,proof_job,retired,purpose,parent,projected_commit) VALUES(?,?,?,?,?,?,?,0,?,?,?)',plan.record_key,job.account,job.version,job.epoch,job.revision,JSON.stringify(plan.binding),proofId,job.purpose,job.purpose==='review'?JSON.parse(job.source).projected_parent:ROOT,hex(plan.binding.projected_commit));
       this.host.sql.exec('INSERT INTO projection_members(projection,kind,id,size) SELECT ?,kind,id,size FROM closure_nodes WHERE job=?',plan.record_key,proofId);
       this.host.sql.exec('INSERT INTO projection_paths(projection,canonical_path,relative_path,kind,id,size,executable,target_bytes) SELECT ?,canonical_path,relative_path,kind,id,size,executable,target_bytes FROM projection_selected WHERE job=?',plan.record_key,job.id);
       for(const origin of plan.private_copy_origins) {
         const encoded=JSON.stringify(origin);if(encoder.encode(encoded).length>8*1024) throw new Invalid();
-        this.host.sql.exec('INSERT INTO projection_private_origins(projection,canonical_path,value) VALUES(?,?,?)',plan.record_key,origin.canonical_path,encoded);
+        this.host.sql.exec('INSERT INTO projection_private_origins(projection,canonical_path,projected_copy,value) VALUES(?,?,?,?)',plan.record_key,origin.canonical_path,hex(origin.projected_copy),encoded);
       }
     }
     this.host.retainProjectionRootInTx(plan.record_key,hex(plan.binding.projected_commit),proofId);
@@ -484,19 +557,19 @@ export class ForgeProjections {
   }
   private async prove(view:ResolvedView,job:Job):Promise<ProjectionStatus> {
     const plan=await this.plan(view,job);const binding=this.closureBinding(job,plan);
-    const closures=this.host.closureForProjection(view,binding,proof=>this.publishInTx(view,job,plan,proof));
+    const closures=this.host.closureForProjection(view,binding,proof=>this.publishInTx(view,job,plan,proof),()=>{this.load(view,job.id);});
     if(!job.closure_job) {
       const status=await closures.begin(`projection-${job.id}`,{kind:3,id:hex(plan.binding.projected_commit)});
       return this.host.transactionSync(() => {const current=this.load(view,job.id,job.generation);if(current.closure_job!==null) fail(409,'aborted');current.closure_job=status.job_id;current.error=null;this.save(current);return this.report(current);});
     }
     const status=closures.status(job.closure_job);
-    if(status.phase==='ready') {closures.publish(status.job_id,status.generation);return this.status(view,job.id);}
+    if(status.phase==='ready') {closures.publish(status.job_id,status.generation);return this.currentStatus(view,job.id);}
     if(status.phase==='published') throw new Invalid();
     if(status.phase==='limit') throw new Limit('closure');
     const next=await closures.advance(status.job_id,status.generation);
     return this.host.transactionSync(() => {const current=this.load(view,job.id,job.generation);current.error=next.error;if(next.phase==='limit') current.phase='limit';this.save(current);return this.report(current);});
   }
-  async advance(view:ResolvedView,progress:ProjectionProgress):Promise<ProjectionStatus> {
+  private async advanceJob(view:ResolvedView,progress:ProjectionProgress):Promise<ProjectionStatus> {
     if(!progress||!safe(progress.expected_generation)||!uuid(progress.job_id)) fail(400,'invalid_argument');
     const job=this.host.transactionSync(()=>this.load(view,progress.job_id,progress.expected_generation));
     if(job.phase==='ready'||job.phase==='limit') return this.report(job);
@@ -516,11 +589,54 @@ export class ForgeProjections {
    * after each backing await and immediately before returning bytes. */
   readyInTx(view:ResolvedView):ReadyProjection|undefined {
     const d=this.check(view);
-    const row=this.one<Catalog>('SELECT id,binding,proof_job,retired FROM projection_catalogs WHERE account=? AND version=? AND epoch=? AND revision=?',this.host.accountId,hex(d.view_version),d.policy_epoch,hex(d.revision));
+    const row=this.one<Catalog>("SELECT id,binding,proof_job,retired FROM projection_catalogs WHERE account=? AND version=? AND epoch=? AND revision=? AND purpose='baseline'",this.host.accountId,hex(d.view_version),d.policy_epoch,hex(d.revision));
     if(!row||row.retired!==0) return undefined;
     let binding:ProjectionBinding;try{binding=JSON.parse(row.binding);}catch{throw new Invalid();}
     if(binding.account_id!==this.host.accountId||hex(binding.view_version)!==hex(d.view_version)||binding.policy_epoch!==d.policy_epoch||hex(binding.canonical_revision)!==hex(d.revision)) throw new Invalid();
     return {catalog_id:row.id,binding,proof_job:row.proof_job};
+  }
+  private catalog(view:ResolvedView,row:Catalog):ReadyProjection {
+    const d=this.check(view);let binding:ProjectionBinding;try{binding=JSON.parse(row.binding);}catch{throw new Invalid();}
+    if(row.retired!==0||binding.account_id!==this.host.accountId||hex(binding.view_version)!==hex(d.view_version)||binding.policy_epoch!==d.policy_epoch) throw new Invalid();
+    hex(binding.canonical_revision);hex(binding.projected_commit);hex(binding.projected_tree);
+    return {catalog_id:row.id,binding,proof_job:row.proof_job};
+  }
+  private catalogForProjectedInTx(view:ResolvedView,head:string):ReadyProjection|undefined {
+    const d=this.check(view);if(!/^[0-9a-f]{64}$/.test(head)) fail(400,'invalid_argument');
+    const revisions=this.rows<{revision:string}>('SELECT DISTINCT revision FROM projection_catalogs WHERE account=? AND version=? AND epoch=? AND projected_commit=? AND retired=0 LIMIT 2',this.host.accountId,hex(d.view_version),d.policy_epoch,head);
+    if(!revisions.length) return undefined;
+    // A projected identity must not silently choose between canonical bases.
+    if(revisions.length!==1) fail(409,'aborted');
+    const row=this.one<Catalog>('SELECT id,binding,proof_job,retired FROM projection_catalogs WHERE account=? AND version=? AND epoch=? AND projected_commit=? AND retired=0 ORDER BY id LIMIT 1',this.host.accountId,hex(d.view_version),d.policy_epoch,head)!;
+    const result=this.catalog(view,row);
+    if(hex(result.binding.projected_commit)!==head||hex(result.binding.canonical_revision)!==revisions[0].revision) throw new Invalid();
+    return result;
+  }
+  readyReviewInTx(view:ResolvedView,input:Readonly<ReviewProjectionSource>):ReadyProjection|undefined {
+    const source=this.source(view,input),d=this.check(view);
+    const id=`forge/projections/v1/${this.host.accountId}/${hex(d.view_version)}/${d.policy_epoch}/review/${source.canonical_head}/${source.change_id}/${source.projected_parent}`;
+    const row=this.one<Catalog>("SELECT id,binding,proof_job,retired FROM projection_catalogs WHERE id=? AND purpose='review'",id);
+    if(!row||row.retired!==0) return undefined;
+    const result=this.catalog(view,row);if(hex(result.binding.canonical_revision)!==source.canonical_head) throw new Invalid();return result;
+  }
+  canonicalForProjectedBaseInTx(view:ResolvedView,projectedCommit:string):{canonical_revision:string;projection_id:string}|undefined {
+    const result=this.catalogForProjectedInTx(view,projectedCommit);
+    return result?{canonical_revision:hex(result.binding.canonical_revision),projection_id:result.catalog_id}:undefined;
+  }
+  authorizedReadMemberInTx(view:ResolvedView,object:ObjectKey):{projection:ReadyProjection;descriptor:Descriptor} {
+    const d=this.check(view);if(!key(object)) fail(400,'invalid_argument');
+    const row=this.one<Catalog&{size:number}>('SELECT c.id,c.binding,c.proof_job,c.retired,m.size FROM projection_catalogs c JOIN projection_members m ON m.projection=c.id WHERE c.account=? AND c.version=? AND c.epoch=? AND c.retired=0 AND m.kind=? AND m.id=? ORDER BY c.id LIMIT 1',this.host.accountId,hex(d.view_version),d.policy_epoch,object.kind,object.id);
+    if(!row) fail(403,'permission_denied');
+    const projection=this.catalog(view,row),expected=descriptor({...object,size_bytes:row.size,format_version:1}),actual=this.host.describeObjectInTx(object);
+    if(!actual||!same(expected,actual)) fail(503,'unavailable');return {projection,descriptor:expected};
+  }
+  /** Private normalization witness; never serialize this into product responses. */
+  projectedCopyOriginInTx(view:ResolvedView,copyId:string):{projection:ReadyProjection;origin:ProjectionCopyOrigin}|undefined {
+    const d=this.check(view);if(!key({kind:5,id:copyId})) fail(400,'invalid_argument');
+    const row=this.one<Catalog&{value:string}>('SELECT c.id,c.binding,c.proof_job,c.retired,o.value FROM projection_private_origins o JOIN projection_catalogs c ON c.id=o.projection WHERE c.account=? AND c.version=? AND c.epoch=? AND c.retired=0 AND o.projected_copy=? ORDER BY c.id LIMIT 1',this.host.accountId,hex(d.view_version),d.policy_epoch,copyId);
+    if(!row) return undefined;this.authorizedReadMemberInTx(view,{kind:5,id:copyId});const projection=this.catalog(view,row);let origin:ProjectionCopyOrigin;try{origin=JSON.parse(row.value);}catch{throw new Invalid();}
+    if(hex(origin.projected_copy)!==copyId||hex(origin.canonical_revision)!==hex(projection.binding.canonical_revision)||!this.allowedPathsInTx(view,[origin.canonical_path])[0]?.allowed) throw new Invalid();
+    hex(origin.file);if(origin.canonical_copy!==null) hex(origin.canonical_copy);return {projection,origin};
   }
   memberInTx(view:ResolvedView,object:ObjectKey):{projection:ReadyProjection;descriptor:Descriptor} {
     if(!key(object)) fail(400,'invalid_argument');

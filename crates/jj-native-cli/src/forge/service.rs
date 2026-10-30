@@ -56,6 +56,7 @@ pub(super) async fn request(
                 None,
             )
             .await?;
+            super::review::admission_pending(&reply, Some(&saved.payload))?;
             if reply.state == "landed" {
                 let mut value: Value = serde_json::from_slice(&reply.result_json)
                     .map_err(|_| user_error("invalid landed review result"))?;

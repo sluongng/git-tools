@@ -134,6 +134,11 @@ enum ForgeHttpMode {
     ResolveStuck,
     ResolveComplete,
     ResolveInvalid,
+    AdmissionPending,
+    AdmissionMismatch,
+    AdmissionBadShape,
+    AdmissionStuck,
+    AdmissionAccepted,
 }
 async fn forge_http_fixture(
     mode: ForgeHttpMode,
@@ -198,6 +203,19 @@ async fn forge_http_fixture(
                         status=503; reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost continuation acknowledgement"}});
                     }
                 }
+                if matches!(mode, ForgeHttpMode::AdmissionPending | ForgeHttpMode::AdmissionMismatch | ForgeHttpMode::AdmissionBadShape | ForgeHttpMode::AdmissionStuck | ForgeHttpMode::AdmissionAccepted) {
+                    let intent:serde_json::Value=serde_json::from_str(input["payload_json"].as_str().unwrap()).unwrap();
+                    let mut value=serde_json::json!({"schema_version":1,"request_id":input["request_id"],"source_base":intent["source_base"],"source_head":intent["source_head"],"view_version":intent["view_version"],"phase":"admission"});
+                    reply["state"]=serde_json::json!("admission_pending");
+                    if matches!(mode,ForgeHttpMode::AdmissionMismatch){value["source_head"]=serde_json::json!("9".repeat(64));}
+                    if matches!(mode,ForgeHttpMode::AdmissionBadShape){value["patchset_id"]=serde_json::json!("8".repeat(64));}
+                    if matches!(mode,ForgeHttpMode::AdmissionAccepted)||(matches!(mode,ForgeHttpMode::AdmissionPending)&&call>=4){
+                        value=serde_json::json!({"change_id":"4".repeat(32),"patchset_id":"5".repeat(64),"source_base":intent["source_base"],"source_head":intent["source_head"],"view_version":intent["view_version"],"is_current":true,"state":"rebase_pending","candidate":null});
+                        reply["state"]=serde_json::json!("rebase_pending");
+                    }
+                    reply["result_json"]=serde_json::json!(value.to_string());
+                    if matches!(mode,ForgeHttpMode::AdmissionPending)&&call==2{status=503;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost admission acknowledgement"}});}
+                }
                 let body=serde_json::to_vec(&reply).unwrap();
                 if matches!(mode,ForgeHttpMode::ChunkedResponseLimit) {
                     socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
@@ -225,7 +243,7 @@ async fn forge_http_fixture(
         compression: false,
         ..Default::default()
     };
-    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck) {
+    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck | ForgeHttpMode::AdmissionStuck) {
         config.rpc.operation_timeout_ms = 80;
         config.rpc.rpc_timeout_ms = 80;
         config.rpc.connect_timeout_ms = 50;
@@ -278,6 +296,28 @@ async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_sha
     assert_eq!(client.forge_resolve_view(input).await.unwrap().state, "complete");
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "local gRPC complete needs no continuation");
     stop.send(()).unwrap(); task.await.unwrap();
+}
+#[tokio::test]
+async fn forge_push_review_continues_only_exact_pre_admission_intent_with_one_deadline() {
+    for (mode,expected,calls) in [
+        (ForgeHttpMode::AdmissionPending,None,Some(4)),
+        (ForgeHttpMode::AdmissionAccepted,None,Some(1)),
+        (ForgeHttpMode::AdmissionMismatch,Some(Code::DataLoss),Some(1)),
+        (ForgeHttpMode::AdmissionBadShape,Some(Code::DataLoss),Some(1)),
+        (ForgeHttpMode::AdmissionStuck,Some(Code::DeadlineExceeded),None),
+    ] {
+        let (client,inputs,stop,task)=forge_http_fixture(mode).await;
+        let mut input=forge_http_input();
+        input.operation=tinytree_client::forge_protocol::ForgeOperation::PushReview as i32;
+        input.payload_json=format!("{{\n \"source_base\":\"{}\", \"source_head\":\"{}\", \"view_version\":\"{}\"\n}}", "1".repeat(64), "2".repeat(64), "3".repeat(64)).into_bytes();
+        let result=client.forge_push_review(input.clone()).await;
+        assert_eq!(result.as_ref().err().map(Status::code),expected,"{mode:?}");
+        if let Ok(reply)=result {assert_eq!(reply.state,"rebase_pending");let value:serde_json::Value=serde_json::from_slice(&reply.result_json).unwrap();assert_eq!(value["candidate"],serde_json::Value::Null);assert_eq!(value["patchset_id"],"5".repeat(64));}
+        let seen=inputs.lock().unwrap().clone();
+        if let Some(calls)=calls {assert_eq!(seen.len(),calls,"{mode:?}");}else{assert!(!seen.is_empty()&&seen.len()<16);}
+        for request in &seen {assert_eq!(request,&seen[0],"every retry/quantum retains original envelope bytes");assert_eq!(request["payload_json"],String::from_utf8(input.payload_json.clone()).unwrap());}
+        stop.send(()).unwrap();task.await.unwrap();
+    }
 }
 fn forge_http_input() -> tinytree_client::forge_protocol::ForgeCallRequest {
     tinytree_client::forge_protocol::ForgeCallRequest {

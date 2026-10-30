@@ -12,6 +12,8 @@ mod search;
 mod reads;
 mod imports;
 mod uploads;
+mod reviews;
+mod review_admission;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -454,6 +456,24 @@ pub extern "C" fn tt_forge_upload_command(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_upload_scope_page(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, uploads::scope_page)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_review_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, reviews::normalize)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_review_identity(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, reviews::derive_identity)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_review_format(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, reviews::format)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_review_admission(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, review_admission::analyze)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

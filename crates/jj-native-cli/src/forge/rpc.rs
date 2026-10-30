@@ -96,6 +96,8 @@ async fn call_inner(
     // decoding before returning an authenticated control-plane assertion.
     let result = if operation == f::ForgeOperation::ResolveView {
         client.forge_resolve_view(input).await
+    } else if operation == f::ForgeOperation::PushReview {
+        client.forge_push_review(input).await
     } else {
         client.forge_call(input).await
     };

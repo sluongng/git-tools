@@ -16,7 +16,10 @@ try {
   JSON.parse(canonical);
   const fixtureJson = join(temporary, "contract.json");
   await writeFile(fixtureJson, canonical, { mode: 0o600 });
-  const child = spawn(process.execPath, ["--test", resolve(directory, "tests/runtime.test.mjs")], {
+  const testArguments = ["--test"];
+  if (process.env.TESTBRIDGE_TEST_ONLY) testArguments.push("--test-name-pattern", process.env.TESTBRIDGE_TEST_ONLY);
+  testArguments.push(resolve(directory, "tests/runtime.test.mjs"));
+  const child = spawn(process.execPath, testArguments, {
     stdio: "inherit",
     env: {
       ...process.env,

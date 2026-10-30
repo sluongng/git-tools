@@ -72,17 +72,27 @@ export class ForgeAccounts {
   }
   /** Host-side fencing only, not an authorization grant or public operation. */
   hasAccountInTx(): boolean { return this.accountInTx() !== undefined; }
-  private authorizeInTx(action: 'member' | 'admin' | 'write'): AccountRow {
-    if (this.host.principal === null) fail(401, 'unauthenticated');
+  private authorizeInTx(action: 'member' | 'admin' | 'write' | 'review', principal: string | null = this.host.principal): AccountRow {
+    if (principal === null) fail(401, 'unauthenticated');
     const row = this.accountInTx();
     if (!row) fail(403, 'permission_denied');
-    if (row.owner === this.host.principal) return row;
-    const member = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, this.host.principal);
+    if (row.owner === principal) return row;
+    const member = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, principal);
     if (!member) fail(403, 'permission_denied');
     const grant = JSON.parse(member.value) as ForgeMember;
     if ((action === 'admin' && grant.is_admin !== true)
-        || (action === 'write' && grant.is_admin !== true && grant.can_write !== true)) fail(403, 'permission_denied');
+        || (action === 'write' && grant.is_admin !== true && grant.can_write !== true)
+        || (action === 'review' && grant.is_admin !== true && grant.can_review !== true)) fail(403, 'permission_denied');
     return row;
+  }
+  /** Trusted review embedding only: alternate subjects come from its persisted
+   * decision records, never a public actor/grant selector. */
+  authorityInTx(action: 'read' | 'write' | 'review', expectedEpoch?: number, principal: string | null = this.host.principal): { epoch: number; is_admin: boolean } {
+    const row = this.authorizeInTx(action === 'read' ? 'member' : action, principal);
+    if (expectedEpoch !== undefined && row.policy_epoch !== expectedEpoch) fail(409, 'aborted');
+    if (row.owner === principal) return { epoch: row.policy_epoch, is_admin: true };
+    const saved = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, principal);
+    return { epoch: row.policy_epoch, is_admin: saved !== undefined && (JSON.parse(saved.value) as ForgeMember).is_admin === true };
   }
   private wire(row: AccountRow): Record<string, unknown> {
     return { account_id: row.account_id, monorepo_id: `forge-${row.account_id}`, policy_epoch: row.policy_epoch,

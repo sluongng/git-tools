@@ -477,6 +477,8 @@ mod forge_product {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let received = requests.clone();
+        let admit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_admit = admit.clone();
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
@@ -486,11 +488,12 @@ mod forge_product {
                     _ = &mut stopped => break,
                 };
                 let received = received.clone();
+                let server_admit = server_admit.clone();
                 connections.spawn(async move {
                     let mut headers = Vec::new();
                     while !headers.ends_with(b"\r\n\r\n") {
                         let mut byte = [0];
-                        socket.read_exact(&mut byte).await.unwrap();
+                        if socket.read_exact(&mut byte).await.is_err() { return; }
                         headers.push(byte[0]);
                         assert!(headers.len() < 16384);
                     }
@@ -500,12 +503,29 @@ mod forge_product {
                     let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
                     assert!(size < 2 * 1024 * 1024);
                     let mut bytes = vec![0; size];
-                    socket.read_exact(&mut bytes).await.unwrap();
+                    if socket.read_exact(&mut bytes).await.is_err() { return; }
                     let input: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(input["version"], 1);
                     assert_eq!(input["view"], "public");
-                    assert_eq!(input["payload_json"], "{}");
-                    received.lock().unwrap().push(input.clone());
+                    if input["operation"] != 20 { assert_eq!(input["payload_json"], "{}"); }
+                    let original_push = {
+                        let mut requests = received.lock().unwrap(); requests.push(input.clone());
+                        requests.iter().find(|request| request["operation"] == 20).cloned()
+                    };
+                    if input["operation"] == 20 || input["operation"] == 22 {
+                        let original = original_push.expect("pending lookup names an actually dispatched original push");
+                        let payload: serde_json::Value = serde_json::from_str(original["payload_json"].as_str().unwrap()).unwrap();
+                        assert_eq!(input["request_id"], original["request_id"]);
+                        let pending = input["operation"] == 22 || !server_admit.load(std::sync::atomic::Ordering::SeqCst);
+                        let result = if pending {
+                            serde_json::json!({"schema_version":1,"request_id":input["request_id"],"source_base":payload["source_base"],"source_head":payload["source_head"],"view_version":payload["view_version"],"phase":"admission"})
+                        } else {
+                            serde_json::json!({"source_base":payload["source_base"],"source_head":payload["source_head"],"view_version":payload["view_version"],"patchset_id":"55".repeat(32),"change_id":"66".repeat(16),"is_current":true,"state":"rebase_pending","candidate":null})
+                        };
+                        let output=serde_json::to_vec(&serde_json::json!({"version":1,"operation":input["operation"],"account_id":input["account_id"],"view":input["view"],"request_id":input["request_id"],"state":if pending {"admission_pending"}else{"rebase_pending"},"result_json":result.to_string()})).unwrap();
+                        let _=socket.write_all(format!("HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",output.len()).as_bytes()).await;
+                        let _=socket.write_all(&output).await; return;
+                    }
                     let denied = input["account_id"] == "missing";
                     let result = match input["account_id"].as_str().unwrap() {
                         "malformed" => "not-json".to_owned(),
@@ -693,6 +713,28 @@ mod forge_product {
             "resume uses the exact HTTP mutation envelope"
         );
         drop(received);
+        // Dispatch a real CLI push, interrupt while admission is pending, then
+        // inspect/reconcile read-only and resume the SAME private saved intent.
+        let base="11".repeat(32);let head="22".repeat(32);let version="33".repeat(32);
+        let mut child=client.spawn(&["push","--source-base",&base,"--source-head",&head,"--view-version",&version,"--request-id","http-admission","--json"]);
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            if requests.lock().unwrap().iter().any(|request|request["operation"]==20) {break;}
+            assert!(std::time::Instant::now()<deadline,"CLI must dispatch before interruption");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        child.0.as_mut().unwrap().kill().unwrap();let _=child.0.take().unwrap().wait_with_output().unwrap();
+        let intent_path=client.home.join("config/tinytree/requests/request-http-admission.json");
+        let intent=fs::read(&intent_path).unwrap();
+        let pending_report:serde_json::Value=serde_json::from_str(&client.success(&["review","operation","http-admission","--json"])).unwrap();
+        assert_eq!(pending_report["state"],"admission_pending");assert!(pending_report["result"]["value"].get("patchset_id").is_none());
+        let reconciled:serde_json::Value=serde_json::from_str(&client.success(&["request","reconcile","http-admission","--json"])).unwrap();
+        assert_eq!(reconciled["state"],"admission_pending");assert!(reconciled["result"]["value"].get("local_reconciliation").is_none());
+        admit.store(true,std::sync::atomic::Ordering::SeqCst);
+        let admitted:serde_json::Value=serde_json::from_str(&client.success(&["request","resume","http-admission","--json"])).unwrap();
+        assert_eq!(admitted["state"],"rebase_pending");assert_eq!(admitted["result"]["value"]["candidate"],serde_json::Value::Null);
+        assert_eq!(fs::read(&intent_path).unwrap(),intent,"admission never replaces original saved payload/key");
+        let requests=requests.lock().unwrap();let pushes=requests.iter().filter(|request|request["operation"]==20).collect::<Vec<_>>();assert!(pushes.len()>=2);for push in &pushes {assert_eq!(*push,pushes[0],"interrupted admission resumes exact op20 envelope");}drop(requests);
         stop.send(()).unwrap();
         server.await.unwrap();
     }

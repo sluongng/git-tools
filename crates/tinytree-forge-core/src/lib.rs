@@ -5,6 +5,8 @@ pub mod account_commands;
 pub mod check;
 pub mod identity;
 pub mod review;
+pub mod review_commands;
+pub mod review_admission;
 pub mod projection;
 pub mod wire;
 pub mod search;

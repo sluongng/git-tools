@@ -41,6 +41,29 @@ interface Session {
 interface Node { kind: number; id: string; path: string; depth: number; role: Role; position: number; done: number }
 interface Usage { account: string; records: number; active: number; assembly_bytes: number; frontier_rows: number }
 interface OwnReceipt { size: number; format: number; expires_at: number }
+export interface OwnedUploadHost {
+  accountId: string; principal: string | null; sql: SqlStorage; views: ForgeViews;
+  requireWriterInTx(): void;
+  describeObjectInTx(key: ObjectKey): Descriptor | undefined;
+}
+/** Exact supplied-byte ownership, never projection or global availability.
+ * Caller holds its authoritative transaction; the opaque view binds identity. */
+export function requireOwnedUploadInTx(host: OwnedUploadHost, view: ResolvedView, path: string, descriptor: Descriptor, now: number): number {
+  if (host.principal === null) fail(401, 'unauthenticated');
+  host.requireWriterInTx(); host.views.checkInTx(view);
+  if (view.description.account_id !== host.accountId || !Number.isSafeInteger(now) || now < 0) fail(403, 'permission_denied');
+  if (!(path === '' && (descriptor.kind === 2 || descriptor.kind === 3))) {
+    const allowed = host.views.pathsAllowedInTx(view, [path]);
+    if (allowed.paths.length !== 1 || !allowed.paths[0].allowed) fail(403, 'permission_denied');
+  }
+  const available = host.describeObjectInTx(descriptor);
+  if (!available || !same(available, descriptor)) fail(403, 'permission_denied');
+  const receipt = [...host.sql.exec('SELECT size,format,expires_at FROM forge_owned_uploads WHERE account=? AND principal=? AND version=? AND epoch=? AND path=? AND kind=? AND id=?',
+    host.accountId, host.principal, hex(view.description.view_version), view.description.policy_epoch, path, descriptor.kind, descriptor.id)][0] as unknown as OwnReceipt | undefined;
+  if (!receipt || receipt.size !== descriptor.size_bytes || receipt.format !== descriptor.format_version
+      || !Number.isSafeInteger(receipt.expires_at) || receipt.expires_at <= now) fail(403, 'permission_denied');
+  return receipt.expires_at;
+}
 const MAX_FILE = 1024 * 1024, MAX_META = 256 * 1024, MAX_NODES = 32768, MAX_FRONTIER = 262144;
 const MAX_PATH_BYTES = 4 * 1024 * 1024, MAX_ENTRIES = 10000, TTL = 86400;
 const encoder = new TextEncoder();
@@ -161,9 +184,8 @@ export class ForgeUploads {
     const d = this.host.describeObjectInTx(key); if (!d) fail(403, 'permission_denied');
     if (expectedSize !== null && d.size_bytes !== expectedSize) fail(400, 'invalid_argument');
     if (this.host.projectionMemberInTx(view, d)) return;
-    const receipt = this.one<OwnReceipt>('SELECT size,format,expires_at FROM forge_owned_uploads WHERE account=? AND principal=? AND version=? AND epoch=? AND path=? AND kind=? AND id=?', this.account, this.principal, s.version, s.epoch, path, key.kind, key.id);
-    if (!receipt || receipt.size !== d.size_bytes || receipt.format !== d.format_version || receipt.expires_at <= this.now()) fail(403, 'permission_denied');
-    s.authority_until = Math.min(s.authority_until, receipt.expires_at);
+    const expiry = requireOwnedUploadInTx(this.host, view, path, d, this.now());
+    s.authority_until = Math.min(s.authority_until, expiry);
   }
   private async stage(s: Session): Promise<Session> {
     const bytes = this.host.transactionSync(() => { this.current(s); if (s.position !== s.size) fail(400, 'failed_precondition'); return this.buffer(s); });

@@ -16,7 +16,9 @@ An independently gated `POST /api/v1/forge/call` endpoint supports account
 provisioning, account snapshots and membership changes (operations 1, 2 and 3),
 plus view publication, discovery and retirement (operations 4, 5 and 11).
 Prepared snapshots, README/file previews and scoped object ranges are available
-through operations 6, 7 and 9.
+through operations 6, 7 and 9. Operation 8 provides bounded, policy-scoped
+code search, and operation 10 supports actor-owned scoped object uploads.
+The bundled browser starts with the pinned README and code search.
 Set `FORGE_BACKEND=enabled` and use a `kind=forge` identity for that endpoint.
 Account ownership, membership, policy epochs and replay receipts are SQLite
 authority; ordinary Forge operations cannot use raw identities. Provisioning
@@ -38,11 +40,21 @@ there is no unnamed/latest restart or local fallback. Use the explicit
 `forge-https-v1` transport when selecting a CLI context. Account/view publication
 does not register a local workspace provider automatically.
 
-It does **not** implement the Forge review, code-search, query, transform,
-workspace-backup, or checked-landing APIs. The normal `tt` Forge workflow is
-not yet supported by this target. Unsupported operations fail explicitly;
-there is no fallback to the local backend. Do not expose it as an equivalent
-public Forge service or switch an existing account between the two authorities.
+Review operations 20–23 provide immutable patchset admission, server-side candidate
+preparation, exact-candidate decisions and comments. Large source admission returns
+bounded `admission_pending` progress before reserving a patchset; the SDK and CLI
+continue the original saved intent. Candidate construction uses the shared native
+rebase engine, and published result reads use a separate sanitized projection.
+Preparation does not execute checks: successful candidates remain `checks_pending`.
+Operation 24 refuses landing until authenticated checker execution and atomic
+checked publication are implemented. Approval votes alone never make a candidate
+ready or publish it.
+
+Query, transforms, workspace backup and checked landing remain unsupported. The
+complete `tt` Forge workflow is not yet supported by this target. Unsupported
+operations fail explicitly; there is no fallback to the local backend. Do not
+expose it as an equivalent public Forge service or switch an existing account
+between the two authorities.
 
 There is no object-deletion API or garbage collector in this first backend.
 Pending uploads and their byte reservations count toward finite account limits.
@@ -97,6 +109,13 @@ membership or view authority: every operation checks the current SQLite policy.
 They are not Forge view permissions. Provisioning requires
 an operator grant, and neither request bodies nor object digests grant access.
 
+Review submission additionally requires an operator-selected
+`FORGE_REVIEW_CONFIG_JSON` secret containing `profile` (`name` and a 64-character
+lowercase hexadecimal `version`) and `committer` (`name` and `email`). Public
+requests cannot select these trusted fields. The version must identify the
+intended immutable check profile; configuring it does not run a checker or
+provide a check receipt. Missing configuration refuses submission.
+
 Raw requests are disabled unless `EXPERIMENTAL_RAW_BACKEND` is explicitly set to
 `enabled`. Never put bearer tokens or principal secrets in source, Wrangler
 configuration, or a public bucket. Cloudflare TLS does not replace application
@@ -105,7 +124,7 @@ authorization.
 ## Deployment selection
 
 Choose the local server deployment for complete Forge behavior, or this Worker
-deployment for the supported experimental raw repository operations. The
+deployment for the supported experimental repository and Forge operations. The
 Worker's `wrangler.jsonc` describes a new SQLite Durable Object namespace and
 an R2 binding; it selects no account, zone, hostname, or credentials and disables
 automatic public preview hostnames.

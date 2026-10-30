@@ -26,6 +26,10 @@ interface CoreExports {
   tt_forge_import_command(pointer: number, length: number): number;
   tt_forge_upload_command(pointer: number, length: number): number;
   tt_forge_upload_scope_page(pointer: number, length: number): number;
+  tt_forge_review_command(pointer: number, length: number): number;
+  tt_forge_review_identity(pointer: number, length: number): number;
+  tt_forge_review_format(pointer: number, length: number): number;
+  tt_forge_review_admission(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -102,6 +106,29 @@ export function normalizeForgeUploadCommand(input: Pick<ForgeCall, 'account_id' 
 export function uploadScopePage(input: import('./forge_uploads').UploadScopeInput): import('./forge_uploads').UploadScopePage {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_upload_scope_page(pointer, bytes.byteLength)) as import('./forge_uploads').UploadScopePage;
+}
+
+/** Strict shared public intent only. Authenticated grants, selected profiles,
+ * source ownership and candidate authority are supplied separately by SQL. */
+export function normalizeForgeReviewCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'request_id' | 'payload_json'>): import('./forge_reviews').ReviewCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_review_command(pointer, bytes.byteLength)) as import('./forge_reviews').ReviewCommand;
+}
+/** Internal exact native identity algorithms. An output digest is not proof of
+ * source possession, policy, a successful check or permission to publish. */
+export function deriveForgeReviewIdentity(input: unknown): Record<string, string> {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_review_identity(pointer, bytes.byteLength)) as Record<string, string>;
+}
+export function formatForgeReview(input: unknown): { state: string; value: Record<string, unknown> } {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_review_format(pointer, bytes.byteLength)) as { state: string; value: Record<string, unknown> };
+}
+/** Complete bounded delta facts or an explicit continuation/limit result. SQL
+ * must satisfy every current authority requirement before admitting a patchset. */
+export function reviewAdmission(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_review_admission(pointer, bytes.byteLength));
 }
 
 /** Internal server-selected context only; never forward a product payload here. */

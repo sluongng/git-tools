@@ -74,9 +74,275 @@ fn projection_fixture(store: &Store) -> Value {
     let projection = store.forge_project_view(&view, 0).unwrap();
     drop(put);
     let uploads = projection_uploads(store, &account, &owner, &view, &projection, secret);
+    let reviews = projection_reviews(store, &account, &owner, &view, &projection);
     let readme_content = String::from_utf8(store.forge_read_view_file(&view, "README.md", 65536).unwrap()).unwrap();
     let snapshot = json!({"account_id":account.0,"view":view.name(),"view_version":view.version().0,"revision":view.revision().0,"policy_epoch":view.epoch().0,"root_prefix":view.root_prefix(),"projected_commit":projection.projected_commit,"projected_tree":projection.projected_tree,"paths":files.into_iter().map(|f|f.path).collect::<Vec<_>>(),"readme":{"path":"README.md","content":readme_content},"readme_error":null,"complete":true});
-    json!({"account_id":account.0,"owner":owner.principal,"uploads":uploads,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
+    json!({"account_id":account.0,"owner":owner.principal,"uploads":uploads,"reviews":reviews,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
+}
+
+// Native admission oracle has genesis main, while the pure candidate oracle
+// explicitly targets the canonical view root. These are different target states;
+// neither is a passing checker receipt or a Cloudflare candidate-state oracle.
+fn projection_reviews(
+    store: &Store,
+    account: &AccountId,
+    actor: &ForgeActor,
+    view: &tinytree_store::ResolvedView,
+    projection: &tinytree_store::ForgeProjection,
+) -> Value {
+    fn encoded(object: Object) -> (Descriptor, Vec<u8>) {
+        let encoded = tinytree_model::encode(&object, Limits::default()).unwrap();
+        (encoded.descriptor, encoded.bytes)
+    }
+    let repository = account.repository_id();
+    let before = store
+        .references(&repository, &["main".into()])
+        .unwrap()
+        .remove(0);
+    let (_, bytes) = store
+        .read_metadata(
+            &repository,
+            tinytree_model::ObjectKey {
+                kind: Kind::Tree,
+                id: tinytree_model::ObjectId(projection.projected_tree),
+            },
+        )
+        .unwrap();
+    let Object::Tree(mut root) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else {
+        panic!("review projected tree")
+    };
+    assert_eq!(root.entries.len(), 701);
+    let (_, bytes) = store
+        .read_metadata(
+            &repository,
+            tinytree_model::ObjectKey {
+                kind: Kind::Commit,
+                id: tinytree_model::ObjectId(projection.projected_commit),
+            },
+        )
+        .unwrap();
+    let Object::Commit(mut source) = tinytree_model::decode(&bytes, Limits::default()).unwrap()
+    else {
+        panic!("review projected commit")
+    };
+    let file_bytes = b"Plain authored source for review admission\n".to_vec();
+    let file = tinytree_model::describe_file(&file_bytes);
+    root.entries.push(TreeEntry {
+        name: "source.txt".into(),
+        value: TreeValue::File {
+            id: FileId(file.key.id.0),
+            executable: false,
+            size_bytes: file.size_bytes,
+            copy_id: None,
+        },
+    });
+    root.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let tree = encoded(Object::Tree(root));
+    source.parents = vec![CommitId(projection.projected_commit)];
+    source.predecessors.clear();
+    source.root_tree = TreeMerge {
+        terms: vec![TreeId(tree.0.key.id.0)],
+        labels: vec![String::new()],
+    };
+    source.change_id = ChangeId([94; 16]);
+    source.description = "Plain authored review fixture".into();
+    let committer = source.committer.clone();
+    let head = encoded(Object::Commit(source));
+    let mut objects = Vec::new();
+    for (name, path, (descriptor, bytes)) in [
+        ("plain-file", "source.txt", (file, file_bytes)),
+        ("plain-root-tree", "", tree),
+        ("plain-source-commit", "", head.clone()),
+    ] {
+        let request_id = format!("native-review-upload-{name}");
+        let begun = store
+            .forge_begin_upload(view, actor, &request_id, path, descriptor, 0)
+            .unwrap();
+        let mut offset = 0;
+        for chunk in bytes.chunks(64 * 1024) {
+            let status = store
+                .forge_append_upload(
+                    account,
+                    actor,
+                    view.name(),
+                    begun.session_id,
+                    offset,
+                    chunk,
+                    0,
+                )
+                .unwrap();
+            offset += chunk.len() as u64;
+            assert_eq!(status.offset, offset);
+        }
+        let status = store
+            .forge_finalize_upload(account, actor, view.name(), begun.session_id, 0)
+            .unwrap();
+        assert_eq!(
+            status.state,
+            tinytree_store::forge_upload::ForgeUploadState::Committed
+        );
+        let receipt = status.receipt.as_ref().expect("native scoped byte receipt");
+        assert_eq!(receipt.id, descriptor.key.id.0);
+        assert_eq!(receipt.kind, descriptor.key.kind as u8);
+        assert_eq!(receipt.size_bytes, descriptor.size_bytes);
+        assert_eq!(receipt.format_version, descriptor.format_version);
+        objects.push(json!({"name":name,"path":path,"request_id":request_id,"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes,"session_id":begun.session_id,
+            "native_receipt":serde_json::to_value(receipt).unwrap()}));
+    }
+    let profile = tinytree_store::LandingCheckProfile {
+        name: "checks".into(),
+        version: hex(&tinytree_model::file_id(b"fixture-check-profile-v1").0),
+    };
+    let request = tinytree_store::ForgeReviewPushRequest {
+        request_id: "native-review-plain".into(),
+        source_base: CommitId(projection.projected_commit),
+        source_head: CommitId(head.0.key.id.0),
+        view_version: view.version().0,
+        expected_patchset: None,
+        predecessor: None,
+        provenance: None,
+        lineage: vec![],
+        check_profile: profile.clone(),
+    };
+    let review = store
+        .forge_push_review(account, actor, &request, &committer, 1)
+        .unwrap();
+    assert_eq!(review.change_id, [94; 16]);
+    assert_eq!(review.source_head, head.0.key.id.0);
+    assert_eq!(review.source_base, projection.projected_commit);
+    assert_eq!(review.view_version, view.version().0);
+    assert_eq!(review.patchset_number, 1);
+    assert!(review.is_current);
+    assert_eq!(review.check_profile, profile);
+    let replay = store
+        .forge_push_review(account, actor, &request, &committer, 1)
+        .unwrap();
+    assert_eq!(replay.patchset_id, review.patchset_id);
+    assert_eq!(replay.patchset_number, 1);
+    assert_eq!(
+        store
+            .forge_review_operation(account, actor, &request.request_id)
+            .unwrap()
+            .unwrap()
+            .patchset_id,
+        review.patchset_id
+    );
+    let after = store
+        .references(&repository, &["main".into()])
+        .unwrap()
+        .remove(0);
+    assert_eq!(before.generation, after.generation);
+    assert_eq!(before.commit, after.commit);
+
+    struct Reader<'a> {
+        store: &'a Store,
+        repository: &'a str,
+        reads: usize,
+    }
+    impl tinytree_landing::MetadataReader for Reader<'_> {
+        fn read(
+            &mut self,
+            key: tinytree_model::ObjectKey,
+            maximum: usize,
+        ) -> Result<Vec<u8>, tinytree_landing::ReadError> {
+            assert_ne!(
+                key.kind,
+                Kind::File,
+                "pure builder must never read FILE bodies"
+            );
+            let descriptor = self
+                .store
+                .descriptor(self.repository, key)
+                .map_err(|_| tinytree_landing::ReadError::Unavailable)?
+                .ok_or(tinytree_landing::ReadError::Missing)?;
+            if descriptor.size_bytes > maximum as u64 {
+                return Err(tinytree_landing::ReadError::Limit);
+            }
+            self.reads += 1;
+            self.store
+                .read_metadata(self.repository, key)
+                .map(|(_, bytes)| bytes)
+                .map_err(|_| tinytree_landing::ReadError::Unavailable)
+        }
+    }
+    let mut reader = Reader {
+        store,
+        repository: &repository,
+        reads: 0,
+    };
+    // This mapping is established by the real native view/projection above,
+    // never a client-submitted guessed canonical/source relationship.
+    let candidate = tinytree_landing::build_on_projected_base(
+        &mut reader,
+        tinytree_landing::Request {
+            source_base: request.source_base,
+            source_head: request.source_head,
+            destination_head: view.revision(),
+            committer: committer.clone(),
+        },
+        view.revision(),
+        tinytree_landing::Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(candidate.rewrites.len(), 1);
+    assert_eq!(candidate.rewrites[0].old, request.source_head);
+    assert_eq!(candidate.rewrites[0].change_id, ChangeId([94; 16]));
+    let (_, canonical_commit) = store
+        .read_metadata(
+            &repository,
+            tinytree_model::ObjectKey {
+                kind: Kind::Commit,
+                id: tinytree_model::ObjectId(view.revision().0),
+            },
+        )
+        .unwrap();
+    let Object::Commit(canonical_commit) =
+        tinytree_model::decode(&canonical_commit, Limits::default()).unwrap()
+    else {
+        panic!("canonical source commit")
+    };
+    let (_, canonical_tree) = store
+        .read_metadata(
+            &repository,
+            tinytree_model::ObjectKey {
+                kind: Kind::Tree,
+                id: tinytree_model::ObjectId(canonical_commit.root_tree.terms[0].0),
+            },
+        )
+        .unwrap();
+    let Object::Tree(mut canonical_tree) =
+        tinytree_model::decode(&canonical_tree, Limits::default()).unwrap()
+    else {
+        panic!("canonical source tree")
+    };
+    assert!(
+        canonical_tree
+            .entries
+            .iter()
+            .any(|entry| entry.name == "private")
+    );
+    canonical_tree.entries.push(TreeEntry {
+        name: "source.txt".into(),
+        value: TreeValue::File {
+            id: FileId(file.key.id.0),
+            executable: false,
+            size_bytes: file.size_bytes,
+            copy_id: None,
+        },
+    });
+    canonical_tree.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let expected_tree = encoded(Object::Tree(canonical_tree));
+    assert_eq!(
+        candidate.root_tree.0, expected_tree.0.key.id.0,
+        "builder preserves excluded canonical subtree and exact unchanged baseline entries"
+    );
+    let (state, native_review) =
+        tinytree_forge_core::review_commands::format_review(&review).unwrap();
+    json!({"case":"plain-addition","objects":objects,"request_id":request.request_id,
+        "push":{"source_base":hex(&projection.projected_commit),"source_head":hex(&head.0.key.id.0),"view_version":hex(&view.version().0),"expected_patchset":null,"predecessor":null,"provenance":null,"lineage":[]},
+        "profile":profile,"change_id":hex(&[94;16]),"patchset_id":hex(&review.patchset_id),
+        "admission_oracle":{"actual_main":reference(&before),"state":state,"review":native_review,"check_execution":"not_run","main_unchanged":true,"replay_same_patchset":true,"candidate_state_parity":false},
+        "builder_oracle":{"destination_head":hex(&view.revision().0),"root_tree":hex(&candidate.root_tree.0),"change_id":hex(&candidate.rewrites[0].change_id.0),"source_head":hex(&request.source_head.0),"metadata_reads":reader.reads,"file_body_reads":0,"committer_clock":"frozen_native_fixture_not_runtime_head_oracle"}})
 }
 
 // Ordered public session uploads run against the actual native policy/scope

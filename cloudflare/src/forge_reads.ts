@@ -166,15 +166,15 @@ export class ForgeReads {
   private async object(view: ResolvedView, command: Extract<ReadCommand, { operation: 9 }>): Promise<unknown> {
     const key = { kind: command.kind, id: hex(command.id) };
     const expected = this.host.transactionSync(() => {
-      this.readyInTx(view);
-      return this.host.projections.memberInTx(view, key).descriptor;
+      this.checkInTx(view);
+      return this.host.projections.authorizedReadMemberInTx(view, key).descriptor;
     });
     if (!Number.isSafeInteger(expected.size_bytes) || expected.size_bytes < 0) fail(503, 'unavailable');
     if (command.offset > expected.size_bytes) fail(400, 'invalid_argument');
     const length = Math.min(command.max_bytes, expected.size_bytes - command.offset);
     const recheck = () => {
-      this.readyInTx(view);
-      if (!same(expected, this.host.projections.memberInTx(view, key).descriptor)) fail(409, 'aborted');
+      this.checkInTx(view);
+      if (!same(expected, this.host.projections.authorizedReadMemberInTx(view, key).descriptor)) fail(409, 'aborted');
     };
     let bytes: Uint8Array = new Uint8Array();
     if (length !== 0) {

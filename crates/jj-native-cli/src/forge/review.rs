@@ -83,6 +83,29 @@ pub(super) enum ReviewCommand {
         request_id: Option<String>,
     },
 }
+/// A known pending admission is not an accepted patchset or a source release.
+/// Read-only standalone lookup has no original payload; validate its strict wire
+/// identity only. Saved-intent callers additionally compare the original bytes.
+pub(super) fn admission_pending(
+    reply: &tinytree_client::forge_protocol::ForgeCallResponse,
+    original: Option<&serde_json::Value>,
+) -> Result<bool, CommandError> {
+    use tinytree_forge_core::review_commands::{self, AdmissionPending, ReviewCommand, ADMISSION_PENDING_STATE};
+    if reply.state != ADMISSION_PENDING_STATE { return Ok(false); }
+    let pending: AdmissionPending = serde_json::from_slice(&reply.result_json)
+        .map_err(|_| user_error("invalid pending review admission"))?;
+    let inferred;
+    let original = if let Some(original) = original { original } else {
+        inferred = json!({"source_base":pending.source_base,"source_head":pending.source_head,"view_version":pending.view_version});
+        &inferred
+    };
+    let Some(ReviewCommand::Push(intent)) = review_commands::parse(20, &serde_json::to_vec(original).map_err(user_error)?)
+        .map_err(|_| user_error("invalid original review admission intent"))? else { return Err(user_error("invalid review admission intent")); };
+    pending.validate_against(&reply.request_id, &intent)
+        .map_err(|_| user_error("pending review admission differs from the original intent"))?;
+    Ok(true)
+}
+
 fn hex<const N: usize>(value: String) -> Result<String, CommandError> {
     service::id::<N>(&value)?;
     Ok(value)
@@ -368,7 +391,7 @@ async fn submit(
     let reply = match rpc::call(
         context,
         Op::PushReview,
-        body,
+        body.clone(),
         Some(key.clone()),
         true,
         Some(source),
@@ -410,6 +433,11 @@ async fn submit(
                         retained.save().map_err(user_error)?;
                     }
                     Ok(reply) => {
+                        if admission_pending(&reply, Some(&body))? {
+                            // Admission has not reserved/ACKed a patchset. Keep
+                            // exact source roots and preserve the original denial.
+                            return Err(error);
+                        }
                         accept(retained, &key, &reply)?;
                         return rpc::print(ui, machine, reply);
                     }
@@ -434,6 +462,9 @@ fn accept(
     key: &str,
     reply: &tinytree_client::forge_protocol::ForgeCallResponse,
 ) -> Result<bool, CommandError> {
+    if reply.state == tinytree_forge_core::review_commands::ADMISSION_PENDING_STATE {
+        return Err(user_error("review admission is pending; source remains retained, not acknowledged"));
+    }
     let value: serde_json::Value = serde_json::from_slice(&reply.result_json)
         .map_err(|_| user_error("invalid accepted review result"))?;
     let patchset = value
@@ -475,6 +506,9 @@ fn accept_saved(
     saved: &super::pending::Intent,
     reply: &tinytree_client::forge_protocol::ForgeCallResponse,
 ) -> Result<bool, CommandError> {
+    if admission_pending(reply, Some(&saved.payload))? {
+        return Err(user_error("review admission is pending, not an accepted patchset"));
+    }
     let Some(source) = &saved.source else {
         return Ok(false);
     };
@@ -514,7 +548,7 @@ async fn resume_inner(
     machine: bool,
     saved: super::pending::Intent,
 ) -> Result<(), CommandError> {
-    match rpc::call(
+    let known_pending = match rpc::call(
         &saved.context,
         Op::GetReviewOperation,
         json!({}),
@@ -524,7 +558,8 @@ async fn resume_inner(
     )
     .await
     {
-        Ok(reply) if reply.state == "not_found" => {}
+        Ok(reply) if reply.state == "not_found" => false,
+        Ok(reply) if admission_pending(&reply, Some(&saved.payload))? => true,
         Ok(reply) => {
             let current = accept_saved(&saved, &reply)?;
             if !current || reply.state == "landed" {
@@ -561,8 +596,9 @@ async fn resume_inner(
             {
                 return Err(error);
             }
+            false
         }
-    }
+    };
     let source = saved
         .source
         .as_ref()
@@ -603,30 +639,32 @@ async fn resume_inner(
     {
         return Err(user_error("saved review source retention binding mismatch"));
     }
-    let _helper = command.workspace_helper(ui).await?;
-    let locator = crate::broker::locator(&repo.join("store")).map_err(user_error)?;
-    let provider = native_broker::BrokerObjectIo::connect(
-        locator.socket,
-        locator.store,
-        repo.join("store/native-broker-spool"),
-        Default::default(),
-    )
-    .await
-    .map_err(user_error)?;
-    let provider = if let Some(token) = crate::commands::token(&repo).map_err(user_error)? {
-        provider.with_command_token(token)
-    } else {
-        provider
-    };
-    super::upload::closure(
-        &saved.context,
-        record.view_version,
-        service::id::<32>(&source.base)?,
-        service::id::<32>(&source.head)?,
-        &saved.request_id,
-        std::sync::Arc::new(provider),
-    )
-    .await?;
+    if !known_pending {
+        let _helper = command.workspace_helper(ui).await?;
+        let locator = crate::broker::locator(&repo.join("store")).map_err(user_error)?;
+        let provider = native_broker::BrokerObjectIo::connect(
+            locator.socket,
+            locator.store,
+            repo.join("store/native-broker-spool"),
+            Default::default(),
+        )
+        .await
+        .map_err(user_error)?;
+        let provider = if let Some(token) = crate::commands::token(&repo).map_err(user_error)? {
+            provider.with_command_token(token)
+        } else {
+            provider
+        };
+        super::upload::closure(
+            &saved.context,
+            record.view_version,
+            service::id::<32>(&source.base)?,
+            service::id::<32>(&source.head)?,
+            &saved.request_id,
+            std::sync::Arc::new(provider),
+        )
+        .await?;
+    }
     let source = saved
         .source
         .ok_or_else(|| user_error("local review source missing"))?;
@@ -712,9 +750,9 @@ pub(super) async fn run(ui: &Ui, machine: bool, args: ReviewCommand) -> Result<(
             true,
         ),
     };
-    rpc::print(
-        ui,
-        machine,
-        rpc::call(&service::context()?, op, body, key, mutation, None).await?,
-    )
+    let reply = rpc::call(&service::context()?, op, body, key, mutation, None).await?;
+    if admission_pending(&reply, None)? && op != Op::GetReviewOperation {
+        return Err(user_error("only an original operation lookup may return pending admission"));
+    }
+    rpc::print(ui, machine, reply)
 }

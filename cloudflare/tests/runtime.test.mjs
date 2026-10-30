@@ -208,7 +208,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
   assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
   await forgeValue(await callForge(8, { query: 'fixture', regex: false, limit: 10 }), 400, 'failed_precondition');
-  await forgeValue(await callForge(20, {}, 'unsupported-review'), 501, 'unimplemented');
+  await forgeValue(await callForge(20, {}, 'malformed-review'), 400, 'invalid_argument');
   const malformed = { ...envelope(1, {}, 'actor-injection'), actor: 'forge-owner' };
   await forgeValue(await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${owner}`, 'content-type': 'application/json' }, body: JSON.stringify(malformed) }), 400, 'invalid_argument');
   for (const [operation, payload, method] of [
@@ -670,9 +670,17 @@ async function projectionRuntime(t, source = fixture.projection) {
     const env = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: jjConfig, PATH: emptyPath, TERM: 'dumb', TT_PROJECTION_TOKEN: token };
     const execute = promisify(execFile);
     const command = async args => {
-      const output = await execute(tt, ['--no-pager', '--color=never', ...args, '--json'], {
-        cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024,
-      });
+      let output;
+      try {
+        output = await execute(tt, ['--no-pager', '--color=never', ...args, '--json'], {
+          cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024,
+        });
+      } catch (error) {
+        const bounded = value => String(value ?? '').replaceAll(token, '<redacted>').slice(0, 4096);
+        throw new Error(JSON.stringify({ stage: 'projection-cli', command: args.slice(0, 2),
+          code: error.code, signal: error.signal, killed: error.killed,
+          stdout: bounded(error.stdout), stderr: bounded(error.stderr) }));
+      }
       const report = JSON.parse(output.stdout);
       assert.equal(report.schema_version, 1);
       return report;
@@ -773,8 +781,10 @@ test('ordinary scoped uploads match native byte receipts and copy/path authority
   const first = source.cases[0];
   const unauthorized = await h.call(10, { action: 'status', session_id: first.session_id }, { auth: null, id: 'anonymous-upload-status' });
   assert.equal(unauthorized.status, 401);
-  const unsupported = await h.call(20, {}, { id: 'upload-is-not-review' });
-  assert.equal(unsupported.status, 501, 'review/check/landing authority remains explicitly unsupported');
+  const closedLand = await h.call(24, { change_id: '0'.repeat(32), patchset_id: '0'.repeat(64), candidate_id: '0'.repeat(64) }, { id: 'upload-cannot-land' });
+  assert.equal(closedLand.status, 400, 'byte receipts cannot bypass checked landing authority');
+  assert.equal(closedLand.envelope.error.code, 'failed_precondition');
+  assert.deepEqual((await h.success(2)).value, before.account, 'closed landing leaves protected main unchanged');
   const pending = await h.success(10, { action: 'begin', version: source.view_version, path: 'stale.txt', kind: first.kind,
     id: Array.from(Buffer.from(first.id, 'hex')), size_bytes: first.size_bytes }, { id: 'obsolete-upload' });
   await h.success(4, { spec: { ...h.source.spec, exclude_prefixes: ['private', 'vendor'] }, expected_epoch: source.policy_epoch,
@@ -1252,4 +1262,263 @@ test('declared deployment packet serves exact same-origin UI assets without API 
   const api = await mf.dispatchFetch(origin + '/api/v1/not-a-route');
   assert.equal(api.status, 501); assert.ok(!api.headers.get('content-type')?.startsWith('text/html'));
   const body = await api.json(); assert.equal(body.version, 1); assert.equal(body.error.code, 'unimplemented');
+});
+
+// Production HTTP only: no fixture seed route, direct SQL, manufactured upload
+// grant or checker verdict. Native main stayed genesis in the admission oracle;
+// this runtime deliberately bootstraps the complete source before preparing it.
+test('production reviews admit shipped bootstrap source, persist exact patchsets and expose only scoped candidate projections', async t => {
+  const started = Date.now();
+  const stage = name => t.diagnostic(`review stage=${name} elapsed_ms=${Date.now() - started}`);
+  const source = fixture.projection;
+  const oracle = source.reviews;
+  assert.ok(oracle, 'native scoped upload/admission and pure builder oracle required');
+  assert.equal(oracle.admission_oracle.candidate_state_parity, false);
+  const token = 'review-owner-runtime-fixture';
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-review-runtime-'));
+  const configuration = options(persist, { forge: true, config: [{ principal: source.owner,
+    token_sha256: sha(token), accounts: [source.account_id], operator: true, kind: 'forge' }] });
+  configuration.host = '127.0.0.1'; configuration.port = 0;
+  configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile: oracle.profile,
+    committer: { name: 'Runtime Fixture', email: 'fixture@example.invalid' } });
+  let mf = new Miniflare(configuration);
+  const address = await mf.ready;
+  configuration.port = Number(address.port);
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const reload = async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; };
+  const callReview = async (operation, payload = {}, { id = '', auth = token, signal } = {}) => {
+    const response = await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', {
+      signal, method: 'POST', headers: { 'content-type': 'application/json', ...(auth === null ? {} : { authorization: `Bearer ${auth}` }) },
+      body: JSON.stringify({ version: 1, operation, account_id: source.account_id, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
+    });
+    const envelope = await response.json();
+    if (response.status === 200) {
+      assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id);
+      assert.equal(envelope.account_id, source.account_id); assert.equal(envelope.view, 'public');
+    }
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const success = async (...args) => { const reply = await callReview(...args); assert.equal(reply.status, 200, JSON.stringify(reply)); return reply; };
+  const provisioned = (await success(1, {}, { id: 'review-provision' })).value;
+  const begin = (await success(40, { root: source.root,
+    source: { repository_id: 'native-review-source', reference: 'main', generation: 1, head: source.root.id },
+    destination: { generation: 1, head: Buffer.from(provisioned.main_revision).toString('hex') },
+  }, { id: 'review-bootstrap' })).value;
+  for (let offset = 0; offset < source.objects.length; offset += 8) {
+    await Promise.all(source.objects.slice(offset, offset + 8).map(object => success(41, {
+      import_id: begin.import_id,
+      descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version ?? 1 },
+      data_base64: Buffer.from(object.bytes).toString('base64'),
+    }, { id: `io-${begin.import_id}-${object.kind}-${object.id}` })));
+  }
+  let imported = begin.status;
+  for (let round = 0; round < 200 && !imported.complete; round++) {
+    imported = (await success(42, { import_id: begin.import_id, expected_generation: imported.generation },
+      { id: `ia-${begin.import_id}-${imported.generation}` })).value.status;
+    assert.equal(imported.error, null);
+  }
+  assert.equal(imported.phase, 'ready');
+  await success(44, { import_id: begin.import_id, expected_generation: imported.generation }, { id: 'review-bootstrap-finish' });
+  stage('bootstrap-published');
+  const main = (await success(2)).value;
+  assert.equal(Buffer.from(main.main_revision).toString('hex'), source.root.id);
+  assert.equal(main.main_generation, 2);
+  await success(4, { spec: source.spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'review-public-view' });
+  const before = (await success(2)).value;
+  assert.equal(before.policy_epoch, 2);
+  let baseline = await success(6, {});
+  for (let round = 0; round < 512 && baseline.envelope.state === 'pending'; round++) baseline = await success(6, continuation(baseline));
+  assert.equal(baseline.envelope.state, 'complete');
+  assert.deepEqual(baseline.value, source.expected_snapshot);
+  stage('baseline-ready');
+  const version = baseline.value.view_version;
+  const upload = (payload, id) => callReview(10, payload, { id });
+  for (const object of oracle.objects) {
+    const result = await uploadObject(upload, version, object);
+    assert.equal(result.status, 200, JSON.stringify(result));
+    assert.equal(result.value.state, 'committed');
+    for (const field of ['kind', 'id', 'size_bytes', 'format_version']) {
+      assert.deepEqual(result.value.receipt[field], object.native_receipt[field], `native supplied-byte receipt ${object.name}/${field}`);
+    }
+  }
+  stage('uploads-committed');
+  const resultState = reply => ({ state: reply.envelope.state, value: reply.value });
+  // Match serde_json's explicit CLI object encoding, including omitted lineage.
+  const pushPayload = { expected_patchset: null, predecessor: null, provenance: null,
+    source_base: oracle.push.source_base, source_head: oracle.push.source_head, view_version: oracle.push.view_version };
+  const push = async (round = -1, previous = 'new', signal) => {
+    const reply = await callReview(20, pushPayload, { id: oracle.request_id, signal });
+    assert.equal(reply.status, 200, JSON.stringify({ request_id: oracle.request_id, round, previous_state: previous }));
+    return reply;
+  };
+  let review = await push();
+  assert.equal(review.envelope.state, 'admission_pending', 'wide admission must be durable work, not a fabricated accepted patchset');
+  assert.deepEqual(review.value, { schema_version: 1, request_id: oracle.request_id,
+    source_base: oracle.push.source_base, source_head: oracle.push.source_head,
+    view_version: oracle.push.view_version, phase: 'admission' });
+  assert.deepEqual(resultState(await success(22, {}, { id: oracle.request_id })), resultState(review), 'operation lookup never advances admission');
+  await reload();
+  assert.deepEqual(resultState(await success(22, {}, { id: oracle.request_id })), resultState(review), 'uncertain admission survives workerd restart');
+  // Actual declared tt resumes the same pending server intent over loopback
+  // Forge HTTP. Only explicit immutable IDs are used; no mounted authoring claim.
+  const cliRoot = path.join(persist, 'review-cli');
+  const home = path.join(cliRoot, 'home'), cwd = path.join(cliRoot, 'workspace'), emptyPath = path.join(cliRoot, 'no-programs');
+  await Promise.all([home, cwd, emptyPath].map(directory => mkdir(directory, { recursive: true, mode: 0o700 })));
+  const jjConfig = path.join(cliRoot, 'jj.toml');
+  await writeFile(jjConfig, '[user]\nname="Runtime Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
+  const tt = process.env.TINYTREE_TT_BINARY;
+  assert.ok(tt, 'declared production tt executable required');
+  const env = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: jjConfig,
+    PATH: emptyPath, TERM: 'dumb', TT_REVIEW_TOKEN: token };
+  const cli = async (args, deadline) => {
+    let output;
+    try {
+      const timeout = deadline === undefined ? 70000 : Math.min(70000, deadline - Date.now());
+      assert.ok(timeout > 0, 'same-intent admission exceeds its 120-second absolute budget');
+      output = await promisify(execFile)(tt, ['--no-pager', '--color=never', ...args, '--json'],
+        { cwd, env, encoding: 'utf8', timeout, maxBuffer: 2 * 1024 * 1024 });
+    } catch (error) {
+      const stderr = String(error.stderr ?? '');
+      const bounded = value => String(value ?? '').replaceAll(token, '<redacted>').slice(0, 4096);
+      const diagnostic = new Error(JSON.stringify({ stage: 'review-cli', command: args.slice(0, 2),
+        code: error.code, signal: error.signal, killed: error.killed,
+        stdout: bounded(error.stdout), stderr: bounded(stderr), message: bounded(error.message) }));
+      diagnostic.resumableAdmissionDeadline = !error.killed && typeof error.code === 'number'
+        && /deadline/i.test(stderr) && stderr.includes(`saved request ${oracle.request_id} can be reconciled with tt request resume`);
+      throw diagnostic;
+    }
+    const report = JSON.parse(output.stdout); assert.equal(report.schema_version, 1); return report;
+  };
+  assert.equal((await cli(['context', 'set', '--transport', 'forge-https-v1', '--server', address.origin,
+    '--account', source.account_id, '--view', 'public', '--token-env', 'TT_REVIEW_TOKEN'])).state, 'configured');
+  const contextBytes = await readFile(path.join(home, 'config/tinytree/context.json'), 'utf8');
+  assert.equal(JSON.parse(contextBytes).transport, 'forge_https_v1'); assert.ok(!contextBytes.includes(token));
+  const journalPath = path.join(home, 'config/tinytree/requests', `request-${oracle.request_id}.json`);
+  let originalJournal;
+  const retainedIntent = async () => {
+    const bytes = await readFile(journalPath);
+    const saved = JSON.parse(bytes);
+    assert.equal(saved.request_id, oracle.request_id); assert.equal(saved.operation, 20);
+    assert.equal(saved.source, null, 'explicit immutable source is not a manufactured workspace acknowledgement');
+    assert.deepEqual(saved.context, JSON.parse(contextBytes));
+    assert.equal(JSON.stringify(saved.payload), JSON.stringify(pushPayload), 'HTTP and actual CLI use byte-identical original payload JSON');
+    assert.ok(!bytes.includes(Buffer.from(token)));
+    assert.equal((await stat(journalPath)).mode & 0o777, 0o600);
+    assert.equal(await readFile(path.join(home, 'config/tinytree/context.json'), 'utf8'), contextBytes);
+    if (originalJournal) assert.deepEqual(bytes, originalJournal, 'timeout/resume retains the exact immutable intent, without acknowledgement or replacement');
+    else originalJournal = bytes;
+  };
+  const admissionDeadline = Date.now() + 120000;
+  let cliReview;
+  for (let attempt = 0; attempt <= 3; attempt++) {
+    if (attempt) await retainedIntent();
+    stage(`actual-tt-admission-attempt-${attempt}`);
+    try {
+      cliReview = await cli(attempt === 0
+        ? ['push', '--source-base', oracle.push.source_base, '--source-head', oracle.push.source_head,
+          '--view-version', oracle.push.view_version, '--request-id', oracle.request_id]
+        : ['request', 'resume', oracle.request_id], admissionDeadline);
+      break;
+    } catch (error) {
+      if (!error.resumableAdmissionDeadline) throw error;
+      // A known SDK deadline is uncertainty, not an accepted patchset. Check
+      // durable private identity BEFORE any supported resume action.
+      await retainedIntent();
+      stage(`actual-tt-admission-deadline-${attempt}`);
+      assert.ok(attempt < 3 && Date.now() < admissionDeadline, 'same-intent admission exhausted its bounded resume budget');
+    }
+  }
+  assert.ok(cliReview);
+  await retainedIntent();
+  assert.equal(cliReview.state, 'rebase_pending');
+  assert.equal(cliReview.result.value.patchset_id, oracle.patchset_id);
+  assert.equal(cliReview.result.value.source_head, oracle.push.source_head);
+  review = await success(22, {}, { id: oracle.request_id });
+  assert.deepEqual(resultState(review), { state: cliReview.state, value: cliReview.result.value });
+  stage('actual-tt-admitted');
+  const preparationDeadline = Date.now() + 120000;
+  const preparationSignal = AbortSignal.timeout(120000);
+  let lastReadState;
+  const states = new Set(['admission_pending', review.envelope.state]);
+  for (let round = 0; round < 512; round++) {
+    assert.ok(Date.now() < preparationDeadline, 'review preparation exceeds its 120-second absolute budget');
+    review = await push(round, review.envelope.state, preparationSignal); states.add(review.envelope.state);
+    if (round % 16 === 0) stage(`prepare-${round}-${review.envelope.state}`);
+    if (review.envelope.state !== 'admission_pending') {
+      assert.equal(review.value.change_id, oracle.change_id);
+      assert.equal(review.value.patchset_id, oracle.patchset_id, 'native stable patchset identity, not native candidate state parity');
+      assert.equal(review.value.source_head, oracle.push.source_head);
+      assert.equal(review.value.patchset_number, 1);
+      if (lastReadState !== review.envelope.state || review.value.projected_head) {
+        assert.deepEqual(resultState(await success(21, { change_id: oracle.change_id }, { signal: preparationSignal })), resultState(review), 'review lookup is read-only');
+        assert.deepEqual(resultState(await success(22, {}, { id: oracle.request_id, signal: preparationSignal })), resultState(review), 'operation lookup is read-only after admission');
+        lastReadState = review.envelope.state;
+      }
+      if (review.envelope.state === 'checks_pending' && review.value.projected_head) break;
+      assert.ok(['rebase_pending', 'checks_pending'].includes(review.envelope.state), JSON.stringify(review));
+    }
+  }
+  assert.ok(states.has('rebase_pending'));
+  assert.equal(review.envelope.state, 'checks_pending');
+  assert.ok(review.value.projected_head, 'candidate readiness alone must not grant an unfinished projection');
+  assert.ok(Date.now() < preparationDeadline, 'review preparation must complete within 120 seconds');
+  stage('candidate-projection-ready');
+  const candidate = review.value.candidate;
+  assert.equal(candidate.root_tree, oracle.builder_oracle.root_tree, 'actual pure-builder tree retains excluded canonical subtree');
+  assert.equal(candidate.target, source.root.id);
+  assert.equal(candidate.target_generation, 2);
+  assert.deepEqual(candidate.rewrites, [{ old: oracle.push.source_head, new: candidate.head, change_id: oracle.change_id }]);
+  assert.deepEqual(review.value.projected_rewrites, [{ old: oracle.push.source_head, new: review.value.projected_head, change_id: oracle.change_id }]);
+  assert.deepEqual((await success(6, { version })).value, baseline.value, 'preparation never mutates the baseline view');
+  assert.deepEqual((await success(2)).value, before, 'admission, rebase and projection never publish main');
+  const readObject = (kind, id, max_bytes = 65536) => callReview(9, { version, kind, id: Array.from(Buffer.from(id, 'hex')), max_bytes });
+  const projected = await readObject(3, review.value.projected_head);
+  assert.equal(projected.status, 200, JSON.stringify(projected));
+  assert.equal(projected.value.kind, 3); assert.ok(projected.value.data.length > 0);
+  assert.ok(!Buffer.from(projected.value.data).includes(Buffer.from(source.root.id, 'hex')), 'safe commit cannot expose canonical parent');
+  const anonymousProjected = await callReview(9, { version, kind: 3,
+    id: Array.from(Buffer.from(review.value.projected_head, 'hex')), max_bytes: 65536 }, { auth: null });
+  assert.equal(anonymousProjected.status, 200, JSON.stringify(anonymousProjected));
+  assert.deepEqual(anonymousProjected.value, projected.value, 'anonymous public reads use the same typed ready-result catalog');
+  const anonymousPrivate = await callReview(9, { version, kind: source.private_file.kind,
+    id: Array.from(Buffer.from(source.private_file.id, 'hex')), max_bytes: 0 }, { auth: null });
+  assert.equal(anonymousPrivate.status, 403); assert.equal(anonymousPrivate.envelope.error.code, 'permission_denied');
+  const authored = oracle.objects.find(object => object.kind === 1);
+  assert.deepEqual((await readObject(1, authored.id)).value.data, authored.bytes);
+  for (const forbidden of [source.private_file, source.root, { kind: 3, id: candidate.head }]) {
+    const denied = await readObject(forbidden.kind, forbidden.id, 0);
+    assert.equal(denied.status, 403, JSON.stringify(denied)); assert.equal(denied.envelope.error.code, 'permission_denied');
+  }
+  await reload();
+  assert.deepEqual(resultState(await success(22, {}, { id: oracle.request_id })), resultState(review), 'candidate and scoped result survive reload without advancement');
+  stage('scoped-reads-reload-verified');
+  const selector = { change_id: oracle.change_id, patchset_id: oracle.patchset_id };
+  const staleVote = await callReview(23, { ...selector, decision: 'approve', candidate_id: '0'.repeat(64) }, { id: 'review-stale-vote' });
+  assert.equal(staleVote.status, 400); assert.equal(staleVote.envelope.error.code, 'failed_precondition');
+  const vote = { ...selector, decision: 'approve', candidate_id: candidate.id };
+  const approved = await success(23, vote, { id: 'review-approve' });
+  assert.equal(approved.value.approvals, 1);
+  assert.deepEqual(await success(23, vote, { id: 'review-approve' }), approved);
+  const comment = { ...selector, decision: 'comment', path: 'README.md', body: 'Scoped review comment before policy narrowing' };
+  const commented = await success(23, comment, { id: 'review-comment' });
+  assert.equal(commented.value.comments.length, 1);
+  assert.equal(commented.value.comments[0].body, comment.body);
+  assert.deepEqual(await success(23, comment, { id: 'review-comment' }), commented);
+  const land = await callReview(24, { ...selector, candidate_id: candidate.id }, { id: 'review-no-checker-land' });
+  assert.equal(land.status, 400); assert.equal(land.envelope.error.code, 'failed_precondition', 'approval is not trusted checker evidence');
+  assert.deepEqual((await success(2)).value, before);
+  await success(4, { spec: { ...source.spec, visibility: { kind: 'members' } }, expected_epoch: 2,
+    make_default: false, follow_main: false }, { id: 'review-narrow-policy' });
+  const narrowed = await success(21, selector);
+  assert.equal(narrowed.envelope.state, 'stale');
+  assert.deepEqual(narrowed.value.comments, [], 'warmed unchanged-path comments from a previous policy epoch are not disclosed');
+  assert.equal(narrowed.value.approvals, 0);
+  const anonymous = await callReview(21, selector, { auth: null });
+  assert.equal(anonymous.status, 401);
+  assert.equal(anonymous.envelope.error.code, 'unauthenticated');
+  const oldVote = await callReview(23, vote, { id: 'review-new-epoch-vote' });
+  assert.equal(oldVote.status, 409); assert.equal(oldVote.envelope.error.code, 'aborted');
+  stage('votes-policy-verified');
+  const after = (await success(2)).value;
+  assert.deepEqual(after.main_revision, before.main_revision); assert.equal(after.main_generation, before.main_generation);
 });

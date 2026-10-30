@@ -52,7 +52,7 @@ export class AccountRepository extends Base {
           const proof = [...sql.exec('SELECT * FROM closure_jobs WHERE id=?', jobId)][0];
           if (!proof || proof.phase !== 'ready' || proof.root_kind !== root.kind || proof.root_id !== root.id
               || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'fixture_closure_incomplete');
-          sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(?,?,?)', root.kind, root.id, JSON.stringify({ validator: 'test-native-closure', job_id: jobId }));
+          sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(?,?,?)', root.kind, root.id, JSON.stringify({ validator: 'test-native-closure', root: root.id, job_id: jobId }));
           sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'fixture-source\',?,?,?,1)', root.id, root.kind, root.id);
           return { root, job_id: jobId };
         },
