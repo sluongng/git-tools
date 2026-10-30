@@ -267,9 +267,15 @@ fn forge_projection_excludes_private_objects_and_uploads_are_actor_path_epoch_bo
     let origin={let _gate=store.inner.lock().unwrap();store.inner.forge_projected_copy_origin_in(&store.inner.db.read_tx(),&view,source_copy).unwrap()};
     assert_eq!(origin.canonical_revision,revision.0);assert_eq!(origin.canonical_path,"source.rs");assert_eq!(origin.canonical_copy,None);
     let copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"renamed.rs".into(),parents:vec![source_copy],salt:vec![1]}),Limits::default()).unwrap();
-    store.forge_upload_object(&view,&actor,"renamed.rs",copy.descriptor,&copy.bytes,0).unwrap();
+    let copy_receipt = store.forge_upload_object(&view,&actor,"renamed.rs",copy.descriptor,&copy.bytes,0).unwrap();
     let renamed=tinytree_model::encode(&Object::Tree(Tree{entries:vec![TreeEntry{name:"renamed.rs".into(),value:TreeValue::File{id:source_file,size_bytes:source_size,executable:false,copy_id:Some(CopyId(copy.descriptor.key.id.0))}}]}),Limits::default()).unwrap();
     store.forge_upload_object(&view,&actor,"",renamed.descriptor,&renamed.bytes,0).unwrap();
+    let child_copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"final.rs".into(),parents:vec![CopyId(copy.descriptor.key.id.0)],salt:vec![4]}),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"final.rs",child_copy.descriptor,&child_copy.bytes,1).unwrap();
+    let final_tree=tinytree_model::encode(&Object::Tree(Tree{entries:vec![TreeEntry{name:"final.rs".into(),value:TreeValue::File{id:source_file,size_bytes:source_size,executable:false,copy_id:Some(CopyId(child_copy.descriptor.key.id.0))}}]}),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"",final_tree.descriptor,&final_tree.bytes,copy_receipt.expires_at).unwrap();
+    assert!(matches!(store.forge_upload_object(&view,&actor,"final.rs",child_copy.descriptor,&child_copy.bytes,copy_receipt.expires_at),Err(Error::ForgeAccessDenied)),"TREE copy reference uses admitted child authority; supplying the child again must recheck its expired direct parent receipt");
+
     let secret_copy=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"secret.txt".into(),parents:vec![],salt:vec![2]}),Limits::default()).unwrap();store.put(view.repository(),secret_copy.descriptor,&secret_copy.bytes,0).unwrap();
     let forged=tinytree_model::encode(&Object::CopyHistory(CopyHistory{current_path:"forged.rs".into(),parents:vec![CopyId(secret_copy.descriptor.key.id.0)],salt:vec![3]}),Limits::default()).unwrap();
     assert!(matches!(store.forge_upload_object(&view,&actor,"forged.rs",forged.descriptor,&forged.bytes,0),Err(Error::ForgeAccessDenied)));
@@ -411,7 +417,7 @@ fn forge_rewritten_commit_predecessors_require_scoped_metadata_ownership() {
     let rewritten=tinytree_model::encode(&Object::Commit(rewritten),Limits::default()).unwrap();store.forge_upload_object(&view,&actor,"",rewritten.descriptor,&rewritten.bytes,0).unwrap();
     assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),rewritten.descriptor.key,0,4096).unwrap(),rewritten.bytes,"source identity/bytes must not be sanitized or dropped");
     let Object::Commit(mut victim)=tinytree_model::decode(&original.bytes,Limits::default()).unwrap()else{panic!("not a commit")};victim.description="peer-owned metadata not submitted by writer".into();let victim=tinytree_model::encode(&Object::Commit(victim),Limits::default()).unwrap();store.forge_upload_object(&peer_view,&peer,"",victim.descriptor,&victim.bytes,0).unwrap();
-    for predecessor in [CommitId(victim.descriptor.key.id.0),canonical] {
+    for predecessor in [CommitId(victim.descriptor.key.id.0),canonical,CommitId::ROOT] {
         let Object::Commit(mut forged)=tinytree_model::decode(&rewritten.bytes,Limits::default()).unwrap()else{panic!("not a commit")};forged.predecessors=vec![predecessor];let forged=tinytree_model::encode(&Object::Commit(forged),Limits::default()).unwrap();
         assert!(matches!(store.forge_upload_object(&view,&actor,"",forged.descriptor,&forged.bytes,0),Err(Error::ForgeAccessDenied)),"known victim/private canonical predecessor digest is not an upload receipt");
     }
@@ -15641,10 +15647,27 @@ fn forge_scoped_subtree_upload_preserves_nested_projected_copy_context() {
     subtree.entries.push(TreeEntry { name:"edited.txt".into(),value:TreeValue::File { id:FileId(edited.key.id.0),size_bytes:edited.size_bytes,executable:false,copy_id:None } });subtree.entries.sort_by(|a,b|a.name.cmp(&b.name));
     let subtree = tinytree_model::encode(&Object::Tree(subtree), Limits::default()).unwrap();
     assert!(matches!(store.forge_upload_object(&view,&actor,"wrong",subtree.descriptor,&subtree.bytes,0),Err(Error::ForgeAccessDenied)));
+    // Availability of an intermediate TREE is enough: its descendant leaves
+    // and copy identities, rather than a TREE receipt, carry scope authority.
+    let root = tinytree_model::encode(&Object::Tree(Tree { entries:vec![TreeEntry { name:"vendor".into(),value:TreeValue::Tree(TreeId(subtree.descriptor.key.id.0)) }] }),Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"",root.descriptor,&root.bytes,0).unwrap();
     store.forge_upload_object(&view,&actor,"vendor",subtree.descriptor,&subtree.bytes,0).unwrap();
     assert!(matches!(store.inner.closure(&repo,[subtree.descriptor.key],true,false),Err(Error::Invalid("copy history current path"))),"ordinary repository-root validation remains strict");
     let root = tinytree_model::encode(&Object::Tree(Tree { entries:vec![TreeEntry { name:"vendor".into(),value:TreeValue::Tree(TreeId(subtree.descriptor.key.id.0)) }] }),Limits::default()).unwrap();
     store.forge_upload_object(&view,&actor,"",root.descriptor,&root.bytes,0).unwrap();
+    let Object::Tree(decoded) = tinytree_model::decode(&subtree.bytes, Limits::default()).unwrap() else { panic!("tree") };
+    let visible = decoded.entries.iter().find_map(|entry| match entry.value {
+        TreeValue::File { id, size_bytes, .. } if entry.name != "edited.txt" => Some((id,size_bytes)),
+        _ => None,
+    }).unwrap();
+    let paged = tinytree_model::encode(&Object::Tree(Tree { entries:(0..257).map(|i| TreeEntry {
+        name:format!("page-{i:03}"), value:TreeValue::File {id:visible.0,size_bytes:visible.1,executable:false,copy_id:None}
+    }).collect() }), Limits::default()).unwrap();
+    store.forge_upload_object(&view,&actor,"vendor",paged.descriptor,&paged.bytes,0).unwrap();
+    let Object::Tree(mut wrong_size) = tinytree_model::decode(&paged.bytes, Limits::default()).unwrap() else { panic!("tree") };
+    if let TreeValue::File { size_bytes, .. } = &mut wrong_size.entries[256].value { *size_bytes += 1; }
+    let wrong_size = tinytree_model::encode(&Object::Tree(wrong_size), Limits::default()).unwrap();
+    assert!(matches!(store.forge_upload_object(&view,&actor,"vendor",wrong_size.descriptor,&wrong_size.bytes,0),Err(Error::Invalid("forge uploaded file size"))),"later pages must enforce the same exact descriptor requirements");
     let mut authored = commit(TreeId(root.descriptor.key.id.0),"edit existing nested directory");authored.parents=vec![CommitId(projection.projected_commit)];
     let authored = tinytree_model::encode(&Object::Commit(authored),Limits::default()).unwrap();store.forge_upload_object(&view,&actor,"",authored.descriptor,&authored.bytes,0).unwrap();
     assert_eq!(store.forge_read_authorized_object(&view,Some(&actor),authored.descriptor.key,0,4096).unwrap(),authored.bytes);

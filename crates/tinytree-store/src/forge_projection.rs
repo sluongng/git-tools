@@ -26,6 +26,18 @@ impl From<ProjectionError> for Error {
     }
 }
 
+impl From<tinytree_forge_core::upload_scope::ScopeError> for Error {
+    fn from(error: tinytree_forge_core::upload_scope::ScopeError) -> Self {
+        use tinytree_forge_core::upload_scope::ScopeError;
+        match error {
+            ScopeError::AccessDenied => Self::ForgeAccessDenied,
+            ScopeError::Invalid(reason) => Self::Invalid(reason),
+            ScopeError::Limit(reason) => Self::Limit(reason),
+            ScopeError::Model(error) => Self::Model(error),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectionRecord {
@@ -879,161 +891,106 @@ impl Inner {
         descriptor: Descriptor,
         now: i64,
     ) -> Result<()> {
+        self.forge_validate_scope_in(
+            tx,
+            view,
+            actor,
+            descriptor,
+            tinytree_forge_core::upload_scope::Context {
+                canonical_path: path.to_owned(),
+                depth: 0,
+                role: tinytree_forge_core::upload_scope::Role::Root,
+            },
+            now,
+        )
+    }
+    fn forge_validate_scope_in(
+        &self,
+        tx: &impl Readable,
+        view: &ResolvedView,
+        actor: &ForgeActor,
+        descriptor: Descriptor,
+        context: tinytree_forge_core::upload_scope::Context,
+        now: i64,
+    ) -> Result<()> {
+        use tinytree_forge_core::upload_scope::{Context, Requirement, page_bytes};
         let actor_view =
             self.forge_resolve_view_in(tx, view.account(), Some(actor), view.version())?;
-        let mut pending = vec![(path.to_owned(), descriptor, 0)];
+        let mut pending = vec![(descriptor, context)];
         let mut entries = 0usize;
-        while let Some((path, descriptor, depth)) = pending.pop() {
-            if depth > 64 {
-                return Err(Error::Limit("forge upload tree depth"));
+        while let Some((descriptor, context)) = pending.pop() {
+            // The existing Store gate pins these backing objects throughout scope
+            // validation. Canonical verification/interpretation is shared with Wasm.
+            if descriptor.size_bytes > self.config.model_limits.max_object_bytes as u64 {
+                return Err(Error::Model(tinytree_model::Error::Limit));
             }
-            match self.metadata(view.repository(), descriptor)? {
-                Object::Commit(commit) => {
-                    if !path.is_empty()
-                        || depth != 0
-                        || commit.root_tree.terms.len() != 1
-                        || commit.predecessors.len() > 128
-                        || commit.parents.len() != 1
-                    {
-                        return Err(Error::Invalid("forge uploaded commit shape"));
-                    }
-                    for predecessor in &commit.predecessors {
-                        let descriptor = self
-                            .descriptor(
-                                view.repository(),
-                                ObjectKey {
-                                    kind: Kind::Commit,
-                                    id: ObjectId(predecessor.0),
-                                },
-                            )?
-                            .ok_or(Error::ForgeAccessDenied)?;
-                        self.forge_validate_owned_entry_in(tx, view, actor, "", descriptor, now)?;
-                    }
-                    let parent = commit.parents[0];
-                    if parent != CommitId::ROOT {
-                        let d = self
-                            .descriptor(
-                                view.repository(),
-                                ObjectKey {
-                                    kind: Kind::Commit,
-                                    id: ObjectId(parent.0),
-                                },
-                            )?
-                            .ok_or(Error::ForgeAccessDenied)?;
-                        self.forge_validate_owned_entry_in(tx, view, actor, "", d, now)?;
-                    }
-                    let d = self
-                        .descriptor(
-                            view.repository(),
-                            ObjectKey {
-                                kind: Kind::Tree,
-                                id: ObjectId(commit.root_tree.terms[0].0),
-                            },
-                        )?
-                        .ok_or(Error::ForgeAccessDenied)?;
-                    pending.push((String::new(), d, depth + 1));
+            let file = self.open_backing(view.repository(), descriptor)?;
+            let mut bytes = Vec::new();
+            file.take(self.config.model_limits.max_object_bytes as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let mut cursor = 0;
+            loop {
+                let page = page_bytes(
+                    descriptor,
+                    &bytes,
+                    context.clone(),
+                    cursor,
+                    128,
+                    self.config.model_limits,
+                )?;
+                entries = entries
+                    .checked_add(page.entries)
+                    .ok_or(Error::Limit("forge upload tree entries"))?;
+                if entries > 10_000 {
+                    return Err(Error::Limit("forge upload tree entries"));
                 }
-                Object::Tree(tree) => {
-                    for entry in tree.entries {
-                        entries += 1;
-                        if entries > 10_000 {
-                            return Err(Error::Limit("forge upload tree entries"));
-                        }
-                        let full = if path.is_empty() {
-                            entry.name
-                        } else {
-                            format!("{path}/{}", entry.name)
-                        };
-                        let (key, size) = match entry.value {
-                            TreeValue::Tree(id) => (
-                                ObjectKey {
-                                    kind: Kind::Tree,
-                                    id: ObjectId(id.0),
-                                },
-                                None,
-                            ),
-                            TreeValue::File {
-                                id,
-                                size_bytes,
-                                copy_id,
-                                ..
-                            } => {
-                                if let Some(copy) = copy_id {
-                                    self.forge_validate_copy_in(tx, view, actor, &full, copy, now)?;
-                                }
-                                (
-                                    ObjectKey {
-                                        kind: Kind::File,
-                                        id: ObjectId(id.0),
-                                    },
-                                    Some(size_bytes),
-                                )
-                            }
-                            TreeValue::Symlink { id, .. } => (
-                                ObjectKey {
-                                    kind: Kind::Symlink,
-                                    id: ObjectId(id.0),
-                                },
-                                None,
-                            ),
-                        };
-                        let d = self
-                            .descriptor(view.repository(), key)?
-                            .ok_or(Error::ForgeAccessDenied)?;
-                        if size.is_some_and(|s| s != d.size_bytes) {
-                            return Err(Error::Invalid("forge uploaded file size"));
-                        }
-                        if key.kind == Kind::Tree {
-                            pending.push((full, d, depth + 1));
-                        } else {
-                            if !view.allows_path(&full) || !actor_view.allows_path(&full) {
+                for requirement in page.requirements {
+                    match requirement {
+                        Requirement::Path { canonical_path } => {
+                            if !view.allows_path(&canonical_path)
+                                || !actor_view.allows_path(&canonical_path)
+                            {
                                 return Err(Error::ForgeAccessDenied);
                             }
-                            self.forge_validate_owned_entry_in(tx, view, actor, &full, d, now)?;
+                        }
+                        Requirement::Reference {
+                            canonical_path,
+                            key,
+                            expected_size,
+                        } => {
+                            let d = self
+                                .descriptor(view.repository(), key.object_key()?)?
+                                .ok_or(Error::ForgeAccessDenied)?;
+                            if expected_size.is_some_and(|size| size != d.size_bytes) {
+                                return Err(Error::Invalid("forge uploaded file size"));
+                            }
+                            self.forge_validate_owned_entry_in(
+                                tx,
+                                view,
+                                actor,
+                                &canonical_path,
+                                d,
+                                now,
+                            )?;
                         }
                     }
                 }
-                Object::Symlink(_) => {
-                    if !view.allows_path(&path) || !actor_view.allows_path(&path) {
-                        return Err(Error::ForgeAccessDenied);
-                    }
+                for child in page.children {
+                    let d = self
+                        .descriptor(view.repository(), child.key.object_key()?)?
+                        .ok_or(Error::ForgeAccessDenied)?;
+                    pending.push((
+                        d,
+                        Context {
+                            canonical_path: child.canonical_path,
+                            depth: child.depth,
+                            role: child.role,
+                        },
+                    ));
                 }
-                Object::CopyHistory(history) => {
-                    if history.current_path != path
-                        || !view.allows_path(&path)
-                        || !actor_view.allows_path(&path)
-                        || history.parents.len() > 16
-                    {
-                        return Err(Error::ForgeAccessDenied);
-                    }
-                    for parent in history.parents {
-                        let d = self
-                            .descriptor(
-                                view.repository(),
-                                ObjectKey {
-                                    kind: Kind::CopyHistory,
-                                    id: ObjectId(parent.0),
-                                },
-                            )?
-                            .ok_or(Error::ForgeAccessDenied)?;
-                        let Object::CopyHistory(origin) = self.metadata(view.repository(), d)?
-                        else {
-                            return Err(Error::Corrupt("forge copy parent"));
-                        };
-                        if !view.allows_path(&origin.current_path)
-                            || !actor_view.allows_path(&origin.current_path)
-                        {
-                            return Err(Error::ForgeAccessDenied);
-                        }
-                        self.forge_validate_owned_entry_in(
-                            tx,
-                            view,
-                            actor,
-                            &origin.current_path,
-                            d,
-                            now,
-                        )?;
-                    }
+                match page.next_cursor {
+                    Some(next) => cursor = next,
+                    None => break,
                 }
             }
         }
@@ -1096,14 +1053,18 @@ impl Inner {
                 },
             )?
             .ok_or(Error::ForgeAccessDenied)?;
-        self.forge_validate_owned_entry_in(tx, view, actor, path, descriptor, now)?;
-        let Object::CopyHistory(history) = self.metadata(view.repository(), descriptor)? else {
-            return Err(Error::Corrupt("forge copy type"));
-        };
-        if history.current_path != path {
-            return Err(Error::ForgeAccessDenied);
-        }
-        Ok(())
+        self.forge_validate_scope_in(
+            tx,
+            view,
+            actor,
+            descriptor,
+            tinytree_forge_core::upload_scope::Context {
+                canonical_path: path.to_owned(),
+                depth: 0,
+                role: tinytree_forge_core::upload_scope::Role::CopyAt,
+            },
+            now,
+        )
     }
     /// Admission of a submitted source commit requires its exact supplied-byte
     /// receipt. Knowing a stored commit ID, or a visible leaf, is not ownership.

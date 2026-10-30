@@ -696,6 +696,117 @@ async function projectionRuntime(t, source = fixture.projection) {
 }
 function continuation(reply) { return { version: reply.value.view_version, progress: reply.value.progress }; }
 
+// Existing public session protocol only. A pending Finalize is NOT a receipt;
+// every repeated call names the same immutable session and request intent.
+async function uploadObject(invoke, version, object, { id = object.request_id, pending } = {}) {
+  const begin = await invoke({ action: 'begin', version, path: object.path, kind: object.kind,
+    id: Array.from(Buffer.from(object.id, 'hex')), size_bytes: object.size_bytes }, id);
+  assert.equal(begin.status, 200, JSON.stringify(begin));
+  assert.equal(begin.envelope.state, begin.value.state);
+  const session = begin.value.session_id;
+  for (let offset = begin.value.offset; offset < object.bytes.length; offset += 65536) {
+    const bytes = object.bytes.slice(offset, offset + 65536);
+    const appended = await invoke({ action: 'append', session_id: session, offset, data: bytes }, id);
+    assert.equal(appended.status, 200, JSON.stringify(appended));
+    assert.deepEqual(appended.value.session_id, session);
+    assert.equal(appended.value.offset, offset + bytes.length);
+    assert.equal(appended.value.state, 'pending');
+    assert.equal(appended.envelope.state, 'pending');
+    assert.equal(appended.value.receipt, null);
+  }
+  let result; let rounds = 0;
+  for (; rounds < 512; rounds++) {
+    result = await invoke({ action: 'finalize', session_id: session }, id);
+    if (result.status !== 200 || result.value.state === 'committed') break;
+    assert.deepEqual(result.value.session_id, session);
+    assert.equal(result.value.state, 'pending');
+    assert.equal(result.envelope.state, 'pending');
+    assert.equal(result.value.offset, object.size_bytes);
+    assert.equal(result.value.receipt, null);
+    if (pending) await pending(result, rounds);
+  }
+  assert.ok(rounds < 512, 'same upload finalization must terminate within the finite protocol budget');
+  return { ...result, session_id: session, rounds: rounds + 1 };
+}
+
+test('ordinary scoped uploads match native byte receipts and copy/path authority without publishing main', async t => {
+  const h = await projectionRuntime(t);
+  const source = h.source.uploads;
+  assert.equal(source.expected_wide_file_count, 701);
+  const snapshot = await h.showWithCli(source.view_version);
+  assert.equal(snapshot.projected_commit, Buffer.from(source.projected_base).toString('hex'));
+  const before = { account: (await h.success(2)).value, views: (await h.success(5)).value };
+  const invoke = (payload, id) => h.call(10, payload, { id, view: '' });
+  let widePending = 0;
+  for (const object of source.cases) {
+    const result = await uploadObject(invoke, source.view_version, object, {
+      pending: async (_reply, round) => {
+        if (object.name === 'wide-root-tree') {
+          widePending++;
+          if (round === 0) await h.reload();
+        }
+      },
+    });
+    assert.deepEqual(result.session_id, object.session_id, `${object.name}: native session identity`);
+    if (object.expected.state === 'committed') {
+      assert.equal(result.status, 200, JSON.stringify(result));
+      assert.equal(result.envelope.state, 'committed');
+      assert.equal(result.value.state, 'committed');
+      assert.equal(result.value.offset, object.expected.offset);
+      for (const [field, value] of Object.entries(object.expected.receipt)) assert.deepEqual(result.value.receipt[field], value, `${object.name}: receipt ${field}`);
+      assert.equal(typeof result.value.receipt.staging_lease, 'string');
+      assert.ok(Number.isSafeInteger(result.value.receipt.expires_at));
+      await h.reload();
+      assert.deepEqual((await h.success(10, { action: 'finalize', session_id: result.session_id }, { id: object.request_id, view: '' })).value,
+        result.value, `${object.name}: lost completion ACK returns one durable receipt`);
+      assert.deepEqual((await h.success(10, { action: 'begin', version: source.view_version, path: object.path, kind: object.kind,
+        id: Array.from(Buffer.from(object.id, 'hex')), size_bytes: object.size_bytes }, { id: object.request_id, view: '' })).value,
+        result.value, `${object.name}: exact default-view Begin replay stays at the saved version`);
+    } else {
+      assert.notEqual(result.status, 200, `${object.name}: invalid metadata cannot receive an owned byte receipt`);
+      assert.equal(result.envelope.error.code, object.expected.code, `${object.name}: native observable refusal`);
+    }
+  }
+  assert.ok(widePending > 0, '701-path metadata scope is resumable work, not one synchronous publication');
+  assert.deepEqual((await h.success(2)).value, before.account, 'neither scoped receipts nor canonical closure readiness publishes main');
+  assert.deepEqual((await h.success(5)).value, before.views, 'ordinary byte uploads cannot change named/default views');
+  const first = source.cases[0];
+  const unauthorized = await h.call(10, { action: 'status', session_id: first.session_id }, { auth: null, id: 'anonymous-upload-status' });
+  assert.equal(unauthorized.status, 401);
+  const unsupported = await h.call(20, {}, { id: 'upload-is-not-review' });
+  assert.equal(unsupported.status, 501, 'review/check/landing authority remains explicitly unsupported');
+  const pending = await h.success(10, { action: 'begin', version: source.view_version, path: 'stale.txt', kind: first.kind,
+    id: Array.from(Buffer.from(first.id, 'hex')), size_bytes: first.size_bytes }, { id: 'obsolete-upload' });
+  await h.success(4, { spec: { ...h.source.spec, exclude_prefixes: ['private', 'vendor'] }, expected_epoch: source.policy_epoch,
+    make_default: true, follow_main: false }, { id: 'upload-policy-change' });
+  for (const session of [first.session_id, pending.value.session_id]) {
+    const denied = await h.call(10, { action: 'finalize', session_id: session }, { id: 'obsolete-finalize' });
+    assert.equal(denied.status, 409, 'warm committed or pending session cannot silently refresh its policy epoch');
+    assert.equal(denied.envelope.error.code, 'aborted');
+  }
+  const charged = (await h.control('inspect')).forge_storage_usage[0];
+  const keys = await h.keys();
+  let epoch = source.policy_epoch + 1;
+  for (let index = 0; index < 10; index++) {
+    const receiving = await h.success(10, { action: 'begin', version: source.view_version,
+      path: `interrupted-${index}.txt`, kind: first.kind, id: Array.from(Buffer.from(first.id, 'hex')),
+      size_bytes: first.size_bytes }, { id: `epoch-upload-${index}` });
+    await h.success(4, { spec: { ...h.source.spec, exclude_prefixes: ['private', 'vendor'] }, expected_epoch: epoch,
+      make_default: true, follow_main: false }, { id: `upload-epoch-${index}` });
+    epoch++;
+    assert.equal((await h.call(10, { action: 'status', session_id: receiving.value.session_id }, { id: `obsolete-status-${index}` })).status, 409);
+  }
+  await h.success(10, { action: 'begin', version: source.view_version, path: 'after-interruptions.txt', kind: first.kind,
+    id: Array.from(Buffer.from(first.id, 'hex')), size_bytes: first.size_bytes }, { id: 'after-ten-epochs' });
+  const reclaimed = await h.control('inspect');
+  assert.equal(reclaimed.forge_upload_usage[0].active, 1, '>8 obsolete sessions cannot starve the current writer');
+  assert.equal(reclaimed.forge_upload_usage[0].assembly_bytes, first.size_bytes);
+  assert.equal(reclaimed.forge_upload_buffers[0].count, 1, 'only current private assembly remains');
+  assert.equal(reclaimed.forge_storage_usage[0].objects, charged.objects);
+  assert.equal(reclaimed.forge_storage_usage[0].bytes, charged.bytes, 'obsolete assembly cleanup cannot refund retained R2 work');
+  assert.deepEqual(await h.keys(), keys, 'epoch cleanup does not delete canonical payloads');
+});
+
 test('production Forge projection pages >512 paths, persists pinned progress and serves only ready sanitized public closure', async t => {
   const h = await projectionRuntime(t);
   const first = await h.success(6);
@@ -799,10 +910,12 @@ test('production owner bootstrap imports a wide native closure once, resumes dur
   const boundaryAccount = 'bootstrap-boundary';
   const ownerToken = 'bootstrap-owner-runtime-fixture';
   const adminToken = 'bootstrap-admin-runtime-fixture';
+  const readerToken = 'bootstrap-readonly-runtime-fixture';
   const rawToken = 'bootstrap-raw-runtime-fixture';
   const config = [
     { principal: 'bootstrap-owner', token_sha256: sha(ownerToken), accounts: [account, boundaryAccount], operator: true, kind: 'forge' },
     { principal: 'bootstrap-admin', token_sha256: sha(adminToken), accounts: [account, boundaryAccount], operator: true, kind: 'forge' },
+    { principal: 'bootstrap-reader', token_sha256: sha(readerToken), accounts: [account], operator: true, kind: 'forge' },
     { principal: 'bootstrap-raw', token_sha256: sha(rawToken), accounts: [account, boundaryAccount], operator: true, kind: 'raw' },
   ];
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-bootstrap-runtime-'));
@@ -833,7 +946,7 @@ test('production owner bootstrap imports a wide native closure once, resumes dur
   assert.equal(provisioned.main_generation, 1);
   const genesis = Buffer.from(provisioned.main_revision).toString('hex');
   await invoke(3, { expected_epoch: 1, member: {
-    principal: 'bootstrap-admin', can_write: true, can_review: true, is_admin: true, roles: [],
+    principal: 'bootstrap-admin', can_write: false, can_review: false, is_admin: true, roles: [],
   } }, { id: 'bootstrap-add-admin' });
   const spec = { name: 'public', root_prefix: '', include_prefixes: [''], exclude_prefixes: [],
     visibility: { kind: 'public' }, revision: provisioned.main_revision, export_allowed: false };
@@ -944,6 +1057,47 @@ test('production owner bootstrap imports a wide native closure once, resumes dur
   await invoke(42, finishPayload, { id: 'sealed-advance', expected: 400, code: 'failed_precondition' });
   assert.deepEqual(await invoke(2), after, 'refused reopening cannot mutate main or policy');
 
+  // The shipped post-bootstrap upload API is independent of the sealed import
+  // ledger. Provider operator status alone is not an ordinary writer grant;
+  // account admin does imply write even when can_write is false.
+  await invoke(3, { expected_epoch: after.policy_epoch, member: {
+    principal: 'bootstrap-reader', can_write: false, can_review: false, is_admin: false, roles: [],
+  } }, { id: 'bootstrap-add-reader' });
+  const beforeOrdinary = await invoke(2);
+  const uploadInvoke = async (payload, id, token = adminToken) => {
+    const response = await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 1, operation: 10, account_id: account, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }) });
+    const envelope = await response.json();
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const ordinaryFile = source.uploads.cases[0];
+  const ordinaryBegin = { action: 'begin', version: namedAfter[0].view_version, path: ordinaryFile.path,
+    kind: ordinaryFile.kind, id: Array.from(Buffer.from(ordinaryFile.id, 'hex')), size_bytes: ordinaryFile.size_bytes };
+  const readonly = await uploadInvoke(ordinaryBegin, 'readonly-is-not-writer', readerToken);
+  assert.equal(readonly.status, 403); assert.equal(readonly.envelope.error.code, 'permission_denied');
+  const ordinary = await uploadObject(uploadInvoke, namedAfter[0].view_version, ordinaryFile, { id: 'ordinary-after-bootstrap' });
+  assert.equal(ordinary.status, 200, JSON.stringify(ordinary));
+  assert.equal(ordinary.value.state, 'committed');
+  assert.equal(ordinary.value.receipt.id.length, 32);
+  await reload();
+  assert.deepEqual((await uploadInvoke({ action: 'finalize', session_id: ordinary.session_id }, 'ordinary-after-bootstrap')).value,
+    ordinary.value, 'ordinary receipt survives restart and exact lost ACK replay');
+  const duplicateChunk = { action: 'append', session_id: ordinary.session_id, offset: 0, data: ordinaryFile.bytes };
+  assert.deepEqual((await uploadInvoke(duplicateChunk, 'ordinary-after-bootstrap')).value, ordinary.value,
+    'exact committed chunk replay checks the immutable original bytes');
+  const conflictingBytes = [...ordinaryFile.bytes]; conflictingBytes[0] ^= 1;
+  const conflict = await uploadInvoke({ ...duplicateChunk, data: conflictingBytes }, 'ordinary-after-bootstrap');
+  assert.equal(conflict.status, 409); assert.equal(conflict.envelope.error.code, 'already_exists');
+  const boundaryFile = { ...fixture.bootstrap.largest_file, path: 'boundary-copy.bin' };
+  const largeOrdinary = await uploadObject(uploadInvoke, namedAfter[0].view_version, boundaryFile, { id: 'ordinary-boundary-file' });
+  assert.equal(largeOrdinary.status, 200, JSON.stringify(largeOrdinary));
+  assert.equal(largeOrdinary.value.receipt.size_bytes, 1024 * 1024, 'ordinary upload supports the actual1MiB storage boundary through64KiB chunks');
+  const foreign = await uploadInvoke({ action: 'status', session_id: ordinary.session_id }, 'foreign-session', ownerToken);
+  assert.equal(foreign.status, 403, 'even the account owner cannot claim another actor session');
+  assert.deepEqual(await invoke(2), beforeOrdinary, 'ordinary supplied bytes do not change main or policy');
+  await invoke(40, beginPayload, { id: 'still-sealed-after-upload', expected: 400, code: 'failed_precondition' });
+
   // A second independent native root reaches a FILE exactly at the supported
   // bound. The wide source remains its original native oracle, not a JS codec.
   const boundary = fixture.bootstrap;
@@ -970,7 +1124,7 @@ test('production owner bootstrap imports a wide native closure once, resumes dur
   const boundaryAfter = await boundaryCall(2, {});
   assert.equal(boundaryAfter.main_generation, 2);
   assert.equal(Buffer.from(boundaryAfter.main_revision).toString('hex'), boundary.root.id);
-  assert.deepEqual(await invoke(2), after, 'second account import cannot mutate the first account');
+  assert.deepEqual(await invoke(2), beforeOrdinary, 'second account import cannot mutate the first account');
 });
 
 test('production search pages real native matches through CLI, replay and reload without crossing current view policy', async t => {

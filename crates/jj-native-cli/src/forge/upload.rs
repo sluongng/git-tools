@@ -3,32 +3,14 @@ use super::{context::Context, rpc};
 use futures::AsyncReadExt as _;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_native_backend::NativeObjectIo;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, sync::Arc};
 use tinytree_client::{NativeClient, forge_protocol as f};
+use tinytree_forge_core::upload::{ForgeUploadState, ForgeUploadStatus as Session};
 use tinytree_model as m;
 const MAX_OBJECTS: usize = 5000;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Receipt {
-    kind: u8,
-    id: [u8; 32],
-    size_bytes: u64,
-    format_version: u16,
-    staging_lease: Value,
-    expires_at: Value,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Session {
-    session_id: [u8; 32],
-    offset: u64,
-    state: String,
-    receipt: Option<Receipt>,
-}
 fn failure(status: tonic::Status, key: &str) -> CommandError {
     user_error(rpc::CallError {
         status,
@@ -58,7 +40,7 @@ fn receipt(value: &Session, expected: m::Descriptor) -> Result<(), CommandError>
     let Some(receipt) = &value.receipt else {
         return Err(user_error("committed upload has no retention receipt"));
     };
-    if value.state != "committed"
+    if value.state != ForgeUploadState::Committed
         || value.offset != expected.size_bytes
         || receipt.kind != expected.key.kind as u8
         || receipt.id != expected.key.id.0
@@ -89,10 +71,13 @@ async fn send(
     let session=call(client,context,&key,json!({"action":"begin","version":version,"path":path,"kind":descriptor.key.kind as u8,"id":descriptor.key.id.0,"size_bytes":descriptor.size_bytes})).await.map_err(|e|{
         if let Some(call)=e.error.downcast_ref::<rpc::CallError>(){failure(call.status.clone(),root_key)}else{e}
     })?;
-    if session.state == "committed" {
+    if session.state == ForgeUploadState::Committed {
         return receipt(&session, descriptor);
     }
-    if session.state != "pending" || session.offset > descriptor.size_bytes {
+    if session.state != ForgeUploadState::Pending
+        || session.offset > descriptor.size_bytes
+        || session.receipt.is_some()
+    {
         return Err(user_error("invalid forge upload offset/state"));
     }
     let id = session.session_id;
@@ -112,7 +97,10 @@ async fn send(
             let value=call(client,context,&key,json!({"action":"append","session_id":id,"offset":offset+start as u64,"data":&buffer[start..wanted]})).await.map_err(|e|{
                 if let Some(call)=e.error.downcast_ref::<rpc::CallError>(){failure(call.status.clone(),root_key)}else{e}
             })?;
-            if value.session_id != id || value.offset != end || value.state != "pending" {
+            if value.session_id != id
+                || value.offset != end
+                || value.state != ForgeUploadState::Pending
+            {
                 return Err(user_error("forge upload acknowledgement range mismatch"));
             }
         }
@@ -122,24 +110,58 @@ async fn send(
     if input.read(&mut extra).await.map_err(user_error)? != 0 {
         return Err(user_error("native source exceeds its immutable descriptor"));
     }
-    let value = call(
-        client,
-        context,
-        &key,
-        json!({"action":"finalize","session_id":id}),
-    )
-    .await
-    .map_err(|e| {
-        if let Some(call) = e.error.downcast_ref::<rpc::CallError>() {
-            failure(call.status.clone(), root_key)
-        } else {
-            e
+    // A persisted verification quantum may finish receiving bytes before its
+    // scoped proof is ready. Retry only this exact Finalize/session/key; retain
+    // any narrower whole-transfer deadline already carried by the SDK client.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let client = client.clone().with_operation_deadline(deadline);
+    let finalize = json!({"action":"finalize","session_id":id});
+    for round in 0..512 {
+        if round != 0 {
+            tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .map_err(|_| {
+                failure(
+                    tonic::Status::deadline_exceeded(
+                        "upload verification deadline; resume the original request",
+                    ),
+                    root_key,
+                )
+            })?;
         }
-    })?;
-    if value.session_id != id {
-        return Err(user_error("forge upload final session identity mismatch"));
+        let value = call(&client, context, &key, finalize.clone())
+            .await
+            .map_err(|e| {
+                if let Some(call) = e.error.downcast_ref::<rpc::CallError>() {
+                    failure(call.status.clone(), root_key)
+                } else {
+                    e
+                }
+            })?;
+        if value.session_id != id || value.offset != descriptor.size_bytes {
+            return Err(user_error(
+                "forge upload final session identity/offset mismatch",
+            ));
+        }
+        match &value.state {
+            ForgeUploadState::Committed => return receipt(&value, descriptor),
+            ForgeUploadState::Pending if value.receipt.is_none() => {}
+            _ => {
+                return Err(user_error(
+                    "invalid forge upload final verification state/receipt",
+                ));
+            }
+        }
     }
-    receipt(&value, descriptor)
+    Err(failure(
+        tonic::Status::resource_exhausted(
+            "upload verification round limit; resume the original request",
+        ),
+        root_key,
+    ))
 }
 enum Task {
     Visit(m::ObjectKey, String),
@@ -518,4 +540,338 @@ pub(super) async fn lineage(
         result.push(json!({"operation":if after.contains_key(*source){"copy"}else{"rename"},"source_path":source,"target_path":path}));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        Pending,
+        ResumedFull,
+        OtherSession,
+        ShortOffset,
+        PendingReceipt,
+        OtherReceipt,
+        UnknownState,
+        NarrowDeadline,
+    }
+    struct Upload {
+        id: [u8; 32],
+        descriptor: m::Descriptor,
+        bytes: Vec<u8>,
+        finalized: Vec<Value>,
+        append_calls: usize,
+    }
+
+    // Real canonical local source + SDK HTTP transport. This supporting uploader
+    // contract test is not Cloudflare authorization/storage or mounted-kernel proof.
+    #[tokio::test]
+    async fn finalize_continuations_keep_one_exact_intent_and_reject_unbound_progress() {
+        for mode in [
+            Mode::Pending,
+            Mode::ResumedFull,
+            Mode::OtherSession,
+            Mode::ShortOffset,
+            Mode::PendingReceipt,
+            Mode::OtherReceipt,
+            Mode::UnknownState,
+            Mode::NarrowDeadline,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let io = Arc::new(
+                jj_native_backend::DirectObjectIo::init(directory.path(), Default::default())
+                    .unwrap(),
+            );
+            let tree = io
+                .write_metadata(m::Object::Tree(m::Tree::default()))
+                .await
+                .unwrap();
+            let person = m::Signature {
+                name: "Fixture".into(),
+                email: "fixture@example.invalid".into(),
+                timestamp: m::Timestamp {
+                    millis_since_epoch: 0,
+                    tz_offset_minutes: 0,
+                },
+            };
+            let commit = |parent: m::CommitId, tree: m::TreeId, change: u8| {
+                m::Object::Commit(m::Commit {
+                    parents: vec![parent],
+                    predecessors: vec![],
+                    root_tree: m::TreeMerge {
+                        terms: vec![tree],
+                        labels: vec![String::new()],
+                    },
+                    change_id: m::ChangeId([change; 16]),
+                    description: "Upload fixture".into(),
+                    author: person.clone(),
+                    committer: person.clone(),
+                    secure_signature: None,
+                })
+            };
+            let base = io
+                .write_metadata(commit(m::CommitId::ROOT, m::TreeId(tree.key.id.0), 1))
+                .await
+                .unwrap();
+            let original = b"immutable authored bytes\n".to_vec();
+            let file = io
+                .write_file(
+                    &mut futures::io::Cursor::new(original.clone()),
+                    original.len() as u64,
+                )
+                .await
+                .unwrap();
+            let file_descriptor = m::describe_file(&original);
+            let tree = io
+                .write_metadata(m::Object::Tree(m::Tree {
+                    entries: vec![m::TreeEntry {
+                        name: "file.txt".into(),
+                        value: m::TreeValue::File {
+                            id: file,
+                            executable: false,
+                            size_bytes: original.len() as u64,
+                            copy_id: None,
+                        },
+                    }],
+                }))
+                .await
+                .unwrap();
+            let head = io
+                .write_metadata(commit(
+                    m::CommitId(base.key.id.0),
+                    m::TreeId(tree.key.id.0),
+                    2,
+                ))
+                .await
+                .unwrap();
+            let mut canonical = BTreeMap::new();
+            canonical.insert(
+                (1, file_descriptor.key.id.0),
+                (file_descriptor, original.clone()),
+            );
+            for descriptor in [tree, head] {
+                let metadata = io.read_metadata(descriptor.key).await.unwrap();
+                canonical.insert(
+                    (descriptor.key.kind as u8, descriptor.key.id.0),
+                    (descriptor, metadata.bytes().to_vec()),
+                );
+            }
+            let canonical = Arc::new(canonical);
+            let uploads = Arc::new(Mutex::new(BTreeMap::<String, Upload>::new()));
+            let observed = uploads.clone();
+            let expected = canonical.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = tokio::select! {result=listener.accept()=>result.unwrap(),_=&mut stopped=>break};
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            break;
+                        }
+                        header.push(byte[0]);
+                        assert!(header.len() < 16384);
+                    }
+                    if !header.ends_with(b"\r\n\r\n") {
+                        continue;
+                    }
+                    let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
+                    assert!(header.starts_with("post /api/v1/forge/call http/1.1\r\n"));
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert!(length < 2 * 1024 * 1024);
+                    let mut bytes = vec![0; length];
+                    if socket.read_exact(&mut bytes).await.is_err() {
+                        continue;
+                    }
+                    let input: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(input["operation"], 10);
+                    assert_eq!(input["account_id"], "example");
+                    assert_eq!(input["view"], "public");
+                    let payload: Value =
+                        serde_json::from_str(input["payload_json"].as_str().unwrap()).unwrap();
+                    let key = input["request_id"].as_str().unwrap().to_owned();
+                    let (result, drop_response) = {
+                        let mut uploads = observed.lock().unwrap();
+                        match payload["action"].as_str().unwrap() {
+                            "begin" => {
+                                let kind = payload["kind"].as_u64().unwrap() as u8;
+                                let id: [u8; 32] =
+                                    serde_json::from_value(payload["id"].clone()).unwrap();
+                                let (descriptor, bytes) = expected.get(&(kind, id)).unwrap();
+                                assert_eq!(payload["size_bytes"], descriptor.size_bytes);
+                                assert_eq!(payload["version"], json!(vec![1u8; 32]));
+                                let session = *blake3::hash(key.as_bytes()).as_bytes();
+                                let upload = uploads.entry(key.clone()).or_insert_with(|| Upload {
+                                    id: session,
+                                    descriptor: *descriptor,
+                                    bytes: if matches!(mode, Mode::ResumedFull) {
+                                        bytes.clone()
+                                    } else {
+                                        vec![]
+                                    },
+                                    finalized: vec![],
+                                    append_calls: 0,
+                                });
+                                (
+                                    json!({"session_id":upload.id,"offset":upload.bytes.len(),"state":"pending","receipt":null}),
+                                    false,
+                                )
+                            }
+                            "append" => {
+                                let upload = uploads.get_mut(&key).unwrap();
+                                assert_eq!(payload["session_id"], json!(upload.id));
+                                assert_eq!(payload["offset"], upload.bytes.len());
+                                let data: Vec<u8> =
+                                    serde_json::from_value(payload["data"].clone()).unwrap();
+                                upload.bytes.extend_from_slice(&data);
+                                upload.append_calls += 1;
+                                (
+                                    json!({"session_id":upload.id,"offset":upload.bytes.len(),"state":"pending","receipt":null}),
+                                    false,
+                                )
+                            }
+                            "finalize" => {
+                                let upload = uploads.get_mut(&key).unwrap();
+                                assert_eq!(payload["session_id"], json!(upload.id));
+                                if let Some(first) = upload.finalized.first() {
+                                    assert_eq!(
+                                        &input, first,
+                                        "all continuation/retry envelopes remain identical"
+                                    );
+                                }
+                                upload.finalized.push(input.clone());
+                                m::verify(&upload.descriptor, &upload.bytes, Default::default())
+                                    .unwrap();
+                                assert_eq!(
+                                    &upload.bytes,
+                                    &expected[&(
+                                        upload.descriptor.key.kind as u8,
+                                        upload.descriptor.key.id.0
+                                    )]
+                                        .1
+                                );
+                                let pending = matches!(mode, Mode::NarrowDeadline)
+                                    || upload.finalized.len() == 1;
+                                let mut receipt = json!({"kind":upload.descriptor.key.kind as u8,"id":upload.descriptor.key.id.0,"size_bytes":upload.descriptor.size_bytes,"format_version":upload.descriptor.format_version,"staging_lease":"fixture-retained","expires_at":86400});
+                                let mut result = json!({"session_id":upload.id,"offset":upload.bytes.len(),"state":if pending{"pending"}else{"committed"},"receipt":if pending{Value::Null}else{receipt.clone()}});
+                                match mode {
+                                    Mode::OtherSession => {
+                                        result["session_id"] = json!(vec![9u8; 32])
+                                    }
+                                    Mode::ShortOffset => {
+                                        result["offset"] = json!(upload.bytes.len() - 1)
+                                    }
+                                    Mode::PendingReceipt => result["receipt"] = receipt,
+                                    Mode::OtherReceipt => {
+                                        receipt["id"] = json!(vec![9u8; 32]);
+                                        result["state"] = json!("committed");
+                                        result["receipt"] = receipt;
+                                    }
+                                    Mode::UnknownState => result["state"] = json!("working"),
+                                    _ => {}
+                                }
+                                // Commit one proof quantum before a response is
+                                // lost; the SDK must retry the identical intent.
+                                let lost =
+                                    matches!(mode, Mode::Pending) && upload.finalized.len() == 2;
+                                (result, lost)
+                            }
+                            other => panic!("unexpected upload action {other}"),
+                        }
+                    };
+                    if drop_response {
+                        continue;
+                    }
+                    let reply = json!({"version":1,"operation":10,"account_id":input["account_id"],"view":input["view"],"request_id":input["request_id"],"state":"complete","result_json":result.to_string()});
+                    let bytes = serde_json::to_vec(&reply).unwrap();
+                    let _=socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await;
+                    let _ = socket.write_all(&bytes).await;
+                }
+            });
+            let context = Context {
+                schema_version: 1,
+                transport: tinytree_client::Transport::ForgeHttpsV1,
+                server: endpoint,
+                account_id: "example".into(),
+                view: "public".into(),
+                token_env: None,
+                ca_certificate: None,
+                tls_domain: None,
+            };
+            let result = if matches!(mode, Mode::NarrowDeadline) {
+                // Exercise the physical sender with an inherited shorter public
+                // SDK deadline; the60s continuation cap must not renew it.
+                let client = NativeClient::connect(context.client_config().unwrap())
+                    .await
+                    .unwrap()
+                    .with_operation_deadline(
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(80),
+                    );
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    send(
+                        &client,
+                        &context,
+                        [1; 32],
+                        "saved-root-intent",
+                        "file.txt",
+                        file_descriptor,
+                        &mut futures::io::Cursor::new(original),
+                    ),
+                )
+                .await
+                .expect("shorter SDK deadline must survive the continuation loop")
+            } else {
+                closure(
+                    &context,
+                    [1; 32],
+                    base.key.id.0,
+                    head.key.id.0,
+                    "saved-root-intent",
+                    io,
+                )
+                .await
+            };
+            if matches!(mode, Mode::Pending | Mode::ResumedFull) {
+                assert!(result.is_ok(), "{mode:?}: {result:?}");
+                let uploads = uploads.lock().unwrap();
+                assert_eq!(uploads.len(), 3);
+                for upload in uploads.values() {
+                    assert!(upload.finalized.len() >= 2);
+                    if matches!(mode, Mode::ResumedFull) {
+                        assert_eq!(upload.append_calls, 0);
+                    }
+                }
+            } else if matches!(mode, Mode::NarrowDeadline) {
+                let error = result.unwrap_err();
+                let call = error.error.downcast_ref::<rpc::CallError>().unwrap();
+                assert_eq!(call.status.code(), tonic::Code::DeadlineExceeded);
+                assert_eq!(call.request_id.as_deref(), Some("saved-root-intent"));
+            } else {
+                assert!(result.is_err(), "{mode:?} must fail closed");
+                let uploads = uploads.lock().unwrap();
+                assert_eq!(uploads.len(), 1);
+                assert_eq!(
+                    uploads.values().next().unwrap().finalized.len(),
+                    1,
+                    "invalid progress is not retryable"
+                );
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
 }

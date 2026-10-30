@@ -20,12 +20,12 @@ export class AccountRepository extends Base {
       const account = url.searchParams.get('account');
       if (!row || row.account !== account) fail(400, 'fixture_requires_provisioned_account');
       if (url.pathname === '/__fixture/inspect') {
-        const tables = ['projection_usage', 'projection_jobs', 'projection_frontier', 'projection_selected', 'projection_outputs', 'projection_plan_chunks', 'projection_catalogs', 'closure_job_usage', 'forge_storage_usage', 'objects', 'refs'];
+        const tables = ['projection_usage', 'projection_jobs', 'projection_frontier', 'projection_selected', 'projection_outputs', 'projection_plan_chunks', 'projection_catalogs', 'closure_job_usage', 'forge_storage_usage', 'forge_upload_usage', 'forge_upload_buffers', 'objects', 'refs'];
         const result: Record<string, unknown> = {};
         for (const table of tables) {
           const exists = [...sql.exec('SELECT name FROM sqlite_master WHERE type=\'table\' AND name=?', table)].length;
           if (!exists) { result[table] = []; continue; }
-          result[table] = ['objects', 'projection_frontier', 'projection_selected', 'projection_outputs', 'projection_plan_chunks'].includes(table)
+          result[table] = ['objects', 'projection_frontier', 'projection_selected', 'projection_outputs', 'projection_plan_chunks', 'forge_upload_buffers'].includes(table)
             ? [...sql.exec(`SELECT COUNT(*) AS count FROM ${table}`)] : [...sql.exec(`SELECT * FROM ${table}`)];
         }
         return Response.json(result);

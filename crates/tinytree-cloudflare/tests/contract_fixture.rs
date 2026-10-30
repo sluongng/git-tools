@@ -72,9 +72,120 @@ fn projection_fixture(store: &Store) -> Value {
     let view = store.forge_resolve_view(&account, Some(&owner), "public", None).unwrap();
     let files = store.forge_view_files(&view, 1000).unwrap();
     let projection = store.forge_project_view(&view, 0).unwrap();
+    drop(put);
+    let uploads = projection_uploads(store, &account, &owner, &view, &projection, secret);
     let readme_content = String::from_utf8(store.forge_read_view_file(&view, "README.md", 65536).unwrap()).unwrap();
     let snapshot = json!({"account_id":account.0,"view":view.name(),"view_version":view.version().0,"revision":view.revision().0,"policy_epoch":view.epoch().0,"root_prefix":view.root_prefix(),"projected_commit":projection.projected_commit,"projected_tree":projection.projected_tree,"paths":files.into_iter().map(|f|f.path).collect::<Vec<_>>(),"readme":{"path":"README.md","content":readme_content},"readme_error":null,"complete":true});
-    json!({"account_id":account.0,"owner":owner.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
+    json!({"account_id":account.0,"owner":owner.principal,"uploads":uploads,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
+}
+
+// Ordered public session uploads run against the actual native policy/scope
+// adapter. Canonical metadata comes only from model encode or stored projection
+// bytes, never from a JavaScript codec or a fabricated descriptor.
+fn projection_uploads(
+    store: &Store,
+    account: &AccountId,
+    actor: &ForgeActor,
+    view: &tinytree_store::ResolvedView,
+    projection: &tinytree_store::ForgeProjection,
+    private_file: Descriptor,
+) -> Value {
+    fn encoded(object: Object) -> (Descriptor, Vec<u8>) {
+        let object = tinytree_model::encode(&object, Limits::default()).unwrap();
+        (object.descriptor, object.bytes)
+    }
+    let repository = account.repository_id();
+    let before = store.references(&repository, &["main".into()]).unwrap().remove(0);
+    let (_, bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey {
+        kind: Kind::Tree, id: tinytree_model::ObjectId(projection.projected_tree),
+    }).unwrap();
+    let Object::Tree(mut root) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("projection tree") };
+    assert_eq!(root.entries.len(), 701);
+    let (_, bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey {
+        kind: Kind::Commit, id: tinytree_model::ObjectId(projection.projected_commit),
+    }).unwrap();
+    let Object::Commit(mut source) = tinytree_model::decode(&bytes, Limits::default()).unwrap() else { panic!("projection commit") };
+    let file_bytes = b"New scoped copy content\n".to_vec();
+    let file = tinytree_model::describe_file(&file_bytes);
+    let copy = encoded(Object::CopyHistory(CopyHistory { current_path: "vendor/copied.txt".into(), parents: vec![], salt: b"upload-copy-fixture".to_vec() }));
+    let subtree = encoded(Object::Tree(Tree { entries: vec![TreeEntry {
+        name: "copied.txt".into(), value: TreeValue::File { id: FileId(file.key.id.0), executable: false,
+            size_bytes: file.size_bytes, copy_id: Some(CopyId(copy.0.key.id.0)) },
+    }] }));
+    root.entries.push(TreeEntry { name: "vendor".into(), value: TreeValue::Tree(TreeId(subtree.0.key.id.0)) });
+    root.entries.sort_by(|a,b|a.name.cmp(&b.name));
+    assert!(root.entries.len() > 128);
+    let root = encoded(Object::Tree(root));
+    source.parents = vec![CommitId(projection.projected_commit)];
+    source.predecessors.clear();
+    source.root_tree = TreeMerge { terms: vec![TreeId(root.0.key.id.0)], labels: vec![String::new()] };
+    source.change_id = ChangeId([93;16]);
+    source.description = "Authored scoped fixture source".into();
+    let authored = encoded(Object::Commit(source.clone()));
+    let leaked = encoded(Object::Tree(Tree { entries: vec![TreeEntry {
+        name: "leak.txt".into(), value: TreeValue::File { id: FileId(private_file.key.id.0), executable: false,
+            size_bytes: private_file.size_bytes, copy_id: None },
+    }] }));
+    let mut raw_parent = source.clone(); raw_parent.parents = vec![view.revision()];
+    let raw_parent = encoded(Object::Commit(raw_parent));
+    let mut root_predecessor = source; root_predecessor.predecessors = vec![CommitId::ROOT];
+    let root_predecessor = encoded(Object::Commit(root_predecessor));
+    let wrong_copy = encoded(Object::CopyHistory(CopyHistory { current_path: "elsewhere.txt".into(), parents: vec![], salt: b"upload-wrong-copy-fixture".to_vec() }));
+    let inputs = vec![
+        ("new-file", "vendor/copied.txt", (file,file_bytes), true),
+        ("new-copy", "vendor/copied.txt", copy, true),
+        ("nested-tree", "vendor", subtree.clone(), true),
+        ("wide-root-tree", "", root, true),
+        ("source-commit", "", authored, true),
+        ("nested-tree-wrong-empty-context", "", subtree, false),
+        ("known-private-file", "", leaked, false),
+        ("raw-canonical-parent", "", raw_parent, false),
+        ("intrinsic-root-predecessor", "", root_predecessor, false),
+        ("wrong-copy-current-path", "vendor/copied.txt", wrong_copy, false),
+    ];
+    let mut cases = Vec::new();
+    for (name,path,(descriptor,bytes),success) in inputs {
+        let request_id = format!("native-upload-{name}");
+        let begin = store.forge_begin_upload(view,actor,&request_id,path,descriptor,0).unwrap();
+        let mut offset = 0;
+        for chunk in bytes.chunks(64*1024) {
+            let status = store.forge_append_upload(account,actor,"",begin.session_id,offset,chunk,0).unwrap();
+            offset += chunk.len() as u64; assert_eq!(status.offset,offset);
+        }
+        let result = store.forge_finalize_upload(account,actor,"",begin.session_id,0);
+        assert_eq!(result.is_ok(),success,"native upload case {name}: {result:?}");
+        let expected = match result {
+            Ok(status) => {
+                let receipt = status.receipt.as_ref().expect("native committed receipt");
+                assert_eq!(status.offset,descriptor.size_bytes);
+                assert_eq!(receipt.id,descriptor.key.id.0);
+                assert_eq!(receipt.kind,descriptor.key.kind as u8);
+                assert_eq!(receipt.size_bytes,descriptor.size_bytes);
+                assert_eq!(receipt.format_version,descriptor.format_version);
+                let replay = store.forge_finalize_upload(account,actor,"",begin.session_id,0).unwrap();
+                assert_eq!(serde_json::to_value(replay).unwrap(),serde_json::to_value(&status).unwrap());
+                json!({"state":"committed","offset":status.offset,"receipt":{"kind":receipt.kind,"id":receipt.id,
+                    "size_bytes":receipt.size_bytes,"format_version":receipt.format_version}})
+            }
+            Err(error) => {
+                let code = match error {
+                    Error::ForgeAccessDenied => "permission_denied",
+                    Error::Invalid(_) | Error::Model(_) => "invalid_argument",
+                    Error::Limit(_) => "resource_exhausted",
+                    other => panic!("unexpected native upload error {name}: {other:?}"),
+                };
+                json!({"state":"error","code":code,"stage":"finalize"})
+            }
+        };
+        cases.push(json!({"name":name,"path":path,"request_id":request_id,"kind":descriptor.key.kind as u8,
+            "id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,
+            "bytes":bytes,"session_id":begin.session_id,"expected":expected}));
+    }
+    let after = store.references(&repository, &["main".into()]).unwrap().remove(0);
+    assert_eq!(before.generation,after.generation); assert_eq!(before.commit,after.commit);
+    assert_eq!(store.forge_view_files(view,1000).unwrap().len(),701);
+    json!({"view_version":view.version().0,"policy_epoch":view.epoch().0,"projected_base":projection.projected_commit,
+        "expected_wide_file_count":701,"cases":cases})
 }
 
 // Independent production-ingest boundary: one real 1MiB FILE and its minimal

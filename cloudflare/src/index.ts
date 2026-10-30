@@ -10,6 +10,7 @@ import { ClosureJobs } from './closure_jobs';
 import { BootstrapImports } from './bootstrap_import';
 import { ForgeSearch } from './forge_search';
 import { staticUi } from './static_ui';
+import { ForgeUploads } from './forge_uploads';
 
 interface Env {
   ASSETS?: Fetcher;
@@ -248,7 +249,33 @@ export class AccountRepository {
       },
     });
     let result;
-    if ([4, 5, 6, 7, 8, 9, 11].includes(call.operation)) {
+    if (call.operation === 10) {
+      const { views, projections } = this.forgeServices(call.account_id, auth?.principal ?? null, api, storage);
+      result = await new ForgeUploads({
+        accountId: call.account_id, principal: auth?.principal ?? null, sql: this.sql, views,
+        transactionSync: callback => this.ctx.storage.transactionSync(callback),
+        nowSeconds: () => Math.floor(Date.now() / 1000),
+        requireWriterInTx: () => { api.requireWriterInTx(); },
+        projectionMemberInTx: (view, descriptor) => {
+          const ready = projections.readyInTx(view);
+          if (!ready || !this.one('SELECT 1 FROM projection_members WHERE projection=? AND kind=? AND id=?', ready.catalog_id, descriptor.kind, descriptor.id)) return false;
+          const member = projections.memberInTx(view, descriptor).descriptor;
+          if (member.size_bytes !== descriptor.size_bytes || member.format_version !== descriptor.format_version) fail(503, 'unavailable');
+          return true;
+        },
+        describeObjectInTx: key => storage.describeInTx(key),
+        readVerifiedObject: key => storage.readVerifiedObject(key),
+        reserveUploadInTx: (session, descriptor) => storage.reserveInTx('upload', session, descriptor),
+        stageUpload: (descriptor, bytes) => storage.stage(descriptor, bytes),
+        confirmUploadInTx: (session, descriptor, confirmation) => storage.confirmInTx('upload', session, descriptor, confirmation),
+        retainUploadInTx: (session, descriptor, expiresAt) => {
+          const available = storage.describeInTx(descriptor);
+          if (!available || available.size_bytes !== descriptor.size_bytes || available.format_version !== descriptor.format_version) fail(503, 'unavailable');
+          this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'upload\',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', session, descriptor.kind, descriptor.id);
+          return { staging_lease: `upload-${session}`, expires_at: expiresAt };
+        },
+      }).handle(call);
+    } else if ([4, 5, 6, 7, 8, 9, 11].includes(call.operation)) {
       const services = this.forgeServices(call.account_id, auth?.principal ?? null, api, storage);
       if ([4, 5, 11].includes(call.operation)) result = await services.views.handle(call);
       else if (call.operation === 8) result = await new ForgeSearch({

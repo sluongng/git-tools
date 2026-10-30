@@ -2,10 +2,12 @@
 //! published as native objects or acknowledged as completed object receipts.
 use super::*;
 use std::collections::BTreeSet;
+pub use tinytree_forge_core::upload::{ForgeUploadState, ForgeUploadedObject, ForgeUploadStatus};
+use tinytree_forge_core::upload::{session_id, validate_request_id};
 
 const PREFIX: &[u8] = b"forge/upload-sessions/v1/";
 const DIRECTORY: &str = "forge-upload-sessions";
-const CHUNK: usize = 64 * 1024;
+const CHUNK: usize = tinytree_forge_core::upload::MAX_CHUNK_BYTES;
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const METADATA_LIMIT: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
@@ -15,29 +17,6 @@ const GLOBAL_BYTES: u64 = 1024 * 1024 * 1024;
 const ACCOUNT_BYTES: u64 = 256 * 1024 * 1024;
 const TTL: i64 = 24 * 60 * 60;
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeUploadState {
-    Pending,
-    Committed,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeUploadedObject {
-    pub kind: u8,
-    pub id: [u8; 32],
-    pub size_bytes: u64,
-    pub format_version: u16,
-    pub staging_lease: String,
-    pub expires_at: i64,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeUploadStatus {
-    pub session_id: [u8; 32],
-    pub offset: u64,
-    pub state: ForgeUploadState,
-    pub receipt: Option<ForgeUploadedObject>,
-}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
@@ -114,17 +93,6 @@ fn descriptor_limit(d: Descriptor) -> Result<()> {
     }
     Ok(())
 }
-fn request_id(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-    {
-        return Err(Error::Invalid("upload request identity"));
-    }
-    Ok(())
-}
 fn allows(view: &ResolvedView, path: &str, kind: Kind) -> Result<()> {
     if path.is_empty() && matches!(kind, Kind::Commit | Kind::Tree) {
         return Ok(());
@@ -189,7 +157,7 @@ impl Inner {
     ) -> Result<ResolvedView> {
         if s.binding.account != *account
             || s.binding.principal != actor.principal
-            || s.binding.view_name != view_name
+            || (!view_name.is_empty() && s.binding.view_name != view_name)
         {
             return Err(Error::ForgeAccessDenied);
         }
@@ -201,7 +169,7 @@ impl Inner {
             Some(s.binding.epoch),
         )?;
         let view = self.forge_resolve_view_in(tx, account, Some(actor), s.binding.view)?;
-        if view.name() != view_name || view.epoch() != s.binding.epoch {
+        if view.name() != s.binding.view_name || view.epoch() != s.binding.epoch {
             return Err(Error::StaleForgePolicy);
         }
         allows(
@@ -282,7 +250,7 @@ impl Store {
         descriptor: Descriptor,
         now: i64,
     ) -> Result<ForgeUploadStatus> {
-        request_id(request)?;
+        validate_request_id(request)?;
         descriptor_limit(descriptor)?;
         allows(view, canonical_path, descriptor.key.kind)?;
         let binding = Binding {
@@ -294,17 +262,7 @@ impl Store {
             path: canonical_path.into(),
             descriptor: descriptor.into(),
         };
-        let mut h = blake3::Hasher::new();
-        h.update(b"tinytree-forge-upload-session-v1\0");
-        for part in [
-            view.account().0.as_bytes(),
-            actor.principal.as_bytes(),
-            request.as_bytes(),
-        ] {
-            h.update(&(part.len() as u64).to_le_bytes());
-            h.update(part);
-        }
-        let id = *h.finalize().as_bytes();
+        let id = session_id(view.account(), actor, request)?;
         let fp = fingerprint(&binding)?;
         let _gate = self.inner.lock()?;
         let tx = self.inner.db.read_tx();

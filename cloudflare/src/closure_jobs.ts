@@ -12,6 +12,8 @@ export interface ClosureBinding {
   purpose: string;
   /** Trusted canonical target/expected-CAS binding; never interpreted as a grant. */
   publication: string;
+  /** Trusted scoped TREE upload context only; generic roots remain empty. */
+  tree_prefix?: string;
 }
 export interface ClosureJobHost {
   binding: ClosureBinding;
@@ -93,7 +95,12 @@ function identityCopy(value: ClosureIdentity): ClosureIdentity {
 function bindingString(binding: ClosureBinding): string {
   if (!/^[a-z0-9-]{1,64}$/.test(binding.account_id) || !safe(binding.policy_epoch) || binding.policy_epoch < 1
       || !/^[A-Za-z0-9_.-]{1,64}$/.test(binding.purpose) || !utf8(binding.publication, 4096) || binding.publication.length === 0) fail(400, 'invalid_argument');
-  return JSON.stringify([binding.account_id, binding.identity, binding.policy_epoch, binding.purpose, binding.publication]);
+  if (binding.tree_prefix !== undefined && (typeof binding.tree_prefix !== 'string' || !utf8(binding.tree_prefix, 4096))) fail(400, 'invalid_argument');
+  const fields: unknown[] = [binding.account_id, binding.identity, binding.policy_epoch, binding.purpose, binding.publication];
+  // Preserve the existing generic empty-root binding exactly. Nonempty scoped
+  // TREE prefixes become immutable job identity, not a second empty context.
+  if (binding.tree_prefix) fields.push(['tree_prefix', binding.tree_prefix]);
+  return JSON.stringify(fields);
 }
 
 export class ClosureJobs {
@@ -171,6 +178,7 @@ export class ClosureJobs {
   }
   async begin(requestId: string, key: ObjectKey): Promise<ClosureJobStatus> {
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(requestId) || !validKey(key) || (key.kind === 3 && key.id === ROOT)) fail(400, 'invalid_argument');
+    if (this.binding.tree_prefix !== undefined && key.kind !== 2) fail(400, 'invalid_argument');
     key = { kind: key.kind, id: key.id }; // Pin caller-owned input before crypto await.
     this.host.transactionSync(() => this.host.authorizeCurrentInTx(this.binding));
     const payload = encoder.encode(JSON.stringify([this.encodedBinding, key.kind, key.id]));
@@ -187,7 +195,7 @@ export class ClosureJobs {
         fingerprint, binding: this.encodedBinding, root_kind: key.kind, root_id: key.id, phase: 'graph', generation: 0,
         nodes: 0, bytes: 0, edges: 0, contexts: 0, path_bytes: 0, obligations: 0, checked_nodes: 0, checked_contexts: 0, checked_obligations: 0, error: null, result: null };
       this.host.sql.exec('INSERT INTO closure_jobs(id,account,identity,request_id,fingerprint,binding,root_kind,root_id,phase,generation,nodes,bytes,edges,contexts,path_bytes,obligations,checked_nodes,checked_contexts,checked_obligations) VALUES(?,?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0)', job.id, job.account, job.identity, requestId, fingerprint, job.binding, key.kind, key.id, job.phase);
-      try { this.enqueue(job, key); if (key.kind === 2) this.context(job, key.id, ''); this.save(job); }
+      try { this.enqueue(job, key); if (key.kind === 2) this.context(job, key.id, this.binding.tree_prefix ?? ''); this.save(job); }
       catch (error) { if (error instanceof Limit) fail(429, 'resource_exhausted'); throw error; }
       this.host.sql.exec('UPDATE closure_job_usage SET jobs=jobs+1 WHERE singleton=1');
       return this.report(job);

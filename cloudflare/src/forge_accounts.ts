@@ -72,13 +72,16 @@ export class ForgeAccounts {
   }
   /** Host-side fencing only, not an authorization grant or public operation. */
   hasAccountInTx(): boolean { return this.accountInTx() !== undefined; }
-  private authorizeInTx(admin: boolean): AccountRow {
+  private authorizeInTx(action: 'member' | 'admin' | 'write'): AccountRow {
     if (this.host.principal === null) fail(401, 'unauthenticated');
     const row = this.accountInTx();
     if (!row) fail(403, 'permission_denied');
     if (row.owner === this.host.principal) return row;
     const member = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, this.host.principal);
-    if (!member || (admin && !(JSON.parse(member.value) as ForgeMember).is_admin)) fail(403, 'permission_denied');
+    if (!member) fail(403, 'permission_denied');
+    const grant = JSON.parse(member.value) as ForgeMember;
+    if ((action === 'admin' && grant.is_admin !== true)
+        || (action === 'write' && grant.is_admin !== true && grant.can_write !== true)) fail(403, 'permission_denied');
     return row;
   }
   private wire(row: AccountRow): Record<string, unknown> {
@@ -112,7 +115,13 @@ export class ForgeAccounts {
         member_roles: row.owner === this.host.principal ? [] : member?.roles ?? null } };
   }
   requireAdminInTx(): PolicySnapshot {
-    this.authorizeInTx(true);
+    this.authorizeInTx('admin');
+    return this.policySnapshotInTx();
+  }
+  /** Derive ordinary write authority from current account membership. Provider
+   * admission/operator status is deliberately not an account write grant. */
+  requireWriterInTx(): PolicySnapshot {
+    this.authorizeInTx('write');
     return this.policySnapshotInTx();
   }
   /** Immutable owner authority, not an admin/member grant. Missing bootstrap
@@ -182,7 +191,7 @@ export class ForgeAccounts {
     }
     if (command.operation !== call.operation) fail(503, 'failed_precondition');
     if (command.operation === 2) {
-      return this.host.transactionSync(() => ({ state: 'complete', result: this.snapshot(this.authorizeInTx(false)) }));
+      return this.host.transactionSync(() => ({ state: 'complete', result: this.snapshot(this.authorizeInTx('member')) }));
     }
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(call.request_id)) fail(400, 'invalid_argument');
     const fingerprint = command.fingerprint;
@@ -219,7 +228,7 @@ export class ForgeAccounts {
       });
     }
     return this.host.transactionSync(() => {
-      const row = this.authorizeInTx(true);
+      const row = this.authorizeInTx('admin');
       // Current admin authorization precedes historical replay, but the old
       // expected epoch does not invalidate a previously committed receipt.
       const replay = this.replayInTx(call.request_id, fingerprint);

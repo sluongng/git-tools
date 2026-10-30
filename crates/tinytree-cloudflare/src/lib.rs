@@ -11,6 +11,7 @@ mod views;
 mod search;
 mod reads;
 mod imports;
+mod uploads;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -443,6 +444,16 @@ pub extern "C" fn tt_forge_read_command(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_import_command(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, imports::normalize)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_upload_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, uploads::normalize)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_upload_scope_page(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, uploads::scope_page)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

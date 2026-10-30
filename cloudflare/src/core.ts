@@ -24,6 +24,8 @@ interface CoreExports {
   tt_forge_search_command(pointer: number, length: number): number;
   tt_forge_read_command(pointer: number, length: number): number;
   tt_forge_import_command(pointer: number, length: number): number;
+  tt_forge_upload_command(pointer: number, length: number): number;
+  tt_forge_upload_scope_page(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -86,6 +88,20 @@ export function normalizeForgeAccountCommand(input: Pick<ForgeCall, 'account_id'
 export function normalizeBootstrapImport(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'request_id' | 'payload_json'>): import('./bootstrap_import').ImportCommand {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_import_command(pointer, bytes.byteLength)) as import('./bootstrap_import').ImportCommand;
+}
+
+/** Public selectors plus the host's actual authenticated principal. This
+ * internal adapter must never receive principal/role fields from public JSON. */
+export function normalizeForgeUploadCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'request_id' | 'payload_json'> & { principal: string }): import('./forge_uploads').UploadCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_upload_command(pointer, bytes.byteLength)) as import('./forge_uploads').UploadCommand;
+}
+
+/** Canonical scope requirements only. Current policy and exact byte-ownership
+ * witnesses are resolved by the authoritative upload host, not this adapter. */
+export function uploadScopePage(input: import('./forge_uploads').UploadScopeInput): import('./forge_uploads').UploadScopePage {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_upload_scope_page(pointer, bytes.byteLength)) as import('./forge_uploads').UploadScopePage;
 }
 
 /** Internal server-selected context only; never forward a product payload here. */

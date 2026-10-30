@@ -1,32 +1,9 @@
 //! Bounded resumable WriteObject sessions. Legacy unary uploads remain separate.
-use serde::Deserialize;
+use tinytree_forge_core::upload::{ForgeUploadRequest as Upload, parse_request};
 use serde_json::Value;
 use tinytree_proto::forge_v1::ForgeOperation;
 use tinytree_store::{AccountId, ForgeActor, Store, ViewVersion};
 use tonic::Status;
-
-#[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum Upload {
-    Begin {
-        version: [u8; 32],
-        path: String,
-        kind: u8,
-        id: [u8; 32],
-        size_bytes: u64,
-    },
-    Append {
-        session_id: [u8; 32],
-        offset: u64,
-        data: Vec<u8>,
-    },
-    Status {
-        session_id: [u8; 32],
-    },
-    Finalize {
-        session_id: [u8; 32],
-    },
-}
 
 pub(crate) fn upload_call(
     store: &Store,
@@ -41,18 +18,12 @@ pub(crate) fn upload_call(
     if operation != ForgeOperation::WriteObject {
         return Ok(None);
     }
-    if payload.len() > 2 * 1024 * 1024 {
-        return Err(Status::resource_exhausted("upload request limit"));
-    }
-    // Return only legacy bodies to the existing strict unary adapter. A present
-    // but invalid action cannot silently fall through to another operation.
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|_| Status::invalid_argument("invalid upload request"))?;
-    if value.get("action").is_none() {
-        return Ok(None);
-    }
-    let request: Upload = serde_json::from_slice(payload)
-        .map_err(|_| Status::invalid_argument("invalid upload session request"))?;
+    // None is only an actual legacy object without action; it still goes
+    // through the existing strict unary decoder, never a permissive fallback.
+    let Some(request) = parse_request(payload).map_err(|error| match error {
+        tinytree_forge_core::Error::Limit(_) => Status::resource_exhausted("upload request limit"),
+        _ => Status::invalid_argument("invalid upload session request"),
+    })? else { return Ok(None); };
     let actor = actor.ok_or_else(|| Status::permission_denied("upload requires authentication"))?;
     let result = match request {
         Upload::Begin {
