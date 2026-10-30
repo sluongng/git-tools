@@ -1,4 +1,5 @@
 //! Single-process product façade over the native VCS and hosted forge service.
+mod bootstrap;
 mod context;
 mod output;
 mod pending;

@@ -280,6 +280,30 @@ mod tests {
         assert_eq!(first.request_id, "intent-1");
         let account: serde_json::Value = serde_json::from_slice(&first.result_json).unwrap();
         assert_eq!(account["monorepo_id"], "forge-sample");
+        // The retained local backend must not reinterpret provider bootstrap
+        // commands as raw writes or silently enable another main-update path.
+        for operation in [
+            p::ForgeOperation::BeginBootstrapImport,
+            p::ForgeOperation::PutBootstrapObject,
+            p::ForgeOperation::AdvanceBootstrapImport,
+            p::ForgeOperation::GetBootstrapImport,
+            p::ForgeOperation::FinishBootstrapImport,
+        ] {
+            assert_eq!(call(&service, input(operation, "{}"), None).await.0, "16");
+            assert_eq!(
+                call(&service, input(operation, "{}"), Some(OWNER)).await.0,
+                "12"
+            );
+        }
+        let (_, unchanged) = call(
+            &service,
+            input(p::ForgeOperation::GetAccount, "{}"),
+            Some(OWNER),
+        )
+        .await;
+        let unchanged: serde_json::Value =
+            serde_json::from_slice(&unchanged.unwrap().result_json).unwrap();
+        assert_eq!(unchanged, account);
         assert_eq!(
             call(
                 &service,

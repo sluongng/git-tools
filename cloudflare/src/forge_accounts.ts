@@ -59,6 +59,7 @@ export class ForgeAccounts {
       'CREATE TABLE IF NOT EXISTS forge_account (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account_id TEXT NOT NULL UNIQUE, owner TEXT NOT NULL, policy_epoch INTEGER NOT NULL CHECK(policy_epoch>=1), public_view TEXT)',
       'CREATE TABLE IF NOT EXISTS forge_members (account_id TEXT NOT NULL, principal TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(account_id,principal))',
       'CREATE TABLE IF NOT EXISTS forge_account_receipts (account_id TEXT NOT NULL, principal TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(account_id,principal,request_id))',
+      'CREATE TABLE IF NOT EXISTS forge_bootstrap (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account TEXT NOT NULL, sealed INTEGER NOT NULL CHECK(sealed IN(0,1)), head TEXT, import_id TEXT, job_id TEXT)',
     ]) host.sql.exec(statement);
   }
   private one<T>(query: string, ...bindings: (string | number | null)[]): T | undefined {
@@ -113,6 +114,27 @@ export class ForgeAccounts {
   requireAdminInTx(): PolicySnapshot {
     this.authorizeInTx(true);
     return this.policySnapshotInTx();
+  }
+  /** Immutable owner authority, not an admin/member grant. Missing bootstrap
+   * state is not an untouched account: provisioning alone creates it. */
+  requireOwnerInTx(): { account_id: string; owner: string; policy_epoch: number; main: { head: string; generation: number }; bootstrap_sealed: boolean } {
+    if (this.host.principal === null) fail(401, 'unauthenticated');
+    const row = this.accountInTx();
+    if (!row || row.owner !== this.host.principal) fail(403, 'permission_denied');
+    const state = this.one<{ account: string; sealed: number }>('SELECT account,sealed FROM forge_bootstrap WHERE singleton=1');
+    if (!state || state.account !== row.account_id || ![0, 1].includes(Number(state.sealed))) fail(400, 'failed_precondition');
+    return { account_id: row.account_id, owner: row.owner, policy_epoch: row.policy_epoch,
+      main: this.host.currentMainInTx(), bootstrap_sealed: Number(state.sealed) === 1 };
+  }
+  /** Every canonical-main publisher must call this in its existing publication
+   * transaction. Monotonic only; there is deliberately no reset/reopen API. */
+  sealBootstrapInTx(head: string, importId: string | null = null, jobId: string | null = null): void {
+    if (!/^[0-9a-f]{64}$/.test(head) || head === '0'.repeat(64)) fail(503, 'failed_precondition');
+    const row = this.accountInTx();
+    const state = this.one<{ account: string; sealed: number }>('SELECT account,sealed FROM forge_bootstrap WHERE singleton=1');
+    if (!row || !state || state.account !== row.account_id) fail(400, 'failed_precondition');
+    // Preserve the first sealing identity on all subsequent publications.
+    this.host.sql.exec('UPDATE forge_bootstrap SET sealed=1,head=?,import_id=?,job_id=? WHERE singleton=1 AND sealed=0', head, importId, jobId);
   }
   accountWireInTx(): Record<string, unknown> {
     const row = this.accountInTx(); if (!row) fail(403, 'permission_denied');
@@ -190,6 +212,7 @@ export class ForgeAccounts {
         if (!row) {
           this.host.claimRepositoryInTx(this.host.accountId, genesis.objects, genesis.head);
           this.host.sql.exec('INSERT INTO forge_account(singleton,account_id,owner,policy_epoch,public_view) VALUES(1,?,?,1,NULL)', this.host.accountId, this.host.principal);
+          this.host.sql.exec('INSERT INTO forge_bootstrap(singleton,account,sealed) VALUES(1,?,0)', this.host.accountId);
           row = this.accountInTx()!;
         }
         return { state: 'complete', result: this.finishInTx(call.request_id, fingerprint, this.snapshot(row)) };

@@ -6,8 +6,8 @@ export const FORGE_ROUTE = '/api/v1/forge/call';
 const MAX_REQUEST = 2 * 1024 * 1024;
 const MAX_RESPONSE = 8 * 1024 * 1024;
 const encoder = new TextEncoder();
-const operations = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35]);
-const mutations = new Set([1, 3, 4, 10, 11, 20, 23, 24, 30, 32, 34]);
+const operations = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35, 40, 41, 42, 43, 44]);
+const mutations = new Set([1, 3, 4, 10, 11, 20, 23, 24, 30, 32, 34, 40, 41, 42, 44]);
 const codes: Record<number, string[]> = {
   400: ['invalid_argument', 'failed_precondition', 'out_of_range'],
   401: ['unauthenticated'], 403: ['permission_denied'], 404: ['not_found'],

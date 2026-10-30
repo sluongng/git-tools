@@ -158,6 +158,10 @@ fn validate(input: &p::ForgeCallRequest) -> Result<p::ForgeOperation, Status> {
             | p::ForgeOperation::StartTransform
             | p::ForgeOperation::SetPin
             | p::ForgeOperation::RetirePin
+            | p::ForgeOperation::BeginBootstrapImport
+            | p::ForgeOperation::PutBootstrapObject
+            | p::ForgeOperation::AdvanceBootstrapImport
+            | p::ForgeOperation::FinishBootstrapImport
     ) && input.request_id.is_empty()
     {
         return Err(Status::invalid_argument(
@@ -173,8 +177,27 @@ async fn call_admitted(
     work: Arc<ForgeWork>,
 ) -> Result<p::ForgeCallResponse, Status> {
     let operation = validate(&input)?;
+    if matches!(
+        operation,
+        p::ForgeOperation::BeginBootstrapImport
+            | p::ForgeOperation::PutBootstrapObject
+            | p::ForgeOperation::AdvanceBootstrapImport
+            | p::ForgeOperation::GetBootstrapImport
+            | p::ForgeOperation::FinishBootstrapImport
+    ) {
+        if work.actor.is_none() {
+            return Err(Status::unauthenticated(
+                "bootstrap requires an authenticated owner",
+            ));
+        }
+        return Err(Status::unimplemented(
+            "bootstrap import is not available on this backend",
+        ));
+    }
     let account = AccountId(input.account_id.clone());
-    account.validate().map_err(|error| crate::service::store_status(error.into()))?;
+    account
+        .validate()
+        .map_err(|error| crate::service::store_status(error.into()))?;
     let profile = service.landing_host().forge_profile()?;
     let store = service.forge_store();
     let config = service.service_config();

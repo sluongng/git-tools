@@ -112,6 +112,8 @@ pub(super) struct LoginArgs {
 
 #[derive(clap::Subcommand, Clone, Debug)]
 pub(super) enum AccountCommand {
+    /// Import one exact native source snapshot into untouched account genesis.
+    BootstrapImport(super::bootstrap::Args),
     Show,
     Provision {
         #[arg(long)]
@@ -256,6 +258,7 @@ pub(super) async fn account(
 ) -> Result<(), CommandError> {
     let context = context()?;
     let (op, request, mutation) = match args {
+        AccountCommand::BootstrapImport(args) => return super::bootstrap::run(ui, machine, args, context).await,
         AccountCommand::Show => (Op::GetAccount, None, false),
         AccountCommand::Provision { request_id } => (Op::ProvisionAccount, request_id, true),
     };

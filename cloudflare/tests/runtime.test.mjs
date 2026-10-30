@@ -779,3 +779,186 @@ test('production projection preparation reclaims obsolete epoch plans beyond act
   assert.deepEqual(cleaned.objects, catalogCount);
   assert.deepEqual(await h.keys(), sourceKeys, 'epoch cleanup is preparation GC, not payload/catalog/source GC');
 });
+
+// No fixture endpoint or subclass is installed here: bootstrap authority, byte
+// staging, closure validation and final CAS all traverse the shipped HTTP API.
+test('production owner bootstrap imports a wide native closure once, resumes durable progress and atomically follows main', async t => {
+  const source = fixture.projection;
+  assert.ok(source && source.objects.length > 256, 'canonical native wide import fixture required');
+  const account = 'bootstrap-destination';
+  const boundaryAccount = 'bootstrap-boundary';
+  const ownerToken = 'bootstrap-owner-runtime-fixture';
+  const adminToken = 'bootstrap-admin-runtime-fixture';
+  const rawToken = 'bootstrap-raw-runtime-fixture';
+  const config = [
+    { principal: 'bootstrap-owner', token_sha256: sha(ownerToken), accounts: [account, boundaryAccount], operator: true, kind: 'forge' },
+    { principal: 'bootstrap-admin', token_sha256: sha(adminToken), accounts: [account, boundaryAccount], operator: true, kind: 'forge' },
+    { principal: 'bootstrap-raw', token_sha256: sha(rawToken), accounts: [account, boundaryAccount], operator: true, kind: 'raw' },
+  ];
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-bootstrap-runtime-'));
+  const configuration = options(persist, { config, forge: true });
+  let mf = new Miniflare(configuration);
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const reload = async () => { await mf.dispose(); mf = new Miniflare(configuration); };
+  const invoke = async (operation, payload = {}, { id = '', token = ownerToken, selectedAccount = account, expected = 200, code, literalRequestId } = {}) => {
+    const requestId = literalRequestId ?? (operation === 42 ? `ia-${payload.import_id}-${payload.expected_generation}` : id);
+    const response = await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 1, operation, account_id: selectedAccount, view: 'public', request_id: requestId, payload_json: JSON.stringify(payload) }),
+    });
+    const envelope = await response.json();
+    assert.equal(response.status, expected, JSON.stringify(envelope));
+    assert.equal(envelope.version, 1);
+    if (expected !== 200) {
+      if (code) assert.equal(envelope.error.code, code);
+      return envelope;
+    }
+    assert.equal(envelope.state, 'complete');
+    assert.equal(envelope.operation, operation);
+    assert.equal(envelope.account_id, selectedAccount);
+    assert.equal(envelope.request_id, requestId);
+    return JSON.parse(envelope.result_json);
+  };
+  const provisioned = await invoke(1, {}, { id: 'bootstrap-provision' });
+  assert.equal(provisioned.main_generation, 1);
+  const genesis = Buffer.from(provisioned.main_revision).toString('hex');
+  await invoke(3, { expected_epoch: 1, member: {
+    principal: 'bootstrap-admin', can_write: true, can_review: true, is_admin: true, roles: [],
+  } }, { id: 'bootstrap-add-admin' });
+  const spec = { name: 'public', root_prefix: '', include_prefixes: [''], exclude_prefixes: [],
+    visibility: { kind: 'public' }, revision: provisioned.main_revision, export_allowed: false };
+  await invoke(4, { spec, expected_epoch: 2, make_default: true, follow_main: true }, { id: 'bootstrap-follow-main' });
+  const before = await invoke(2);
+  const namedBefore = await invoke(5);
+  assert.equal(before.policy_epoch, 3);
+  const beginPayload = { root: source.root,
+    source: { repository_id: 'native-import-source', reference: 'main', generation: 2, head: source.root.id },
+    destination: { generation: 1, head: genesis } };
+  await invoke(40, beginPayload, { id: 'admin-cannot-import', token: adminToken, expected: 403, code: 'permission_denied' });
+  await invoke(40, { ...beginPayload, destination: { generation: 1, head: source.root.id } },
+    { id: 'wrong-genesis', expected: 400, code: 'invalid_argument' });
+  await invoke(40, { ...beginPayload, destination: { generation: 2, head: genesis } },
+    { id: 'wrong-main-generation', expected: 400, code: 'invalid_argument' });
+  for (const operation of ['repository', 'refs/read', 'refs/cas']) {
+    const payload = operation === 'refs/read' ? { names: ['main'] } : operation === 'refs/cas'
+      ? { request_id: 'raw-override', name: 'main', expected_generation: 1, expected_head: genesis, head: source.root.id }
+      : { request_id: 'raw-reprovision' };
+    assert.equal((await call(mf, account, operation, payload, { token: rawToken })).status, 403,
+      'raw operator identity cannot bypass a Forge-managed account');
+  }
+  const begin = await invoke(40, beginPayload, { id: 'bootstrap-begin' });
+  assert.equal(begin.root.id, source.root.id);
+  assert.deepEqual(await invoke(40, beginPayload, { id: 'bootstrap-begin' }), begin, 'lost Begin ACK returns its original receipt');
+  await invoke(40, { ...beginPayload, source: { ...beginPayload.source, generation: 3 } },
+    { id: 'bootstrap-begin', expected: 400, code: 'invalid_argument' });
+  const importId = begin.import_id;
+  const progress = status => ({ import_id: importId, expected_generation: status.generation });
+  let status = (await invoke(42, progress(begin.status), { id: 'before-payloads' })).status;
+  assert.equal(status.complete, false);
+  assert.equal(status.error, 'object_unavailable', 'a declared canonical root is not byte/closure authority');
+  const lostAdvance = progress(begin.status);
+  await invoke(42, lostAdvance, { expected: 409, code: 'aborted' });
+  assert.deepEqual((await invoke(43, { import_id: importId })).status, status,
+    'lost Advance ACK recovery reads current status without a second advancement');
+  await invoke(42, progress(status), {
+    literalRequestId: `ia-${importId}-${begin.status.generation}`, expected: 400, code: 'invalid_argument',
+  });
+  assert.deepEqual((await invoke(43, { import_id: importId })).status, status,
+    'a reused Advance identity with changed generation cannot mutate progress');
+  await invoke(44, progress(status), { id: 'premature-finish', expected: 400, code: 'failed_precondition' });
+  const file = source.objects.find(object => object.kind === 1 && object.bytes.length > 0);
+  assert.ok(file);
+  const putPayload = object => ({ import_id: importId,
+    descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version ?? 1 },
+    data_base64: Buffer.from(object.bytes).toString('base64') });
+  const putId = (object, selectedImport = importId) => `io-${selectedImport}-${object.kind}-${object.id}`;
+  const corrupt = Uint8Array.from(file.bytes); corrupt[0] ^= 1;
+  await invoke(41, { ...putPayload(file), data_base64: Buffer.from(corrupt).toString('base64') },
+    { id: putId(file), expected: 400, code: 'invalid_argument' });
+  await invoke(41, { import_id: importId, descriptor: putPayload(file).descriptor },
+    { id: putId(file), expected: 400, code: 'invalid_argument' });
+  // Small bounded batches stay below production admission; no direct R2 or SQL
+  // fixture writes mint import receipts or install source closure membership.
+  for (let offset = 0; offset < source.objects.length; offset += 8) {
+    await Promise.all(source.objects.slice(offset, offset + 8).map(object =>
+      invoke(41, putPayload(object), { id: putId(object) })));
+  }
+  const largest = source.objects.filter(object => object.kind === 1).sort((a, b) => b.size_bytes - a.size_bytes)[0];
+  const acknowledged = await invoke(41, putPayload(largest), { id: putId(largest) });
+  assert.equal(acknowledged.state, 'ready');
+  await invoke(41, { ...putPayload(file), data_base64: Buffer.from(corrupt).toString('base64') },
+    { id: putId(file), expected: 400, code: 'invalid_argument' });
+  const stored = await invoke(43, { import_id: importId });
+  status = stored.status;
+  await reload();
+  assert.deepEqual(await invoke(43, { import_id: importId }), stored, 'import and closure progress survive SQLite/R2 reload');
+  status = (await invoke(42, progress(status), { id: 'first-fresh-validation' })).status;
+  assert.ok(status.counts.checked_objects > 0);
+  assert.equal(status.complete, false, '>256 native objects cannot be treated as an all-in-one proof');
+  await reload();
+  assert.deepEqual((await invoke(43, { import_id: importId })).status, status);
+  for (let step = 0; step < 200 && !status.complete; step++) {
+    status = (await invoke(42, progress(status), { id: `validate-page-${step}` })).status;
+    assert.equal(status.error, null, 'all imported bytes must pass actual native closure validation');
+  }
+  assert.equal(status.phase, 'ready');
+  assert.ok(status.counts.objects > 256);
+  assert.equal(status.counts.checked_objects, status.counts.objects);
+  assert.equal(status.counts.checked_contexts, status.counts.contexts);
+  assert.equal(status.counts.checked_obligations, status.counts.obligations);
+  assert.deepEqual(await invoke(2), before, 'closure readiness alone never moves canonical main');
+  assert.deepEqual(await invoke(5), namedBefore, 'following view is unchanged before explicit Finish');
+  await invoke(44, progress(status), { id: 'admin-cannot-finish', token: adminToken, expected: 403, code: 'permission_denied' });
+  await invoke(44, { import_id: importId, expected_generation: status.generation + 1 },
+    { id: 'stale-finish-generation', expected: 409, code: 'aborted' });
+  assert.deepEqual(await invoke(2), before, 'stale Finish generation cannot advance main');
+  const finishPayload = progress(status);
+  const finished = await invoke(44, finishPayload, { id: 'bootstrap-finish' });
+  await reload();
+  assert.deepEqual(await invoke(44, finishPayload, { id: 'bootstrap-finish' }), finished,
+    'lost Finish ACK replays exact receipt after seal and runtime reload');
+  const after = await invoke(2);
+  assert.equal(after.main_generation, 2);
+  assert.equal(Buffer.from(after.main_revision).toString('hex'), source.root.id);
+  assert.equal(after.policy_epoch, before.policy_epoch, 'following main does not change access policy');
+  const namedAfter = await invoke(5);
+  assert.equal(namedAfter.length, 1);
+  assert.deepEqual(namedAfter[0].revision, after.main_revision);
+  assert.notDeepEqual(namedAfter[0].view_version, namedBefore[0].view_version);
+  assert.deepEqual(after.public_view, namedAfter[0].view_version, 'default and named following pointers advance together');
+  const published = await invoke(43, { import_id: importId });
+  assert.equal(published.state, 'published');
+  assert.deepEqual(published.receipt, finished);
+  await invoke(40, beginPayload, { id: 'sealed-new-begin', expected: 400, code: 'failed_precondition' });
+  await invoke(41, putPayload(file), { id: putId(file), expected: 400, code: 'failed_precondition' });
+  await invoke(42, finishPayload, { id: 'sealed-advance', expected: 400, code: 'failed_precondition' });
+  assert.deepEqual(await invoke(2), after, 'refused reopening cannot mutate main or policy');
+
+  // A second independent native root reaches a FILE exactly at the supported
+  // bound. The wide source remains its original native oracle, not a JS codec.
+  const boundary = fixture.bootstrap;
+  assert.ok(boundary?.largest_file && boundary.objects.length === 3);
+  assert.equal(boundary.largest_file.size_bytes, 1024 * 1024);
+  const boundaryCall = (operation, payload, id = '') => invoke(operation, payload, { id, selectedAccount: boundaryAccount });
+  const boundaryGenesis = await boundaryCall(1, {}, 'boundary-provision');
+  const boundaryBegin = await boundaryCall(40, {
+    root: boundary.root,
+    source: { repository_id: 'native-boundary-source', reference: 'main', generation: 1, head: boundary.root.id },
+    destination: { generation: 1, head: Buffer.from(boundaryGenesis.main_revision).toString('hex') },
+  }, 'boundary-begin');
+  for (const object of boundary.objects) {
+    await boundaryCall(41, { ...putPayload(object), import_id: boundaryBegin.import_id }, putId(object, boundaryBegin.import_id));
+  }
+  let boundaryStatus = boundaryBegin.status;
+  for (let step = 0; step < 20 && !boundaryStatus.complete; step++) {
+    boundaryStatus = (await boundaryCall(42, { import_id: boundaryBegin.import_id, expected_generation: boundaryStatus.generation }, `boundary-page-${step}`)).status;
+    assert.equal(boundaryStatus.error, null);
+  }
+  assert.equal(boundaryStatus.phase, 'ready');
+  assert.equal(boundaryStatus.counts.objects, 3);
+  await boundaryCall(44, { import_id: boundaryBegin.import_id, expected_generation: boundaryStatus.generation }, 'boundary-finish');
+  const boundaryAfter = await boundaryCall(2, {});
+  assert.equal(boundaryAfter.main_generation, 2);
+  assert.equal(Buffer.from(boundaryAfter.main_revision).toString('hex'), boundary.root.id);
+  assert.deepEqual(await invoke(2), after, 'second account import cannot mutate the first account');
+});

@@ -35,6 +35,13 @@ enum ForgeOperation {
   FORGE_OPERATION_RESOLVE_PIN = 33;
   FORGE_OPERATION_RETIRE_PIN = 34;
   FORGE_OPERATION_READ_LINEAGE = 35;
+  // Owner-only, one-time initialization of an untouched account. These do not
+  // expose raw object/ref authority or attest that a source writer is fenced.
+  FORGE_OPERATION_BEGIN_BOOTSTRAP_IMPORT = 40;
+  FORGE_OPERATION_PUT_BOOTSTRAP_OBJECT = 41;
+  FORGE_OPERATION_ADVANCE_BOOTSTRAP_IMPORT = 42;
+  FORGE_OPERATION_GET_BOOTSTRAP_IMPORT = 43;
+  FORGE_OPERATION_FINISH_BOOTSTRAP_IMPORT = 44;
 }
 
 message ForgeCallRequest {

@@ -3102,6 +3102,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "clap",
  "fs2",
@@ -3129,6 +3130,7 @@ dependencies = [
  "tinytree-cloud",
  "tinytree-fixture",
  "tinytree-index",
+ "tinytree-inventory",
  "tinytree-model",
  "tinytree-search",
  "tinytree-server",

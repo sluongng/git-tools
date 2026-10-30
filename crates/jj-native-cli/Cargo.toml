@@ -13,6 +13,7 @@ forge-cli = []
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
 private-fs = { path = "../private-fs" }
 workspace-daemon = { path = "../workspace-daemon" }
@@ -31,6 +32,7 @@ jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
 tinytree-client = { path = "../tinytree-client" }
+tinytree-inventory = { path = "../tinytree-inventory" }
 tinytree-search = { path = "../tinytree-search" }
 tinytree-annotate = { path = "../tinytree-annotate" }
 tinytree-model = { path = "../tinytree-model" }
@@ -42,6 +44,7 @@ tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["zstd"] }
 
 [dev-dependencies]
+base64 = "0.22"
 tinytree-check-runner = { path = "../tinytree-check-runner" }
 sha2 = "0.10"
 tinytree-cloud = { path = "../tinytree-cloud" }

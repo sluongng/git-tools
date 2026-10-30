@@ -14,6 +14,420 @@ mod forge_product {
         value
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_bootstrap_streams_verified_native_bytes_and_resumes_one_private_intent() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use std::sync::{Arc, Mutex};
+        use tinytree_model as m;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Source is a real Store/native RPC service. Destination below is an
+        // explicit transport/assertion fixture; actual owner/SQLite/R2 bootstrap
+        // authority is independently exercised in the workerd runtime suite.
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            tinytree_store::Store::open(directory.path().join("source"), Default::default()).unwrap();
+        store.create_repository("source").unwrap();
+        let body = vec![b'Z'; 1024 * 1024];
+        let file = m::describe_file(&body);
+        let file_receipt = store.put("source", file, &body, 0).unwrap();
+        let tree = m::encode(
+            &m::Object::Tree(m::Tree {
+                entries: vec![m::TreeEntry {
+                    name: "large.bin".into(),
+                    value: m::TreeValue::File {
+                        id: m::FileId(file.key.id.0),
+                        executable: false,
+                        size_bytes: file.size_bytes,
+                        copy_id: None,
+                    },
+                }],
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let tree_receipt = store
+            .put("source", tree.descriptor, &tree.bytes, 0)
+            .unwrap();
+        let person = m::Signature {
+            name: "Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: m::Timestamp {
+                millis_since_epoch: 0,
+                tz_offset_minutes: 0,
+            },
+        };
+        let commit = m::encode(
+            &m::Object::Commit(m::Commit {
+                parents: vec![m::CommitId::ROOT],
+                predecessors: vec![],
+                root_tree: m::TreeMerge {
+                    terms: vec![m::TreeId(tree.descriptor.key.id.0)],
+                    labels: vec![String::new()],
+                },
+                change_id: m::ChangeId([88; 16]),
+                description: "Bootstrap fixture".into(),
+                author: person.clone(),
+                committer: person,
+                secure_signature: None,
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let commit_receipt = store
+            .put("source", commit.descriptor, &commit.bytes, 0)
+            .unwrap();
+        store
+            .publish(
+                "source",
+                &tinytree_store::PublishRequest {
+                    idempotency_key: "source-seed".into(),
+                    reference_name: "main".into(),
+                    expected_generation: 0,
+                    new_commit: Some(m::CommitId(commit.descriptor.key.id.0)),
+                    staging_leases: vec![
+                        file_receipt.staging_lease,
+                        tree_receipt.staging_lease,
+                        commit_receipt.staging_lease,
+                    ],
+                },
+                1,
+            )
+            .unwrap();
+        let source_control = store.clone();
+        let source_commit = m::CommitId(commit.descriptor.key.id.0);
+        let native = tinytree_server::RepositoryService::new(
+            store,
+            Default::default(),
+            vec!["source".into()],
+            vec![
+                tinytree_server::Principal::new(
+                    "fixture",
+                    "public-forge-fixture-token-not-a-secret",
+                    vec!["source".into()],
+                    false,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = listener.local_addr().unwrap();
+        let source_endpoint = format!("http://{source_address}");
+        let source_restart = native.clone();
+        let (source_stop, source_stopped) = tokio::sync::oneshot::channel();
+        let stop_source_on_finish = Arc::new(Mutex::new(Some(source_stop)));
+        let stop_source = stop_source_on_finish.clone();
+        let source_task = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, native, None, async {
+                let _ = source_stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", http.local_addr().unwrap());
+        let head = fixture_hex(&commit.descriptor.key.id.0);
+        let objects = [
+            (file, body),
+            (tree.descriptor, tree.bytes),
+            (commit.descriptor, commit.bytes),
+        ]
+        .into_iter()
+        .map(|(d, b)| ((d.key.kind as u8, fixture_hex(&d.key.id.0)), (d, b)))
+        .collect::<std::collections::HashMap<_, _>>();
+        let state = Arc::new(Mutex::new(
+            serde_json::json!({"inputs":[],"uploaded":[],"begin":null,"deny_status":true,"ready":false,"finished":false,"put_lost":false,"finish_lost":false,"finishes":0}),
+        ));
+        let observed = state.clone();
+        let (http_stop, mut http_stopped) = tokio::sync::oneshot::channel();
+        let http_task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) =
+                    tokio::select! {value=http.accept()=>value.unwrap(),_=&mut http_stopped=>break};
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).await.is_err() {
+                        break;
+                    }
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 16384);
+                }
+                let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+                assert!(headers.starts_with("post /api/v1/forge/call http/1.1\r\n"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(length <= 2 * 1024 * 1024);
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let input: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let payload: serde_json::Value =
+                    serde_json::from_str(input["payload_json"].as_str().unwrap()).unwrap();
+                let (status, result, drop_response) = {
+                    let mut state = observed.lock().unwrap();
+                    state["inputs"].as_array_mut().unwrap().push(input.clone());
+                    let import = "12345678-1234-4234-8234-123456789abc";
+                    let job = "22345678-1234-4234-8234-123456789abc";
+                    let root = serde_json::json!({"kind":3,"id":head});
+                    let source = serde_json::json!({"repository_id":"source","reference":"main","generation":1,"head":head});
+                    let destination = serde_json::json!({"generation":1,"head":"aa".repeat(32)});
+                    let ready = state["ready"] == true;
+                    let progress = serde_json::json!({"job_id":job,"root":root,"phase":if ready {"ready"}else{"graph"},"generation":if ready {1}else{0},"complete":ready,"error":null,"counts":{"objects":if ready {3}else{0},"bytes":if ready {1048576}else{0},"edges":0,"contexts":0,"context_path_bytes":0,"obligations":0,"checked_objects":if ready {3}else{0},"checked_contexts":0,"checked_obligations":0}});
+                    let receipt = serde_json::json!({"import_id":import,"closure_job_id":job,"root":root,"declared_source":source,"policy_epoch":1,"main":{"head":head,"generation":2},"bootstrap_sealed":true});
+                    match input["operation"].as_u64().unwrap() {
+                        2 => (
+                            200,
+                            serde_json::json!({"account_id":"example","monorepo_id":"forge-example","policy_epoch":1,"public_view":null,"main_revision":if state["finished"]==true {fixture_id::<32>(&head).to_vec()}else{vec![0xaau8;32]},"main_generation":if state["finished"]==true {2}else{1}}),
+                            false,
+                        ),
+                        40 => {
+                            assert_eq!(payload["source"], source);
+                            assert_eq!(payload["destination"], destination);
+                            if !state["begin"].is_null() {
+                                assert_eq!(state["begin"], input);
+                            }
+                            state["begin"] = input.clone();
+                            (
+                                200,
+                                serde_json::json!({"import_id":import,"closure_job_id":job,"root":root,"declared_source":source,"destination":destination,"policy_epoch":1,"status":progress,"limits":{"object_bytes":1048576,"metadata_bytes":262144,"account_objects":32768,"account_bytes":536870912,"attempts":4}}),
+                                false,
+                            )
+                        }
+                        41 => {
+                            let kind = payload["descriptor"]["kind"].as_u64().unwrap() as u8;
+                            let id = payload["descriptor"]["id"].as_str().unwrap().to_owned();
+                            let (d, expected) = objects.get(&(kind, id.clone())).unwrap();
+                            let bytes = STANDARD
+                                .decode(payload["data_base64"].as_str().unwrap())
+                                .unwrap();
+                            assert_eq!(&bytes, expected);
+                            m::verify(d, &bytes, Default::default()).unwrap();
+                            assert_eq!(input["request_id"], format!("io-{import}-{kind}-{id}"));
+                            let typed = serde_json::json!([kind, id]);
+                            if !state["uploaded"].as_array().unwrap().contains(&typed) {
+                                state["uploaded"].as_array_mut().unwrap().push(typed);
+                            }
+                            let lost = kind == 1 && state["put_lost"] == false;
+                            if lost {
+                                state["put_lost"] = serde_json::json!(true);
+                            }
+                            (
+                                200,
+                                serde_json::json!({"import_id":import,"kind":kind,"id":id,"size_bytes":d.size_bytes,"format_version":1,"state":"ready"}),
+                                lost,
+                            )
+                        }
+                        43 => {
+                            if state["uploaded"].as_array().unwrap().len() == 3
+                                && state["deny_status"] == true
+                            {
+                                state["deny_status"] = serde_json::json!(false);
+                                (
+                                    403,
+                                    serde_json::json!({"version":1,"error":{"code":"permission_denied","message":"fixture interruption"}}),
+                                    false,
+                                )
+                            } else if state["finished"] == true {
+                                (
+                                    200,
+                                    serde_json::json!({"import_id":import,"state":"published","receipt":receipt}),
+                                    false,
+                                )
+                            } else {
+                                (
+                                    200,
+                                    serde_json::json!({"import_id":import,"root":root,"declared_source":source,"destination":destination,"policy_epoch":1,"obsolete":false,"bootstrap_sealed":false,"status":progress}),
+                                    false,
+                                )
+                            }
+                        }
+                        42 => {
+                            assert_eq!(input["request_id"], format!("ia-{import}-0"));
+                            state["ready"] = serde_json::json!(true);
+                            (
+                                200,
+                                serde_json::json!({"import_id":import,"status":progress}),
+                                false,
+                            )
+                        }
+                        44 => {
+                            assert_eq!(payload["expected_generation"], 1);
+                            if state["finished"] != true {
+                                if let Some(stop) = stop_source.lock().unwrap().take() {
+                                    let _ = stop.send(());
+                                }
+                                state["finished"] = serde_json::json!(true);
+                                state["finishes"] =
+                                    serde_json::json!(state["finishes"].as_u64().unwrap() + 1);
+                            }
+                            let lost = state["finish_lost"] == false;
+                            state["finish_lost"] = serde_json::json!(true);
+                            if lost {
+                                (
+                                    503,
+                                    serde_json::json!({"version":1,"error":{"code":"unavailable","message":"fixture lost finish acknowledgement"}}),
+                                    false,
+                                )
+                            } else {
+                                (200, receipt, false)
+                            }
+                        }
+                        other => panic!("unexpected bootstrap opcode {other}"),
+                    }
+                };
+                if drop_response {
+                    continue;
+                }
+                let reply = if status == 200 {
+                    serde_json::json!({"version":1,"operation":input["operation"],"account_id":input["account_id"],"view":input["view"],"request_id":input["request_id"],"state":"complete","result_json":result.to_string()})
+                } else {
+                    result
+                };
+                let bytes = serde_json::to_vec(&reply).unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await.unwrap();
+                let _ = socket.write_all(&bytes).await;
+            }
+        });
+        let client = client();
+        let source_config = client.root.join("source.toml");
+        let mut native_config = tinytree_client::Config {
+            endpoint: source_endpoint,
+            repository_id: "source".into(),
+            token_env: Some("FORGE_TEST_TOKEN".into()),
+            compression: false,
+            ..Default::default()
+        };
+        native_config.rpc.operation_timeout_ms = 2000;
+        native_config.rpc.rpc_timeout_ms = 1000;
+        native_config.rpc.connect_timeout_ms = 500;
+        fs::write(&source_config, toml::to_string(&native_config).unwrap()).unwrap();
+        client.success(&[
+            "context",
+            "set",
+            "--transport",
+            "forge-https-v1",
+            "--server",
+            &endpoint,
+            "--account",
+            "example",
+            "--token-env",
+            "FORGE_TEST_TOKEN",
+        ]);
+        let args = [
+            "account",
+            "bootstrap-import",
+            "--source-config",
+            source_config.to_str().unwrap(),
+            "--source-reference",
+            "main",
+            "--source-writes-paused",
+            "--json",
+        ];
+        let first = client.run(&args);
+        assert!(
+            !first.status.success(),
+            "first status read deliberately denies after uploads"
+        );
+        let path = client.home.join("config/tinytree/bootstrap-import.json");
+        let saved = fs::read(&path).unwrap();
+        let intent: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(intent["transfer_complete"], true);
+        assert!(saved.len() < 128 * 1024);
+        assert!(!String::from_utf8_lossy(&saved).contains("data_base64"));
+        assert!(!client.home.join("config/tinytree/requests").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let mut resume = args.to_vec();
+        resume.push("--resume");
+        let unknown = client.run(&resume);
+        assert!(!unknown.status.success());
+        assert!(
+            String::from_utf8_lossy(&unknown.stderr).contains("source_readback_unknown_after_publish")
+                || String::from_utf8_lossy(&unknown.stdout)
+                    .contains("source_readback_unknown_after_publish")
+        );
+        let uncertain: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!uncertain["receipt"].is_null());
+        assert_eq!(
+            uncertain["source_changed_after_publish"], false,
+            "unavailable is not observed main movement"
+        );
+        source_task.await.unwrap();
+        let listener = tokio::net::TcpListener::bind(source_address).await.unwrap();
+        let (restart_stop, restart_stopped) = tokio::sync::oneshot::channel();
+        let restarted = tokio::spawn(async move {
+            tinytree_server::serve_tcp(listener, source_restart, None, async {
+                let _ = restart_stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        let complete: serde_json::Value = serde_json::from_str(&client.success(&resume)).unwrap();
+        assert_eq!(complete["state"], "complete");
+        assert_eq!(
+            complete["result"]["source_exclusivity"],
+            "operator_asserted_not_verified"
+        );
+        // Trusted fixture independently advances the REAL source ref. Unlike
+        // the prior unavailable read, this observed generation mismatch is a
+        // terminal partial outcome after destination publication.
+        source_control.publish("source", &tinytree_store::PublishRequest {
+            idempotency_key: "source-advance-after-import".into(), reference_name: "main".into(),
+            expected_generation: 1, new_commit: Some(source_commit), staging_leases: vec![],
+        }, 2).unwrap();
+        let changed = client.run(&resume);
+        assert!(!changed.status.success());
+        assert!(String::from_utf8_lossy(&changed.stderr).contains("source_changed_after_publish") || String::from_utf8_lossy(&changed.stdout).contains("source_changed_after_publish"));
+        let changed_journal: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(changed_journal["source_changed_after_publish"], true);
+        let seen = state.lock().unwrap();
+        assert_eq!(seen["uploaded"].as_array().unwrap().len(), 3);
+        assert_eq!(seen["finishes"], 1);
+        let puts = seen["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["operation"] == 41)
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 4);
+        let file_puts = puts
+            .iter()
+            .filter(|value| {
+                serde_json::from_str::<serde_json::Value>(value["payload_json"].as_str().unwrap())
+                    .unwrap()["descriptor"]["kind"]
+                    == 1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_puts.len(), 2);
+        assert_eq!(
+            file_puts[0], file_puts[1],
+            "lost object ACK replays exact key and original1MiB bytes"
+        );
+        let finishes = seen["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["operation"] == 44)
+            .collect::<Vec<_>>();
+        assert_eq!(finishes.len(), 2);
+        assert_eq!(finishes[0], finishes[1]);
+        drop(seen);
+        http_stop.send(()).unwrap();
+        restart_stop.send(()).unwrap();
+        http_task.await.unwrap();
+        restarted.await.unwrap();
+    }
+
     #[test]
     fn forge_product_context_is_private_machine_readable_and_never_a_login_claim() {
         let client = client();

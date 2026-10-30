@@ -1,4 +1,4 @@
-import { inspect, validateClosure, forgeViewCore, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
+import { inspect, validateClosure, forgeViewCore, normalizeForgeAccountCommand, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
 import { authenticate, admitsForgeAccount, body, digest, fail, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
 import { forgeReply, protectForge, readForgeCall } from './forge';
 import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
@@ -7,6 +7,7 @@ import { ForgeProjections } from './forge_projection';
 import { ForgeReads } from './forge_reads';
 import { ForgeStorage } from './forge_storage';
 import { ClosureJobs } from './closure_jobs';
+import { BootstrapImports } from './bootstrap_import';
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace;
@@ -249,9 +250,78 @@ export class AccountRepository {
         readVerifiedObject: key => storage.readVerifiedObject(key),
         readRange: (descriptor, offset, length) => storage.readRange(descriptor, offset, length),
       }).handle(call);
+    } else if ([40, 41, 42, 43, 44].includes(call.operation)) {
+      if (!auth) fail(401, 'unauthenticated');
+      result = await this.bootstrapImports(call.account_id, auth.principal, api, storage).handle(call);
     } else if (call.operation === 8) fail(501, 'unimplemented');
     else result = await api.handle(call);
     return forgeReply(call, result.state, result.result);
+  }
+  private bootstrapImports(account: string, principal: string, api: ForgeAccounts, storage: ForgeStorage): BootstrapImports {
+    // These services are request-scoped and initialized before publication's
+    // transaction, never constructed inside the no-await attach callback.
+    const { views } = this.forgeServices(account, principal, api, storage);
+    let genesis: string | undefined;
+    const canonicalGenesis = (): string => {
+      if (genesis === undefined) {
+        genesis = normalizeForgeAccountCommand({ account_id: account, operation: 1, view: '', payload_json: '{}' }).genesis?.head;
+        if (!genesis) fail(503, 'failed_precondition');
+      }
+      return genesis;
+    };
+    return new BootstrapImports({
+      accountId: account, principal, sql: this.sql,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      requireOwnerInTx: () => api.requireOwnerInTx(), canonicalGenesis,
+      replayInTx: (id, fingerprint) => api.replayInTx(id, fingerprint),
+      finishInTx: (id, fingerprint, result) => api.finishInTx(id, fingerprint, result),
+      // Canonical availability is account-shared. The import module separately
+      // binds per-attempt typed upload receipts; neither grants read authority.
+      reserveObjectInTx: descriptor => storage.reserveInTx('bootstrap', 'bootstrap', descriptor),
+      stageObject: (descriptor, bytes) => storage.stage(descriptor, bytes),
+      confirmObjectInTx: (descriptor, token) => storage.confirmInTx('bootstrap', 'bootstrap', descriptor, token),
+      makeClosureJobs: (binding, attach) => {
+        if (binding.account_id !== account || binding.identity.kind !== 'principal' || binding.identity.principal !== principal
+            || binding.purpose !== 'bootstrap_import') fail(403, 'permission_denied');
+        const expected = Object.freeze({ principal, epoch: binding.policy_epoch, publication: binding.publication });
+        return new ClosureJobs({
+          binding, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
+          authorizeCurrentInTx: selected => {
+            const owner = api.requireOwnerInTx();
+            if (selected.account_id !== account || selected.identity.kind !== 'principal' || selected.identity.principal !== expected.principal
+                || selected.purpose !== 'bootstrap_import' || selected.policy_epoch !== expected.epoch
+                || selected.publication !== expected.publication) fail(403, 'permission_denied');
+            if (owner.policy_epoch !== expected.epoch) fail(409, 'aborted');
+            if (owner.bootstrap_sealed || owner.main.generation !== 1 || owner.main.head !== canonicalGenesis()) fail(400, 'failed_precondition');
+          },
+          describeObjectInTx: key => storage.describeInTx(key),
+          readVerifiedObject: key => storage.readVerifiedObject(key),
+          attachRootInTx: attach,
+        });
+      },
+      attachBootstrapInTx: (record, root, jobId) => {
+        const owner = api.requireOwnerInTx();
+        if (record.account !== account || record.principal !== principal || record.epoch !== owner.policy_epoch
+            || record.job_id !== jobId || root.kind !== 3 || root.id !== record.payload.root.id
+            || owner.bootstrap_sealed || owner.main.generation !== 1 || owner.main.head !== canonicalGenesis()
+            || record.payload.destination.generation !== 1 || record.payload.destination.head !== owner.main.head) fail(409, 'aborted');
+        const proof = this.one('SELECT account,identity,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', jobId);
+        if (!proof || proof.account !== account || proof.identity !== JSON.stringify({ kind: 'principal', principal })
+            || proof.root_kind !== 3 || proof.root_id !== root.id || proof.phase !== 'ready'
+            || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts
+            || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
+        const updated = this.one('UPDATE refs SET head=?,generation=2 WHERE name=\'main\' AND generation=1 AND head=? RETURNING head,generation', root.id, canonicalGenesis());
+        if (!updated) fail(409, 'aborted');
+        this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?) ON CONFLICT(kind,id) DO UPDATE SET proof=excluded.proof', root.id,
+          JSON.stringify({ validator: 'native-closure-v1', job_id: jobId, root: root.id }));
+        this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'main\' AND owner_id=\'main\'');
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', root.id);
+        views.advanceFollowingViewsInTx(root.id);
+        api.sealBootstrapInTx(root.id, record.id, jobId);
+        return { import_id: record.id, closure_job_id: jobId, root, declared_source: record.payload.source,
+          policy_epoch: record.epoch, main: { head: root.id, generation: 2 }, bootstrap_sealed: true };
+      },
+    });
   }
   private forgeServices(account: string, principal: string | null, api: ForgeAccounts, storage: ForgeStorage): { views: ForgeViews; projections: ForgeProjections } {
     const requireCanonicalRootInTx = (head: string): void => {

@@ -22,6 +22,7 @@ interface CoreExports {
   tt_forge_advance_view(pointer: number, length: number): number;
   tt_forge_search_file(pointer: number, length: number): number;
   tt_forge_read_command(pointer: number, length: number): number;
+  tt_forge_import_command(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -77,6 +78,13 @@ export function validateForgeView(account_id: string, spec: unknown): { view_ver
 export function normalizeForgeAccountCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'payload_json'>): import('./forge_accounts').AccountCommand {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_account_command(pointer, bytes.byteLength)) as import('./forge_accounts').AccountCommand;
+}
+
+/** Intent normalization only. Owner, one-time seal, storage availability and
+ * canonical publication remain the embedding's current SQL authority. */
+export function normalizeBootstrapImport(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'request_id' | 'payload_json'>): import('./bootstrap_import').ImportCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_import_command(pointer, bytes.byteLength)) as import('./bootstrap_import').ImportCommand;
 }
 
 /** Internal server-selected context only; never forward a product payload here. */

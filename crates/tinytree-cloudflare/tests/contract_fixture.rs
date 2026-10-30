@@ -77,6 +77,76 @@ fn projection_fixture(store: &Store) -> Value {
     json!({"account_id":account.0,"owner":owner.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes},"private_file":{"kind":1,"id":hex(&secret.key.id.0)}})
 }
 
+// Independent production-ingest boundary: one real 1MiB FILE and its minimal
+// canonical TREE/COMMIT closure. Never reuse fabricated or invalid object IDs.
+fn bootstrap_fixture(store: &Store) -> Value {
+    let repository = "bootstrap-boundary";
+    store.create_repository(repository).unwrap();
+    let mut objects = Vec::new();
+    let mut put = |object: Option<Object>, body: &[u8]| {
+        let (descriptor, bytes) = match object {
+            Some(object) => {
+                let encoded = tinytree_model::encode(&object, Limits::default()).unwrap();
+                (encoded.descriptor, encoded.bytes)
+            }
+            None => (tinytree_model::describe_file(body), body.to_vec()),
+        };
+        tinytree_model::verify(&descriptor, &bytes, Limits::default()).unwrap();
+        store.put(repository, descriptor, &bytes, 0).unwrap();
+        objects.push(json!({"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),
+            "size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes}));
+        descriptor
+    };
+    let file = put(None, &vec![b'x'; 1024 * 1024]);
+    assert_eq!(file.size_bytes, 1024 * 1024);
+    let tree = put(
+        Some(Object::Tree(Tree {
+            entries: vec![TreeEntry {
+                name: "boundary.bin".into(),
+                value: TreeValue::File {
+                    id: FileId(file.key.id.0),
+                    executable: false,
+                    size_bytes: file.size_bytes,
+                    copy_id: None,
+                },
+            }],
+        })),
+        &[],
+    );
+    let person = Signature {
+        name: "Fixture".into(),
+        email: "fixture@example.invalid".into(),
+        timestamp: Timestamp {
+            millis_since_epoch: 0,
+            tz_offset_minutes: 0,
+        },
+    };
+    let root = put(
+        Some(Object::Commit(Commit {
+            parents: vec![CommitId::ROOT],
+            predecessors: vec![],
+            root_tree: TreeMerge {
+                terms: vec![TreeId(tree.key.id.0)],
+                labels: vec![String::new()],
+            },
+            change_id: ChangeId([92; 16]),
+            description: "Bootstrap boundary fixture".into(),
+            author: person.clone(),
+            committer: person,
+            secure_signature: None,
+        })),
+        &[],
+    );
+    drop(put);
+    // Native publication independently checks the complete typed closure.
+    let publication = store
+        .publish(repository, &publish("bootstrap-boundary", 0, root), 0)
+        .unwrap();
+    assert_eq!(publication.reference.commit.unwrap(), root);
+    assert_eq!(objects.len(), 3);
+    json!({"root":{"kind":3,"id":hex(&root.key.id.0)},"largest_file":objects[0],"objects":objects})
+}
+
 fn main() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), Config::default()).unwrap();
@@ -302,8 +372,10 @@ fn main() {
     }
     let history_publication = store.publish(REPOSITORY, &publish("closure-history", 2, history_head), 4).unwrap();
     let projection_fixture = projection_fixture(&store);
+    let bootstrap_fixture = bootstrap_fixture(&store);
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
         "projection":projection_fixture,
+        "bootstrap":bootstrap_fixture,
         "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
         "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),
