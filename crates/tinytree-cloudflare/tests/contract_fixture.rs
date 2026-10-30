@@ -5,7 +5,7 @@ use tinytree_model::{
     ChangeId, Commit, CommitId, CopyHistory, CopyId, Descriptor, FileId, Kind, Limits, Object,
     Signature, SymlinkId, Timestamp, Tree, TreeEntry, TreeId, TreeMerge, TreeValue,
 };
-use tinytree_store::{AccountId, Config, Error, ForgeAccountMutation, ForgeActor, ForgeMember, PolicyEpoch, PublishRequest, Reference, Store};
+use tinytree_store::{AccountId, Config, Error, ForgeAccountMutation, ForgeActor, ForgeMember, ForgeViewVisibility, PolicyEpoch, PublishRequest, Reference, Store, ViewSpec, ViewVersion};
 
 const REPOSITORY: &str = "forge-example";
 
@@ -240,8 +240,31 @@ fn main() {
     let added = store.forge_mutate_account(&account, &owner, "add-member", ForgeAccountMutation::SetMember { member: member.clone(), expected_epoch: PolicyEpoch(1) }).unwrap();
     let unchanged = store.forge_mutate_account(&account, &owner, "same-member", ForgeAccountMutation::SetMember { member: member.clone(), expected_epoch: PolicyEpoch(2) }).unwrap();
     let revoked = store.forge_mutate_account(&account, &owner, "revoke-admin", ForgeAccountMutation::SetMember { member: ForgeMember { is_admin: false, ..member }, expected_epoch: PolicyEpoch(2) }).unwrap();
+    let public_spec = ViewSpec { name: "public".into(), root_prefix: String::new(), include_prefixes: vec![String::new()], exclude_prefixes: vec![], visibility: ForgeViewVisibility::Public, revision: serde_json::from_value(provisioned["main_revision"].clone()).unwrap(), export_allowed: false };
+    let public = store.forge_mutate_account(&account, &owner, "public-view", ForgeAccountMutation::PublishView { spec: public_spec.clone(), expected_epoch: PolicyEpoch(3), make_default: true, follow_main: true }).unwrap();
+    let locked_spec = ViewSpec { visibility: ForgeViewVisibility::Members, ..public_spec.clone() };
+    let locked = store.forge_mutate_account(&account, &owner, "locked-view", ForgeAccountMutation::PublishView { spec: locked_spec.clone(), expected_epoch: PolicyEpoch(4), make_default: false, follow_main: true }).unwrap();
+    let retired = store.forge_mutate_account(&account, &owner, "retire-old-view", ForgeAccountMutation::RetireView { version: ViewVersion(serde_json::from_value(public["view_version"].clone()).unwrap()), expected_epoch: PolicyEpoch(5), view: "public".into() }).unwrap();
+    // A real canonical closure larger than the old all-in-one 256-object cap.
+    // Keep these objects separate so raw-backend fixtures retain their scope.
+    let mut history = Vec::new();
+    let mut history_head = next;
+    for ordinal in 0..300u128 {
+        let encoded = tinytree_model::encode(&Object::Commit(Commit {
+            parents: vec![CommitId(history_head.key.id.0)], predecessors: vec![],
+            root_tree: TreeMerge { terms: vec![TreeId(next_tree.key.id.0)], labels: vec![String::new()] },
+            change_id: ChangeId((ordinal + 1000).to_le_bytes()),
+            description: format!("Closure fixture {ordinal}"),
+            author: person.clone(), committer: person.clone(), secure_signature: None,
+        }), Limits::default()).unwrap();
+        store.put(REPOSITORY, encoded.descriptor, &encoded.bytes, 0).unwrap();
+        history_head = encoded.descriptor;
+        history.push(json!({"kind":encoded.descriptor.key.kind as u8,"id":hex(&encoded.descriptor.key.id.0),"size_bytes":encoded.descriptor.size_bytes,"format_version":encoded.descriptor.format_version,"bytes":encoded.bytes}));
+    }
+    let history_publication = store.publish(REPOSITORY, &publish("closure-history", 2, history_head), 4).unwrap();
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
-        "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked},
+        "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
+        "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),
         "next":reference(&next_result.reference),"historical_replay":reference(&historical_replay.reference),
         "after_refusals":after,"refusals":refused,"reopen":true}});

@@ -4,7 +4,7 @@
 //! from authenticated transport identity, never from a JSON principal field.
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest};
+use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest, PublishViewRequest, RetireViewRequest, ResolveViewRequest};
 use tinytree_proto::forge_v1;
 use tinytree_store::{AccountId, ForgeAction, ForgeActor, PolicyEpoch, ViewSpec, ViewVersion};
 use tinytree_store::{ResolvedView, Store};
@@ -15,24 +15,6 @@ const MAX_FILE: usize = 1024 * 1024;
 const MAX_READ: usize = 8 * 1024 * 1024;
 const MAX_MATCHES: usize = 100;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetireViewRequest {
-    version: [u8; 32],
-    expected_epoch: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublishViewRequest {
-    spec: ViewSpec,
-    expected_epoch: u64,
-    make_default: bool,
-    #[serde(default = "follow_main_default")]
-    follow_main: bool,
-}
-fn follow_main_default() -> bool {
-    true
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ObjectRequest {
@@ -173,7 +155,7 @@ pub(crate) fn account_call(
             )?
         }
         Op::ResolveView => {
-            let input: ForgeResolveRequest = payload(bytes)?;
+            let input: ResolveViewRequest = payload(bytes)?;
             let resolved = store
                 .forge_resolve_view(account, actor, view, input.version.map(ViewVersion))
                 .map_err(crate::service::store_status)?;
@@ -306,12 +288,6 @@ pub struct ForgeFileResponse {
     pub context: ForgeViewDescription,
     #[serde(flatten)]
     pub file: ForgeTextFile,
-}
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeResolveRequest {
-    #[serde(default)]
-    pub version: Option<[u8; 32]>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

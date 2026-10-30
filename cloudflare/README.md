@@ -13,7 +13,8 @@ request replay, and explicit commit pins. `GET /v1/capabilities` reports the
 supported raw operations and resource limits and requires authentication.
 
 An independently gated `POST /api/v1/forge/call` endpoint supports account
-provisioning, account snapshots and membership changes (operations 1, 2 and 3).
+provisioning, account snapshots and membership changes (operations 1, 2 and 3),
+plus view publication, discovery and retirement (operations 4, 5 and 11).
 Set `FORGE_BACKEND=enabled` and use a `kind=forge` identity for that endpoint.
 Account ownership, membership, policy epochs and replay receipts are SQLite
 authority; ordinary Forge operations cannot use raw identities. Provisioning
@@ -21,7 +22,13 @@ requires an operator identity, and an existing unowned raw repository cannot
 be silently adopted. Once Forge owns an account, all raw object/ref/pin routes
 for it are fenced, including operator calls.
 
-It does **not** implement the Forge review, filtered-view, query, transform,
+View definitions use the native version identity, current membership policy and
+durable replay rules. Publication requires an already validated canonical root;
+this is not an arbitrary-digest import path. Public anonymous ingress and the
+projection/read/search presentation are not connected yet. Recording a public
+view does not make canonical objects or ancestry publicly readable.
+
+It does **not** implement the Forge review, filtered-view reads, query, transform,
 workspace-backup, or checked-landing APIs. The normal `tt` Forge workflow is
 not yet supported by this target. Unsupported operations fail explicitly;
 there is no fallback to the local backend. Do not expose it as an equivalent
@@ -54,6 +61,9 @@ Runtime tests use local workerd/Miniflare with SQLite Durable Objects and R2
 bindings. A declared Rust fixture generates canonical objects and expected
 reference/replay results using the existing local Store. These tests do not
 establish deployed provider durability, availability, latency, or billing.
+The declared `tt` binary also exercises account commands against the actual
+workerd endpoint and resumes an exact completed intent after SQLite/R2 restart;
+this does not establish the full workspace or checked-landing workflow.
 
 ## Authority and authentication
 

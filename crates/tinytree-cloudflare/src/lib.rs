@@ -5,6 +5,10 @@ use serde::Deserialize;
 mod forge;
 mod accounts;
 mod landing;
+mod projection;
+mod closure_step;
+mod views;
+mod search;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -397,6 +401,34 @@ pub extern "C" fn tt_forge_account_command(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_build_candidate(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, landing::build_candidate)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_build_projection(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, projection::build_projection)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_closure_step(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, closure_step::step)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_view_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, views::normalize_view_command)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_view_policy(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, views::resolve_view_policy)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_view_paths(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, views::paths_allowed)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_advance_view(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, views::advance_view_revision)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_search_file(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, search::search_file)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

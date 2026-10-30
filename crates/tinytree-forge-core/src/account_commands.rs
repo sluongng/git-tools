@@ -2,7 +2,7 @@
 //! these pure functions authenticate a principal or grant account membership.
 use crate::{
     Error, Result,
-    accounts::{AccountId, ForgeAccountMutation, ForgeMember, validate_name, validate_principal},
+    accounts::{AccountId, ForgeAccountMutation, ForgeMember, ViewSpec, MAX_VIEW_BYTES, validate_name, validate_principal},
 };
 use serde::{Deserialize, Serialize};
 use tinytree_model::{
@@ -21,6 +21,28 @@ pub struct EmptyRequest {}
 pub struct SetMemberRequest {
     pub member: ForgeMember,
     pub expected_epoch: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishViewRequest {
+    pub spec: ViewSpec,
+    pub expected_epoch: u64,
+    pub make_default: bool,
+    #[serde(default = "follow_main_default")]
+    pub follow_main: bool,
+}
+fn follow_main_default() -> bool { true }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireViewRequest {
+    pub version: [u8; 32],
+    pub expected_epoch: u64,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveViewRequest {
+    #[serde(default)]
+    pub version: Option<[u8; 32]>,
 }
 
 pub fn validate_member(member: &ForgeMember) -> Result<()> {
@@ -54,7 +76,11 @@ pub fn member_change(
 /// account and request ID are separately bound by the authoritative embedding.
 pub fn mutation_fingerprint(mutation: &ForgeAccountMutation) -> Result<[u8; 32]> {
     let bytes = serde_json::to_vec(mutation).map_err(|_| Error::Corrupt("metadata encoding"))?;
-    if bytes.len() > MAX_ACCOUNT_COMMAND_BYTES {
+    let limit = match mutation {
+        ForgeAccountMutation::PublishView { .. } => MAX_VIEW_BYTES + MAX_ACCOUNT_COMMAND_BYTES,
+        _ => MAX_ACCOUNT_COMMAND_BYTES,
+    };
+    if bytes.len() > limit {
         return Err(Error::Limit("forge account command"));
     }
     Ok(*blake3::hash(&bytes).as_bytes())
@@ -142,6 +168,22 @@ mod tests {
         let mut invalid = member();
         invalid.roles = vec!["role".into(); 17];
         assert!(validate_member(&invalid).is_err());
+        // View publications retain the native 1MiB spec envelope; the smaller
+        // account/member command limit must not restrict this distinct command.
+        let spec = ViewSpec {
+            name: "public".into(), root_prefix: String::new(),
+            include_prefixes: vec!["x".repeat(4096); 8], exclude_prefixes: vec![],
+            visibility: crate::accounts::ForgeViewVisibility::Public,
+            revision: [1; 32], export_allowed: true,
+        };
+        spec.validate().unwrap();
+        let mutation = ForgeAccountMutation::PublishView {
+            spec, expected_epoch: crate::accounts::PolicyEpoch(1),
+            make_default: true, follow_main: true,
+        };
+        let bytes = serde_json::to_vec(&mutation).unwrap();
+        assert!(bytes.len() > MAX_ACCOUNT_COMMAND_BYTES);
+        assert_eq!(mutation_fingerprint(&mutation).unwrap(), *blake3::hash(&bytes).as_bytes());
     }
     #[test]
     fn owner_and_noop_rules_and_canonical_genesis() {

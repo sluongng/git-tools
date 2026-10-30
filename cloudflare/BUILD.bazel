@@ -32,23 +32,44 @@ js_test(
     name = "typecheck",
     include_types = True,
     entry_point = "tools/typecheck.mjs",
-    data = glob(["src/**/*.ts", "tools/*.d.ts"]) + [
+    data = glob(["src/**/*.ts", "tests/**/*.ts", "tools/*.d.ts"]) + [
         "tsconfig.json",
         ":node_modules/typescript",
         ":node_modules/@cloudflare/workers-types",
     ],
 )
 
+# Test-only module harness; never a production Worker or deployment dependency.
+js_run_binary(
+    name = "closure_job_harness",
+    testonly = True,
+    tool = ":bundle_tool",
+    srcs = glob(["src/**/*.ts"]) + ["tests/closure-harness.ts", "//crates/tinytree-cloudflare:wasm"],
+    outs = ["closure-harness/worker.mjs", "closure-harness/core.wasm"],
+    args = [
+        "cloudflare/tests/closure-harness.ts",
+        "$(execpath //crates/tinytree-cloudflare:wasm)",
+        "$(RULEDIR)/closure-harness/worker.mjs",
+        "$(RULEDIR)/closure-harness/core.wasm",
+    ],
+    mnemonic = "ClosureHarnessBundle",
+)
+
 # Real workerd runtime, SQLite Durable Objects and R2; no host Node or services.
 js_test(
     name = "runtime_tests",
     entry_point = "tools/runner.mjs",
-    args = ["$(rootpath //crates/tinytree-cloudflare:contract_fixture)"],
+    args = [
+        "$(rootpath //crates/tinytree-cloudflare:contract_fixture)",
+        "$(rootpath //crates/jj-native-cli:tt)",
+    ],
     data = [
         "tests/runtime.test.mjs",
+        ":closure_job_harness",
         ":worker",
         ":node_modules/miniflare",
         "//crates/tinytree-cloudflare:contract_fixture",
+        "//crates/jj-native-cli:tt",
     ],
     timeout = "moderate",
 )

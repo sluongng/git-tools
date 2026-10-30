@@ -2,6 +2,7 @@
  * binds this host to exactly one account Durable Object. R2 contains bytes only. */
 import { normalizeForgeAccountCommand, type ForgeCall, type Descriptor } from './core';
 import { fail } from './protocol';
+import type { PolicySnapshot } from './forge_views';
 
 export interface ForgeMember {
   principal: string;
@@ -21,7 +22,7 @@ export interface AccountCommand {
 export interface ForgeAccountHost {
   /** Trusted current authenticated values, not fields extracted from JSON. */
   accountId: string;
-  principal: string;
+  principal: string | null;
   canProvision: boolean;
   sql: SqlStorage;
   transactionSync<T>(callback: () => T): T;
@@ -71,6 +72,7 @@ export class ForgeAccounts {
   /** Host-side fencing only, not an authorization grant or public operation. */
   hasAccountInTx(): boolean { return this.accountInTx() !== undefined; }
   private authorizeInTx(admin: boolean): AccountRow {
+    if (this.host.principal === null) fail(401, 'unauthenticated');
     const row = this.accountInTx();
     if (!row) fail(403, 'permission_denied');
     if (row.owner === this.host.principal) return row;
@@ -88,13 +90,54 @@ export class ForgeAccounts {
         || !Number.isSafeInteger(main.generation) || main.generation < 1) fail(503, 'failed_precondition');
     return { ...this.wire(row), main_revision: Array.from(main.head.match(/../g)!, byte => parseInt(byte, 16)), main_generation: main.generation };
   }
-  private replayInTx(requestId: string, fingerprint: string): unknown | undefined {
+  /** Internal shared authority for view/read embeddings. A snapshot is not a
+   * continuing grant: callers must rederive it inside every authority tx. */
+  policySnapshotInTx(): PolicySnapshot {
+    const row = this.accountInTx();
+    if (!row) fail(403, 'permission_denied');
+    let member: ForgeMember | undefined;
+    if (this.host.principal !== null) {
+      const saved = this.one<MemberRow>('SELECT value FROM forge_members WHERE account_id=? AND principal=?', row.account_id, this.host.principal);
+      if (saved) member = JSON.parse(saved.value) as ForgeMember;
+    }
+    let publicView: string | null = null;
+    if (row.public_view !== null) {
+      const bytes: unknown = JSON.parse(row.public_view);
+      if (!Array.isArray(bytes) || bytes.length !== 32 || !bytes.every(v => Number.isInteger(v) && v >= 0 && v <= 255)) fail(503, 'failed_precondition');
+      publicView = bytes.map(v => v.toString(16).padStart(2, '0')).join('');
+    }
+    return { accountId: row.account_id, principal: this.host.principal, epoch: row.policy_epoch, publicView,
+      grant: { is_admin: row.owner === this.host.principal || member?.is_admin === true,
+        member_roles: row.owner === this.host.principal ? [] : member?.roles ?? null } };
+  }
+  requireAdminInTx(): PolicySnapshot {
+    this.authorizeInTx(true);
+    return this.policySnapshotInTx();
+  }
+  accountWireInTx(): Record<string, unknown> {
+    const row = this.accountInTx(); if (!row) fail(403, 'permission_denied');
+    return this.wire(row);
+  }
+  bumpEpochInTx(expected: number): number {
+    if (!Number.isSafeInteger(expected) || expected < 1 || expected >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
+    const updated = this.one<{ policy_epoch: number }>('UPDATE forge_account SET policy_epoch=policy_epoch+1 WHERE singleton=1 AND policy_epoch=? RETURNING policy_epoch', expected);
+    if (!updated) fail(409, 'aborted');
+    return Number(updated.policy_epoch);
+  }
+  setPublicViewInTx(version: string | null): void {
+    if (version !== null && !/^[0-9a-f]{64}$/.test(version)) fail(503, 'failed_precondition');
+    const value = version === null ? null : JSON.stringify(Array.from(version.match(/../g)!, pair => parseInt(pair, 16)));
+    this.host.sql.exec('UPDATE forge_account SET public_view=? WHERE singleton=1', value);
+  }
+  replayInTx(requestId: string, fingerprint: string): unknown | undefined {
+    if (this.host.principal === null) fail(401, 'unauthenticated');
     const receipt = this.one<ReceiptRow>('SELECT fingerprint,result FROM forge_account_receipts WHERE account_id=? AND principal=? AND request_id=?', this.host.accountId, this.host.principal, requestId);
     if (!receipt) return undefined;
     if (receipt.fingerprint !== fingerprint) fail(400, 'invalid_argument');
     return JSON.parse(receipt.result);
   }
-  private finishInTx(requestId: string, fingerprint: string, result: unknown): unknown {
+  finishInTx(requestId: string, fingerprint: string, result: unknown): unknown {
+    if (this.host.principal === null) fail(401, 'unauthenticated');
     const count = this.one<{ n: number }>('SELECT COUNT(*) AS n FROM forge_account_receipts WHERE account_id=?', this.host.accountId)!;
     if (Number(count.n) >= MAX_RECEIPTS) fail(429, 'resource_exhausted');
     const encoded = JSON.stringify(result);
@@ -104,6 +147,7 @@ export class ForgeAccounts {
   }
   async handle(call: ForgeCall): Promise<{ state: 'complete'; result: unknown }> {
     if (call.account_id !== this.host.accountId) fail(403, 'permission_denied');
+    if (this.host.principal === null) fail(401, 'unauthenticated');
     if (encoder.encode(this.host.principal).byteLength < 1 || encoder.encode(this.host.principal).byteLength > 128
         || new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(encoder.encode(this.host.principal)) !== this.host.principal
         || /[\u0000-\u001f\u007f-\u009f]/u.test(this.host.principal)) fail(401, 'unauthenticated');
@@ -170,8 +214,7 @@ export class ForgeAccounts {
       if (current?.value !== encoded) {
         if (!Number.isSafeInteger(row.policy_epoch) || row.policy_epoch >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
         this.host.sql.exec('INSERT INTO forge_members(account_id,principal,value) VALUES(?,?,?) ON CONFLICT(account_id,principal) DO UPDATE SET value=excluded.value', row.account_id, member.principal, encoded);
-        this.host.sql.exec('UPDATE forge_account SET policy_epoch=policy_epoch+1 WHERE singleton=1');
-        row.policy_epoch++;
+        row.policy_epoch = this.bumpEpochInTx(row.policy_epoch);
       }
       return { state: 'complete', result: this.finishInTx(call.request_id, fingerprint, this.wire(row)) };
     });

@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const directory = fileURLToPath(new URL("../", import.meta.url));
 const fixture = process.argv[2];
-if (!fixture) throw new Error("declared native contract fixture argument is required");
+const tt = process.argv[3];
+if (!fixture || !tt) throw new Error("declared native contract fixture and tt arguments are required");
 const temporary = await mkdtemp(join(process.env.TEST_TMPDIR ?? tmpdir(), "native-contract-"));
 try {
   const canonical = execFileSync(resolve(fixture), [], {
@@ -22,6 +23,9 @@ try {
       TINYTREE_WORKER_BUNDLE: resolve(directory, "worker.mjs"),
       TINYTREE_CORE_WASM: resolve(directory, "core.wasm"),
       TINYTREE_CONTRACT_FIXTURE: fixtureJson,
+      TINYTREE_TT_BINARY: resolve(tt),
+      TINYTREE_CLOSURE_HARNESS_BUNDLE: resolve(directory, "closure-harness/worker.mjs"),
+      TINYTREE_CLOSURE_HARNESS_WASM: resolve(directory, "closure-harness/core.wasm"),
     },
   });
   process.exitCode = await new Promise((done, reject) => {

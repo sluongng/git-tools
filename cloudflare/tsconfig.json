@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts", "tools/*.d.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "tools/*.d.ts"]
 }

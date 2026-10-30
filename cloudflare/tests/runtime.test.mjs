@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, stat, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Miniflare } from 'miniflare';
@@ -156,6 +158,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   };
   await forgeValue(await callForge(1, {}, 'member-create', { token: memberToken }), 403, 'permission_denied');
   await forgeValue(await callForge(1, {}, 'wrong-kind', { token: raw }), 403, 'permission_denied');
+  await forgeValue(await callForge(5, {}, '', { selectedAccount: 'legacy' }), 403, 'permission_denied');
   const provisioned = await forgeValue(await callForge(1, {}, 'provision-owner'));
   assert.deepEqual(provisioned, fixture.forge.provisioned);
   assert.deepEqual(await forgeValue(await callForge(1, {}, 'provision-owner')), provisioned);
@@ -178,6 +181,26 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   await forgeValue(await callForge(3, { member, expected_epoch: 2 }, 'member-self-noop', { token: memberToken }), 403, 'permission_denied');
   assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added, 'historical receipt never reapplies membership');
   assert.equal((await forgeValue(await callForge(2))).policy_epoch, 3);
+  const views = fixture.forge.views;
+  const publishPublic = { spec: views.public_spec, expected_epoch: 3, make_default: true };
+  await forgeValue(await callForge(4, publishPublic, 'member-cannot-publish', { token: memberToken }), 403, 'permission_denied');
+  await forgeValue(await callForge(4, publishPublic, 'add-member'), 400, 'invalid_argument');
+  await forgeValue(await callForge(4, { ...publishPublic, spec: { ...views.public_spec, revision: Array(32).fill(9) } }, 'unknown-view-root'), 403, 'permission_denied');
+  assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public);
+  assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public);
+  assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: other })), [views.public], 'current public policy permits nonmember view discovery');
+  assert.deepEqual((await forgeValue(await callForge(2))).public_view, views.public.view_version);
+  const publishLocked = { spec: views.locked_spec, expected_epoch: 4, make_default: false };
+  assert.deepEqual(await forgeValue(await callForge(4, publishLocked, 'locked-view')), views.locked);
+  assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: other })), [], 'new current member policy removes old public discovery');
+  assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: memberToken })), [views.locked]);
+  assert.equal((await forgeValue(await callForge(2))).public_view, null);
+  await forgeValue(await callForge(11, { version: views.locked.view_version, expected_epoch: 5 }, 'cannot-retire-current'), 400, 'failed_precondition');
+  assert.deepEqual(await forgeValue(await callForge(11, { version: views.public.view_version, expected_epoch: 5 }, 'retire-old-view')), views.retired);
+  assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public, 'historical view replay never changes current policy');
+  assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
+  assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
+  await forgeValue(await callForge(6), 501, 'unimplemented');
   await forgeValue(await callForge(20, {}, 'unsupported-review'), 501, 'unimplemented');
   const malformed = { ...envelope(1, {}, 'actor-injection'), actor: 'forge-owner' };
   await forgeValue(await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${owner}`, 'content-type': 'application/json' }, body: JSON.stringify(malformed) }), 400, 'invalid_argument');
@@ -191,7 +214,8 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   await value(await call(mf, 'legacy', 'repository', { request_id: 'raw-legacy' }, { token: raw }));
   await forgeValue(await callForge(1, {}, 'adopt-legacy', { selectedAccount: 'legacy' }), 400, 'failed_precondition');
   await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true }));
-  assert.equal((await forgeValue(await callForge(2))).policy_epoch, 3);
+  assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
+  assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
   assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added);
   for (const [fault, selectedAccount] of [['after', 'r2-recovery'], ['sql-receipt', 'sql-recovery']]) {
     await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true, fault }));
@@ -338,4 +362,246 @@ test('account admission is bounded while the real R2 transport is pending', asyn
     if (status === 429) assert.equal(result.error, 'account_admission_limit');
     else assert.equal(status, 200);
   }
+});
+
+
+test('declared tt CLI uses actual workerd account authority and resumes exact intents after SQLite/R2 restart', async t => {
+  const tt = process.env.TINYTREE_TT_BINARY;
+  assert.ok(tt, 'the shipped tt binary must be declared by the runtime test target');
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-tt-workerd-'));
+  const firstAccount = fixture.forge.account_id;
+  const peerAccount = 'cli-peer';
+  const firstToken = 'tt-workerd-owner-fixture-token';
+  const peerToken = 'tt-workerd-peer-fixture-token';
+  // Both transport principals can route to both accounts. The real account
+  // authority, not a coarse token-routing filter, must deny cross-owner reads.
+  const config = [
+    { principal: 'forge-owner', token_sha256: sha(firstToken), accounts: [firstAccount, peerAccount], operator: true, kind: 'forge' },
+    { principal: 'cli-peer-owner', token_sha256: sha(peerToken), accounts: [firstAccount, peerAccount], operator: true, kind: 'forge' },
+  ];
+  let mf = new Miniflare({ ...options(persist, { config, forge: true }), host: '127.0.0.1', port: 0 });
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const address = await mf.ready;
+  const endpoint = address.origin;
+  assert.equal(address.hostname, '127.0.0.1');
+  const execute = promisify(execFile);
+  async function client(name, token) {
+    const root = path.join(persist, name);
+    const home = path.join(root, 'home');
+    const cwd = path.join(root, 'workspace');
+    const emptyPath = path.join(root, 'no-programs');
+    await Promise.all([mkdir(home, { recursive: true, mode: 0o700 }), mkdir(cwd, { recursive: true, mode: 0o700 }), mkdir(emptyPath, { recursive: true, mode: 0o700 })]);
+    const jjConfig = path.join(root, 'jj.toml');
+    await writeFile(jjConfig, '[user]\nname="Runtime Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
+    return {
+      home, cwd,
+      env: { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: jjConfig, PATH: emptyPath, TERM: 'dumb', TT_RUNTIME_TOKEN: token },
+      context: path.join(home, 'config/tinytree/context.json'),
+      intent: key => path.join(home, `config/tinytree/requests/request-${key}.json`),
+    };
+  }
+  async function command(selected, args, success = true) {
+    let output;
+    try {
+      // Asynchronous subprocesses let Miniflare's real HTTP/DO/R2 services run.
+      output = await execute(tt, ['--no-pager', '--color=never', ...args, '--json'], {
+        cwd: selected.cwd, env: selected.env, encoding: 'utf8', timeout: 20000, maxBuffer: 2 * 1024 * 1024,
+      });
+      assert.ok(success, `command unexpectedly succeeded: ${args.join(' ')}`);
+    } catch (error) {
+      if (success) throw error;
+      assert.equal(typeof error.code, 'number', 'expected a CLI application failure, not a spawn or timeout failure');
+      output = error;
+    }
+    const report = JSON.parse(output.stdout);
+    assert.equal(report.schema_version, 1);
+    assert.equal(report.state, success ? (args[0] === 'context' ? 'configured' : 'complete') : 'failed');
+    if (!success) assert.equal(report.result, null);
+    return report;
+  }
+  const select = (selected, account) => command(selected, ['context', 'set', '--transport', 'forge-https-v1', '--server', endpoint, '--account', account, '--token-env', 'TT_RUNTIME_TOKEN']);
+  const login = (selected, account, success = true) => command(selected, ['login', '--transport', 'forge-https-v1', '--server', endpoint, '--account', account, '--token-env', 'TT_RUNTIME_TOKEN'], success);
+  const first = await client('first', firstToken);
+  const peer = await client('peer', peerToken);
+  // Selecting context is local setup, not a login claim. Provision the fresh
+  // account through tt before its authenticated account snapshot can be read.
+  await select(first, firstAccount);
+  const provisioned = (await command(first, ['account', 'provision', '--request-id', 'tt-provision-first'])).result.value;
+  const expected = { ...fixture.forge.provisioned, main_revision: Buffer.from(fixture.forge.provisioned.main_revision).toString('hex') };
+  assert.deepEqual(provisioned, expected, 'real CLI account result matches the native Store fixture');
+  const intent = await readFile(first.intent('tt-provision-first'));
+  assert.equal(JSON.parse(intent).context.transport, 'forge_https_v1');
+  assert.deepEqual((await command(first, ['account', 'provision', '--request-id', 'tt-provision-first'])).result.value, provisioned);
+  assert.deepEqual((await login(first, firstAccount)).result.value, provisioned);
+  assert.deepEqual((await command(first, ['account', 'show'])).result.value, provisioned);
+  const context = await readFile(first.context);
+  assert.equal(JSON.parse(context).transport, 'forge_https_v1');
+  assert.equal(JSON.parse(context).token_env, 'TT_RUNTIME_TOKEN');
+  assert.equal((await stat(first.context)).mode & 0o777, 0o600);
+  assert.ok(!context.includes(firstToken));
+  assert.ok(!intent.includes(firstToken));
+  await select(peer, peerAccount);
+  const peerProvisioned = (await command(peer, ['account', 'provision', '--request-id', 'tt-provision-peer'])).result.value;
+  assert.equal(peerProvisioned.account_id, peerAccount);
+  assert.equal(peerProvisioned.monorepo_id, `forge-${peerAccount}`);
+  assert.notEqual(peerProvisioned.monorepo_id, provisioned.monorepo_id);
+  assert.deepEqual((await login(peer, peerAccount)).result.value, peerProvisioned);
+  await login(first, peerAccount, false);
+  assert.deepEqual(await readFile(first.context), context, 'denied cross-account login keeps the working context');
+  await select(first, peerAccount);
+  await command(first, ['account', 'show'], false);
+  await command(first, ['account', 'provision', '--request-id', 'tt-cannot-steal-peer'], false);
+  assert.deepEqual((await command(peer, ['account', 'show'])).result.value, peerProvisioned);
+  await select(first, firstAccount);
+  const keys = async () => (await (await mf.getR2Bucket('OBJECTS')).list({ prefix: `native/v1/${firstAccount}/` })).objects.map(object => object.key).sort();
+  const originalKeys = await keys();
+  assert.ok(originalKeys.includes(`native/v1/${firstAccount}/3/${provisioned.main_revision}`));
+  await mf.dispose();
+  mf = new Miniflare({ ...options(persist, { config, forge: true }), host: '127.0.0.1', port: Number(address.port) });
+  assert.equal((await mf.ready).origin, endpoint, 'restart retains the exact context origin, not a rebound request');
+  assert.deepEqual((await command(first, ['request', 'resume', 'tt-provision-first'])).result.value, provisioned);
+  assert.deepEqual(await readFile(first.intent('tt-provision-first')), intent, 'resume keeps the original private intent bytes');
+  assert.deepEqual((await command(first, ['account', 'show'])).result.value, provisioned);
+  assert.deepEqual((await command(peer, ['account', 'show'])).result.value, peerProvisioned);
+  assert.deepEqual(await keys(), originalKeys, 'provision retry/restart does not stage a new canonical repository');
+});
+
+async function closureHarness(t, history = false) {
+  const entry = process.env.TINYTREE_CLOSURE_HARNESS_BUNDLE;
+  const core = process.env.TINYTREE_CLOSURE_HARNESS_WASM;
+  assert.ok(entry && core, 'declared test-only ClosureJobs bundle and RustWasm are required');
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-closure-module-'));
+  const configuration = {
+    modules: [{ type: 'ESModule', path: entry }, { type: 'CompiledWasm', path: core }],
+    compatibilityDate: '2026-07-08',
+    durableObjects: { CLOSURES: { className: 'ClosureHarness', useSQLite: true } },
+    r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(persist, 'do'), r2Persist: path.join(persist, 'r2'),
+  };
+  const state = { mf: new Miniflare(configuration) };
+  t.after(async () => { await state.mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const raw = async (action, fields = {}) => {
+    const response = await state.mf.dispatchFetch('https://closure-module.invalid/harness', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action, ...fields }),
+    });
+    return { code: response.status, value: await response.json() };
+  };
+  const invoke = async (action, fields = {}, expected = 200) => {
+    const result = await raw(action, fields);
+    assert.equal(result.code, expected, JSON.stringify(result.value)); return result.value;
+  };
+  const imported = [...fixture.objects, ...(history ? fixture.closure.objects : [])];
+  await invoke('setup', { objects: imported, main: fixture.native.next });
+  return {
+    invoke, raw,
+    bucket: () => state.mf.getR2Bucket('OBJECTS'),
+    reload: async () => { await state.mf.dispose(); state.mf = new Miniflare(configuration); await state.mf.ready; },
+  };
+}
+function closureKey(object) { return { kind: object.kind, id: object.id }; }
+async function runClosure(harness, status) {
+  for (let calls = 0; calls < 24 && !status.complete && status.error === null; calls++) {
+    status = await harness.invoke('advance', { job_id: status.job_id, generation: status.generation });
+  }
+  assert.ok(status.complete || status.error, 'bounded fixture calls must reach ready or an explicit error');
+  return status;
+}
+function jobTables(snapshot) {
+  return { jobs: snapshot.jobs, nodes: snapshot.nodes, contexts: snapshot.contexts, obligations: snapshot.obligations, usage: snapshot.usage };
+}
+
+test('internal ClosureJobs persists native >256-object frontiers, fences competing advancement and atomically attaches exact roots', async t => {
+  assert.ok(fixture.closure.objects.length >= 300);
+  const harness = await closureHarness(t, true);
+  let status = await harness.invoke('begin', { request_id: 'native-long-history', root: fixture.closure.root });
+  assert.equal(status.complete, false);
+  assert.deepEqual(await harness.invoke('begin', { request_id: 'native-long-history', root: fixture.closure.root }), status);
+  const sameGeneration = { job_id: status.job_id, generation: status.generation };
+  // Two real requests race through actual R2 awaits and SQLite transactions.
+  const races = await Promise.all([
+    harness.raw('advance', sameGeneration),
+    harness.raw('advance', sameGeneration),
+  ]);
+  assert.deepEqual(races.map(result => result.code).sort(), [200, 409]);
+  status = races.find(result => result.code === 200).value;
+  assert.equal(races.find(result => result.code === 409).value.error, 'aborted');
+  assert.equal(status.complete, false);
+  assert.ok(status.counts.checked_objects > 0 && status.counts.checked_objects <= 64);
+  const progress = await harness.invoke('inspect');
+  assert.equal(progress.nodes.length, status.counts.objects, 'concurrent loser cannot double frontier counters');
+  assert.equal(progress.nodes.filter(node => node.done === 1).length, status.counts.checked_objects);
+  assert.equal(progress.contexts.length, status.counts.contexts);
+  assert.equal(progress.obligations.length, status.counts.obligations);
+  await harness.reload();
+  assert.deepEqual(await harness.invoke('status', { job_id: status.job_id }), status, 'job identity, counters and cursor survive runtime disposal');
+  assert.deepEqual(jobTables(await harness.invoke('inspect')), jobTables(progress));
+  status = await runClosure(harness, status);
+  assert.equal(status.phase, 'ready');
+  assert.ok(status.counts.objects > 256);
+  assert.equal(status.counts.checked_objects, status.counts.objects);
+  assert.equal(status.counts.checked_contexts, status.counts.contexts);
+  assert.equal(status.counts.checked_obligations, status.counts.obligations);
+  const ready = await harness.invoke('inspect');
+  await harness.invoke('fail-attach', { enabled: true });
+  assert.equal((await harness.invoke('publish', { job_id: status.job_id, generation: status.generation }, 503)).error, 'fixture_attach_failure');
+  const rolledBack = await harness.invoke('inspect');
+  assert.deepEqual(jobTables(rolledBack), jobTables(ready), 'failed attach rolls back job phase and receipt');
+  assert.equal(rolledBack.state.head, ready.state.head);
+  assert.equal(rolledBack.state.generation, ready.state.generation);
+  assert.equal(rolledBack.state.attachments, 0, 'callback wrote before throwing; native SQLite must roll it back');
+  await harness.invoke('fail-attach', { enabled: false });
+  const published = await harness.invoke('publish', { job_id: status.job_id, generation: status.generation });
+  assert.equal(published.status.phase, 'published');
+  assert.deepEqual(published.result, fixture.closure.native_publication, 'actual native Store publication reference is the oracle');
+  assert.deepEqual(await harness.invoke('publish', { job_id: status.job_id, generation: status.generation }), published);
+  const replayed = await harness.invoke('inspect');
+  assert.equal(replayed.state.attachments, 1);
+  assert.equal(replayed.state.generation, fixture.closure.native_publication.generation);
+});
+
+test('internal ClosureJobs never marks missing/corrupt bytes or native FILE/copy path violations ready', async t => {
+  const harness = await closureHarness(t);
+  for (const scenario of [
+    { request: 'missing-dependency', root: 'missing_commit', error: 'object_unavailable', native: 'missing', refusal: 'missing_closure' },
+    { request: 'wrong-file-size', root: 'wrong_size_commit', error: 'object_invalid', native: 'wrong_size', refusal: 'invalid_closure' },
+    { request: 'wrong-copy-path', root: 'wrong_copy_commit', error: 'object_invalid', native: 'wrong_copy', refusal: 'invalid_closure' },
+  ]) {
+    assert.equal(fixture.native.refusals[scenario.native], scenario.refusal);
+    const begin = await harness.invoke('begin', { request_id: scenario.request, root: closureKey(objects.get(scenario.root)) });
+    const blocked = await runClosure(harness, begin);
+    assert.equal(blocked.complete, false); assert.equal(blocked.error, scenario.error);
+    assert.equal((await harness.invoke('publish', { job_id: blocked.job_id, generation: blocked.generation }, 400)).error, 'failed_precondition');
+  }
+  const file = objects.get('original_file');
+  const key = `closure-fixture/${file.kind}/${file.id}`;
+  const bucket = await harness.bucket();
+  for (const scenario of [
+    { request: 'stored-body-missing', mutate: () => bucket.delete(key) },
+    { request: 'stored-body-corrupt', mutate: () => bucket.put(key, Uint8Array.from(file.bytes).map(byte => byte ^ 1)) },
+  ]) {
+    const begin = await harness.invoke('begin', { request_id: scenario.request, root: closureKey(objects.get('first_commit')) });
+    await scenario.mutate();
+    try {
+      const blocked = await runClosure(harness, begin);
+      assert.equal(blocked.complete, false); assert.ok(blocked.error);
+      assert.equal((await harness.invoke('publish', { job_id: blocked.job_id, generation: blocked.generation }, 400)).error, 'failed_precondition');
+    } finally { await bucket.put(key, Uint8Array.from(file.bytes)); }
+  }
+  assert.equal((await harness.invoke('inspect')).state.attachments, 0);
+});
+
+test('internal ClosureJobs rechecks SQL epoch after an admitted R2 read without persisting stale progress', async t => {
+  const harness = await closureHarness(t);
+  const status = await harness.invoke('begin', { request_id: 'epoch-fence', root: closureKey(objects.get('first_commit')) });
+  const before = await harness.invoke('inspect');
+  await harness.invoke('arm-read');
+  const pending = harness.invoke('advance', { job_id: status.job_id, generation: status.generation }, 403);
+  const deadline = Date.now() + 5000;
+  while (!(await harness.invoke('inspect')).entered) {
+    assert.ok(Date.now() < deadline, 'real R2 read must reach fixture gate');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  await harness.invoke('revoke');
+  await harness.invoke('release-read');
+  assert.equal((await pending).error, 'permission_denied');
+  assert.deepEqual(jobTables(await harness.invoke('inspect')), jobTables(before));
 });

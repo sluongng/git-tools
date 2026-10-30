@@ -8,6 +8,7 @@ description = "Bounded canonical repository validation for WebAssembly hosts"
 [dependencies]
 base64 = "0.22"
 tinytree-landing = { path = "../tinytree-landing" }
+tinytree-search = { path = "../tinytree-search" }
 tinytree-forge-core = { path = "../tinytree-forge-core" }
 tinytree-model = { path = "../tinytree-model" }
 serde = { version = "1", features = ["derive"] }

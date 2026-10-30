@@ -5695,6 +5695,7 @@ dependencies = [
  "tinytree-forge-core",
  "tinytree-landing",
  "tinytree-model",
+ "tinytree-search",
  "tinytree-store",
 ]
 

@@ -1,7 +1,8 @@
-import { inspect, validateClosure, type Descriptor, type Inspection, type ObjectKey } from './core';
+import { inspect, validateClosure, forgeViewCore, type Descriptor, type Inspection, type ObjectKey } from './core';
 import { authenticate, body, digest, fail, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
 import { forgeReply, protectForge, readForgeCall } from './forge';
 import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
+import { ForgeViews } from './forge_views';
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace;
@@ -85,6 +86,8 @@ export class AccountRepository {
       'CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, principal TEXT NOT NULL, fingerprint TEXT NOT NULL, status INTEGER, result TEXT)',
       'CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, generation INTEGER NOT NULL, head TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, head TEXT NOT NULL, active INTEGER NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS forge_validated_roots(kind INTEGER NOT NULL, id TEXT NOT NULL, proof TEXT NOT NULL, PRIMARY KEY(kind,id))',
+      'CREATE TABLE IF NOT EXISTS forge_retained_roots(owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, kind INTEGER NOT NULL, id TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN(0,1)), PRIMARY KEY(owner_kind,owner_id,kind,id))',
     ]) this.sql.exec(statement);
   }
   async fetch(request: Request): Promise<Response> {
@@ -208,6 +211,10 @@ export class AccountRepository {
         }
         this.sql.exec('INSERT INTO repository(singleton,account) VALUES(1,?)', account);
         this.sql.exec('INSERT INTO refs(name,generation,head) VALUES(\'main\',1,?)', head);
+        // stageGenesis checked this exact complete native closure and confirmed
+        // both durable puts. Installing proof/root is atomic with the account.
+        this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-genesis-v1', root: head }));
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1)', head);
       },
       currentMainInTx: () => {
         const main = this.one('SELECT generation,head FROM refs WHERE name=\'main\'');
@@ -215,7 +222,35 @@ export class AccountRepository {
         return { head: String(main.head), generation: Number(main.generation) };
       },
     });
-    const result = await api.handle(call);
+    let result;
+    if ([4, 5, 11].includes(call.operation)) {
+      const requireCanonicalRootInTx = (head: string): void => {
+        if (!this.one('SELECT id FROM objects WHERE kind=3 AND id=? AND visible=1', head)) fail(403, 'permission_denied');
+        if (!this.one('SELECT id FROM forge_validated_roots WHERE kind=3 AND id=?', head)) fail(400, 'failed_precondition');
+      };
+      const views = new ForgeViews({
+        accountId: call.account_id, principal: auth.principal, sql: this.sql, core: forgeViewCore,
+        transactionSync: callback => this.ctx.storage.transactionSync(callback),
+        policySnapshotInTx: () => api.policySnapshotInTx(), requireAdminInTx: () => api.requireAdminInTx(),
+        replayInTx: (id, fingerprint) => api.replayInTx(id, fingerprint),
+        finishInTx: (id, fingerprint, value) => api.finishInTx(id, fingerprint, value),
+        bumpEpochInTx: expected => api.bumpEpochInTx(expected),
+        setPublicViewInTx: version => api.setPublicViewInTx(version),
+        accountWireInTx: () => api.accountWireInTx(),
+        currentMainInTx: () => { const row = this.one('SELECT head,generation FROM refs WHERE name=\'main\''); if (!row) fail(503, 'failed_precondition'); return { head: String(row.head), generation: Number(row.generation) }; },
+        requireCanonicalRootInTx,
+        retainViewRootInTx: (version, head) => {
+          requireCanonicalRootInTx(head);
+          this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'view\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', version, head);
+        },
+        releaseViewRootsInTx: version => {
+          // Projection retention will be added by its own ledger, never by an
+          // account-wide object deletion or a digest-only read allowance.
+          this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'view\' AND owner_id=?', version);
+        },
+      });
+      result = await views.handle(call);
+    } else result = await api.handle(call);
     return forgeReply(call, result.state, result.result);
   }
   private async stageGenesis(account: string, objects: CanonicalAccountObject[], staged: Set<string>): Promise<void> {

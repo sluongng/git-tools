@@ -1,4 +1,5 @@
 import coreModule from './core.wasm';
+import type { ViewCore } from './forge_views';
 
 export interface ObjectKey { kind: number; id: string }
 export interface Descriptor extends ObjectKey { size_bytes: number; format_version: number }
@@ -13,6 +14,13 @@ interface CoreExports {
   tt_forge_parse_call(pointer: number, length: number): number;
   tt_forge_account_command(pointer: number, length: number): number;
   tt_forge_build_candidate(pointer: number, length: number): number;
+  tt_forge_build_projection(pointer: number, length: number): number;
+  tt_closure_step(pointer: number, length: number): number;
+  tt_forge_view_command(pointer: number, length: number): number;
+  tt_forge_view_policy(pointer: number, length: number): number;
+  tt_forge_view_paths(pointer: number, length: number): number;
+  tt_forge_advance_view(pointer: number, length: number): number;
+  tt_forge_search_file(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -75,3 +83,45 @@ export function buildForgeCandidate(input: unknown): unknown {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_build_candidate(pointer, bytes.byteLength));
 }
+
+/** Internal authorized selection only; output includes host-private copy origins.
+ * Construction is not proof of ACL, object availability or publication. */
+export function buildForgeProjection(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_build_projection(pointer, bytes.byteLength));
+}
+
+/** Internal native graph/path facts. SQL owns monotonic frontier coverage and
+ * fresh FILE verification; a page is not a complete closure or read grant. */
+export function closureStep(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_closure_step(pointer, bytes.byteLength));
+}
+
+/** Internal per-FILE search only. The host owns path authorization, current
+ * policy, cross-file budgets, opaque cursors and unsupported-file accounting. */
+export function searchForgeFile(input: unknown): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_search_file(pointer, bytes.byteLength));
+}
+
+/** Pure canonical policy helpers. Only SQL-derived context/grants may reach the
+ * policy/path/advance methods; normalized public selectors are not authority. */
+export const forgeViewCore: ViewCore = {
+  normalize(input) {
+    const bytes = encoder.encode(JSON.stringify(input));
+    return invoke(bytes, pointer => core.tt_forge_view_command(pointer, bytes.byteLength)) as ReturnType<ViewCore['normalize']>;
+  },
+  resolvePolicy(input) {
+    const bytes = encoder.encode(JSON.stringify(input));
+    return invoke(bytes, pointer => core.tt_forge_view_policy(pointer, bytes.byteLength)) as ReturnType<ViewCore['resolvePolicy']>;
+  },
+  pathsAllowed(input) {
+    const bytes = encoder.encode(JSON.stringify(input));
+    return invoke(bytes, pointer => core.tt_forge_view_paths(pointer, bytes.byteLength)) as ReturnType<ViewCore['pathsAllowed']>;
+  },
+  advance(input) {
+    const bytes = encoder.encode(JSON.stringify(input));
+    return invoke(bytes, pointer => core.tt_forge_advance_view(pointer, bytes.byteLength)) as ReturnType<ViewCore['advance']>;
+  },
+};
