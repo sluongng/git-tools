@@ -2,6 +2,7 @@
 //! leases. Git conversion, jj catalogs and mount residency are separate layers.
 mod client;
 mod config;
+mod forge_http;
 mod transport;
 mod verified;
 pub use client::NativeClient;
@@ -25,7 +26,7 @@ pub use client::query::{
     GraphRow, IdRow, PrefixTarget, QueryFact,
 };
 pub use client::search::{CheckedSearch, CheckedSearchPage};
-pub use config::{Config, ConfigError, Limits, Tls};
+pub use config::{Config, ConfigError, Limits, Tls, Transport};
 pub use tinytree_proto::PublicationFailureReason;
 pub use tinytree_proto::cloud_v1 as cloud_protocol;
 pub use tinytree_proto::forge_v1 as forge_protocol;

@@ -12,105 +12,8 @@ const MAX_ATTEMPTS: usize = 8;
 const MAX_DECISIONS: usize = 128;
 const MAX_COMMENTS: usize = 128;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeReviewDependency {
-    pub change_id: [u8; 16],
-    pub patchset_id: [u8; 32],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeReviewLineageOperation {
-    Rename,
-    Copy,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeReviewLineageHint {
-    pub operation: ForgeReviewLineageOperation,
-    pub source_path: String,
-    pub target_path: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct ForgeReviewPushRequest {
-    pub request_id: String,
-    pub source_base: CommitId,
-    pub source_head: CommitId,
-    pub view_version: [u8; 32],
-    pub expected_patchset: Option<[u8; 32]>,
-    pub predecessor: Option<ForgeReviewDependency>,
-    pub provenance: Option<[u8; 32]>,
-    pub lineage: Vec<ForgeReviewLineageHint>,
-    /// Selected by trusted server configuration, not an arbitrary client command.
-    pub check_profile: LandingCheckProfile,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeReviewState {
-    RebasePending,
-    Prepared,
-    Conflict,
-    Stale,
-    ChecksPending,
-    ReadyToLand,
-    Landed,
-    Unsupported,
-    CheckFailed,
-    Expired,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForgeReviewCandidate {
-    pub id: [u8; 32],
-    pub head: [u8; 32],
-    pub root_tree: [u8; 32],
-    pub target: [u8; 32],
-    pub target_generation: u64,
-    pub rewrites: Vec<ForgeReviewRewrite>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForgeReviewRewrite {
-    pub old: [u8; 32],
-    pub new: [u8; 32],
-    pub change_id: [u8; 16],
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForgeReview {
-    pub change_id: [u8; 16],
-    pub owner: String,
-    pub patchset_id: [u8; 32],
-    pub patchset_number: u64,
-    pub is_current: bool,
-    pub source_base: [u8; 32],
-    pub source_head: [u8; 32],
-    pub view_version: [u8; 32],
-    pub predecessor: Option<ForgeReviewDependency>,
-    pub provenance: Option<[u8; 32]>,
-    pub lineage: Vec<ForgeReviewLineageHint>,
-    pub check_profile: LandingCheckProfile,
-    pub state: ForgeReviewState,
-    pub candidate: Option<ForgeReviewCandidate>,
-    pub conflict_path: Option<String>,
-    pub approvals: usize,
-    pub comments: Vec<ForgeReviewComment>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForgeReviewComment {
-    pub author: String,
-    pub patchset_id: [u8; 32],
-    pub body: String,
-    pub path: Option<String>,
-    pub created_at: i64,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeReviewDecision {
-    Approve,
-    RequestChanges,
-}
+pub use tinytree_forge_core::review::*;
+use tinytree_forge_core::identity;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -221,11 +124,7 @@ fn binding_key(repo: &str, job: [u8; 32]) -> Vec<u8> {
     scoped(BINDINGS, repo, &job)
 }
 fn operation_key(account: &AccountId, actor: &ForgeActor, request: &str) -> Vec<u8> {
-    let mut h = blake3::Hasher::new();
-    h.update(actor.principal.as_bytes());
-    h.update(&[0]);
-    h.update(request.as_bytes());
-    scoped(REQUESTS, &account.0, h.finalize().as_bytes())
+    scoped(REQUESTS, &account.0, &identity::operation_id(&actor.principal, request))
 }
 fn object(id: [u8; 32]) -> ObjectKey {
     ObjectKey {
@@ -239,22 +138,6 @@ fn bounded<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>> {
         return Err(Error::Limit("review record bytes"));
     }
     Ok(bytes)
-}
-fn push_fingerprint(r: &ForgeReviewPushRequest) -> Result<[u8; 32]> {
-    Ok(*blake3::hash(&bounded(
-        &(
-            r.source_base.0,
-            r.source_head.0,
-            r.view_version,
-            r.expected_patchset,
-            &r.predecessor,
-            r.provenance,
-            &r.lineage,
-            &r.check_profile,
-        ),
-        16 * 1024,
-    )?)
-    .as_bytes())
 }
 
 impl Inner {
@@ -837,7 +720,7 @@ impl Store {
         {
             return Err(Error::Invalid("review check profile"));
         }
-        let fingerprint = push_fingerprint(request)?;
+        let fingerprint = identity::push_fingerprint(request)?;
         let replay_key = operation_key(account, actor, &request.request_id);
         let (change, patchset) = {
             let _gate = self.inner.lock()?;
@@ -959,13 +842,7 @@ impl Store {
                 if record.patchsets.len() >= MAX_PATCHSETS {
                     return Err(Error::Limit("review patchsets"));
                 }
-                let mut h = blake3::Hasher::new();
-                h.update(b"tinytree-forge-patchset-v1\0");
-                h.update(account.0.as_bytes());
-                h.update(&change);
-                h.update(&fingerprint);
-                h.update(&access.epoch.0.to_be_bytes());
-                let id = *h.finalize().as_bytes();
+                let id = identity::patchset_id(account, ChangeId(change), fingerprint, access.epoch);
                 record.patchsets.push(Patchset {
                     id,
                     epoch: access.epoch.0,
@@ -1146,11 +1023,7 @@ impl Store {
                         return Err(Error::Limit("review rebase attempts"));
                     }
                     let token = format!("forge-{}-{}", hex(&patchset_id), p.attempts.len());
-                    let mut h = blake3::Hasher::new();
-                    h.update(b"tinytree-forge-review-owner-v1\0");
-                    h.update(account.0.as_bytes());
-                    h.update(&change.0);
-                    let owner = *h.finalize().as_bytes();
+                    let owner = identity::review_owner(account, change);
                     let job =
                         crate::landing::job_id(&access.repository, LandingOwner(owner), &token);
                     let attempt = Attempt {
@@ -1438,11 +1311,7 @@ impl Store {
     ) -> Result<ForgeReview> {
         request_token(request_id)?;
         let replay_key = operation_key(account, actor, request_id);
-        let fingerprint = *blake3::hash(&bounded(
-            &("decision", change.0, patchset, candidate, decision),
-            1024,
-        )?)
-        .as_bytes();
+        let fingerprint = identity::decision_fingerprint(change, patchset, candidate, decision)?;
         {
             let _gate = self.inner.lock()?;
             let db = self.inner.db.read_tx();
@@ -1573,8 +1442,7 @@ impl Store {
     ) -> Result<ForgeReview> {
         request_token(request_id)?;
         let replay_key = operation_key(account, actor, request_id);
-        let fingerprint =
-            *blake3::hash(&bounded(&("land", change.0, patchset, candidate), 1024)?).as_bytes();
+        let fingerprint = identity::land_fingerprint(change, patchset, candidate)?;
         let (repo, owner, token) = {
             let _gate = self.inner.lock()?;
             let db = self.inner.db.read_tx();
@@ -1664,11 +1532,7 @@ impl Store {
             return Err(Error::Limit("review comment"));
         }
         let replay_key = operation_key(account, actor, request_id);
-        let fingerprint = *blake3::hash(&bounded(
-            &("comment", change.0, patchset, body, path),
-            12 * 1024,
-        )?)
-        .as_bytes();
+        let fingerprint = identity::comment_fingerprint(change, patchset, body, path)?;
         {
             let _gate = self.inner.lock()?;
             let db = self.inner.db.read_tx();

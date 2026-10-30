@@ -69,9 +69,24 @@ pub struct Tls {
     pub ca_certificate: PathBuf,
     pub domain_name: Option<String>,
 }
+/// Explicit wire protocol; an HTTPS URL alone does not distinguish gRPC.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    Grpc,
+    ForgeHttpsV1,
+}
+impl Transport {
+    fn is_grpc(value: &Self) -> bool {
+        *value == Self::Grpc
+    }
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Transport::is_grpc")]
+    pub transport: Transport,
     pub endpoint: String,
     pub repository_id: String,
     pub token_env: Option<String>,
@@ -89,6 +104,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            transport: Transport::Grpc,
             endpoint: "http://127.0.0.1:8093".into(),
             repository_id: "default".into(),
             token_env: None,
@@ -200,7 +216,10 @@ impl Config {
             }
         }
         if self.endpoint.starts_with("unix://") {
-            if self.tls.is_some() || !Path::new(&self.endpoint[7..]).is_absolute() {
+            if self.transport != Transport::Grpc
+                || self.tls.is_some()
+                || !Path::new(&self.endpoint[7..]).is_absolute()
+            {
                 return Err(ConfigError("invalid native Unix endpoint"));
             }
             return Ok(());
@@ -215,8 +234,20 @@ impl Config {
         {
             return Err(ConfigError("invalid native endpoint"));
         }
+        if self.transport == Transport::ForgeHttpsV1
+            && self
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.domain_name.as_deref())
+                .is_some_and(|domain| {
+                    !uri.host()
+                        .is_some_and(|host| host.eq_ignore_ascii_case(domain))
+                })
+        {
+            return Err(ConfigError("HTTPS trust name must match the endpoint host"));
+        }
         match uri.scheme_str() {
-            Some("https") if self.tls.is_some() => {}
+            Some("https") if self.tls.is_some() || self.transport == Transport::ForgeHttpsV1 => {}
             Some("http")
                 if self.tls.is_none()
                     && uri

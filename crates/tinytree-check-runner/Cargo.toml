@@ -6,6 +6,7 @@ license = "MIT"
 description = "Bounded operator-trusted checks on immutable native source mounts"
 
 [dependencies]
+tinytree-forge-core = { path = "../tinytree-forge-core" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4.5", features = ["derive"] }

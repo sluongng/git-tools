@@ -2,6 +2,7 @@
 //! Descriptor-only FILE entries in closure requests MUST come from the host's
 //! verified, durable byte receipts; this API cannot authenticate an external CAS.
 use serde::Deserialize;
+mod forge;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -374,6 +375,18 @@ pub extern "C" fn tt_inspect(kind: u32, ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_validate_closure(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, validate_closure)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_validate_view(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, forge::validate_view)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_parse_call(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, |bytes| {
+        let envelope = tinytree_forge_core::wire::Call::decode(bytes)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(envelope).map_err(|_| "forge envelope encoding".to_string())
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_output_ptr() -> *const u8 {

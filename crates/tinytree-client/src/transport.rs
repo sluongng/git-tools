@@ -12,29 +12,58 @@ use tonic::{
     transport::Channel,
 };
 #[derive(Clone)]
+enum Backend {
+    Grpc {
+        channel: Channel,
+        client: tonic::client::Grpc<Channel>,
+    },
+    Https(crate::forge_http::Client),
+}
+#[derive(Clone)]
 pub(crate) struct Client {
-    channel: Channel,
-    inner: tonic::client::Grpc<Channel>,
+    backend: Backend,
     limits: Limits,
     decode: usize,
+    encode: usize,
     owner: Option<PhysicalOwner>,
 }
 impl Client {
     pub fn new(channel: Channel, limits: Limits) -> Self {
-        let decode = limits.max_batch_bytes;
         Self {
-            inner: tonic::client::Grpc::new(channel.clone()),
-            channel,
+            decode: limits.max_batch_bytes,
+            encode: limits.max_request_bytes,
+            backend: Backend::Grpc {
+                client: tonic::client::Grpc::new(channel.clone()),
+                channel,
+            },
             limits,
-            decode,
             owner: None,
         }
     }
-    /// Small replies use no compression: a decoded-byte cap alone does not
-    /// bound an advertised compression window. Keep the same channel and owner.
+    pub fn https(client: crate::forge_http::Client, limits: Limits) -> Self {
+        Self {
+            decode: limits.max_batch_bytes,
+            encode: limits.max_request_bytes,
+            backend: Backend::Https(client),
+            limits,
+            owner: None,
+        }
+    }
+    fn grpc(&self) -> Result<tonic::client::Grpc<Channel>, Status> {
+        match &self.backend {
+            Backend::Grpc { client, .. } => Ok(client
+                .clone()
+                .max_decoding_message_size(self.decode)
+                .max_encoding_message_size(self.encode)),
+            Backend::Https(_) => Err(Status::unimplemented(
+                "operation is unavailable over Forge HTTPS",
+            )),
+        }
+    }
     pub fn uncompressed(mut self) -> Self {
-        self.inner =
-            tonic::client::Grpc::new(self.channel.clone()).max_decoding_message_size(self.decode);
+        if let Backend::Grpc { channel, client } = &mut self.backend {
+            *client = tonic::client::Grpc::new(channel.clone());
+        }
         self
     }
     pub fn with_owner(mut self, owner: PhysicalOwner) -> Self {
@@ -43,19 +72,22 @@ impl Client {
     }
     pub fn max_decoding_message_size(mut self, n: usize) -> Self {
         self.decode = n;
-        self.inner = self.inner.max_decoding_message_size(n);
         self
     }
     pub fn max_encoding_message_size(mut self, n: usize) -> Self {
-        self.inner = self.inner.max_encoding_message_size(n);
+        self.encode = n;
         self
     }
     pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.inner = self.inner.send_compressed(encoding);
+        if let Backend::Grpc { client, .. } = &mut self.backend {
+            *client = client.clone().send_compressed(encoding);
+        }
         self
     }
     pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-        self.inner = self.inner.accept_compressed(encoding);
+        if let Backend::Grpc { client, .. } = &mut self.backend {
+            *client = client.clone().accept_compressed(encoding);
+        }
         self
     }
     async fn unary<T: Message + Send + 'static, U: Message + Default + Send + 'static>(
@@ -64,11 +96,12 @@ impl Client {
         path: &'static str,
         shape: Shape,
     ) -> Result<Response<U>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .unary(
                 request,
                 http::uri::PathAndQuery::from_static(path),
@@ -86,23 +119,22 @@ impl Client {
         self.limits.max_batch_items = limits.max_rewrites;
         self.limits.max_metadata_bytes = limits.max_conflict_path_bytes;
         self.decode = limits.max_response_bytes;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(self.decode)
-            .max_encoding_message_size(16 * 1024);
+        self.encode = 16 * 1024;
         self.unary(request, path, Shape::LandingResponse).await
     }
     pub(crate) async fn forge_call(
         &mut self,
         request: Request<tinytree_proto::forge_v1::ForgeCallRequest>,
+        deadline: tokio::time::Instant,
     ) -> Result<Response<tinytree_proto::forge_v1::ForgeCallResponse>, Status> {
+        if let Backend::Https(client) = &self.backend {
+            return client
+                .call(request, deadline, self.owner.clone())
+                .await
+                .map(Response::new);
+        }
         self.decode = tinytree_proto::FORGE_MAX_RESPONSE_BYTES;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(self.decode)
-            .max_encoding_message_size(tinytree_proto::FORGE_MAX_REQUEST_BYTES);
+        self.encode = tinytree_proto::FORGE_MAX_REQUEST_BYTES;
         self.unary(
             request,
             "/tinytree.forge.v1.Forge/Call",
@@ -126,11 +158,7 @@ impl Client {
         self.limits.max_metadata_bytes = limits.max_manifest_bytes;
         self.limits.max_frame_bytes = limits.max_chunk_bytes;
         self.decode = cap;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(request_bound);
+        self.encode = request_bound;
         self.unary(request, path, shape).await
     }
     pub(crate) async fn cloud_read(
@@ -139,17 +167,15 @@ impl Client {
         limits: &crate::CloudLimits,
     ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::ObjectChunk>>, Status> {
         let cap = limits.max_chunk_bytes + 1024;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(4096);
+        self.decode = cap;
+        self.encode = 4096;
         self.limits.max_frame_bytes = limits.max_chunk_bytes;
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 request,
                 http::uri::PathAndQuery::from_static(
@@ -169,17 +195,15 @@ impl Client {
         limits: &crate::CloudLimits,
     ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::ObjectChunk>>, Status> {
         let cap = limits.max_chunk_bytes + 1024;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(4096);
+        self.decode = cap;
+        self.encode = 4096;
         self.limits.max_frame_bytes = limits.max_chunk_bytes;
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 request,
                 http::uri::PathAndQuery::from_static(
@@ -199,17 +223,15 @@ impl Client {
         limits: &crate::CloudLimits,
     ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::IndexArtifactChunk>>, Status> {
         let cap = limits.max_chunk_bytes + 1024;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(4096);
+        self.decode = cap;
+        self.encode = 4096;
         self.limits.max_frame_bytes = limits.max_chunk_bytes;
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 request,
                 http::uri::PathAndQuery::from_static(
@@ -229,17 +251,15 @@ impl Client {
         limits: &crate::CloudLimits,
     ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::CaptureChunk>>, Status> {
         let cap = limits.max_chunk_bytes + 1024;
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(4096);
+        self.decode = cap;
+        self.encode = 4096;
         self.limits.max_frame_bytes = limits.max_chunk_bytes;
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 request,
                 http::uri::PathAndQuery::from_static(
@@ -258,16 +278,14 @@ impl Client {
         request: Request<tinytree_proto::cloud_v1::ReadNativeClosureRequest>,
     ) -> Result<Response<Streaming<tinytree_proto::cloud_v1::NativeClosureChunk>>, Status> {
         let cap = self.limits.max_frame_bytes.saturating_add(1024);
-        self.inner = self
-            .inner
-            .clone()
-            .max_decoding_message_size(cap)
-            .max_encoding_message_size(self.limits.max_request_bytes);
-        self.inner
+        self.decode = cap;
+        self.encode = self.limits.max_request_bytes;
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 request,
                 http::uri::PathAndQuery::from_static(
@@ -286,11 +304,12 @@ impl Client {
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
         owner: PhysicalOwner,
     ) -> Result<Response<q::QueryScope>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .client_streaming(
                 request.into_streaming_request(),
                 http::uri::PathAndQuery::from_static(
@@ -310,11 +329,12 @@ impl Client {
         request: impl tonic::IntoStreamingRequest<Message = q::OpenScopeFrame>,
         owner: PhysicalOwner,
     ) -> Result<Response<q::QueryScope>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .client_streaming(
                 request.into_streaming_request(),
                 http::uri::PathAndQuery::from_static(
@@ -334,11 +354,12 @@ impl Client {
         request: impl tonic::IntoStreamingRequest<Message = q::ForkScopeFrame>,
         owner: PhysicalOwner,
     ) -> Result<Response<q::QueryScope>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .client_streaming(
                 request.into_streaming_request(),
                 http::uri::PathAndQuery::from_static(
@@ -372,27 +393,23 @@ impl Client {
         // The transport/decompress cap must match cleanup admission, not the
         // much larger ordinary metadata-page response cap.
         let mut grpc = self
-            .clone()
+            .grpc()?
             .max_decoding_message_size(QUERY_CLOSE_CAP)
             .max_encoding_message_size(QUERY_CLOSE_CAP);
-        grpc.inner
-            .ready()
+        grpc.ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        grpc.inner
-            .unary(
-                request,
-                http::uri::PathAndQuery::from_static(
-                    "/tinytree.query.v1.RepositoryQuery/CloseQuery",
-                ),
-                BoundedCodec::<q::CloseQueryRequest, q::CloseQueryResponse>::new(
-                    Shape::QueryEmpty,
-                    self.limits.clone(),
-                    QUERY_CLOSE_CAP,
-                )
-                .with_owner(owner),
+        grpc.unary(
+            request,
+            http::uri::PathAndQuery::from_static("/tinytree.query.v1.RepositoryQuery/CloseQuery"),
+            BoundedCodec::<q::CloseQueryRequest, q::CloseQueryResponse>::new(
+                Shape::QueryEmpty,
+                self.limits.clone(),
+                QUERY_CLOSE_CAP,
             )
-            .await
+            .with_owner(owner),
+        )
+        .await
     }
     pub async fn query_facts(
         &mut self,
@@ -537,11 +554,12 @@ impl Client {
             Ok(q::Projection::Canonical) => Shape::CanonicalPage,
             _ => return Err(Status::invalid_argument("invalid query projection")),
         };
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .unary(
                 request,
                 http::uri::PathAndQuery::from_static("/tinytree.query.v1.RepositoryQuery/Evaluate"),
@@ -616,11 +634,12 @@ impl Client {
         &mut self,
         r: Request<p::BatchReadObjectsRequest>,
     ) -> Result<Response<Streaming<p::ObjectResult>>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 r,
                 http::uri::PathAndQuery::from_static("/tinytree.v1.Repository/BatchReadObjects"),
@@ -637,11 +656,12 @@ impl Client {
         &mut self,
         r: Request<p::ReadFileRequest>,
     ) -> Result<Response<Streaming<p::FileFrame>>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .server_streaming(
                 r,
                 http::uri::PathAndQuery::from_static("/tinytree.v1.Repository/ReadFile"),
@@ -658,11 +678,12 @@ impl Client {
         &mut self,
         r: impl tonic::IntoStreamingRequest<Message = p::WriteFrame>,
     ) -> Result<Response<p::WriteReceipt>, Status> {
-        self.inner
+        let mut inner = self.grpc()?;
+        inner
             .ready()
             .await
             .map_err(|_| Status::unavailable("native gRPC transport not ready"))?;
-        self.inner
+        inner
             .client_streaming(
                 r.into_streaming_request(),
                 http::uri::PathAndQuery::from_static("/tinytree.v1.Repository/WriteObject"),

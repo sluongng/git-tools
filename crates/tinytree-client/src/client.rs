@@ -49,7 +49,7 @@ pub struct NativeClient {
 }
 struct Inner {
     config: Config,
-    grpc: RepositoryClient,
+    transport: RepositoryClient,
     token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     inflight: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
@@ -151,7 +151,7 @@ impl NativeClient {
         Arc::new(guards)
     }
     fn rpc_client(&self, budget: Arc<Budget>) -> RepositoryClient {
-        self.inner.grpc.clone().with_owner(budget)
+        self.inner.transport.clone().with_owner(budget)
     }
     pub async fn connect(config: Config) -> Result<Self, Status> {
         Self::connect_with_trust(config, None).await
@@ -194,93 +194,128 @@ impl NativeClient {
                 )
             }
         };
-        let channel = if let Some(path) = config.endpoint.strip_prefix("unix://") {
-            #[cfg(unix)]
-            {
-                let checked = PathBuf::from(path);
-                blocking(deadline, move || secure_unix(&checked)).await?;
-                let path = PathBuf::from(path);
-                let endpoint = Endpoint::from_static("http://[::]:50051")
-                    .connect_timeout(config.rpc.connect_timeout());
-                reapi::policy::timeout(deadline, async {
-                    endpoint
-                        .connect_with_connector(tower::service_fn(move |_| {
-                            let path = path.clone();
-                            async move {
-                                tokio::net::UnixStream::connect(path)
-                                    .await
-                                    .map(hyper_util::rt::TokioIo::new)
+        let transport = if config.transport == crate::Transport::ForgeHttpsV1 {
+            let ca = match (&config.tls, ca_snapshot) {
+                (_, Some(ca)) => Some(ca),
+                (Some(tls), None) => {
+                    let path = tls.ca_certificate.clone();
+                    Some(Arc::from(
+                        blocking(deadline, move || {
+                            use std::io::Read;
+                            let mut bytes = Vec::new();
+                            std::fs::File::open(path)
+                                .and_then(|file| file.take(1024 * 1024 + 1).read_to_end(&mut bytes))
+                                .map_err(|_| {
+                                    Status::failed_precondition("cannot read native trust roots")
+                                })?;
+                            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                                return Err(Status::resource_exhausted(
+                                    "native trust roots exceed limit",
+                                ));
                             }
-                        }))
-                        .await
-                        .map_err(|_| Status::unavailable("cannot connect to native Unix endpoint"))
-                })
-                .await?
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = path;
-                return Err(Status::failed_precondition("Unix transport unavailable"));
-            }
+                            Ok(bytes)
+                        })
+                        .await?,
+                    ))
+                }
+                (None, None) => None,
+            };
+            RepositoryClient::https(
+                crate::forge_http::Client::new(&config, ca)?,
+                config.limits.clone(),
+            )
         } else {
-            let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
-                .map_err(|_| Status::invalid_argument("invalid native endpoint"))?
-                .connect_timeout(config.rpc.connect_timeout());
-            if let Some(tls) = &config.tls {
-                let path = tls.ca_certificate.clone();
-                let ca = if let Some(ca) = ca_snapshot {
-                    ca.as_ref().to_vec()
-                } else {
-                    blocking(deadline, move || {
-                        use std::io::Read;
-                        let mut bytes = Vec::new();
-                        std::fs::File::open(path)
+            let channel = if let Some(path) = config.endpoint.strip_prefix("unix://") {
+                #[cfg(unix)]
+                {
+                    let checked = PathBuf::from(path);
+                    blocking(deadline, move || secure_unix(&checked)).await?;
+                    let path = PathBuf::from(path);
+                    let endpoint = Endpoint::from_static("http://[::]:50051")
+                        .connect_timeout(config.rpc.connect_timeout());
+                    reapi::policy::timeout(deadline, async {
+                        endpoint
+                            .connect_with_connector(tower::service_fn(move |_| {
+                                let path = path.clone();
+                                async move {
+                                    tokio::net::UnixStream::connect(path)
+                                        .await
+                                        .map(hyper_util::rt::TokioIo::new)
+                                }
+                            }))
+                            .await
                             .map_err(|_| {
-                                Status::failed_precondition("cannot read native trust roots")
-                            })?
-                            .take(1024 * 1024 + 1)
-                            .read_to_end(&mut bytes)
-                            .map_err(|_| {
-                                Status::failed_precondition("cannot read native trust roots")
-                            })?;
-                        if bytes.is_empty() || bytes.len() > 1024 * 1024 {
-                            return Err(Status::resource_exhausted(
-                                "native trust roots exceed limit",
-                            ));
-                        }
-                        Ok(bytes)
+                                Status::unavailable("cannot connect to native Unix endpoint")
+                            })
                     })
                     .await?
-                };
-                let mut settings = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
-                if let Some(domain) = &tls.domain_name {
-                    settings = settings.domain_name(domain);
                 }
-                endpoint = endpoint
-                    .tls_config(settings)
-                    .map_err(|_| Status::failed_precondition("invalid native TLS configuration"))?;
-            }
-            config
-                .rpc
-                .retry(deadline, config.rpc.connect_timeout(), |_| {
-                    let endpoint = endpoint.clone();
-                    async move {
-                        endpoint
-                            .connect()
-                            .await
-                            .map_err(|_| Status::unavailable("cannot connect to native endpoint"))
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    return Err(Status::failed_precondition("Unix transport unavailable"));
+                }
+            } else {
+                let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+                    .map_err(|_| Status::invalid_argument("invalid native endpoint"))?
+                    .connect_timeout(config.rpc.connect_timeout());
+                if let Some(tls) = &config.tls {
+                    let path = tls.ca_certificate.clone();
+                    let ca = if let Some(ca) = ca_snapshot {
+                        ca.as_ref().to_vec()
+                    } else {
+                        blocking(deadline, move || {
+                            use std::io::Read;
+                            let mut bytes = Vec::new();
+                            std::fs::File::open(path)
+                                .map_err(|_| {
+                                    Status::failed_precondition("cannot read native trust roots")
+                                })?
+                                .take(1024 * 1024 + 1)
+                                .read_to_end(&mut bytes)
+                                .map_err(|_| {
+                                    Status::failed_precondition("cannot read native trust roots")
+                                })?;
+                            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                                return Err(Status::resource_exhausted(
+                                    "native trust roots exceed limit",
+                                ));
+                            }
+                            Ok(bytes)
+                        })
+                        .await?
+                    };
+                    let mut settings =
+                        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
+                    if let Some(domain) = &tls.domain_name {
+                        settings = settings.domain_name(domain);
                     }
-                })
-                .await?
+                    endpoint = endpoint.tls_config(settings).map_err(|_| {
+                        Status::failed_precondition("invalid native TLS configuration")
+                    })?;
+                }
+                config
+                    .rpc
+                    .retry(deadline, config.rpc.connect_timeout(), |_| {
+                        let endpoint = endpoint.clone();
+                        async move {
+                            endpoint.connect().await.map_err(|_| {
+                                Status::unavailable("cannot connect to native endpoint")
+                            })
+                        }
+                    })
+                    .await?
+            };
+            let mut grpc = RepositoryClient::new(channel, config.limits.clone())
+                .max_decoding_message_size(config.limits.max_batch_bytes)
+                .max_encoding_message_size(config.limits.max_request_bytes);
+            if config.compression {
+                grpc = grpc
+                    .send_compressed(CompressionEncoding::Zstd)
+                    .accept_compressed(CompressionEncoding::Zstd);
+            }
+            grpc
         };
-        let mut grpc = RepositoryClient::new(channel, config.limits.clone())
-            .max_decoding_message_size(config.limits.max_batch_bytes)
-            .max_encoding_message_size(config.limits.max_request_bytes);
-        if config.compression {
-            grpc = grpc
-                .send_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Zstd);
-        }
         let (query_cleanup, cleanup_receiver) =
             tokio::sync::mpsc::channel(config.limits.query_cleanup_capacity);
         let client = Self {
@@ -300,7 +335,7 @@ impl NativeClient {
                 )),
                 disk: Arc::new(Semaphore::new(config.limits.max_temporary_bytes as usize)),
                 config,
-                grpc,
+                transport,
                 token,
                 query_cleanup,
             }),

@@ -3124,8 +3124,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tinytree-annotate",
- "tinytree-client",
  "tinytree-check-runner",
+ "tinytree-client",
  "tinytree-cloud",
  "tinytree-fixture",
  "tinytree-index",
@@ -4843,12 +4843,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -5627,6 +5629,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tinytree-forge-core",
  "tokio",
  "toml",
 ]
@@ -5647,7 +5650,9 @@ dependencies = [
  "private-fs",
  "prost",
  "reapi",
+ "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "tinytree-cloud",
  "tinytree-fixture",
@@ -5686,6 +5691,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-forge-core",
  "tinytree-model",
  "tinytree-store",
 ]
@@ -5699,6 +5705,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tinytree-model",
+]
+
+[[package]]
+name = "tinytree-forge-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
  "tinytree-model",
 ]
 
@@ -5748,8 +5765,8 @@ dependencies = [
  "tinytree-store",
  "tokio",
  "tokio-stream",
- "tonic",
  "toml",
+ "tonic",
  "uuid",
 ]
 
@@ -5768,6 +5785,23 @@ dependencies = [
  "tinytree-model",
  "tinytree-search",
  "uuid",
+]
+
+[[package]]
+name = "tinytree-inventory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-client",
+ "tinytree-model",
+ "tinytree-proto",
+ "tinytree-server",
+ "tinytree-store",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -5865,8 +5899,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tinytree-cloud",
- "tinytree-model",
+ "tinytree-forge-core",
  "tinytree-landing",
+ "tinytree-model",
  "windows-sys 0.61.2",
  "zstd 0.13.3",
 ]
@@ -6473,6 +6508,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

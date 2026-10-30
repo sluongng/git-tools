@@ -112,6 +112,217 @@ async fn forge_transport_fixture(
     (client, fixture, stop, task)
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ForgeHttpMode {
+    RetryExact,
+    Rebound,
+    WrongVersion,
+    Denied,
+    StatusMismatch,
+    Redirect,
+    ExtraField,
+    EncodedResponseLimit,
+    ChunkedResponseLimit,
+    SlowBody,
+}
+async fn forge_http_fixture(
+    mode: ForgeHttpMode,
+) -> (
+    NativeClient,
+    Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = inputs.clone();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (mut socket, _) =
+                tokio::select! { result=listener.accept()=>result.unwrap(), _=&mut stopped=>break };
+            let seen = seen.clone();
+            connections.spawn(async move {
+                let mut header=Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte=[0];
+                    if socket.read_exact(&mut byte).await.is_err() { return; }
+                    header.push(byte[0]); assert!(header.len()<16384);
+                }
+                let header=String::from_utf8(header).unwrap();
+                assert!(header.starts_with("POST /api/v1/forge/call HTTP/1.1\r\n"));
+                let header=header.to_ascii_lowercase();
+                assert!(header.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+                assert!(header.contains("accept-encoding: identity\r\n"));
+                let len:usize=header.lines().find_map(|line|line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                assert!(len<=tinytree_proto::FORGE_MAX_REQUEST_BYTES);
+                let mut body=vec![0;len]; socket.read_exact(&mut body).await.unwrap();
+                let input:serde_json::Value=serde_json::from_slice(&body).unwrap();
+                let call={ let mut seen=seen.lock().unwrap(); seen.push(input.clone());seen.len() };
+                let mut reply=serde_json::json!({"version":1,"operation":input["operation"],"account_id":input["account_id"],"view":input["view"],"request_id":input["request_id"],"state":"ready","result_json":"{\"ready\":true}"});
+                let mut status=200;
+                match mode {
+                    ForgeHttpMode::RetryExact if call==1 => {status=503;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"transient fixture"}});},
+                    ForgeHttpMode::Rebound=>reply["request_id"]=serde_json::json!("other-request"),
+                    ForgeHttpMode::WrongVersion=>reply["version"]=serde_json::json!(2),
+                    ForgeHttpMode::Denied=>{status=403;reply=serde_json::json!({"version":1,"error":{"code":"permission_denied","message":"fixture denied"}});},
+                    ForgeHttpMode::StatusMismatch=>{status=403;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"not retry authority"}});},
+                    ForgeHttpMode::Redirect=>{status=307;},
+                    ForgeHttpMode::ExtraField=>reply["unexpected"]=serde_json::json!(true),
+                    _=>{},
+                }
+                let body=serde_json::to_vec(&reply).unwrap();
+                if matches!(mode,ForgeHttpMode::ChunkedResponseLimit) {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
+                    let chunk=vec![b' ';65536];
+                    for _ in 0..130 {
+                        if socket.write_all(b"10000\r\n").await.is_err() || socket.write_all(&chunk).await.is_err() || socket.write_all(b"\r\n").await.is_err(){return;}
+                    }
+                    let _=socket.write_all(b"0\r\n\r\n").await;return;
+                }
+                let len=if matches!(mode,ForgeHttpMode::EncodedResponseLimit){tinytree_proto::FORGE_MAX_RESPONSE_BYTES+1}else{body.len()};
+                let header=format!("HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nlocation: /not-a-forge-endpoint\r\nconnection: close\r\n\r\n");
+                socket.write_all(header.as_bytes()).await.unwrap();
+                if matches!(mode,ForgeHttpMode::SlowBody){tokio::time::sleep(Duration::from_millis(300)).await;}
+                let _=socket.write_all(&body).await;
+            });
+        }
+        while let Some(result) = connections.join_next().await {
+            result.unwrap();
+        }
+    });
+    let mut config = Config {
+        transport: tinytree_client::Transport::ForgeHttpsV1,
+        endpoint: format!("http://{address}"),
+        token_env: Some("TINYTREE_CLIENT_TEST_TOKEN".into()),
+        compression: false,
+        ..Default::default()
+    };
+    if matches!(mode, ForgeHttpMode::SlowBody) {
+        config.rpc.operation_timeout_ms = 80;
+        config.rpc.rpc_timeout_ms = 80;
+        config.rpc.connect_timeout_ms = 50;
+    }
+    let client = NativeClient::connect(config).await.unwrap();
+    (client, inputs, stop, task)
+}
+fn forge_http_input() -> tinytree_client::forge_protocol::ForgeCallRequest {
+    tinytree_client::forge_protocol::ForgeCallRequest {
+        operation: tinytree_client::forge_protocol::ForgeOperation::GetAccount as i32,
+        account_id: "alpha".into(),
+        view: "public".into(),
+        request_id: "saved-http-request".into(),
+        payload_json: b"{\n \"exact\":\"quoted \\\" content\"\n}".to_vec(),
+    }
+}
+#[tokio::test]
+async fn forge_https_call_replays_exact_intent_and_rejects_invalid_http_assertions() {
+    for (mode, expected, calls) in [
+        (ForgeHttpMode::RetryExact, None, 2),
+        (ForgeHttpMode::Rebound, Some(Code::DataLoss), 1),
+        (ForgeHttpMode::WrongVersion, Some(Code::DataLoss), 1),
+        (ForgeHttpMode::Denied, Some(Code::PermissionDenied), 1),
+        (ForgeHttpMode::StatusMismatch, Some(Code::DataLoss), 1),
+        (ForgeHttpMode::Redirect, Some(Code::DataLoss), 1),
+        (ForgeHttpMode::ExtraField, Some(Code::DataLoss), 1),
+    ] {
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        let input = forge_http_input();
+        let result = client.forge_call(input.clone()).await;
+        assert_eq!(
+            result.as_ref().err().map(Status::code),
+            expected,
+            "{mode:?}"
+        );
+        if let Ok(reply) = result {
+            assert_eq!(reply.result_json, b"{\"ready\":true}");
+        }
+        let expected = serde_json::json!({"version":1,"operation":input.operation,"account_id":input.account_id,"view":input.view,"request_id":input.request_id,"payload_json":String::from_utf8(input.payload_json).unwrap()});
+        assert_eq!(*inputs.lock().unwrap(), vec![expected; calls], "{mode:?}");
+        assert_eq!(
+            client.open(vec!["main".into()]).await.unwrap_err().code(),
+            Code::Unimplemented
+        );
+        assert_eq!(
+            inputs.lock().unwrap().len(),
+            calls,
+            "raw calls must not fall back to gRPC or HTTP routes"
+        );
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn forge_https_encoded_bounds_and_whole_operation_deadline_are_enforced() {
+    for (mode, code) in [
+        (ForgeHttpMode::EncodedResponseLimit, Code::DataLoss),
+        (ForgeHttpMode::ChunkedResponseLimit, Code::DataLoss),
+        (ForgeHttpMode::SlowBody, Code::DeadlineExceeded),
+    ] {
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        assert_eq!(
+            client
+                .forge_call(forge_http_input())
+                .await
+                .unwrap_err()
+                .code(),
+            code,
+            "{mode:?}"
+        );
+        assert_eq!(inputs.lock().unwrap().len(), 1);
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+    let (client, inputs, stop, task) = forge_http_fixture(ForgeHttpMode::Denied).await;
+    let mut input = forge_http_input();
+    // Semantically below 2 MiB but escaping exceeds the finite HTTP body cap.
+    input.payload_json = vec![b'\n'; tinytree_proto::FORGE_MAX_REQUEST_BYTES / 2 + 1024];
+    assert_eq!(
+        client.forge_call(input).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    assert!(inputs.lock().unwrap().is_empty());
+    stop.send(()).unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn forge_https_connect_is_explicit_and_does_not_connect_a_tonic_channel() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let config = Config {
+        transport: tinytree_client::Transport::ForgeHttpsV1,
+        endpoint: format!("http://{address}"),
+        ..Default::default()
+    };
+    let client = NativeClient::connect(config).await.unwrap();
+    assert_eq!(
+        client.open(vec!["main".into()]).await.unwrap_err().code(),
+        Code::Unimplemented
+    );
+    let https = Config {
+        transport: tinytree_client::Transport::ForgeHttpsV1,
+        endpoint: "https://repository.example".into(),
+        ..Default::default()
+    };
+    assert!(https.validate().is_ok());
+    let insecure = Config {
+        transport: tinytree_client::Transport::ForgeHttpsV1,
+        endpoint: "http://repository.example".into(),
+        ..Default::default()
+    };
+    assert!(insecure.validate().is_err());
+    assert!(
+        serde_json::to_value(Config::default())
+            .unwrap()
+            .get("transport")
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn forge_call_preserves_intent_on_retry_and_rejects_rebound_responses() {
     use tinytree_client::forge_protocol::{ForgeCallRequest, ForgeOperation};

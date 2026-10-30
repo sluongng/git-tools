@@ -174,7 +174,7 @@ async fn call_admitted(
 ) -> Result<p::ForgeCallResponse, Status> {
     let operation = validate(&input)?;
     let account = AccountId(input.account_id.clone());
-    account.validate().map_err(crate::service::store_status)?;
+    account.validate().map_err(|error| crate::service::store_status(error.into()))?;
     let profile = service.landing_host().forge_profile()?;
     let store = service.forge_store();
     let config = service.service_config();

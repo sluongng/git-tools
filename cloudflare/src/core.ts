@@ -9,6 +9,8 @@ interface CoreExports {
   tt_dealloc(pointer: number, length: number): void;
   tt_inspect(kind: number, pointer: number, length: number): number;
   tt_validate_closure(pointer: number, length: number): number;
+  tt_forge_validate_view(pointer: number, length: number): number;
+  tt_forge_parse_call(pointer: number, length: number): number;
   tt_output_ptr(): number;
   tt_output_len(): number;
 }
@@ -38,4 +40,24 @@ export function validateClosure(root: ObjectKey, objects: (Descriptor & { bytes?
   const bytes = encoder.encode(JSON.stringify({ root, objects }));
   const result = invoke(bytes, pointer => core.tt_validate_closure(pointer, bytes.byteLength)) as { valid?: boolean };
   if (result.valid !== true) throw new Error('native closure validation failed');
+}
+
+export interface ForgeCall {
+  version: 1;
+  operation: number;
+  account_id: string;
+  view: string;
+  request_id: string;
+  payload_json: string;
+}
+
+/** Strict Rust framing parser, not a trusted actor or current-policy decision. */
+export function parseForgeCall(bytes: Uint8Array): ForgeCall {
+  return invoke(bytes, pointer => core.tt_forge_parse_call(pointer, bytes.byteLength)) as ForgeCall;
+}
+
+/** Canonical Rust view validation and identity; callers still authorize policy. */
+export function validateForgeView(account_id: string, spec: unknown): { view_version: string; spec: unknown } {
+  const bytes = encoder.encode(JSON.stringify({ account_id, spec }));
+  return invoke(bytes, pointer => core.tt_forge_validate_view(pointer, bytes.byteLength)) as { view_version: string; spec: unknown };
 }

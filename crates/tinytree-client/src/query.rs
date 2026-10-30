@@ -1629,7 +1629,7 @@ impl NativeClient {
             .query_retry(query.deadline, merged_path, |allowance| {
                 query.cleanup_armed = true;
                 query.cleanup_guards = self.guards.clone();
-                let mut grpc = self.inner.grpc.clone();
+                let mut grpc = self.inner.transport.clone();
                 let request = request.clone();
                 let owner = owner.clone();
                 async move {
@@ -1926,7 +1926,7 @@ impl NativeClient {
             .query_retry(core.deadline, merged_path, |allowance| {
                 core.cleanup_armed = true;
                 core.cleanup_guards = self.guards.clone();
-                let mut grpc = self.inner.grpc.clone();
+                let mut grpc = self.inner.transport.clone();
                 let request = request.clone();
                 let owner = owner.clone();
                 async move {
@@ -2191,7 +2191,7 @@ pub(super) struct QueryCleanup {
     queued_bytes: Option<OwnedSemaphorePermit>,
 }
 pub(super) struct CleanupWorker {
-    grpc: RepositoryClient,
+    transport: RepositoryClient,
     token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     policy: reapi::policy::Policy,
     inflight: Arc<Semaphore>,
@@ -2201,7 +2201,7 @@ pub(super) struct CleanupWorker {
 impl CleanupWorker {
     pub(super) fn new(client: &NativeClient) -> Self {
         Self {
-            grpc: client.inner.grpc.clone(),
+            transport: client.inner.transport.clone(),
             token: client.inner.token.clone(),
             policy: client.inner.config.rpc.clone(),
             inflight: client.inner.inflight.clone(),
@@ -2254,7 +2254,7 @@ impl CleanupWorker {
         };
         self.policy
             .retry(deadline, self.policy.rpc_timeout(), |allowance| {
-                let mut grpc = self.grpc.clone();
+                let mut grpc = self.transport.clone();
                 let mut request = Request::new(request.clone());
                 request.set_timeout(allowance);
                 if let Some(token) = &self.token {

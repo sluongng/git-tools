@@ -42,12 +42,7 @@ impl LandingConfig {
 /// Stable authenticated-principal scope selected by the embedding service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LandingOwner(pub [u8; 32]);
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LandingCheckProfile {
-    pub name: String,
-    pub version: String,
-}
+pub use tinytree_forge_core::review::LandingCheckProfile;
 #[derive(Clone, Debug)]
 pub struct LandingRequest {
     pub idempotency_key: String,
@@ -315,13 +310,7 @@ fn encode_record<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>> {
     Ok(writer.bytes)
 }
 pub(super) fn job_id(repo: &str, owner: LandingOwner, token: &str) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"tinytree-landing-job-v1\0");
-    h.update(&(repo.len() as u64).to_be_bytes());
-    h.update(repo.as_bytes());
-    h.update(&owner.0);
-    h.update(token.as_bytes());
-    *h.finalize().as_bytes()
+    tinytree_forge_core::identity::landing_job_id(repo, owner.0, token)
 }
 fn roots(intent: &Intent) -> impl Iterator<Item = ObjectKey> {
     [intent.base, intent.head, intent.target]

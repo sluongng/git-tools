@@ -1,0 +1,21 @@
+[package]
+name = "tinytree-inventory"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded verified inventory of explicitly selected native repository closures"
+
+[dependencies]
+tinytree-client = { path = "../tinytree-client" }
+tinytree-model = { path = "../tinytree-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+
+[dev-dependencies]
+tinytree-store = { path = "../tinytree-store" }
+tinytree-server = { path = "../tinytree-server" }
+tinytree-proto = { path = "../tinytree-proto" }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["zstd", "tls-ring"] }

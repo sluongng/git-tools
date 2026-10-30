@@ -16,6 +16,36 @@ const tokenA = 'account-a-runtime-fixture';
 const tokenB = 'account-b-runtime-fixture';
 const member = 'account-a-member-fixture';
 const sha = value => createHash('sha256').update(value).digest('hex');
+
+test('actual RustWasm shares native Forge view identities and strict HTTP framing', async () => {
+  const { instance } = await WebAssembly.instantiate(await readFile(wasm), {});
+  const core = instance.exports;
+  const invoke = (command, value) => {
+    const bytes = new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
+    const pointer = core.tt_alloc(bytes.byteLength);
+    assert.ok(pointer);
+    try {
+      new Uint8Array(core.memory.buffer, pointer, bytes.byteLength).set(bytes);
+      const ok = core[command](pointer, bytes.byteLength);
+      const result = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(
+        new Uint8Array(core.memory.buffer, core.tt_output_ptr(), core.tt_output_len())));
+      return { ok, result };
+    } finally { core.tt_dealloc(pointer, bytes.byteLength); }
+  };
+  const spec = { name: 'public', root_prefix: 'pkg', include_prefixes: ['src'],
+    exclude_prefixes: ['src/private'], visibility: { kind: 'roles', roles: ['member'] },
+    revision: Array(32).fill(1), export_allowed: true };
+  const view = invoke('tt_forge_validate_view', { account_id: 'example', spec });
+  assert.equal(view.ok, 1);
+  assert.deepEqual(view.result, { view_version: 'b459fc5356b0b5ec653a22dba7073aaaa393b65d4ed317cd1f1c6ef6bcb8b2fa', spec });
+  assert.equal(invoke('tt_forge_validate_view', { account_id: 'example', spec, actor: 'operator' }).ok, 0);
+  const call = { version: 1, operation: 20, account_id: 'example', view: 'public',
+    request_id: 'saved-1', payload_json: '{"source_head":"unchanged opaque payload"}' };
+  assert.deepEqual(invoke('tt_forge_parse_call', call), { ok: 1, result: call });
+  assert.equal(invoke('tt_forge_parse_call', JSON.stringify(call).replace('"operation":20', '"operation":20,"operation":21')).ok, 0);
+  assert.equal(invoke('tt_forge_parse_call', { ...call, actor: 'operator' }).ok, 0);
+});
+
 const principals = () => [
   { principal: 'operator-a', token_sha256: sha(tokenA), accounts: [fixture.account], operator: true },
   { principal: 'operator-b', token_sha256: sha(tokenB), accounts: ['other'], operator: true },

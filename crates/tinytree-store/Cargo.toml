@@ -6,6 +6,7 @@ license = "MIT"
 description = "Durable native repository objects and compare-and-set references"
 
 [dependencies]
+tinytree-forge-core = { path = "../tinytree-forge-core" }
 private-fs = { path = "../private-fs" }
 packblob = { path = "../packblob" }
 tinytree-model = { path = "../tinytree-model" }

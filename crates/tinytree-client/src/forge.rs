@@ -29,16 +29,27 @@ impl NativeClient {
         let deadline = self.deadline();
         // Retained request plus retry/encoding, bounded response and decoding.
         // This uses the same physical-owner budget as other native RPCs.
+        // JSON's encoded body and decoded strings coexist with the retained
+        // semantic envelope; preserve the existing gRPC admission bound.
+        let factor = if self.inner.config.transport == crate::Transport::ForgeHttpsV1 {
+            4
+        } else {
+            3
+        };
         let memory = input
             .encoded_len()
-            .saturating_mul(3)
-            .saturating_add(FORGE_MAX_RESPONSE_BYTES * 3);
+            .saturating_mul(factor)
+            .saturating_add(FORGE_MAX_RESPONSE_BYTES * factor);
         let budget = self.admit(deadline, memory).await?;
         let response = self
             .retry(deadline, false, |allowance| {
                 let request = self.request(input.clone(), allowance);
                 let mut grpc = self.rpc_client(budget.clone()).uncompressed();
-                async move { grpc.forge_call(request).await.map(|r| r.into_inner()) }
+                async move {
+                    grpc.forge_call(request, deadline.min(Instant::now() + allowance))
+                        .await
+                        .map(|r| r.into_inner())
+                }
             })
             .await?;
         if response.operation != input.operation

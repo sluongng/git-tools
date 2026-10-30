@@ -8,6 +8,26 @@ use tinytree_model::{
     ChangeId, Commit, Object, Signature, Timestamp, TreeId, TreeMerge, TreeValue,
 };
 
+pub(super) use tinytree_forge_core::accounts::validate_path as valid_path;
+pub use tinytree_forge_core::accounts::{
+    AccountId, ForgeAccess, ForgeAccount, ForgeAccountMutation, ForgeAction, ForgeActor,
+    ForgeMember, ForgeViewVisibility, PolicyEpoch, ViewSpec, ViewVersion,
+};
+use tinytree_forge_core::accounts::{
+    MAX_VIEW_BYTES, validate_name as valid_name, validate_principal as valid_principal,
+    view_version,
+};
+
+impl From<tinytree_forge_core::Error> for Error {
+    fn from(error: tinytree_forge_core::Error) -> Self {
+        match error {
+            tinytree_forge_core::Error::Invalid(reason) => Self::Invalid(reason),
+            tinytree_forge_core::Error::Limit(reason) => Self::Limit(reason),
+            tinytree_forge_core::Error::Corrupt(reason) => Self::Corrupt(reason),
+        }
+    }
+}
+
 const ACCOUNT_PREFIX: &[u8] = b"forge/accounts/v1/";
 const VIEW_PREFIX: &[u8] = b"forge/views/v1/";
 const MAX_ACCOUNTS: u64 = 1024;
@@ -18,162 +38,7 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_TREE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VIEW_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACCOUNT_BYTES: usize = 256 * 1024;
-const MAX_VIEW_BYTES: usize = 1024 * 1024;
 const MAX_REPLAY_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AccountId(pub String);
-impl AccountId {
-    pub fn validate(&self) -> Result<()> {
-        if self.0.is_empty()
-            || self.0.len() > 64
-            || !self
-                .0
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return Err(Error::Invalid("forge account identifier"));
-        }
-        Ok(())
-    }
-    pub fn repository_id(&self) -> String {
-        format!("forge-{}", self.0)
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ViewVersion(pub [u8; 32]);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PolicyEpoch(pub u64);
-
-/// Trusted authenticated identity; intentionally not deserializable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForgeActor {
-    pub principal: String,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ForgeAction {
-    Read,
-    Write,
-    Review,
-    Admin,
-    Export,
-}
-#[derive(Clone, Debug)]
-pub struct ForgeAccess {
-    pub account: AccountId,
-    pub repository: String,
-    pub epoch: PolicyEpoch,
-    pub can_write: bool,
-    pub can_review: bool,
-    pub is_admin: bool,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeMember {
-    pub principal: String,
-    pub can_write: bool,
-    pub can_review: bool,
-    pub is_admin: bool,
-    pub roles: Vec<String>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeAccount {
-    #[serde(rename = "account_id")]
-    pub id: AccountId,
-    #[serde(rename = "monorepo_id")]
-    pub repository: String,
-    #[serde(rename = "policy_epoch")]
-    pub epoch: PolicyEpoch,
-    pub public_view: Option<ViewVersion>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "roles", rename_all = "snake_case")]
-pub enum ForgeViewVisibility {
-    Public,
-    Members,
-    Roles(Vec<String>),
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ViewSpec {
-    pub name: String,
-    pub root_prefix: String,
-    pub include_prefixes: Vec<String>,
-    pub exclude_prefixes: Vec<String>,
-    pub visibility: ForgeViewVisibility,
-    pub revision: [u8; 32],
-    pub export_allowed: bool,
-}
-impl ViewSpec {
-    fn validate(&self) -> Result<()> {
-        valid_name(&self.name)?;
-        valid_path(&self.root_prefix, true)?;
-        if self.include_prefixes.is_empty()
-            || self.include_prefixes.len() > 64
-            || self.exclude_prefixes.len() > 64
-        {
-            return Err(Error::Limit("forge view path rules"));
-        }
-        for prefix in self.include_prefixes.iter().chain(&self.exclude_prefixes) {
-            valid_path(prefix, true)?;
-        }
-        if let ForgeViewVisibility::Roles(roles) = &self.visibility {
-            if roles.is_empty() || roles.len() > 16 {
-                return Err(Error::Limit("forge view roles"));
-            }
-            for role in roles {
-                valid_name(role)?;
-            }
-        }
-        if self.revision == CommitId::ROOT.0 {
-            return Err(Error::Invalid("forge view revision"));
-        }
-        if encode(self)?.len() > MAX_VIEW_BYTES {
-            return Err(Error::Limit("forge view record"));
-        }
-        Ok(())
-    }
-    fn allows(&self, canonical: &str) -> bool {
-        let relative = if self.root_prefix.is_empty() {
-            Some(canonical)
-        } else {
-            canonical
-                .strip_prefix(&self.root_prefix)
-                .and_then(|tail| tail.strip_prefix('/'))
-        };
-        relative.is_some_and(|path| {
-            self.include_prefixes
-                .iter()
-                .any(|p| prefix_matches(p, path))
-                && !self
-                    .exclude_prefixes
-                    .iter()
-                    .any(|p| prefix_matches(p, path))
-        })
-    }
-    fn could_contain(&self, canonical: &str) -> bool {
-        let full = |relative: &str| {
-            if self.root_prefix.is_empty() {
-                relative.to_owned()
-            } else if relative.is_empty() {
-                self.root_prefix.clone()
-            } else {
-                format!("{}/{relative}", self.root_prefix)
-            }
-        };
-        self.include_prefixes.iter().any(|p| {
-            let allowed = full(p);
-            prefix_matches(&allowed, canonical) || prefix_matches(canonical, &allowed)
-        }) && !self
-            .exclude_prefixes
-            .iter()
-            .any(|p| prefix_matches(&full(p), canonical))
-    }
-}
 
 /// Only Store resolution constructs this capability. Every Store read rechecks
 /// its current policy epoch; cloning a context never extends authorization.
@@ -272,49 +137,6 @@ impl AccountRecord {
     }
 }
 
-fn valid_name(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-    {
-        return Err(Error::Invalid("forge name"));
-    }
-    Ok(())
-}
-fn valid_principal(value: &str) -> Result<()> {
-    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(Error::Invalid("forge principal"));
-    }
-    Ok(())
-}
-pub(super) fn valid_path(value: &str, empty: bool) -> Result<()> {
-    if empty && value.is_empty() {
-        return Ok(());
-    }
-    if value.is_empty()
-        || value.len() > 4096
-        || value.split('/').count() > 64
-        || value.split('/').any(|s| {
-            s.is_empty()
-                || s == "."
-                || s == ".."
-                || s.contains('\\')
-                || s.chars().any(char::is_control)
-        })
-    {
-        return Err(Error::Invalid("forge path"));
-    }
-    Ok(())
-}
-fn prefix_matches(prefix: &str, path: &str) -> bool {
-    prefix.is_empty()
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|s| s.starts_with('/'))
-}
 fn account_key(id: &AccountId) -> Vec<u8> {
     [ACCOUNT_PREFIX, id.0.as_bytes()].concat()
 }
@@ -338,36 +160,6 @@ fn retired_key(id: &AccountId, version: ViewVersion) -> Vec<u8> {
 }
 fn view_reference(version: ViewVersion) -> String {
     format!("_tinytree/forge/views/v1/{}", hex(&version.0))
-}
-fn view_version(account: &AccountId, spec: &ViewSpec) -> Result<ViewVersion> {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"tinytree-forge-view-v1\0");
-    hash.update(account.0.as_bytes());
-    hash.update(&[0]);
-    hash.update(&encode(spec)?);
-    Ok(ViewVersion(*hash.finalize().as_bytes()))
-}
-
-/// Concrete account mutations with same-transaction durable replay receipts.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "operation", deny_unknown_fields)]
-pub enum ForgeAccountMutation {
-    Provision,
-    RetireView {
-        version: ViewVersion,
-        expected_epoch: PolicyEpoch,
-        view: String,
-    },
-    SetMember {
-        member: ForgeMember,
-        expected_epoch: PolicyEpoch,
-    },
-    PublishView {
-        spec: ViewSpec,
-        expected_epoch: PolicyEpoch,
-        make_default: bool,
-        follow_main: bool,
-    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
