@@ -1,5 +1,6 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
 load("@cloudflare_npm//:defs.bzl", "npm_link_all_packages")
+load("@cloudflare_npm//cloudflare:wrangler/package_json.bzl", wrangler_bin = "bin")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -52,11 +53,17 @@ js_test(
     timeout = "moderate",
 )
 
-# Explicit operator invocation only; this target is never a build/test action.
-js_binary(
+# Invoke the package-declared CLI bin, not an unexported module subpath.
+# Operators select deployment configuration explicitly with --config.
+wrangler_bin.wrangler_binary(
     name = "wrangler",
     env = {"WRANGLER_SEND_METRICS": "false"},
-    entry_point = "tools/wrangler.mjs",
-    data = [":node_modules/wrangler", ":worker", "wrangler.jsonc"],
     tags = ["manual"],
+)
+
+js_test(
+    name = "wrangler_smoke_tests",
+    entry_point = "tools/wrangler-smoke.mjs",
+    args = ["$(rootpath :wrangler)"],
+    data = [":wrangler", "package.json"],
 )
