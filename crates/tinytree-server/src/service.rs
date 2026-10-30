@@ -37,6 +37,7 @@ pub struct RepositoryService {
     query: Option<Arc<crate::query_index::QueryHost>>,
     cloud: Option<Arc<crate::cloud::CloudHost>>,
     landing: Arc<crate::landing::LandingHost>,
+    forge_reads: crate::forge_accounts::ForgeReadApi,
 }
 struct Inner {
     store: tinytree_store::Store,
@@ -113,6 +114,7 @@ impl RepositoryService {
         continuation_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Self {
             query: None,
+            forge_reads: crate::forge_accounts::ForgeReadApi::new(store.clone()),
             cloud,
             landing,
             inner: Arc::new(Inner {
@@ -150,6 +152,9 @@ impl RepositoryService {
     }
     pub fn forge_grpc_service(&self) -> crate::ForgeGrpcService {
         crate::ForgeGrpcService::new(self.clone())
+    }
+    pub(crate) fn forge_read_api(&self) -> crate::forge_accounts::ForgeReadApi {
+        self.forge_reads.clone()
     }
     pub(crate) fn forge_store(&self) -> tinytree_store::Store {
         self.inner.store.clone()

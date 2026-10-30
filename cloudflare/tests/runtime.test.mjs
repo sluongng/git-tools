@@ -200,7 +200,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public, 'historical view replay never changes current policy');
   assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
   assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
-  await forgeValue(await callForge(8, { query: 'fixture', regex: false, limit: 10 }), 501, 'unimplemented');
+  await forgeValue(await callForge(8, { query: 'fixture', regex: false, limit: 10 }), 400, 'failed_precondition');
   await forgeValue(await callForge(20, {}, 'unsupported-review'), 501, 'unimplemented');
   const malformed = { ...envelope(1, {}, 'actor-injection'), actor: 'forge-owner' };
   await forgeValue(await mf.dispatchFetch('https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${owner}`, 'content-type': 'application/json' }, body: JSON.stringify(malformed) }), 400, 'invalid_argument');
@@ -608,11 +608,10 @@ test('internal ClosureJobs rechecks SQL epoch after an admitted R2 read without 
 
 // Test-only source import installs a verified root receipt, never main. Every
 // view mutation, projection continuation and read below uses production HTTP.
-async function projectionRuntime(t) {
+async function projectionRuntime(t, source = fixture.projection) {
   const entry = process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE;
   const core = process.env.TINYTREE_PROJECTION_HARNESS_WASM;
   assert.ok(entry && core && fixture.projection, 'declared projection harness/native oracle required');
-  const source = fixture.projection;
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-projection-runtime-'));
   const token = 'wide-projection-owner-fixture';
   const config = [{ principal: source.owner, token_sha256: sha(token), accounts: [source.account_id], operator: true, kind: 'forge' }];
@@ -650,7 +649,7 @@ async function projectionRuntime(t) {
   assert.deepEqual((await success(2)).value, before, 'trusted fixture import must not mutate protected main');
   const published = await success(4, { spec: source.spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'wide-view' });
   assert.deepEqual(published.value, source.published);
-  const showWithCli = async version => {
+  const cliCommand = async args => {
     const tt = process.env.TINYTREE_TT_BINARY;
     assert.ok(tt, 'declared production tt executable required');
     const root = path.join(persist, 'projection-cli');
@@ -672,14 +671,17 @@ async function projectionRuntime(t) {
     };
     const selected = await command(['context', 'set', '--transport', 'forge-https-v1', '--server', address.origin, '--account', source.account_id, '--view', 'public', '--token-env', 'TT_PROJECTION_TOKEN']);
     assert.equal(selected.state, 'configured');
-    const shown = await command(['view', 'show', '--version', Buffer.from(version).toString('hex')]);
-    assert.equal(shown.state, 'complete');
+    const shown = await command(args);
     const saved = await readFile(path.join(home, 'config/tinytree/context.json'));
     assert.equal(JSON.parse(saved).transport, 'forge_https_v1');
     assert.ok(!saved.includes(token));
-    return shown.result.value;
+    return shown;
   };
-  return { source, call, success, control, showWithCli,
+  const showWithCli = async version => {
+    const shown = await cliCommand(['view', 'show', '--version', Buffer.from(version).toString('hex')]);
+    assert.equal(shown.state, 'complete'); return shown.result.value;
+  };
+  return { source, call, success, control, showWithCli, cliCommand,
     reload: async () => { await state.mf.dispose(); state.mf = new Miniflare({ ...configuration, port: Number(address.port) }); await state.mf.ready; },
     keys: async () => (await (await state.mf.getR2Bucket('OBJECTS')).list()).objects.map(object => object.key).sort(),
   };
@@ -961,4 +963,86 @@ test('production owner bootstrap imports a wide native closure once, resumes dur
   assert.equal(boundaryAfter.main_generation, 2);
   assert.equal(Buffer.from(boundaryAfter.main_revision).toString('hex'), boundary.root.id);
   assert.deepEqual(await invoke(2), after, 'second account import cannot mutate the first account');
+});
+
+test('production search pages real native matches through CLI, replay and reload without crossing current view policy', async t => {
+  const source = fixture.search;
+  assert.equal(source.expected_hits.length, 131, 'native matcher oracle includes intra-FILE and late cross-file hits');
+  const h = await projectionRuntime(t, source);
+  const firstCli = await h.cliCommand(['search', '-F', 'needle', '--limit', '17']);
+  assert.equal(firstCli.state, 'incomplete', 'fresh CLI search drives a cold projection and returns one bounded page');
+  assert.deepEqual(firstCli.result.value.matches, source.expected_hits.slice(0, 17));
+  const version = source.expected_snapshot.view_version;
+  assert.equal(firstCli.result.value.view_version, Buffer.from(version).toString('hex'));
+  const nextCli = await h.cliCommand(['search', '-F', 'needle', '--limit', '17', '--version', firstCli.result.value.view_version,
+    '--cursor', firstCli.result.value.cursor]);
+  assert.equal(nextCli.state, 'incomplete');
+  assert.deepEqual(nextCli.result.value.matches, source.expected_hits.slice(17, 34));
+
+  const query = { version, query: 'needle', regex: false, limit: 17 };
+  const first = (await h.success(8, query)).value;
+  assert.deepEqual(first.matches, source.expected_hits.slice(0, 17));
+  const secondInput = { ...query, cursor: first.cursor };
+  const [second, raced] = await Promise.all([h.success(8, secondInput), h.success(8, secondInput)]);
+  assert.deepEqual(raced.value, second.value, 'same immutable page input returns one exact result and successor');
+  await h.reload();
+  assert.deepEqual((await h.success(8, secondInput)).value, second.value, 'lost ACK replay survives DO/SQLite restart');
+  for (const [payload, options] of [
+    [{ ...secondInput, query: 'changed' }, {}],
+    [{ ...secondInput, limit: 18 }, {}],
+    [{ ...secondInput, version: undefined }, {}],
+    [secondInput, { auth: null }],
+  ]) {
+    const denied = await h.call(8, payload, options);
+    assert.ok([400, 403, 409].includes(denied.status), JSON.stringify(denied));
+    assert.equal(denied.value, undefined, 'invalid cursor bindings never return cached snippets');
+  }
+  const hits = [...first.matches, ...second.value.matches];
+  let page = second.value;
+  for (let count = 0; page.cursor !== null && count < 40; count++) {
+    page = (await h.success(8, { ...query, cursor: page.cursor })).value;
+    hits.push(...page.matches);
+  }
+  assert.equal(page.cursor, null, 'bounded scan terminates rather than recycling a non-progressing input');
+  assert.equal(page.complete, false, 'excluded binary FILE is terminal partial coverage');
+  assert.deepEqual(page.skipped_files, source.expected_skipped_files);
+  assert.deepEqual(hits, source.expected_hits, 'all paths, byte columns, UTF-8/NUL previews and offsets match native Pattern exactly');
+  assert.ok(!hits.some(hit => hit.path.includes('private') || hit.path === '02-link' || hit.path === '01-binary.bin'));
+
+  // The late match is after eight references to a verified 1MiB FILE. A bounded
+  // first page must not claim coverage of this entire source prefix.
+  const lateQuery = { version, query: '^after prefix', regex: true, limit: 100 };
+  let late = (await h.success(8, lateQuery, { auth: null })).value;
+  assert.deepEqual(late.matches, []);
+  assert.equal(late.complete, false);
+  assert.ok(late.cursor);
+  const lateHits = [];
+  for (let count = 0; late.cursor !== null && count < 8; count++) {
+    late = (await h.success(8, { ...lateQuery, cursor: late.cursor }, { auth: null })).value;
+    lateHits.push(...late.matches);
+  }
+  assert.equal(late.cursor, null);
+  assert.deepEqual(lateHits.map(hit => hit.path), [source.late_match_path]);
+  assert.deepEqual(late.skipped_files, source.expected_skipped_files);
+
+  await h.success(4, { spec: { ...source.spec, visibility: { kind: 'members' } }, expected_epoch: 2,
+    make_default: false, follow_main: false }, { id: 'search-lock-current' });
+  const revoked = await h.call(8, secondInput, { auth: null });
+  assert.equal(revoked.status, 403);
+  assert.equal(revoked.value, undefined, 'a warmed persisted page never survives public-to-private policy revocation');
+  const oldOwnerPage = await h.call(8, secondInput);
+  assert.ok([400, 403, 409].includes(oldOwnerPage.status));
+
+  // Pattern validation is the actual native compiler, even with no FILEs to
+  // trigger matching. An empty sanitized projection is not a compiler proof.
+  const empty = (await h.success(4, { spec: { ...source.spec, include_prefixes: ['absent'] }, expected_epoch: 3,
+    make_default: true, follow_main: false }, { id: 'search-empty-view' })).value;
+  const emptyVersion = empty.view_version;
+  const snapshot = await h.showWithCli(emptyVersion);
+  assert.deepEqual(snapshot.paths, []);
+  const invalid = await h.call(8, { version: emptyVersion, query: '(', regex: true, limit: 100 }, { auth: null });
+  assert.equal(invalid.status, 400);
+  const valid = (await h.success(8, { version: emptyVersion, query: 'needle', regex: false, limit: 100 }, { auth: null })).value;
+  assert.equal(valid.complete, true); assert.equal(valid.cursor, null); assert.deepEqual(valid.matches, []);
+  assert.deepEqual(valid.skipped_files, { binary: 0, oversized: 0 });
 });

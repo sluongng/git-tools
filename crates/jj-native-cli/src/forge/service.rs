@@ -163,6 +163,9 @@ pub(super) struct SearchArgs {
     limit: usize,
     #[arg(long)]
     version: Option<String>,
+    /// Continue the same query/mode/limit and explicit version; never latest main.
+    #[arg(long, requires = "version")]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -342,16 +345,91 @@ pub(super) async fn view(ui: &Ui, machine: bool, args: ViewCommand) -> Result<()
 }
 
 pub(super) async fn search(ui: &Ui, machine: bool, args: SearchArgs) -> Result<(), CommandError> {
-    if args.query.is_empty() || args.query.len() > 1024 || !(1..=1000).contains(&args.limit) {
-        return Err(user_error(
-            "search requires a nonempty query <=1024 bytes and limit 1..1000",
-        ));
+    use tinytree_forge_core::search::{ForgeSearchRequest, ForgeSearchResponse};
+    if args.query.is_empty() {
+        return Err(user_error("search requires a nonempty query"));
     }
-    let body = json!({"version":args.version.as_deref().map(id::<32>).transpose()?,"query":args.query,"regex":!args.fixed_strings,"limit":args.limit});
-    let mut reply = rpc::call(&context()?, Op::Search, body, None, false, None).await?;
-    let value: Value = serde_json::from_slice(&reply.result_json)
+    let context = context()?;
+    let mut request = ForgeSearchRequest {
+        version: args.version.as_deref().map(id::<32>).transpose()?,
+        query: args.query,
+        regex: !args.fixed_strings,
+        limit: args.limit,
+        cursor: args.cursor,
+    };
+    request.validate().map_err(|_| {
+        user_error("search requires query <=1024 bytes, limit 1..100 and an exact cursor/version")
+    })?;
+    let selection = if request.cursor.is_none() {
+        // ResolveView's SDK workflow drives bounded preparation and pins the
+        // first selection. A search continuation never repeats this selection.
+        let reply = rpc::call(
+            &context,
+            Op::ResolveView,
+            json!({"version":request.version}),
+            None,
+            false,
+            None,
+        )
+        .await?;
+        let snapshot: Value = serde_json::from_slice(&reply.result_json)
+            .map_err(|_| user_error("invalid resolved search view"))?;
+        request.version = Some(
+            serde_json::from_value(snapshot["view_version"].clone())
+                .map_err(|_| user_error("invalid resolved search version"))?,
+        );
+        Some(snapshot)
+    } else {
+        None
+    };
+    let body = serde_json::to_value(&request).map_err(user_error)?;
+    let mut reply = rpc::call(&context, Op::Search, body, None, false, None).await?;
+    let value: ForgeSearchResponse = serde_json::from_slice(&reply.result_json)
         .map_err(|_| user_error("invalid search response"))?;
-    if value.get("complete") == Some(&Value::Bool(false)) {
+    let valid_cursor = |cursor: &str| {
+        !cursor.is_empty()
+            && cursor.len() <= 128
+            && cursor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    };
+    if value.account_id != context.account_id
+        || (!context.view.is_empty() && value.view != context.view)
+        || Some(value.view_version) != request.version
+        || value.revision == [0; 32]
+        || value.policy_epoch == 0
+        || value.matches.len() > request.limit
+        || value
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| !valid_cursor(cursor))
+        || (value.complete && value.cursor.is_some())
+        || value
+            .matches
+            .iter()
+            .any(|hit| hit.path.is_empty() || hit.line == 0 || hit.column == 0)
+    {
+        return Err(user_error("search response binding is invalid"));
+    }
+    if let Some(selection) = selection {
+        let response = serde_json::to_value(&value).map_err(user_error)?;
+        if [
+            "account_id",
+            "view",
+            "view_version",
+            "revision",
+            "policy_epoch",
+            "root_prefix",
+        ]
+        .iter()
+        .any(|field| selection[*field] != response[*field])
+        {
+            return Err(user_error(
+                "search view changed after preparation; exact request was not restarted",
+            ));
+        }
+    }
+    if !value.complete {
         reply.state = "incomplete".into();
     }
     rpc::print(ui, machine, reply)

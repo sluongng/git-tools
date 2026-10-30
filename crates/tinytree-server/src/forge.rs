@@ -200,6 +200,7 @@ async fn call_admitted(
         .map_err(|error| crate::service::store_status(error.into()))?;
     let profile = service.landing_host().forge_profile()?;
     let store = service.forge_store();
+    let forge_reads = service.forge_read_api();
     let config = service.service_config();
     let deadline = work.deadline;
     let output = tokio::task::spawn_blocking(move || {
@@ -237,7 +238,7 @@ async fn call_admitted(
         let result = match upload {
             Some(result) => Some(result),
             None => crate::forge_accounts::account_call(
-                &store,
+                &forge_reads,
                 actor,
                 operation,
                 &account,

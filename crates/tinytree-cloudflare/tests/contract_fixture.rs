@@ -147,6 +147,194 @@ fn bootstrap_fixture(store: &Store) -> Value {
     json!({"root":{"kind":3,"id":hex(&root.key.id.0)},"largest_file":objects[0],"objects":objects})
 }
 
+// Independent paged-search oracle. Large FILE content is stored once even
+// though eight visible paths reference it; no preexisting fixtures are changed.
+fn search_fixture(store: &Store) -> Value {
+    use tinytree_search::{MatchBudget, MatchLimits, Pattern, SearchMode};
+    let account = AccountId("forge-search".into());
+    let owner = ForgeActor {
+        principal: "forge-owner".into(),
+    };
+    store
+        .forge_mutate_account(
+            &account,
+            &owner,
+            "search-provision",
+            ForgeAccountMutation::Provision,
+        )
+        .unwrap();
+    let repository = account.repository_id();
+    let mut objects = Vec::new();
+    let mut identities = std::collections::HashSet::new();
+    let mut put = |object: Option<Object>, body: &[u8]| {
+        let (descriptor, bytes) = match object {
+            Some(object) => {
+                let encoded = tinytree_model::encode(&object, Limits::default()).unwrap();
+                (encoded.descriptor, encoded.bytes)
+            }
+            None => (tinytree_model::describe_file(body), body.to_vec()),
+        };
+        store.put(&repository, descriptor, &bytes, 0).unwrap();
+        if identities.insert(descriptor.key) {
+            objects.push(json!({"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes}));
+        }
+        descriptor
+    };
+    let mut first_bytes = String::new();
+    for ordinal in 0..128 {
+        first_bytes.push_str(&format!("line {ordinal:03} needle\n"));
+    }
+    first_bytes.push_str("α needle\n");
+    first_bytes.push_str("nul\0needle\n");
+    let first = put(None, first_bytes.as_bytes());
+    let binary = put(None, b"\xffneedle\n");
+    let link = put(Some(Object::Symlink("00-hits.txt".into())), &[]);
+    let filler = put(None, &vec![b'f'; 1024 * 1024]);
+    let readme_bytes = b"# Paged search fixture\nPublic code search\n";
+    let readme = put(None, readme_bytes);
+    let late = put(None, b"after prefix needle\n");
+    let secret = put(None, b"private secret needle\n");
+    let file_entry = |name: &str, descriptor: Descriptor| TreeEntry {
+        name: name.into(),
+        value: TreeValue::File {
+            id: FileId(descriptor.key.id.0),
+            executable: false,
+            size_bytes: descriptor.size_bytes,
+            copy_id: None,
+        },
+    };
+    let private_tree = put(
+        Some(Object::Tree(Tree {
+            entries: vec![file_entry("secret.txt", secret)],
+        })),
+        &[],
+    );
+    let mut entries = vec![
+        file_entry("00-hits.txt", first),
+        file_entry("01-binary.bin", binary),
+        TreeEntry {
+            name: "02-link".into(),
+            value: TreeValue::Symlink {
+                id: SymlinkId(link.key.id.0),
+                target_bytes: 11,
+            },
+        },
+    ];
+    for ordinal in 0..8 {
+        entries.push(file_entry(
+            &format!("{}-fill-{ordinal}.txt", ordinal + 10),
+            filler,
+        ));
+    }
+    entries.push(file_entry("README.md", readme));
+    entries.push(TreeEntry {
+        name: "private".into(),
+        value: TreeValue::Tree(TreeId(private_tree.key.id.0)),
+    });
+    entries.push(file_entry("zzmatch.txt", late));
+    let tree = put(Some(Object::Tree(Tree { entries })), &[]);
+    let person = Signature {
+        name: "Fixture".into(),
+        email: "fixture@example.invalid".into(),
+        timestamp: Timestamp {
+            millis_since_epoch: 0,
+            tz_offset_minutes: 0,
+        },
+    };
+    let root = put(
+        Some(Object::Commit(Commit {
+            parents: vec![CommitId::ROOT],
+            predecessors: vec![],
+            root_tree: TreeMerge {
+                terms: vec![TreeId(tree.key.id.0)],
+                labels: vec![String::new()],
+            },
+            change_id: ChangeId([93; 16]),
+            description: "Paged search fixture".into(),
+            author: person.clone(),
+            committer: person,
+            secure_signature: None,
+        })),
+        &[],
+    );
+    drop(put);
+    let spec = ViewSpec {
+        name: "public".into(),
+        root_prefix: String::new(),
+        include_prefixes: vec![String::new()],
+        exclude_prefixes: vec!["private".into()],
+        visibility: ForgeViewVisibility::Public,
+        revision: root.key.id.0,
+        export_allowed: false,
+    };
+    let published = store
+        .forge_mutate_account(
+            &account,
+            &owner,
+            "search-view",
+            ForgeAccountMutation::PublishView {
+                spec: spec.clone(),
+                expected_epoch: PolicyEpoch(1),
+                make_default: true,
+                follow_main: false,
+            },
+        )
+        .unwrap();
+    let view = store.forge_resolve_view(&account, None, "", None).unwrap();
+    let files = store.forge_view_files(&view, 1000).unwrap();
+    let projection = store.forge_project_view(&view, 0).unwrap();
+    let pattern = Pattern::new(b"needle", SearchMode::Literal).unwrap();
+    let mut expected_hits = Vec::new();
+    let mut skipped_binary = 0;
+    for file in &files {
+        if file.descriptor.key.kind != Kind::File {
+            continue;
+        }
+        let bytes = store
+            .forge_read_view_file(&view, &file.path, 1024 * 1024)
+            .unwrap();
+        if std::str::from_utf8(&bytes).is_err() {
+            skipped_binary += 1;
+            continue;
+        }
+        let mut budget = MatchBudget::new(MatchLimits {
+            max_input_bytes: 1024 * 1024,
+            max_work: 64 * 1024 * 1024,
+            max_output_bytes: 256 * 1024,
+        });
+        let page = pattern.scan(&bytes, 0, 1000, &mut budget, || true).unwrap();
+        assert!(page.next_offset.is_none());
+        for hit in page.hits {
+            expected_hits.push(json!({"path":file.path,"line":hit.line,"column":hit.column,"preview":String::from_utf8_lossy(&hit.snippet)}));
+        }
+    }
+    assert_eq!(expected_hits.len(), 131);
+    assert_eq!(skipped_binary, 1);
+    assert_eq!(expected_hits.last().unwrap()["path"], "zzmatch.txt");
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file.descriptor == filler)
+            .count(),
+        8
+    );
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|object| object["kind"] == 1 && object["id"] == hex(&filler.key.id.0))
+            .count(),
+        1
+    );
+    let readme_content = String::from_utf8(
+        store
+            .forge_read_view_file(&view, "README.md", 65536)
+            .unwrap(),
+    )
+    .unwrap();
+    let snapshot = json!({"account_id":account.0,"view":view.name(),"view_version":view.version().0,"revision":view.revision().0,"policy_epoch":view.epoch().0,"root_prefix":view.root_prefix(),"projected_commit":projection.projected_commit,"projected_tree":projection.projected_tree,"paths":files.into_iter().map(|f|f.path).collect::<Vec<_>>(),"readme":{"path":"README.md","content":readme_content},"readme_error":null,"complete":true});
+    json!({"account_id":account.0,"owner":owner.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"published":published,"expected_snapshot":snapshot,"expected_hits":expected_hits,"expected_skipped_files":{"binary":skipped_binary,"oversized":0},"late_match_path":"zzmatch.txt","readme":{"kind":1,"id":hex(&readme.key.id.0),"bytes":readme_bytes.as_slice()},"private_file":{"kind":1,"id":hex(&secret.key.id.0)},"filler_file":{"kind":1,"id":hex(&filler.key.id.0),"size_bytes":filler.size_bytes,"format_version":filler.format_version}})
+}
+
 fn main() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), Config::default()).unwrap();
@@ -373,14 +561,18 @@ fn main() {
     let history_publication = store.publish(REPOSITORY, &publish("closure-history", 2, history_head), 4).unwrap();
     let projection_fixture = projection_fixture(&store);
     let bootstrap_fixture = bootstrap_fixture(&store);
+    let search_fixture = search_fixture(&store);
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
         "projection":projection_fixture,
         "bootstrap":bootstrap_fixture,
+        "search":search_fixture,
         "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
         "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),
         "next":reference(&next_result.reference),"historical_replay":reference(&historical_replay.reference),
         "after_refusals":after,"refusals":refused,"reopen":true}});
-    println!("{value}");
+    let output = serde_json::to_string(&value).unwrap();
+    assert!(output.len() < 16 * 1024 * 1024, "contract fixture exceeds runtime runner output bound");
+    println!("{output}");
     assert_eq!(first.key.kind, Kind::Commit);
 }

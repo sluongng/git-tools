@@ -3129,6 +3129,7 @@ dependencies = [
  "tinytree-client",
  "tinytree-cloud",
  "tinytree-fixture",
+ "tinytree-forge-core",
  "tinytree-index",
  "tinytree-inventory",
  "tinytree-model",

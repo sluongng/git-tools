@@ -14,6 +14,10 @@ use std::{
     fmt,
     io::{self, Write},
 };
+use tinytree_forge_core::{
+    accounts::{AccountId, validate_name},
+    search::{ForgeSearchRequest, query_fingerprint},
+};
 use tinytree_model::{self as model, Descriptor, Kind, ObjectId, ObjectKey};
 use tinytree_search::{Error, MatchBudget, MatchLimits, MatchUsage, Pattern, SearchMode};
 
@@ -37,6 +41,32 @@ struct Input {
     limit: usize,
     #[serde(default)]
     start_offset: u64,
+    /// Trusted host-only remaining page accounting. Never copied from the
+    /// public request; the shared ForgeSearchRequest rejects this field.
+    #[serde(default)]
+    remaining_budget: Option<RemainingBudget>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemainingBudget {
+    max_work: usize,
+    max_output_bytes: usize,
+}
+impl RemainingBudget {
+    fn limits(&self) -> Result<MatchLimits, String> {
+        if self.max_work == 0
+            || self.max_work > MAX_WORK
+            || self.max_output_bytes == 0
+            || self.max_output_bytes > MAX_MATCH_OUTPUT
+        {
+            return Err("invalid remaining search budget".into());
+        }
+        Ok(MatchLimits {
+            max_input_bytes: MAX_FILE,
+            max_work: self.max_work,
+            max_output_bytes: self.max_output_bytes,
+        })
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +154,10 @@ pub fn search_file(input: &[u8]) -> Result<Value, String> {
     if input.schema != 1 || input.limit == 0 || input.limit > MAX_HITS {
         return Err("invalid search schema or hit limit".into());
     }
+    let chosen_limits = match &input.remaining_budget {
+        Some(budget) => budget.limits()?,
+        None => match_limits(),
+    };
     let file = input.descriptor;
     if file.kind != Kind::File as u8
         || file.format_version != model::FORMAT_VERSION
@@ -174,7 +208,7 @@ pub fn search_file(input: &[u8]) -> Result<Value, String> {
             json!({"state":"binary","matches":[],"complete":false,"next_offset":null,"verified_bytes":size,"usage":usage(MatchUsage::default())}),
         );
     }
-    let mut budget = MatchBudget::new(match_limits());
+    let mut budget = MatchBudget::new(chosen_limits);
     let result = pattern.scan(&bytes, input.start_offset, input.limit, &mut budget, || {
         true
     });
@@ -183,9 +217,9 @@ pub fn search_file(input: &[u8]) -> Result<Value, String> {
         Ok(page) => page,
         Err(Error::Invalid) => return Err("invalid search offset or matcher input".into()),
         Err(Error::Limit) => {
-            let reason = if counters.work > MAX_WORK {
+            let reason = if counters.work > chosen_limits.max_work {
                 "work"
-            } else if counters.output_bytes > MAX_MATCH_OUTPUT {
+            } else if counters.output_bytes > chosen_limits.max_output_bytes {
                 "match_output"
             } else if counters.input_bytes > MAX_FILE {
                 "input_bytes"
@@ -208,6 +242,51 @@ pub fn search_file(input: &[u8]) -> Result<Value, String> {
         size,
         counters,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchCommand {
+    account_id: String,
+    operation: u32,
+    view: String,
+    payload_json: String,
+}
+/// Strict public operation normalization and REAL pattern compilation. This
+/// rejects invalid/unsupported patterns even when the selected view is empty.
+/// A successful normalization is not a serialized compiled plan or authority;
+/// the host separately binds current actor/view/epoch/catalog to opaque cursors.
+pub fn normalize_command(input: &[u8]) -> Result<Value, String> {
+    const MAX_COMMAND: usize = 64 * 1024;
+    if input.len() > MAX_COMMAND {
+        return Err("search command byte limit".into());
+    }
+    let command: SearchCommand =
+        serde_json::from_slice(input).map_err(|_| "invalid strict search command")?;
+    if command.operation != 8 {
+        return Err("unsupported search operation".into());
+    }
+    AccountId(command.account_id.clone())
+        .validate()
+        .map_err(|e| e.to_string())?;
+    if !command.view.is_empty() {
+        validate_name(&command.view).map_err(|e| e.to_string())?;
+    }
+    let request: ForgeSearchRequest = serde_json::from_slice(command.payload_json.as_bytes())
+        .map_err(|_| "invalid strict search payload")?;
+    request.validate().map_err(|e| e.to_string())?;
+    let mode = if request.regex {
+        SearchMode::Regex
+    } else {
+        SearchMode::Literal
+    };
+    let _pattern = Pattern::new(request.query.as_bytes(), mode)
+        .map_err(|_| "invalid bounded search pattern")?;
+    let fingerprint = query_fingerprint(&command.account_id, &command.view, &request)
+        .map_err(|e| e.to_string())?;
+    Ok(
+        json!({"operation":8,"version":request.version,"query":request.query,"regex":request.regex,"limit":request.limit,"cursor":request.cursor,"fingerprint":fingerprint}),
+    )
 }
 
 #[cfg(test)]
@@ -368,5 +447,115 @@ mod tests {
         assert_eq!(page["complete"], false);
         assert!(page["matches"].as_array().unwrap().is_empty());
         assert!(page["next_offset"].is_null());
+    }
+    fn command(payload: Value) -> Value {
+        json!({"account_id":"example","operation":8,"view":"public","payload_json":payload.to_string()})
+    }
+    fn normalize(value: &Value) -> Result<Value, String> {
+        normalize_command(&serde_json::to_vec(value).unwrap())
+    }
+    #[test]
+    fn empty_view_preflight_uses_real_native_compiler_and_shared_intent_fingerprint() {
+        let payload = json!({"query":"needle","limit":10});
+        let result = normalize(&command(payload.clone())).unwrap();
+        assert_eq!(result["operation"], 8);
+        assert_eq!(result["regex"], false);
+        assert!(result["version"].is_null());
+        assert!(result["cursor"].is_null());
+        let request: ForgeSearchRequest = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            result["fingerprint"],
+            query_fingerprint("example", "public", &request).unwrap()
+        );
+        assert!(
+            result.get("compiled").is_none(),
+            "normalization is not a persisted compiler or authorization proof"
+        );
+        for (name, query, regex) in [
+            ("empty literal", "", false),
+            ("unsupported lookaround", "(?=needle)", true),
+            ("invalid regex", "(", true),
+            ("newline pattern", "first\nsecond", false),
+        ] {
+            assert!(
+                normalize(&command(json!({"query":query,"regex":regex,"limit":10}))).is_err(),
+                "{name}"
+            );
+        }
+        let literal = normalize(&command(json!({"query":"(","regex":false,"limit":10}))).unwrap();
+        assert_eq!(literal["query"], "(");
+        let continuation = normalize(&command(json!({"version":vec![1u8;32],"cursor":"page-one","query":"needle","regex":false,"limit":10}))).unwrap();
+        assert_eq!(
+            continuation["fingerprint"], result["fingerprint"],
+            "selected version/cursor remain separate authoritative host bindings"
+        );
+        assert!(
+            normalize(&command(
+                json!({"cursor":"page-one","query":"needle","limit":10})
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn public_search_cannot_select_internal_budgets_or_extra_authority() {
+        let mut public = command(
+            json!({"query":"needle","limit":10,"remaining_budget":{"max_work":1,"max_output_bytes":1}}),
+        );
+        assert!(normalize(&public).is_err());
+        public = command(json!({"query":"needle","limit":10}));
+        public["principal"] = json!("owner");
+        assert!(normalize(&public).is_err());
+        let mut duplicate = command(json!({"query":"needle","limit":10}));
+        duplicate["payload_json"] = json!(r#"{"query":"needle","limit":10,"limit":11}"#);
+        assert!(normalize(&duplicate).is_err());
+        let mut wrong = command(json!({"query":"needle","limit":10}));
+        wrong["operation"] = json!(7);
+        assert!(normalize(&wrong).is_err());
+        assert!(normalize(&command(json!({"query":"needle","limit":101}))).is_err());
+        assert!(normalize_command(&vec![b' '; 64 * 1024 + 1]).is_err());
+    }
+    #[test]
+    fn remaining_page_budgets_are_enforced_by_matcher_and_never_return_partial_file_hits() {
+        let valid = input(b"x x x\n", "x", false, 100, 0);
+        let full = call(&valid).unwrap();
+        assert_eq!(full["matches"].as_array().unwrap().len(), 3);
+        let work = full["usage"]["work"].as_u64().unwrap() as usize;
+        let output = full["usage"]["output_bytes"].as_u64().unwrap() as usize;
+        assert!(work > 1 && output > 1);
+        for (name, remaining_work, remaining_output, expected_budget) in [
+            ("remaining work", work - 1, MAX_MATCH_OUTPUT, "work"),
+            ("remaining output", MAX_WORK, output - 1, "match_output"),
+        ] {
+            let mut request = valid.clone();
+            request["remaining_budget"] =
+                json!({"max_work":remaining_work,"max_output_bytes":remaining_output});
+            let result = call(&request).unwrap();
+            assert_eq!(result["state"], "limit", "{name}");
+            assert_eq!(result["budget"], expected_budget, "{name}");
+            assert!(result["matches"].as_array().unwrap().is_empty(), "{name}");
+            assert_eq!(result["complete"], false);
+            assert!(result["next_offset"].is_null());
+        }
+        let mut exact = valid.clone();
+        exact["remaining_budget"] = json!({"max_work":work,"max_output_bytes":output});
+        assert_eq!(
+            call(&exact).unwrap(),
+            full,
+            "exact remaining budgets preserve native hit semantics"
+        );
+        for (name, remaining_work, remaining_output) in [
+            ("zero work", 0, MAX_MATCH_OUTPUT),
+            ("zero output", MAX_WORK, 0),
+            ("inflated work", MAX_WORK + 1, MAX_MATCH_OUTPUT),
+            ("inflated output", MAX_WORK, MAX_MATCH_OUTPUT + 1),
+        ] {
+            let mut request = valid.clone();
+            request["remaining_budget"] =
+                json!({"max_work":remaining_work,"max_output_bytes":remaining_output});
+            assert!(call(&request).is_err(), "{name}");
+        }
+        let mut extra = valid;
+        extra["remaining_budget"] = json!({"max_work":1,"max_output_bytes":1,"grant":true});
+        assert!(call(&extra).is_err());
     }
 }

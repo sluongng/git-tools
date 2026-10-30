@@ -433,6 +433,10 @@ pub extern "C" fn tt_forge_search_file(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, search::search_file)
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_search_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, search::normalize_command)
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_read_command(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, reads::normalize_read_command)
 }

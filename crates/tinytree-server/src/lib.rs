@@ -11,6 +11,7 @@ pub(crate) const SERVER_CODEC_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 mod auth;
 mod forge;
 mod forge_accounts;
+mod forge_search;
 mod forge_review;
 mod forge_transforms;
 mod forge_upload;

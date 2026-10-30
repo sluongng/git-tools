@@ -32,6 +32,7 @@ jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 native-broker = { path = "../native-broker" }
 tinytree-client = { path = "../tinytree-client" }
+tinytree-forge-core = { path = "../tinytree-forge-core" }
 tinytree-inventory = { path = "../tinytree-inventory" }
 tinytree-search = { path = "../tinytree-search" }
 tinytree-annotate = { path = "../tinytree-annotate" }

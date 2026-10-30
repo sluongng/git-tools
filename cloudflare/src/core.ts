@@ -21,6 +21,7 @@ interface CoreExports {
   tt_forge_view_paths(pointer: number, length: number): number;
   tt_forge_advance_view(pointer: number, length: number): number;
   tt_forge_search_file(pointer: number, length: number): number;
+  tt_forge_search_command(pointer: number, length: number): number;
   tt_forge_read_command(pointer: number, length: number): number;
   tt_forge_import_command(pointer: number, length: number): number;
   tt_output_ptr(): number;
@@ -112,6 +113,17 @@ export function closureStep(input: unknown): unknown {
 export function searchForgeFile(input: unknown): unknown {
   const bytes = encoder.encode(JSON.stringify(input));
   return invoke(bytes, pointer => core.tt_forge_search_file(pointer, bytes.byteLength));
+}
+
+export interface ForgeSearchCommand {
+  operation: 8; version: number[] | null; query: string; regex: boolean;
+  limit: number; cursor: string | null; fingerprint: string;
+}
+/** Shared selector normalization and real native pattern preflight, not a
+ * persisted compiler capability or current-policy/object read grant. */
+export function normalizeForgeSearchCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'payload_json'>): ForgeSearchCommand {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_search_command(pointer, bytes.byteLength)) as ForgeSearchCommand;
 }
 
 /** Strict public read selectors only; SQL-resolved policy/catalog owns access. */

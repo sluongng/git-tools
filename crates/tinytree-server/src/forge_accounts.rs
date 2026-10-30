@@ -3,7 +3,8 @@
 //! These methods consume opaque Store-resolved views. Ingress derives actors
 //! from authenticated transport identity, never from a JSON principal field.
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+pub use tinytree_forge_core::search::{ForgeSearchRequest, ForgeSearchHit, ForgeSearchResponse};
 use tinytree_forge_core::account_commands::{EmptyRequest, SetMemberRequest, PublishViewRequest, RetireViewRequest, ResolveViewRequest, ReadFileRequest, ReadObjectRequest};
 use tinytree_proto::forge_v1;
 use tinytree_store::{AccountId, ForgeAction, ForgeActor, PolicyEpoch, ViewSpec, ViewVersion};
@@ -12,8 +13,6 @@ use tonic::Status;
 
 const MAX_FILES: usize = 10_000;
 const MAX_FILE: usize = 1024 * 1024;
-const MAX_READ: usize = 8 * 1024 * 1024;
-const MAX_MATCHES: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,7 +49,7 @@ fn required_actor(actor: Option<&ForgeActor>) -> Result<&ForgeActor, Status> {
 /// Shared authenticated dispatch. The caller owns request admission and durable
 /// replay binding; these payloads intentionally have no actor/principal field.
 pub(crate) fn account_call(
-    store: &Store,
+    api: &ForgeReadApi,
     actor: Option<&ForgeActor>,
     operation: forge_v1::ForgeOperation,
     account: &AccountId,
@@ -60,7 +59,7 @@ pub(crate) fn account_call(
     now: i64,
 ) -> Result<Option<(String, serde_json::Value)>, Status> {
     use forge_v1::ForgeOperation as Op;
-    let api = ForgeReadApi::new(store.clone());
+    let store = &api.store;
     let result = match operation {
         Op::ProvisionAccount => {
             let _: EmptyRequest = payload(bytes)?;
@@ -161,7 +160,7 @@ pub(crate) fn account_call(
             let resolved = store
                 .forge_resolve_view(account, actor, view, input.version.map(ViewVersion))
                 .map_err(crate::service::store_status)?;
-            value(api.search(&resolved, &input)?)?
+            value(api.search(&resolved, actor, &input)?)?
         }
         Op::ReadObject => {
             let input: ReadObjectRequest = payload(bytes)?;
@@ -231,6 +230,7 @@ pub(crate) fn account_call(
 #[derive(Clone)]
 pub struct ForgeReadApi {
     store: Store,
+    search: Arc<crate::forge_search::SearchCache>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -277,34 +277,9 @@ pub struct ForgeFileResponse {
     #[serde(flatten)]
     pub file: ForgeTextFile,
 }
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeSearchRequest {
-    #[serde(default)]
-    pub version: Option<[u8; 32]>,
-    pub query: String,
-    #[serde(default)]
-    pub regex: bool,
-    pub limit: usize,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeSearchHit {
-    pub path: String,
-    pub line: u64,
-    pub column: u64,
-    pub preview: String,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeSearchResponse {
-    #[serde(flatten)]
-    pub context: ForgeViewDescription,
-    pub matches: Vec<ForgeSearchHit>,
-    pub complete: bool,
-}
-
 impl ForgeReadApi {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self { store, search: Arc::new(crate::forge_search::SearchCache::default()) }
     }
     pub fn describe(&self, view: &ResolvedView) -> Result<ForgeViewDescription, Status> {
         self.store
@@ -379,92 +354,12 @@ impl ForgeReadApi {
             },
         })
     }
-    /// Real regex/literal content matching in authorized regular UTF-8 files.
-    /// This bounded projection scan deliberately does not claim indexed coverage.
-    pub fn search(
-        &self,
-        view: &ResolvedView,
-        request: &ForgeSearchRequest,
-    ) -> Result<ForgeSearchResponse, Status> {
-        if request.limit == 0 || request.limit > MAX_MATCHES {
-            return Err(Status::invalid_argument("forge search limit must be 1-100"));
-        }
-        let mode = if request.regex {
-            tinytree_search::SearchMode::Regex
-        } else {
-            tinytree_search::SearchMode::Literal
-        };
-        let pattern = tinytree_search::Pattern::new(request.query.as_bytes(), mode)
-            .map_err(|_| Status::invalid_argument("invalid bounded forge search pattern"))?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let files = self
-            .store
-            .forge_view_files(view, MAX_FILES)
-            .map_err(crate::service::store_status)?;
-        let mut matches = Vec::new();
-        let mut read = 0usize;
-        let mut complete = true;
-        let mut budget = tinytree_search::MatchBudget::new(tinytree_search::MatchLimits {
-            max_input_bytes: MAX_READ,
-            max_work: 64 * 1024 * 1024,
-            max_output_bytes: 256 * 1024,
-        });
-        for file in files {
-            if file.descriptor.key.kind != tinytree_model::Kind::File {
-                continue;
-            }
-            let size = usize::try_from(file.descriptor.size_bytes).unwrap_or(usize::MAX);
-            if size > MAX_FILE
-                || read.checked_add(size).is_none_or(|n| n > MAX_READ)
-                || Instant::now() >= deadline
-            {
-                complete = false;
-                break;
-            }
-            let bytes = self
-                .store
-                .forge_read_view_file(view, &file.path, MAX_FILE)
-                .map_err(crate::service::store_status)?;
-            read += bytes.len();
-            if std::str::from_utf8(&bytes).is_err() {
-                continue;
-            }
-            let page = pattern
-                .scan(
-                    &bytes,
-                    0,
-                    request.limit - matches.len(),
-                    &mut budget,
-                    || Instant::now() < deadline,
-                )
-                .map_err(|error| match error {
-                    tinytree_search::Error::Invalid => {
-                        Status::invalid_argument("invalid forge search")
-                    }
-                    _ => Status::resource_exhausted("forge search work budget exhausted"),
-                })?;
-            for hit in page.hits {
-                matches.push(ForgeSearchHit {
-                    path: file.path.clone(),
-                    line: hit.line,
-                    column: hit.column,
-                    preview: String::from_utf8_lossy(&hit.snippet).into_owned(),
-                });
-            }
-            if page.next_offset.is_some() || matches.len() == request.limit {
-                complete = false;
-                break;
-            }
-        }
-        self.store
-            .forge_check_view(view)
-            .map_err(crate::service::store_status)?;
-        Ok(ForgeSearchResponse {
-            context: view.into(),
-            matches,
-            complete,
-        })
+    /// Bounded pages over authorized native FILEs; tokens are service-local
+    /// disposable read state, never authorization or repository retention.
+    pub fn search(&self, view: &ResolvedView, actor: Option<&ForgeActor>, request: &ForgeSearchRequest) -> Result<ForgeSearchResponse, Status> {
+        self.search.search(&self.store, view, actor, request)
     }
+
 }
 
 #[cfg(test)]
@@ -481,6 +376,11 @@ pub(crate) mod tests {
         ForgeActor,
         ResolvedView,
     ) {
+        fixture_with_files(Vec::new())
+    }
+    fn fixture_with_files(additional: Vec<(String, Vec<u8>)>) -> (
+        tempfile::TempDir, Store, AccountId, ForgeActor, ResolvedView,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path(), Default::default()).unwrap();
         let account = AccountId("example".into());
@@ -490,13 +390,14 @@ pub(crate) mod tests {
         store.forge_provision_account(&account, &actor).unwrap();
         let repository = account.repository_id();
         let mut entries = Vec::new();
-        for (name, bytes) in [
+        let contents = [
             ("README.md", b"# Welcome\nExplore this tree.\n".as_slice()),
             ("private.txt", b"secret needle\n".as_slice()),
             ("source.rs", b"fn public_needle() {}\n".as_slice()),
-        ] {
-            let descriptor = tinytree_model::describe_file(bytes);
-            store.put(&repository, descriptor, bytes, 0).unwrap();
+        ].into_iter().map(|(name, bytes)| (name.to_string(), bytes.to_vec())).chain(additional);
+        for (name, bytes) in contents {
+            let descriptor = tinytree_model::describe_file(&bytes);
+            store.put(&repository, descriptor, &bytes, 0).unwrap();
             entries.push(TreeEntry {
                 name: name.into(),
                 value: TreeValue::File {
@@ -507,6 +408,7 @@ pub(crate) mod tests {
                 },
             });
         }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         let tree =
             tinytree_model::encode(&Object::Tree(Tree { entries }), Default::default()).unwrap();
         store
@@ -564,7 +466,7 @@ pub(crate) mod tests {
         let (_directory, store, account, _actor, view) = fixture();
         let call = |operation, payload: serde_json::Value| {
             account_call(
-                &store,
+                &ForgeReadApi::new(store.clone()),
                 None,
                 operation,
                 &account,
@@ -594,8 +496,10 @@ pub(crate) mod tests {
         assert_eq!(search["matches"][0]["path"], "source.rs");
         assert_eq!(search["matches"].as_array().unwrap().len(), 1);
         assert_eq!(search["complete"], true);
+        assert_eq!(search["cursor"], serde_json::Value::Null);
+        assert_eq!(search["skipped_files"], serde_json::json!({"binary":0,"oversized":0}));
         let error = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             None,
             forge_v1::ForgeOperation::ReadFile,
             &account,
@@ -607,7 +511,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
         let error = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             None,
             forge_v1::ForgeOperation::ResolveView,
             &account,
@@ -623,7 +527,7 @@ pub(crate) mod tests {
     fn forge_adapter_mutation_retry_and_descriptor_only_read_are_bound() {
         let (_directory, store, account, actor, view) = fixture();
         let bootstrap = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             Some(&actor),
             forge_v1::ForgeOperation::GetAccount,
             &account,
@@ -650,7 +554,7 @@ pub(crate) mod tests {
             )
         );
         let provision = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             Some(&actor),
             forge_v1::ForgeOperation::ProvisionAccount,
             &account,
@@ -663,7 +567,7 @@ pub(crate) mod tests {
         assert_eq!(
             provision,
             account_call(
-                &store,
+                &ForgeReadApi::new(store.clone()),
                 Some(&actor),
                 forge_v1::ForgeOperation::ProvisionAccount,
                 &account,
@@ -680,7 +584,7 @@ pub(crate) mod tests {
         );
         let request=serde_json::to_vec(&serde_json::json!({"member":{"principal":"writer","can_write":true,"can_review":false,"is_admin":false,"roles":[]},"expected_epoch":view.epoch().0})).unwrap();
         let first = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             Some(&actor),
             forge_v1::ForgeOperation::SetMember,
             &account,
@@ -693,7 +597,7 @@ pub(crate) mod tests {
         assert_eq!(
             first,
             account_call(
-                &store,
+                &ForgeReadApi::new(store.clone()),
                 Some(&actor),
                 forge_v1::ForgeOperation::SetMember,
                 &account,
@@ -708,7 +612,7 @@ pub(crate) mod tests {
         let projection = store.forge_project_view(&view, 0).unwrap();
         let request=serde_json::to_vec(&serde_json::json!({"kind":tinytree_model::Kind::Commit as u8,"id":projection.projected_commit,"max_bytes":0})).unwrap();
         let result = account_call(
-            &store,
+            &ForgeReadApi::new(store.clone()),
             None,
             forge_v1::ForgeOperation::ReadObject,
             &account,
@@ -754,7 +658,7 @@ pub(crate) mod tests {
         .unwrap();
         let call = |view: &str, request_id: &str, bytes: &[u8]| {
             account_call(
-                &store,
+                &ForgeReadApi::new(store.clone()),
                 Some(&actor),
                 forge_v1::ForgeOperation::RetireView,
                 &account,
@@ -785,4 +689,66 @@ pub(crate) mod tests {
             tonic::Code::InvalidArgument
         );
     }
+    #[test]
+    fn forge_search_pages_cross_files_with_exact_replay_skips_and_current_policy() {
+        let mut files = vec![
+            ("a-hits.txt".into(), (0..120).map(|i| format!("needle {i:03}\n")).collect::<String>().into_bytes()),
+            ("b-hits.txt".into(), (120..140).map(|i| format!("needle {i:03}\n")).collect::<String>().into_bytes()),
+            ("c-binary.bin".into(), vec![0xff, 0xfe]),
+            ("zz-oversized.txt".into(), vec![b'x'; 1024 * 1024 + 1]),
+        ];
+        files.extend((0..10).map(|i| (format!("z-{i:02}.txt"), b"no matches here\n".to_vec())));
+        let (_directory, store, account, actor, view) = fixture_with_files(files);
+        let api = ForgeReadApi::new(store.clone());
+        let request = ForgeSearchRequest { version: Some(view.version().0), query: "needle ".into(), regex: false, limit: 17, cursor: None };
+        let first = api.search(&view, None, &request).unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.matches.len(), 17);
+        let token = first.cursor.clone().unwrap();
+        let next_request = ForgeSearchRequest { cursor: Some(token.clone()), ..request.clone() };
+        let second = api.search(&view, None, &next_request).unwrap();
+        assert_eq!(api.clone().search(&view, None, &next_request).unwrap(), second,
+            "immutable input token replay must retain the same page and successor");
+        let changed = ForgeSearchRequest { query: "other".into(), ..next_request.clone() };
+        assert_eq!(api.search(&view, None, &changed).unwrap_err().code(), tonic::Code::Aborted);
+        let unpinned = ForgeSearchRequest { version: None, ..next_request.clone() };
+        assert_eq!(api.search(&view, None, &unpinned).unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(api.search(&view, Some(&actor), &next_request).unwrap_err().code(), tonic::Code::Aborted,
+            "another authorized principal cannot borrow an anonymous page token");
+        let restarted = ForgeReadApi::new(store.clone());
+        assert_eq!(restarted.search(&view, None, &next_request).unwrap_err().code(), tonic::Code::Aborted,
+            "a missing disposable cache must not silently restart the scan");
+        let mut hits = first.matches.clone();
+        let mut page = second.clone();
+        let mut pages = 1;
+        loop {
+            hits.extend(page.matches.clone());
+            let Some(cursor) = page.cursor.clone() else { break; };
+            pages += 1; assert!(pages < 40);
+            page = api.search(&view, None, &ForgeSearchRequest { cursor: Some(cursor), ..request.clone() }).unwrap();
+        }
+        assert_eq!(hits.len(), 140);
+        for (i, hit) in hits.iter().enumerate() {
+            assert_eq!(hit.path, if i < 120 { "a-hits.txt" } else { "b-hits.txt" });
+            assert_eq!(hit.line, (if i < 120 { i + 1 } else { i - 119 }) as u64);
+            assert_eq!(hit.column, 1);
+            assert_eq!(hit.preview.trim_end(), format!("needle {i:03}"));
+        }
+        assert!(!page.complete, "excluded FILE formats cannot claim full coverage");
+        assert_eq!(page.skipped_files.binary, 1);
+        assert_eq!(page.skipped_files.oversized, 1);
+        assert!(pages > 8, "cross-file call budget needs another page even without new hits");
+        let regex = ForgeSearchRequest { query: "needle [0-9]+".into(), regex: true, ..request.clone() };
+        assert_eq!(api.search(&view, None, &regex).unwrap().matches, first.matches);
+        store.forge_publish_view(&account, &actor, ViewSpec {
+            name: view.name().into(), root_prefix: String::new(), include_prefixes: vec![String::new()],
+            exclude_prefixes: vec!["private.txt".into()], visibility: tinytree_store::ForgeViewVisibility::Members,
+            revision: view.revision().0, export_allowed: true,
+        }, view.epoch(), false).unwrap();
+        assert!(api.search(&view, None, &next_request).is_err(), "warmed cached response must reauthorize after visibility revocation");
+        let owner_view = store.forge_resolve_view(&account, Some(&actor), "public", None).unwrap();
+        let owner_request = ForgeSearchRequest { version: Some(owner_view.version().0), ..request };
+        assert_eq!(api.search(&owner_view, Some(&actor), &owner_request).unwrap().matches, first.matches);
+    }
+
 }

@@ -1065,6 +1065,39 @@ mod forge_product {
         assert_eq!(partial["state"], "incomplete");
         assert_eq!(partial["result"]["value"]["complete"], false);
         assert!(!search.contains("private-sentinel"));
+        assert_eq!(partial["result"]["value"]["skipped_files"]["oversized"], 1);
+        let first_page: serde_json::Value = serde_json::from_str(&client.success(&["search", "hello", "--limit", "1", "--json"])).unwrap();
+        assert_eq!(first_page["state"], "incomplete");
+        let pinned_version = first_page["result"]["value"]["view_version"].as_str().unwrap().to_owned();
+        let first_cursor = first_page["result"]["value"]["cursor"].as_str().expect("two matching files require continuation at limit1").to_owned();
+        let missing_version = client.run(&["search", "hello", "--limit", "1", "--cursor", &first_cursor, "--json"]);
+        assert!(!missing_version.status.success(), "continuation requires an explicit immutable version");
+        let wrong_query = client.run(&["search", "public", "--limit", "1", "--version", &pinned_version, "--cursor", &first_cursor, "--json"]);
+        assert!(!wrong_query.status.success(), "a cursor cannot restart/rebind a different query");
+        let excessive_limit = client.run(&["search", "hello", "--limit", "101", "--json"]);
+        assert!(!excessive_limit.status.success());
+        let mut page = first_page;
+        let mut hits = std::collections::BTreeSet::new();
+        let mut finished = false;
+        for _ in 0..8 {
+            let value = &page["result"]["value"];
+            assert_eq!(value["view_version"], pinned_version);
+            for hit in value["matches"].as_array().unwrap() {
+                assert!(hits.insert((hit["path"].as_str().unwrap().to_owned(), hit["line"].as_u64().unwrap(), hit["column"].as_u64().unwrap())), "continuation must not duplicate hits");
+            }
+            let Some(cursor) = value["cursor"].as_str() else {
+                assert_eq!(value["complete"], false, "oversized file makes terminal page explicitly partial");
+                assert_eq!(page["state"], "incomplete");
+                assert_eq!(value["skipped_files"]["oversized"], 1);
+                finished = true;
+                break;
+            };
+            page = serde_json::from_str(&client.success(&["search", "hello", "--limit", "1", "--version", &pinned_version, "--cursor", cursor, "--json"])).unwrap();
+        }
+        assert!(finished, "bounded cursor walk must terminate");
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| hit.0 == "README.md"));
+        assert!(hits.iter().any(|hit| hit.0 == "main.rs"));
         let rejected = client.run(&["view", "read", "../secrets/token.txt", "--json"]);
         assert!(!rejected.status.success());
         assert!(!String::from_utf8_lossy(&rejected.stdout).contains("private-sentinel"));

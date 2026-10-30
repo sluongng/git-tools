@@ -8,6 +8,7 @@ import { ForgeReads } from './forge_reads';
 import { ForgeStorage } from './forge_storage';
 import { ClosureJobs } from './closure_jobs';
 import { BootstrapImports } from './bootstrap_import';
+import { ForgeSearch } from './forge_search';
 
 interface Env {
   REPOSITORIES: DurableObjectNamespace;
@@ -241,9 +242,16 @@ export class AccountRepository {
       },
     });
     let result;
-    if ([4, 5, 6, 7, 9, 11].includes(call.operation)) {
+    if ([4, 5, 6, 7, 8, 9, 11].includes(call.operation)) {
       const services = this.forgeServices(call.account_id, auth?.principal ?? null, api, storage);
       if ([4, 5, 11].includes(call.operation)) result = await services.views.handle(call);
+      else if (call.operation === 8) result = await new ForgeSearch({
+        accountId: call.account_id, principal: auth?.principal ?? null, sql: this.sql,
+        views: services.views, projections: services.projections,
+        transactionSync: callback => this.ctx.storage.transactionSync(callback),
+        readVerifiedObject: key => storage.readVerifiedObject(key),
+        nowSeconds: () => Math.floor(Date.now() / 1000),
+      }).handle(call);
       else result = await new ForgeReads({
         accountId: call.account_id, sql: this.sql, views: services.views, projections: services.projections,
         transactionSync: callback => this.ctx.storage.transactionSync(callback),
@@ -253,8 +261,7 @@ export class AccountRepository {
     } else if ([40, 41, 42, 43, 44].includes(call.operation)) {
       if (!auth) fail(401, 'unauthenticated');
       result = await this.bootstrapImports(call.account_id, auth.principal, api, storage).handle(call);
-    } else if (call.operation === 8) fail(501, 'unimplemented');
-    else result = await api.handle(call);
+    } else result = await api.handle(call);
     return forgeReply(call, result.state, result.result);
   }
   private bootstrapImports(account: string, principal: string, api: ForgeAccounts, storage: ForgeStorage): BootstrapImports {

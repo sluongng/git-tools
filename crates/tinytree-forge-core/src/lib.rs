@@ -7,6 +7,7 @@ pub mod identity;
 pub mod review;
 pub mod projection;
 pub mod wire;
+pub mod search;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
