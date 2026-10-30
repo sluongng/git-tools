@@ -20,8 +20,9 @@ try {
     stdio: "inherit",
     env: {
       ...process.env,
-      TINYTREE_WORKER_BUNDLE: resolve(directory, "worker.mjs"),
-      TINYTREE_CORE_WASM: resolve(directory, "core.wasm"),
+      TINYTREE_WORKER_BUNDLE: resolve(directory, "release/worker.mjs"),
+      TINYTREE_CORE_WASM: resolve(directory, "release/core.wasm"),
+      TINYTREE_UI_ASSETS_DIRECTORY: resolve(directory, "release/ui-assets"),
       TINYTREE_CONTRACT_FIXTURE: fixtureJson,
       TINYTREE_TT_BINARY: resolve(tt),
       TINYTREE_CLOSURE_HARNESS_BUNDLE: resolve(directory, "closure-harness/worker.mjs"),

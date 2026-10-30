@@ -28,6 +28,10 @@ enum Command {
         query: String,
         matches: Vec<Match>,
         complete: bool,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default)]
+        skipped_files: SkippedFiles,
     },
     Source {
         content: String,
@@ -41,6 +45,12 @@ struct Suggestion {
     label: String,
     detail: &'static str,
 }
+#[derive(Default, Deserialize)]
+struct SkippedFiles {
+    binary: u64,
+    oversized: u64,
+}
+
 #[derive(Deserialize)]
 struct Match {
     path: String,
@@ -288,11 +298,24 @@ fn suggestions(query: &str, paths: &[String]) -> Vec<Suggestion> {
     result
 }
 
-fn render_results(query: &str, matches: &[Match], complete: bool) -> String {
+fn render_results(
+    query: &str,
+    matches: &[Match],
+    complete: bool,
+    has_more: bool,
+    skipped: &SkippedFiles,
+) -> String {
     let coverage = if complete {
-        "Search complete"
+        "Search complete".to_string()
+    } else if has_more {
+        "Partial results · more pages available".to_string()
+    } else if skipped.binary != 0 || skipped.oversized != 0 {
+        format!(
+            "Partial results · {} binary and {} oversized files skipped",
+            skipped.binary, skipped.oversized
+        )
     } else {
-        "Partial results · search limit reached"
+        "Partial results · scan limit reached".to_string()
     };
     let mut output = format!(
         "<header class=\"results-heading\"><div><p class=\"eyebrow\">SEARCH RESULTS</p><h1>{}</h1></div><p>{} match{}<br><span>{coverage}</span></p></header>",
@@ -301,7 +324,13 @@ fn render_results(query: &str, matches: &[Match], complete: bool) -> String {
         if matches.len() == 1 { "" } else { "es" }
     );
     if matches.is_empty() {
-        output.push_str(if complete { "<div class=\"empty-state\"><h2>No matches found</h2><p>Try a shorter phrase, or open a file from the search suggestions.</p></div>" } else { "<div class=\"empty-state\"><h2>No matches in the scanned files</h2><p>The search limit was reached. This is not proof that the repository has no matches.</p></div>" });
+        output.push_str(if complete {
+            "<div class=\"empty-state\"><h2>No matches found</h2><p>Try a shorter phrase, or open a file from the search suggestions.</p></div>"
+        } else if has_more {
+            "<div class=\"empty-state\"><h2>No matches on this page</h2><p>Choose Next to continue this exact search.</p></div>"
+        } else {
+            "<div class=\"empty-state\"><h2>No matches in the scanned files</h2><p>Coverage is partial. This is not proof that the repository has no matches.</p></div>"
+        });
     }
     for item in matches {
         output.push_str(&format!("<button type=\"button\" class=\"search-match\" data-path=\"{}\" data-line=\"{}\"><span class=\"match-location\">{}<span>{}:{}</span></span><code>{}</code></button>", escape(&item.path), item.line, escape(&item.path), item.line, item.column, escape(&item.preview)));
@@ -349,7 +378,11 @@ pub fn command(input: &[u8]) -> Vec<u8> {
             query,
             matches,
             complete,
-        }) => serde_json::json!({"html": render_results(&query, &matches, complete)}),
+            has_more,
+            skipped_files,
+        }) => {
+            serde_json::json!({"html": render_results(&query, &matches, complete, has_more, &skipped_files)})
+        }
         Ok(Command::Source { content, line }) => {
             serde_json::json!({"html": source(&content, line)})
         }
@@ -430,6 +463,34 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("data-path=\"&quot;onfocus=bad\""));
         assert!(!html.contains("<img>"));
+        for (fields, expected, forbidden) in [
+            (
+                serde_json::json!({"complete":false,"has_more":true,"skipped_files":{"binary":0,"oversized":0}}),
+                "more pages available",
+                "Search complete",
+            ),
+            (
+                serde_json::json!({"complete":false,"has_more":false,"skipped_files":{"binary":2,"oversized":1}}),
+                "2 binary and 1 oversized files skipped",
+                "search limit reached",
+            ),
+            (
+                serde_json::json!({"complete":true,"has_more":false,"skipped_files":{"binary":0,"oversized":0}}),
+                "Search complete",
+                "Partial results",
+            ),
+        ] {
+            let mut input = serde_json::json!({"op":"results","query":"literal","matches":[]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let result: serde_json::Value =
+                serde_json::from_slice(&command(&serde_json::to_vec(&input).unwrap())).unwrap();
+            let html = result["html"].as_str().unwrap();
+            assert!(html.contains(expected), "{html}");
+            assert!(!html.contains(forbidden), "{html}");
+        }
     }
     #[test]
     fn relative_links_cannot_escape_repository_or_use_protocol_relative_urls() {

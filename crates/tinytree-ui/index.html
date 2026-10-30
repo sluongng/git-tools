@@ -25,12 +25,13 @@
   <main>
     <section class="workspace-bar" aria-label="Repository selection">
       <form id="repository-form">
-        <div class="field"><label for="repository">Repository</label><select id="repository"><option value="default">default</option></select></div>
+        <div class="field" id="repository-field"><label for="repository">Repository</label><select id="repository"><option value="default">default</option></select></div>
+        <div class="field" id="account-field" hidden><label for="account">Account</label><input id="account" autocomplete="off" spellcheck="false" maxlength="64" pattern="[a-z0-9-]+" placeholder="Account name"></div>
         <span class="divider-slash" aria-hidden="true">/</span>
         <div class="field ref-field"><label for="reference">Reference</label><input id="reference" value="main" autocomplete="off" spellcheck="false"></div>
         <button type="submit" id="open-repository">Open <span aria-hidden="true">↗</span></button>
       </form>
-      <p class="revision" id="revision">No revision selected</p>
+      <div class="snapshot-identities"><p class="revision" id="view-version" hidden></p><p class="revision" id="revision">No revision selected</p></div>
     </section>
     <section class="search-section" aria-label="Repository search">
       <div class="search-intro"><p class="eyebrow">FOLLOW A THREAD</p><p>Find a file. Find an idea.</p></div>
@@ -53,6 +54,7 @@
       </aside>
       <section class="document-panel" aria-label="Repository content">
         <div class="document-toolbar"><span id="document-path">README</span><button id="back-to-readme" type="button" hidden>Back to overview</button></div>
+        <nav id="search-pagination" class="search-pagination" aria-label="Search result pages" hidden><button type="button" id="search-previous">Previous</button><span id="search-page-label" aria-live="polite"></span><button type="button" id="search-next">Next</button></nav>
         <p id="status" class="status" role="status" aria-live="polite">Starting the browser…</p>
         <article id="document" tabindex="-1"><div class="empty-state initial-state"><span class="large-branch" aria-hidden="true">⑂</span><p class="eyebrow">WELCOME TO TINYTREE</p><h1>Your repository,<br>in view.</h1><p>Open a reference to read its README and explore the code.</p></div></article>
       </section>

@@ -1104,3 +1104,13 @@ footer>span:last-child span {
     transition: none!important;
   }
 }
+
+/* Bounded search-page controls reuse the repository toolbar's visual language. */
+.search-pagination { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.5rem; }
+.search-pagination[hidden], #repository-field[hidden], #account-field[hidden] { display: none; }
+.search-pagination button { border: 1px solid var(--line); border-radius: 6px; padding: 0.35rem 0.65rem; background: transparent; color: inherit; cursor: pointer; }
+.search-pagination button:disabled { opacity: 0.45; cursor: default; }
+.search-pagination span { font-size: 0.8rem; }
+
+.snapshot-identities { display: grid; gap: 0.35rem; }
+.snapshot-identities .revision { margin: 0; }

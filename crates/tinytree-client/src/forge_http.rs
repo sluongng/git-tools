@@ -7,6 +7,7 @@ use std::{io::Write, sync::Arc};
 use tinytree_proto::{FORGE_MAX_REQUEST_BYTES, FORGE_MAX_RESPONSE_BYTES, forge_v1 as f};
 use tokio::time::Instant;
 use tonic::{Code, Request, Status};
+use tinytree_forge_core::wire::Reply;
 
 type Owner = Arc<dyn std::any::Any + Send + Sync>;
 
@@ -24,17 +25,6 @@ struct Call<'a> {
     view: &'a str,
     request_id: &'a str,
     payload_json: &'a str,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reply {
-    version: u32,
-    operation: i32,
-    account_id: String,
-    view: String,
-    request_id: String,
-    state: String,
-    result_json: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,10 +208,7 @@ impl Client {
             };
             return Err(Status::new(code, failure.error.message));
         }
-        let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if reply.version != 1 {
-            return Err(invalid());
-        }
+        let reply = Reply::decode(&bytes).map_err(|_| invalid())?;
         Ok(f::ForgeCallResponse {
             operation: reply.operation,
             account_id: reply.account_id,

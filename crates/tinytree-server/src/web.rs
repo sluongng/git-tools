@@ -7,7 +7,7 @@ use axum::{
     extract::{Request as HttpRequest, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response as HttpResponse},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use serde_json::{Value, json};
 use std::net::IpAddr;
@@ -53,7 +53,7 @@ fn browser_routes(service: RepositoryService, port: Option<u16>) -> Router {
         .route("/ui/app.js", get(script))
         .route("/ui/style.css", get(styles))
         .route("/ui/tinytree_ui.wasm", get(wasm))
-        .route("/ui/api/forge", post(forge_call))
+        .route("/api/v1/forge/call", any(forge_call))
         .route("/ui/api/repositories", post(repositories))
         .route("/ui/api/snapshot", post(snapshot))
         .route("/ui/api/file", post(file))
@@ -187,54 +187,101 @@ fn browser_identity(
     let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
     state.service.inner.auth.identify(&metadata)
 }
+/// Forge's ordinary HTTP wire has its own bounded structured errors. Legacy
+/// non-account browser APIs retain their existing errors and identity behavior.
+fn forge_error(status: Status) -> HttpResponse {
+    use tonic::Code;
+    let (http, code) = match status.code() {
+        Code::Unauthenticated => (StatusCode::UNAUTHORIZED, "unauthenticated"),
+        Code::PermissionDenied => (StatusCode::FORBIDDEN, "permission_denied"),
+        Code::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        Code::ResourceExhausted => (StatusCode::TOO_MANY_REQUESTS, "resource_exhausted"),
+        Code::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded"),
+        Code::Unavailable | Code::Cancelled => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        Code::InvalidArgument => (StatusCode::BAD_REQUEST, "invalid_argument"),
+        Code::FailedPrecondition => (StatusCode::BAD_REQUEST, "failed_precondition"),
+        Code::OutOfRange => (StatusCode::BAD_REQUEST, "out_of_range"),
+        Code::Aborted => (StatusCode::CONFLICT, "aborted"),
+        Code::AlreadyExists => (StatusCode::CONFLICT, "already_exists"),
+        Code::Unimplemented => (StatusCode::NOT_IMPLEMENTED, "unimplemented"),
+        Code::DataLoss => (StatusCode::INTERNAL_SERVER_ERROR, "data_loss"),
+        Code::Unknown => (StatusCode::INTERNAL_SERVER_ERROR, "unknown"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    };
+    // Never expose caught SQL, source paths, configuration or backend errors.
+    let mut response = (
+        http,
+        axum::Json(json!({"version":1,"error":{"code":code,"message":code}})),
+    )
+        .into_response();
+    security_headers(response.headers_mut());
+    response
+}
 async fn forge_call(State(state): State<WebState>, request: HttpRequest) -> HttpResponse {
     let result = async {
-        // Public views may be anonymous. Origin/Host safeguards still apply;
-        // Forge ingress, not the legacy local-owner shortcut, resolves identity.
+        if request.method() != http::Method::POST || request.uri().query().is_some() {
+            return Err(Status::invalid_argument("invalid forge HTTP route"));
+        }
+        if request.headers().get_all(header::HOST).iter().count() > 1
+            || request.headers().get_all(header::ORIGIN).iter().count() > 1
+        {
+            return Err(Status::permission_denied("ambiguous forge HTTP origin"));
+        }
+        // SDK calls may omit Origin. Browser Origin/Fetch Metadata safeguards
+        // still apply, and neither path inherits legacy local-owner identity.
         browser_origin(&state, request.headers(), request.uri())?;
         if request
             .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(';').next())
-            .map(str::trim)
-            != Some("application/json")
+            .get_all(header::CONTENT_TYPE)
+            .iter()
+            .count()
+            != 1
+            || !request
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(';').next())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
         {
             return Err(Status::invalid_argument(
-                "browser API requires application/json",
+                "forge HTTP requires application/json",
             ));
         }
         let headers = request.headers().clone();
+        // Reserve global/memory admission before collecting even chunked input.
         let work = crate::forge::admit_http(&state.service, &headers).await?;
-        let deadline = work.deadline;
-        let bytes = tokio::time::timeout_at(
-            deadline,
-            to_bytes(
-                request.into_body(),
-                MAX_BODY.min(state.service.inner.config.max_request_bytes),
-            ),
-        )
-        .await
-        .map_err(|_| Status::deadline_exceeded("browser request deadline exceeded"))?
-        .map_err(|_| Status::resource_exhausted("browser request exceeds byte budget"))?;
-        let input = serde_json::from_slice::<crate::forge::ForgeHttpRequest>(&bytes)
-            .map_err(|_| Status::invalid_argument("invalid browser forge request"))?;
-        let value =
+        let limit = tinytree_forge_core::wire::MAX_REQUEST_BYTES
+            .min(state.service.inner.config.max_request_bytes);
+        let bytes = tokio::time::timeout_at(work.deadline, to_bytes(request.into_body(), limit))
+            .await
+            .map_err(|_| Status::deadline_exceeded("forge HTTP request deadline exceeded"))?
+            .map_err(|_| Status::resource_exhausted("forge HTTP request exceeds byte budget"))?;
+        let input =
+            tinytree_forge_core::wire::Call::decode(&bytes).map_err(|error| match error {
+                tinytree_forge_core::Error::Limit(_) => {
+                    Status::resource_exhausted("forge HTTP request exceeds byte budget")
+                }
+                _ => Status::invalid_argument("invalid forge HTTP envelope"),
+            })?;
+        let bytes =
             crate::forge::call_http_admitted(state.service, &headers, input, work.clone()).await?;
-        Ok::<_, Status>((value, work))
+        Ok::<_, Status>((bytes, work))
     }
     .await;
     match result {
-        Ok((value, work)) => {
-            let mut response = json_response(value);
+        Ok((bytes, work)) => {
+            let mut response =
+                ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+            security_headers(response.headers_mut());
             response
                 .extensions_mut()
                 .insert(crate::body_deadline::ResponseBudget::new(work));
             response
         }
-        Err(status) => error(status),
+        Err(status) => forge_error(status),
     }
 }
+
 async fn input<T: serde::de::DeserializeOwned>(
     state: &WebState,
     request: HttpRequest,
@@ -735,6 +782,7 @@ fn metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tinytree_proto::forge_v1::ForgeOperation as Op;
     use tower::ServiceExt;
 
     const TOKEN: &str = "browser-reader-token-not-a-secret";
@@ -857,7 +905,11 @@ mod tests {
     ) -> (StatusCode, Value) {
         let mut request = HttpRequest::builder()
             .method("POST")
-            .uri(format!("/ui/api/{action}"))
+            .uri(if action == "forge" {
+                "/api/v1/forge/call".to_owned()
+            } else {
+                format!("/ui/api/{action}")
+            })
             .header("host", "localhost:8093")
             .header("origin", "http://localhost:8093")
             .header("content-type", "application/json");
@@ -871,6 +923,11 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 4 * MAX_FILE).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    fn forge_payload(value: &Value) -> Value {
+        let reply =
+            tinytree_forge_core::wire::Reply::decode(&serde_json::to_vec(value).unwrap()).unwrap();
+        serde_json::from_str(&reply.result_json).unwrap()
     }
     use axum::body::Body;
 
@@ -965,7 +1022,7 @@ mod tests {
         });
         let request = HttpRequest::builder()
             .method("POST")
-            .uri("/ui/api/forge")
+            .uri("/api/v1/forge/call")
             .header("host", "localhost:8093")
             .header("origin", "http://localhost:8093")
             .header("content-type", "application/json")
@@ -977,6 +1034,279 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            json!({"version":1,"error":{"code":"deadline_exceeded","message":"deadline_exceeded"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn forge_http_shared_wire_accepts_sdk_and_browser_without_legacy_authority() {
+        let (_directory, store, account, actor, _) = crate::forge_accounts::tests::fixture();
+        let service = RepositoryService::new(
+            store,
+            ServiceConfig::default(),
+            vec![],
+            vec![Principal::new_forge(actor.principal, TOKEN).unwrap()],
+        )
+        .unwrap();
+        let call = json!({"version":1,"operation":6,"account_id":account.0,"view":"public","request_id":"wire-read","payload_json":"{}"});
+        let encoded = call.to_string();
+        let mut unknown = call.clone();
+        unknown["actor"] = json!("owner");
+        let mut large = call.clone();
+        large["payload_json"] = json!(format!("{}{{}}", " ".repeat(MAX_BODY + 1)));
+        let mut bootstrap = call.clone();
+        bootstrap["operation"] = json!(40);
+        bootstrap["request_id"] = json!("native-unsupported");
+        struct Case {
+            name: &'static str,
+            origin: Option<&'static str>,
+            fetch: Option<&'static str>,
+            token: Option<&'static str>,
+            method: &'static str,
+            uri: &'static str,
+            body: String,
+            status: StatusCode,
+            error: Option<&'static str>,
+        }
+        for case in [
+            Case {
+                name: "SDK without Origin",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::OK,
+                error: None,
+            },
+            Case {
+                name: "same-origin browser",
+                origin: Some("http://localhost:8093"),
+                fetch: Some("same-origin"),
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::OK,
+                error: None,
+            },
+            Case {
+                name: "cross-origin browser",
+                origin: Some("http://foreign.invalid"),
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::FORBIDDEN,
+                error: Some("permission_denied"),
+            },
+            Case {
+                name: "cross-site metadata",
+                origin: Some("http://localhost:8093"),
+                fetch: Some("cross-site"),
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::FORBIDDEN,
+                error: Some("permission_denied"),
+            },
+            Case {
+                name: "invalid token never falls back to public",
+                origin: None,
+                fetch: None,
+                token: Some("invalid-wire-token"),
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::UNAUTHORIZED,
+                error: Some("unauthenticated"),
+            },
+            Case {
+                name: "POST only",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "GET",
+                uri: "/api/v1/forge/call",
+                body: encoded.clone(),
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_argument"),
+            },
+            Case {
+                name: "canonical route",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call?other=1",
+                body: encoded.clone(),
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_argument"),
+            },
+            Case {
+                name: "old string wrapper rejected",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: json!({"operation":"resolve_view","account_id":account.0,"payload":{}})
+                    .to_string(),
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_argument"),
+            },
+            Case {
+                name: "duplicate operation rejected",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: encoded.replace("\"operation\":6", "\"operation\":6,\"operation\":7"),
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_argument"),
+            },
+            Case {
+                name: "caller actor rejected",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: unknown.to_string(),
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_argument"),
+            },
+            Case {
+                name: "not legacy 16KiB cap",
+                origin: None,
+                fetch: None,
+                token: None,
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: large.to_string(),
+                status: StatusCode::OK,
+                error: None,
+            },
+            Case {
+                name: "native bootstrap remains unsupported",
+                origin: None,
+                fetch: None,
+                token: Some(TOKEN),
+                method: "POST",
+                uri: "/api/v1/forge/call",
+                body: bootstrap.to_string(),
+                status: StatusCode::NOT_IMPLEMENTED,
+                error: Some("unimplemented"),
+            },
+        ] {
+            let mut request = HttpRequest::builder()
+                .method(case.method)
+                .uri(case.uri)
+                .header("host", "localhost:8093")
+                .header("content-type", "application/json");
+            if let Some(origin) = case.origin {
+                request = request.header("origin", origin);
+            }
+            if let Some(fetch) = case.fetch {
+                request = request.header("sec-fetch-site", fetch);
+            }
+            if let Some(token) = case.token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = browser_routes(service.clone(), Some(8093))
+                .oneshot(request.body(Body::from(case.body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), case.status, "{}", case.name);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let bytes = to_bytes(
+                response.into_body(),
+                tinytree_forge_core::wire::MAX_RESPONSE_BYTES,
+            )
+            .await
+            .unwrap();
+            if let Some(code) = case.error {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    value,
+                    json!({"version":1,"error":{"code":code,"message":code}}),
+                    "{}",
+                    case.name
+                );
+            } else {
+                let reply = tinytree_forge_core::wire::Reply::decode(&bytes).unwrap();
+                assert_eq!(reply.operation, 6);
+                assert_eq!(reply.account_id, account.0);
+                assert_eq!(reply.view, "public");
+                assert_eq!(reply.request_id, "wire-read");
+                assert_eq!(reply.state, "complete");
+                let result: Value = serde_json::from_str(&reply.result_json).unwrap();
+                assert_eq!(result["readme"]["path"], "README.md");
+            }
+        }
+        let retired = HttpRequest::builder()
+            .method("POST")
+            .uri("/ui/api/forge")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            browser_routes(service, Some(8093))
+                .oneshot(retired)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn forge_http_without_authentication_never_inherits_local_owner() {
+        let (_directory, store, account, _owner, _) = crate::forge_accounts::tests::fixture();
+        let service =
+            RepositoryService::new(store, ServiceConfig::default(), vec![account.repository_id()], vec![]).unwrap();
+        assert!(!service.authentication_enabled());
+        let body = json!({"version":1,"operation":2,"account_id":account.0,"view":"public","request_id":"","payload_json":"{}"});
+        let (status, value) = api(&service, "forge", body, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            value,
+            json!({"version":1,"error":{"code":"unauthenticated","message":"unauthenticated"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn forge_http_limits_streamed_input_without_trusting_content_length() {
+        let (_directory, service, _) = setup(b"# Example", false, true);
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::from(vec![b' ';tinytree_forge_core::wire::MAX_REQUEST_BYTES/2+1]));
+            yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::from(vec![b' ';tinytree_forge_core::wire::MAX_REQUEST_BYTES/2+1]));
+        });
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/forge/call")
+            .header("host", "localhost:8093")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let response = browser_routes(service, Some(8093))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({"version":1,"error":{"code":"resource_exhausted","message":"resource_exhausted"}})
+        );
     }
 
     #[tokio::test]
@@ -992,33 +1322,39 @@ mod tests {
             vec![Principal::new_forge(actor.principal.clone(), TOKEN).unwrap()],
         )
         .unwrap();
-        let envelope = |operation: &str, payload: Value| json!({"operation":operation,"account_id":account.0,"view":"public","request_id":"browser-read","payload":payload});
+        let envelope = |operation: Op, payload: Value| json!({"version":1,"operation":operation as i32,"account_id":account.0,"view":"public","request_id":"browser-read","payload_json":payload.to_string()});
         let (status, snapshot) = api(
             &service,
             "forge",
-            envelope("resolve_view", json!({})),
+            envelope(Op::ResolveView, json!({})),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{snapshot}");
-        assert_eq!(snapshot["result"]["readme"]["path"], "README.md");
+        assert_eq!(forge_payload(&snapshot)["readme"]["path"], "README.md");
         assert_eq!(
-            snapshot["result"]["paths"],
+            forge_payload(&snapshot)["paths"],
             json!(["README.md", "source.rs"])
         );
         let (status, search) = api(
             &service,
             "forge",
-            envelope("search", json!({"query":"needle","regex":false,"limit":10})),
+            envelope(
+                Op::Search,
+                json!({"query":"needle","regex":false,"limit":10}),
+            ),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{search}");
-        assert_eq!(search["result"]["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            forge_payload(&search)["matches"].as_array().unwrap().len(),
+            1
+        );
         let (status, _) = api(
             &service,
             "forge",
-            envelope("read_file", json!({"path":"private.txt"})),
+            envelope(Op::ReadFile, json!({"path":"private.txt"})),
             false,
         )
         .await;
@@ -1038,13 +1374,18 @@ mod tests {
         let (status, _) = api(
             &service,
             "forge",
-            envelope("resolve_view", json!({})),
+            envelope(Op::ResolveView, json!({})),
             false,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let (status, locked) =
-            api(&service, "forge", envelope("resolve_view", json!({})), true).await;
+        let (status, locked) = api(
+            &service,
+            "forge",
+            envelope(Op::ResolveView, json!({})),
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{locked}");
         // Even authenticated product users cannot use the raw repository browser.
         let (status, _) = api(
@@ -1112,13 +1453,13 @@ mod tests {
             service: &RepositoryService,
             account: &str,
             token: &str,
-            operation: &str,
+            operation: Op,
             payload: Value,
         ) -> (StatusCode, Value) {
-            let request = HttpRequest::builder().method("POST").uri("/ui/api/forge")
+            let request = HttpRequest::builder().method("POST").uri("/api/v1/forge/call")
                 .header("host", "localhost:8093").header("origin", "http://localhost:8093")
                 .header("content-type", "application/json").header("authorization", format!("Bearer {token}"))
-                .body(Body::from(json!({"operation":operation,"account_id":account,"view":"locked","request_id":format!("membership-proof-{operation}"),"payload":payload}).to_string())).unwrap();
+                .body(Body::from(json!({"version":1,"operation":operation as i32,"account_id":account,"view":"locked","request_id":format!("membership-proof-{}", operation as i32),"payload_json":payload.to_string()}).to_string())).unwrap();
             let response = browser_routes(service.clone(), Some(8093))
                 .oneshot(request)
                 .await
@@ -1134,7 +1475,7 @@ mod tests {
                 &service,
                 &account.0,
                 owner_token,
-                "provision_account",
+                Op::ProvisionAccount,
                 json!({})
             )
             .await
@@ -1146,7 +1487,7 @@ mod tests {
                 &service,
                 &account.0,
                 owner_token,
-                "provision_account",
+                Op::ProvisionAccount,
                 json!({"repository_id":"second-monorepo"})
             )
             .await
@@ -1154,36 +1495,40 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(store.forge_account_repositories(10).unwrap(), repositories);
-        let (status, snapshot) = call(&service, &account.0, TOKEN, "resolve_view", json!({})).await;
+        let (status, snapshot) =
+            call(&service, &account.0, TOKEN, Op::ResolveView, json!({})).await;
         assert_eq!(status, StatusCode::OK, "{snapshot}");
-        let version = snapshot["result"]["view_version"].clone();
+        let version = forge_payload(&snapshot)["view_version"].clone();
         let private = tinytree_model::describe_file(b"secret needle\n");
         let requests = [
-            ("read_file", json!({"version":version,"path":"private.txt"})),
             (
-                "read_object",
+                Op::ReadFile,
+                json!({"version":version,"path":"private.txt"}),
+            ),
+            (
+                Op::ReadObject,
                 json!({"version":version,"kind":tinytree_model::Kind::File as u8,"id":private.key.id.0}),
             ),
             (
-                "search",
+                Op::Search,
                 json!({"version":version,"query":"secret","regex":false,"limit":10}),
             ),
         ];
         for (operation, payload) in &requests {
             let (status, result) =
-                call(&service, &account.0, TOKEN, operation, payload.clone()).await;
-            assert_eq!(status, StatusCode::OK, "warm {operation}: {result}");
-            if *operation == "search" {
-                assert_eq!(result["result"]["matches"][0]["path"], "private.txt");
+                call(&service, &account.0, TOKEN, *operation, payload.clone()).await;
+            assert_eq!(status, StatusCode::OK, "warm {operation:?}: {result}");
+            if *operation == Op::Search {
+                assert_eq!(forge_payload(&result)["matches"][0]["path"], "private.txt");
             }
         }
-        let projected = json!({"version":version,"kind":tinytree_model::Kind::Commit as u8,"id":snapshot["result"]["projected_commit"]});
+        let projected = json!({"version":version,"kind":tinytree_model::Kind::Commit as u8,"id":forge_payload(&snapshot)["projected_commit"]});
         assert_eq!(
             call(
                 &service,
                 &account.0,
                 TOKEN,
-                "read_object",
+                Op::ReadObject,
                 projected.clone()
             )
             .await
@@ -1195,15 +1540,15 @@ mod tests {
             .unwrap();
         for (operation, payload) in &requests {
             assert_eq!(
-                call(&service, &account.0, TOKEN, operation, payload.clone())
+                call(&service, &account.0, TOKEN, *operation, payload.clone())
                     .await
                     .0,
                 StatusCode::FORBIDDEN,
-                "revoked {operation}"
+                "revoked {operation:?}"
             );
         }
         assert_eq!(
-            call(&service, &account.0, TOKEN, "read_object", projected)
+            call(&service, &account.0, TOKEN, Op::ReadObject, projected)
                 .await
                 .0,
             StatusCode::FORBIDDEN
@@ -1214,7 +1559,7 @@ mod tests {
                 &service,
                 &account.0,
                 owner_token,
-                "resolve_view",
+                Op::ResolveView,
                 json!({"version":version})
             )
             .await
@@ -1226,11 +1571,11 @@ mod tests {
                 &service,
                 &account.0,
                 owner_token,
-                operation,
+                *operation,
                 payload.clone(),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "owner {operation}: {result}");
+            assert_eq!(status, StatusCode::OK, "owner {operation:?}: {result}");
         }
     }
 

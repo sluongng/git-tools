@@ -28,6 +28,47 @@ js_run_binary(
     mnemonic = "WorkerBundle",
 )
 
+# One declared deployment tree; UI Wasm is a static browser asset, not the
+# repository core's CompiledWasm module. No provider resources are selected here.
+js_binary(
+    name = "package_tool",
+    entry_point = "tools/package.mjs",
+)
+
+js_run_binary(
+    name = "release_package",
+    tool = ":package_tool",
+    # package.mjs resolves declared source paths from the execution root;
+    # rules_js cannot copy another package's source assets into this package.
+    copy_srcs_to_bin = False,
+    srcs = [
+        ":worker",
+        "wrangler.jsonc",
+        "//crates/tinytree-ui:assets",
+        "//crates/tinytree-ui:wasm",
+    ],
+    outs = [
+        "release/worker.mjs",
+        "release/core.wasm",
+        "release/wrangler.jsonc",
+        "release/ui-assets/ui/index.html",
+        "release/ui-assets/ui/app.js",
+        "release/ui-assets/ui/style.css",
+        "release/ui-assets/ui/tinytree_ui.wasm",
+    ],
+    args = [
+        "$(RULEDIR)/worker.mjs",
+        "$(RULEDIR)/core.wasm",
+        "cloudflare/wrangler.jsonc",
+        "crates/tinytree-ui/index.html",
+        "crates/tinytree-ui/app.js",
+        "crates/tinytree-ui/style.css",
+        "$(execpath //crates/tinytree-ui:wasm)",
+        "$(RULEDIR)/release",
+    ],
+    mnemonic = "WorkerReleasePackage",
+)
+
 js_test(
     name = "typecheck",
     include_types = True,
@@ -83,12 +124,26 @@ js_test(
         "tests/runtime.test.mjs",
         ":closure_job_harness",
         ":projection_harness",
-        ":worker",
+        ":release_package",
         ":node_modules/miniflare",
         "//crates/tinytree-cloudflare:contract_fixture",
         "//crates/jj-native-cli:tt",
     ],
     timeout = "moderate",
+)
+
+# Explicit local interactive acceptance, never a deployed Worker entrypoint.
+js_binary(
+    name = "browser_fixture",
+    testonly = True,
+    entry_point = "tools/browser-fixture.mjs",
+    args = ["$(rootpath //crates/tinytree-cloudflare:contract_fixture)"],
+    data = [
+        ":release_package",
+        ":projection_harness",
+        ":node_modules/miniflare",
+        "//crates/tinytree-cloudflare:contract_fixture",
+    ],
 )
 
 # Invoke the package-declared CLI bin, not an unexported module subpath.
@@ -102,6 +157,17 @@ wrangler_bin.wrangler_binary(
 js_test(
     name = "wrangler_smoke_tests",
     entry_point = "tools/wrangler-smoke.mjs",
-    args = ["$(rootpath :wrangler)"],
-    data = [":wrangler", "package.json"],
+    # These are read-only comparison inputs, never imported as ESM modules.
+    # Keep the normal copied entrypoint and package dependency behavior.
+    no_copy_to_bin = ["//crates/tinytree-ui:assets"],
+    args = ["$(rootpath :wrangler)", "$(rootpath //crates/tinytree-ui:wasm)"],
+    data = [
+        ":wrangler",
+        ":node_modules/wrangler",
+        ":worker",
+        ":release_package",
+        "package.json",
+        "//crates/tinytree-ui:assets",
+        "//crates/tinytree-ui:wasm",
+    ],
 )

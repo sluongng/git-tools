@@ -1,9 +1,8 @@
 //! Account-scoped product dispatch. Transport identity is never a payload field.
 use crate::RepositoryService;
 use prost::Message;
-use serde::Deserialize;
-use serde_json::{Value, json};
 use std::sync::Arc;
+use tinytree_forge_core::wire;
 use tinytree_proto::{FORGE_MAX_REQUEST_BYTES, FORGE_MAX_RESPONSE_BYTES, forge_v1 as p};
 use tinytree_store::{AccountId, ForgeActor};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
@@ -61,72 +60,54 @@ pub(crate) async fn admit_http(
     admit(service, &MetadataMap::from_headers(headers.clone())).await
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ForgeHttpRequest {
-    operation: String,
-    account_id: String,
-    #[serde(default)]
-    view: String,
-    #[serde(default)]
-    request_id: String,
-    payload: Value,
-}
-
-fn http_request(input: ForgeHttpRequest) -> Result<p::ForgeCallRequest, Status> {
-    if input.operation.is_empty()
-        || input.operation.len() > 64
-        || !input
-            .operation
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b == b'_')
-    {
-        return Err(Status::invalid_argument("invalid forge operation"));
-    }
-    let name = format!("FORGE_OPERATION_{}", input.operation.to_ascii_uppercase());
-    let operation = p::ForgeOperation::from_str_name(&name)
-        .ok_or_else(|| Status::invalid_argument("unknown forge operation"))?;
-    let payload_json = serde_json::to_vec(&input.payload)
-        .map_err(|_| Status::invalid_argument("invalid forge payload"))?;
-    Ok(p::ForgeCallRequest {
-        operation: operation as i32,
-        account_id: input.account_id,
-        view: input.view,
-        request_id: input.request_id,
-        payload_json,
-    })
-}
-
+/// The HTTP layer has already strictly decoded the bounded shared envelope.
+/// Admission belongs to the exact transport identity, never JSON input.
 pub(crate) async fn call_http_admitted(
     service: RepositoryService,
     headers: &http::HeaderMap,
-    input: ForgeHttpRequest,
+    input: wire::Call,
     work: Arc<ForgeWork>,
-) -> Result<Value, Status> {
-    // Admission belongs to this exact transport identity, not to JSON input.
+) -> Result<Vec<u8>, Status> {
     let current = actor(&service, &MetadataMap::from_headers(headers.clone()))?;
     if current.as_ref().map(|a| &a.principal) != work.actor.as_ref().map(|a| &a.principal) {
         return Err(Status::permission_denied(
             "forge admission identity changed",
         ));
     }
-    let operation = input.operation.clone();
-    let result = call_admitted(service, http_request(input)?, work).await?;
-    let payload: Value = serde_json::from_slice(&result.result_json)
-        .map_err(|_| Status::internal("invalid forge result"))?;
-    Ok(
-        json!({"schema_version":1,"operation":operation,"account_id":result.account_id,"view":result.view,"request_id":result.request_id,"state":result.state,"result":payload}),
+    let result = call_admitted(
+        service,
+        p::ForgeCallRequest {
+            operation: input.operation,
+            account_id: input.account_id,
+            view: input.view,
+            request_id: input.request_id,
+            payload_json: input.payload_json.into_bytes(),
+        },
+        work.clone(),
     )
-}
-
-#[cfg(test)]
-pub(crate) async fn call_http(
-    service: RepositoryService,
-    headers: &http::HeaderMap,
-    input: ForgeHttpRequest,
-) -> Result<Value, Status> {
-    let work = admit_http(&service, headers).await?;
-    call_http_admitted(service, headers, input, work).await
+    .await?;
+    let reply = wire::Reply {
+        version: 1,
+        operation: result.operation,
+        account_id: result.account_id,
+        view: result.view,
+        request_id: result.request_id,
+        state: result.state,
+        result_json: String::from_utf8(result.result_json)
+            .map_err(|_| Status::internal("forge result encoding failed"))?,
+    };
+    let bytes = reply.encode().map_err(|error| match error {
+        tinytree_forge_core::Error::Limit(_) => {
+            Status::resource_exhausted("forge HTTP response exceeds byte budget")
+        }
+        _ => Status::internal("forge HTTP response encoding failed"),
+    })?;
+    if Instant::now() >= work.deadline {
+        return Err(Status::deadline_exceeded(
+            "forge HTTP response deadline exceeded",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn validate(input: &p::ForgeCallRequest) -> Result<p::ForgeOperation, Status> {

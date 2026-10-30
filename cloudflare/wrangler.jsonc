@@ -8,6 +8,13 @@
   "preview_urls": false,
   "find_additional_modules": true,
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
+  "assets": {
+    "directory": "./ui-assets",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
   "durable_objects": { "bindings": [{ "name": "REPOSITORIES", "class_name": "AccountRepository" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRepository"] }],
   "r2_buckets": [{ "binding": "OBJECTS", "bucket_name": "tinytree-experimental-objects" }]

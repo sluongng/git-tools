@@ -9,8 +9,10 @@ import { ForgeStorage } from './forge_storage';
 import { ClosureJobs } from './closure_jobs';
 import { BootstrapImports } from './bootstrap_import';
 import { ForgeSearch } from './forge_search';
+import { staticUi } from './static_ui';
 
 interface Env {
+  ASSETS?: Fetcher;
   REPOSITORIES: DurableObjectNamespace;
   OBJECTS: R2Bucket;
   PRINCIPALS_JSON: string;
@@ -74,13 +76,17 @@ function nativeInspect(kind: number, bytes: Uint8Array): Inspection {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (new URL(request.url).pathname.startsWith('/api/v1/forge/')) {
+    const presentation = await staticUi(request, env.ASSETS);
+    if (presentation) return presentation;
+    const path = new URL(request.url).pathname;
+    if (path === '/api/v1/forge/call') {
       return protectForge(async () => {
         const { call, bytes } = await admitForge(request, env);
         const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
         return env.REPOSITORIES.get(id).fetch(new Request(request, { body: bytes }));
       });
     }
+    if (path === '/api' || path.startsWith('/api/')) return protectForge(async () => fail(501, 'unimplemented'));
     return protect(async () => {
       if (env.EXPERIMENTAL_RAW_BACKEND !== 'enabled') fail(503, 'experimental_backend_disabled');
       const auth = await authenticate(request, env.PRINCIPALS_JSON);

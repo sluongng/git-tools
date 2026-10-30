@@ -11,6 +11,7 @@ import { Miniflare } from 'miniflare';
 const bundle = process.env.TINYTREE_WORKER_BUNDLE;
 const wasm = process.env.TINYTREE_CORE_WASM;
 const fixturePath = process.env.TINYTREE_CONTRACT_FIXTURE;
+const uiAssetsDirectory = process.env.TINYTREE_UI_ASSETS_DIRECTORY;
 assert.ok(bundle && wasm && fixturePath, 'declared Worker, RustWasm and native Store fixture are required');
 const fixture = JSON.parse(await readFile(fixturePath, 'utf8'));
 const objects = new Map(fixture.objects.map(object => [object.name, object]));
@@ -18,6 +19,12 @@ const tokenA = 'account-a-runtime-fixture';
 const tokenB = 'account-b-runtime-fixture';
 const member = 'account-a-member-fixture';
 const sha = value => createHash('sha256').update(value).digest('hex');
+function staticAssets() {
+  assert.ok(uiAssetsDirectory, 'declared UI deployment assets required');
+  return { directory: uiAssetsDirectory, binding: 'ASSETS',
+    routerConfig: { invoke_user_worker_ahead_of_assets: true, has_user_worker: true },
+    assetConfig: { html_handling: 'none', not_found_handling: 'none' } };
+}
 
 test('actual RustWasm shares native Forge view identities and strict HTTP framing', async () => {
   const { instance } = await WebAssembly.instantiate(await readFile(wasm), {});
@@ -54,7 +61,7 @@ const principals = () => [
   { principal: 'member-a', token_sha256: sha(member), accounts: [fixture.account], operator: false, kind: 'raw' },
 ];
 
-function options(persist, { fault, config = principals(), forge = false } = {}) {
+function options(persist, { fault, config = principals(), forge = false, ui = false } = {}) {
   const modules = [{ type: 'ESModule', path: bundle }, { type: 'CompiledWasm', path: wasm }];
   if (fault) {
     // Test-only transport fault around the REAL R2 binding: after-write failure
@@ -92,7 +99,7 @@ function options(persist, { fault, config = principals(), forge = false } = {}) 
     modules.unshift({ type: 'ESModule', path: path.join(path.dirname(bundle), 'runtime-fault-entry.mjs'), contents: entry });
   }
   return {
-    modules, compatibilityDate: '2026-07-08',
+    modules, compatibilityDate: '2026-07-08', ...(ui ? { assets: staticAssets() } : {}),
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
     r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(persist, 'do'), r2Persist: path.join(persist, 'r2'),
     bindings: { PRINCIPALS_JSON: JSON.stringify(config), EXPERIMENTAL_RAW_BACKEND: 'enabled', FORGE_BACKEND: forge ? 'enabled' : 'disabled' },
@@ -617,6 +624,7 @@ async function projectionRuntime(t, source = fixture.projection) {
   const config = [{ principal: source.owner, token_sha256: sha(token), accounts: [source.account_id], operator: true, kind: 'forge' }];
   const configuration = {
     host: '127.0.0.1', port: 0,
+    assets: staticAssets(),
     modules: [{ type: 'ESModule', path: entry }, { type: 'CompiledWasm', path: core }],
     compatibilityDate: '2026-07-08',
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
@@ -1045,4 +1053,49 @@ test('production search pages real native matches through CLI, replay and reload
   const valid = (await h.success(8, { version: emptyVersion, query: 'needle', regex: false, limit: 100 }, { auth: null })).value;
   assert.equal(valid.complete, true); assert.equal(valid.cursor, null); assert.deepEqual(valid.matches, []);
   assert.deepEqual(valid.skipped_files, { binary: 0, oversized: 0 });
+});
+
+test('declared deployment packet serves exact same-origin UI assets without API fallback or credential reflection', async t => {
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-ui-assets-'));
+  const mf = new Miniflare(options(persist, { forge: true, ui: true }));
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const origin = 'https://repository.invalid';
+  const redirected = await mf.dispatchFetch(`${origin}/ui/?account=sample&view=public&version=${'a'.repeat(64)}&token=must-not-reflect`, { redirect: 'manual' });
+  assert.equal(redirected.status, 307);
+  const destination = new URL(redirected.headers.get('location'), origin);
+  assert.equal(destination.searchParams.get('mode'), 'forge');
+  assert.equal(destination.searchParams.get('account'), 'sample');
+  assert.equal(destination.searchParams.get('view'), 'public');
+  assert.equal(destination.searchParams.get('version'), 'a'.repeat(64));
+  assert.equal(destination.searchParams.has('token'), false);
+  assert.equal(redirected.headers.get('set-cookie'), null);
+  for (const [route, file, mime] of [
+    ['/ui/?mode=forge', 'index.html', 'text/html'],
+    ['/ui/app.js', 'app.js', 'text/javascript'],
+    ['/ui/style.css', 'style.css', 'text/css'],
+    ['/ui/tinytree_ui.wasm', 'tinytree_ui.wasm', 'application/wasm'],
+  ]) {
+    const response = await mf.dispatchFetch(origin + route, { headers: { authorization: 'Bearer must-not-reflect', cookie: 'fixture=must-not-reflect' } });
+    assert.equal(response.status, 200, route);
+    assert.ok(response.headers.get('content-type').startsWith(mime));
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+    const csp = response.headers.get('content-security-policy');
+    assert.ok(csp.includes("connect-src 'self'"));
+    assert.ok(csp.includes("object-src 'none'"));
+    assert.ok(csp.includes("frame-ancestors 'none'"));
+    assert.ok(!csp.includes("'unsafe-inline'"));
+    assert.equal(response.headers.get('set-cookie'), null);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), await readFile(path.join(uiAssetsDirectory, 'ui', file)));
+    const head = await mf.dispatchFetch(origin + route, { method: 'HEAD' });
+    assert.equal(head.status, 200); assert.equal((await head.arrayBuffer()).byteLength, 0);
+  }
+  const badAsset = await mf.dispatchFetch(origin + '/ui/app.js', { method: 'POST', body: '{}' });
+  assert.equal(badAsset.status, 405); assert.equal(badAsset.headers.get('allow'), 'GET, HEAD');
+  const absent = await mf.dispatchFetch(origin + '/ui/not-a-route');
+  assert.equal(absent.status, 404);
+  const api = await mf.dispatchFetch(origin + '/api/v1/not-a-route');
+  assert.equal(api.status, 501); assert.ok(!api.headers.get('content-type')?.startsWith('text/html'));
+  const body = await api.json(); assert.equal(body.version, 1); assert.equal(body.error.code, 'unimplemented');
 });

@@ -10,15 +10,91 @@ let activeSuggestion = -1;
 let generation = 0;
 let requestSequence = 0;
 let controller = null;
+let requestTimer = null;
+let searchSession = null;
 const locationContext = new URLSearchParams(location.search);
-const account = locationContext.get('account') || '';
-const accountMode = Boolean(account);
+let account = locationContext.get('account') || '';
+const forgeOnly = locationContext.get('mode') === 'forge';
+const accountMode = Boolean(account) || forgeOnly;
+let pinnedVersion = locationContext.get('version');
 const selectedView = () => $('#reference').value.trim();
 const digestHex = (bytes) => Array.isArray(bytes) ? bytes.map((b) => b.toString(16).padStart(2, '0')).join('') : bytes;
-async function forge(operation, payload, signal) {
-  const envelope = await api('forge', { operation, account_id: account, view: selectedView(), request_id: crypto.randomUUID(), payload }, signal);
-  if (envelope.schema_version !== 1 || envelope.account_id !== account || envelope.operation !== operation || envelope.view !== selectedView()) throw new Error('Unexpected view response.');
-  return envelope.result;
+const MAX_RESPONSE = 8 * 1024 * 1024;
+const validId = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) && !/^0+$/.test(value);
+const validNativeId = value => Array.isArray(value) && value.length === 32 && value.every(b => Number.isInteger(b) && b >= 0 && b <= 255) && value.some(b => b !== 0);
+const safeCount = value => Number.isSafeInteger(value) && value >= 0;
+const exact = (value, fields) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field));
+async function boundedJson(response) {
+  if (!response.body) throw new Error('The server returned no response body.');
+  const reader = response.body.getReader(); const parts = []; let length = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      length += value.byteLength;
+      if (length > MAX_RESPONSE) { await reader.cancel(); throw new Error('The response exceeded the browser byte limit.'); }
+      parts.push(value);
+    }
+    const bytes = new Uint8Array(length); let offset = 0;
+    for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } finally { reader.releaseLock(); }
+}
+function responseError(response, data) {
+  const message = data?.error?.message || (typeof data?.error === 'string' ? data.error : data?.message) || `Request failed (${response.status}).`;
+  const error = new Error(response.status === 401 ? 'An access token is required or the supplied token is invalid.' : message);
+  error.status = response.status; error.requiresToken = response.status === 401; return error;
+}
+async function forge(operation, payload, request, view = selectedView()) {
+  const request_id = crypto.randomUUID(); const selectedAccount = account;
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch('/api/v1/forge/call', {
+    method: 'POST', headers,
+    body: JSON.stringify({ version: 1, operation, account_id: selectedAccount, view, request_id, payload_json: JSON.stringify(payload) }),
+    signal: request.signal, credentials: 'omit', redirect: 'error', cache: 'no-store',
+  });
+  const envelope = await boundedJson(response);
+  if (!response.ok) throw responseError(response, envelope);
+  if (!exact(envelope, ['version', 'operation', 'account_id', 'view', 'request_id', 'state', 'result_json']) || envelope.version !== 1 || envelope.account_id !== selectedAccount || envelope.operation !== operation || envelope.view !== view || envelope.request_id !== request_id || !['pending', 'complete'].includes(envelope.state) || typeof envelope.result_json !== 'string') throw new Error('Unexpected Forge response binding.');
+  return { state: envelope.state, value: JSON.parse(envelope.result_json) };
+}
+function sameContext(data, view) {
+  return data.account_id === account && data.view === view.view && digestHex(data.view_version) === digestHex(view.view_version) && digestHex(data.revision) === digestHex(view.revision) && data.policy_epoch === view.policy_epoch && data.root_prefix === view.root_prefix;
+}
+function checkContext(data, name, version) {
+  if (data.account_id !== account || typeof data.view !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(data.view) || (name && data.view !== name) || !validNativeId(data.view_version) || !validNativeId(data.revision) || !safeCount(data.policy_epoch) || data.policy_epoch === 0 || typeof data.root_prefix !== 'string' || (version && digestHex(data.view_version) !== digestHex(version))) throw new Error('Unexpected immutable view identity.');
+}
+async function resolveView(request, name) {
+  if (pinnedVersion && !validId(pinnedVersion)) throw new Error('Version must be an exact nonzero lowercase hex identity.');
+  let version = pinnedVersion ? pinnedVersion.match(/../g).map(byte => parseInt(byte, 16)) : null;
+  let progress = null; let selection = null;
+  for (let step = 0; step < 512; step++) {
+    if (Date.now() >= request.deadline) throw new Error('View preparation timed out. Reopen this pinned view to continue.');
+    let reply;
+    for (let retry = 0; ; retry++) {
+      try { reply = await forge(6, { version, ...(progress ? { progress } : {}) }, request, name); break; }
+      catch (error) {
+        // Only retry an already pinned continuation, never a fresh/default
+        // selection or a server authorization/protocol error.
+        if (!progress || retry >= 2 || error.status || error.name === 'AbortError' || !(error instanceof TypeError)) throw error;
+      }
+    }
+    const data = reply.value; checkContext(data, name, version);
+    if (selection && !sameContext(data, selection)) { const error = new Error('View policy changed during preparation. Reopen the view explicitly.'); error.status = 409; throw error; }
+    if (reply.state === 'complete') {
+      if (!exact(data, ['account_id','view','view_version','revision','policy_epoch','root_prefix','projected_commit','projected_tree','paths','readme','readme_error','complete']) || data.complete !== true || !validNativeId(data.projected_commit) || !validNativeId(data.projected_tree) || !Array.isArray(data.paths) || data.paths.length > 10000 || data.paths.some(path => typeof path !== 'string') || data.paths.reduce((n, path) => n + encoder.encode(path).length, 0) > 1024 * 1024 || !(data.readme === null || (exact(data.readme, ['path','content']) && typeof data.readme.path === 'string' && typeof data.readme.content === 'string')) || !(data.readme_error === null || typeof data.readme_error === 'string')) throw new Error('The view snapshot is incomplete or invalid.');
+      return data;
+    }
+    if (!exact(data, ['account_id','view','view_version','revision','policy_epoch','root_prefix','progress']) || !exact(data.progress, ['job_id','expected_generation']) || typeof data.progress.job_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(data.progress.job_id) || !safeCount(data.progress.expected_generation) || (progress && (progress.job_id !== data.progress.job_id || progress.expected_generation > data.progress.expected_generation))) throw new Error('Unexpected view preparation progress.');
+    selection = data; version = data.view_version; progress = data.progress;
+    status('Preparing this immutable view…');
+    await new Promise((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); reject(new DOMException('Cancelled', 'AbortError')); };
+      const timer = setTimeout(() => { request.signal.removeEventListener('abort', abort); resolve(); }, 10);
+      if (request.signal.aborted) abort(); else request.signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+  throw new Error('View preparation reached its bounded work limit. Reopen the pinned view explicitly.');
 }
 
 function present(input) {
@@ -55,34 +131,50 @@ async function api(action, body, signal) {
     method: 'POST', headers, body: JSON.stringify(body), signal,
     credentials: 'omit', redirect: 'error', cache: 'no-store',
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    if (response.status === 401) {
-      const error = new Error('An access token is required. Connect to open this repository.');
-      error.requiresToken = true;
-      throw error;
-    }
-    throw new Error(data.error || data.message || `Request failed (${response.status}).`);
-  }
+  const data = await boundedJson(response);
+  if (!response.ok) throw responseError(response, data);
   return data;
 }
 
 function beginRequest() {
   controller?.abort();
+  clearTimeout(requestTimer);
   controller = new AbortController();
-  return { sequence: ++requestSequence, revisionGeneration: generation, signal: controller.signal };
+  const activeController = controller;
+  const deadline = Date.now() + 60000;
+  requestTimer = setTimeout(() => activeController.abort(), 60000);
+  return { sequence: ++requestSequence, revisionGeneration: generation, signal: controller.signal, deadline };
 }
 function current(request) { return request.sequence === requestSequence && request.revisionGeneration === generation; }
+
+function showFailure(error, request, title) {
+  if (!current(request)) return;
+  if (error.name === 'AbortError') {
+    if (Date.now() < request.deadline) return;
+    error = new Error('The request timed out. Retry the exact selected view explicitly.');
+  }
+  clearTimeout(requestTimer);
+  if ([401,403,409].includes(error.status)) resetSnapshot();
+  if (error.requiresToken) $('#connection').open = true;
+  status(error.message, true); empty(title, error.message);
+  $('#search-pagination').hidden = true;
+}
 
 function resetSnapshot() {
   generation++;
   controller?.abort();
   requestSequence++;
-  snapshot = null;
+  clearTimeout(requestTimer);
+  snapshot = null; searchSession = null; suggestions = [];
+  $('#suggestions').replaceChildren();
+  $('#search-page-label').textContent = '';
+  $('#search').value = '';
+  $('#search-pagination').hidden = true;
   if (wasm) present({ op: 'manifest', paths: [] });
   $('#search').disabled = true;
   $('#search-submit').disabled = true;
-  $('#revision').textContent = 'No revision selected';
+  $('#revision').textContent = 'No revision selected'; $('#revision').title = '';
+  $('#view-version').hidden = true; $('#view-version').textContent = ''; $('#view-version').title = '';
   $('#path-count').textContent = 'Open a reference to explore.';
   $('#connection-dot').classList.remove('connected');
   $('#back-to-readme').hidden = true;
@@ -94,7 +186,8 @@ function resetSnapshot() {
 
 function showReadme() {
   if (!snapshot) return;
-  controller?.abort(); requestSequence++;
+  controller?.abort(); clearTimeout(requestTimer); requestSequence++;
+  searchSession = null; $('#search-pagination').hidden = true;
   closeSuggestions();
   $('#back-to-readme').hidden = true;
   $('#document-path').textContent = snapshot.readme?.path || 'README';
@@ -111,7 +204,16 @@ function showReadme() {
   status(snapshot.paths_complete ? '' : 'File suggestions cover part of this repository; the path limit was reached.');
 }
 
-async function openRepository() {
+async function openRepository(openCurrent = false) {
+  if (accountMode) {
+    const chosen = $('#account').value.trim();
+    if (!/^[a-z0-9-]{1,64}$/.test(chosen)) {
+      resetSnapshot(); status('Choose an account to open its public README.');
+      empty('Choose a tree to explore.', 'Enter an account name, then open its public view.'); return;
+    }
+    if (chosen !== account || openCurrent) pinnedVersion = null;
+    account = chosen;
+  }
   const repository = accountMode ? account : $('#repository').value;
   const reference = $('#reference').value.trim();
   if (!repository || (!accountMode && !reference)) return;
@@ -120,23 +222,29 @@ async function openRepository() {
   status('Opening the reference and reading its README…');
   empty('Opening this tree…', 'The README and file suggestions are on their way.');
   try {
-    const data = accountMode ? await forge('resolve_view', {}, request.signal) : await api('snapshot', { repository, reference }, request.signal);
-    if (accountMode) { data.paths_complete = data.complete; data.version = data.view_version; data.revision = digestHex(data.revision); }
+    const data = accountMode ? await resolveView(request, reference) : await api('snapshot', { repository, reference }, request.signal);
+    if (accountMode) {
+      data.paths_complete = data.complete; data.version = data.view_version; data.revision = digestHex(data.revision);
+    }
     if (!current(request)) return;
+    if (accountMode) {
+      pinnedVersion = digestHex(data.version);
+      const url = new URL(location.href); url.searchParams.set('account', account); url.searchParams.set('view', reference); url.searchParams.set('version', pinnedVersion);
+      history.replaceState(null, '', url); document.title = `${account} · tinytree`;
+    }
     snapshot = data;
     present({ op: 'manifest', paths: data.paths });
     $('#search').disabled = false;
     $('#search-submit').disabled = false;
-    $('#revision').textContent = `${data.revision.slice(0, 12)} · immutable revision`;
+    $('#view-version').hidden = !accountMode;
+    if (accountMode) { $('#view-version').textContent = `View version ${digestHex(data.version).slice(0, 12)}`; $('#view-version').title = digestHex(data.version); }
+    $('#revision').textContent = accountMode ? `Canonical revision ${data.revision.slice(0, 12)}` : `${data.revision.slice(0, 12)} · immutable revision`;
     $('#revision').title = data.revision;
     $('#path-count').textContent = `${data.paths.length.toLocaleString()}${data.paths_complete ? '' : '+'} files in view`;
     $('#connection-dot').classList.add('connected');
     showReadme();
   } catch (error) {
-    if (!current(request) || error.name === 'AbortError') return;
-    if (error.requiresToken) $('#connection').open = true;
-    status(error.message, true);
-    empty('This tree is not open yet.', 'Check the repository, reference, and connection, then try again.');
+    showFailure(error, request, 'This tree is not open yet.');
   }
 }
 
@@ -215,31 +323,49 @@ function activateSuggestion(index) {
 
 async function searchContents(query) {
   if (!snapshot || !query.trim()) return;
+  const session = { query, view: snapshot, limit: 100, regex: false, inputs: [null], page: 0, next: null };
+  searchSession = session;
+  await loadSearchPage(session, 0);
+}
+async function loadSearchPage(session, index) {
+  if (searchSession !== session || !snapshot || index < 0 || index >= 64) return;
   closeSuggestions();
-  const request = beginRequest();
-  const view = snapshot;
-  $('#document-path').textContent = 'Search';
-  $('#back-to-readme').hidden = false;
+  const request = beginRequest(); const view = session.view;
+  $('#document-path').textContent = 'Search'; $('#back-to-readme').hidden = false;
+  $('#search-pagination').hidden = true;
   status('Searching repository contents…');
-  $('#document').className = 'results';
-  empty('Following that thread…', 'Searching file contents at the selected revision.');
+  $('#document').className = 'results'; empty('Following that thread…', 'Searching this exact immutable view.');
   try {
-    const data = accountMode ? await forge('search', { version: view.version, query, regex: false, limit: 100 }, request.signal) : await api('search', { repository: view.repository, revision: view.revision, query }, request.signal);
-    if (!current(request)) return;
+    let data;
+    if (accountMode) {
+      const reply = await forge(8, { version: view.version, query: session.query, regex: session.regex, limit: session.limit, cursor: session.inputs[index] }, request, view.view);
+      data = reply.value;
+      if (!sameContext(data, view)) { const error = new Error('Search view policy changed. Reopen the selected view.'); error.status = 409; throw error; }
+      if (reply.state !== 'complete' || !exact(data, ['account_id','view','view_version','revision','policy_epoch','root_prefix','matches','complete','cursor','skipped_files']) || !sameContext(data, view) || !Array.isArray(data.matches) || data.matches.length > session.limit || typeof data.complete !== 'boolean' || !(data.cursor === null || (typeof data.cursor === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(data.cursor))) || (data.complete && data.cursor !== null) || !exact(data.skipped_files, ['binary','oversized']) || !safeCount(data.skipped_files.binary) || !safeCount(data.skipped_files.oversized) || data.matches.some(hit => !exact(hit, ['path','line','column','preview']) || typeof hit.path !== 'string' || typeof hit.preview !== 'string' || !safeCount(hit.line) || hit.line === 0 || !safeCount(hit.column) || hit.column === 0)) throw new Error('Unexpected search page or immutable view binding.');
+    } else {
+      data = await api('search', { repository: view.repository, revision: view.revision, query: session.query }, request.signal);
+      data.cursor = null; data.skipped_files = { binary: 0, oversized: 0 };
+    }
+    if (!current(request) || searchSession !== session) return;
+    session.page = index; session.next = data.cursor;
     $('#document').className = 'results';
-    $('#document').innerHTML = present({ op: 'results', query, matches: data.matches, complete: data.complete }).html;
-    status(data.complete ? `${data.matches.length} matches. Search complete.` : 'Partial results. A search limit was reached; more matches may exist.');
+    $('#document').innerHTML = present({ op: 'results', query: session.query, matches: data.matches, complete: data.complete, has_more: data.cursor !== null, skipped_files: data.skipped_files }).html;
+    $('#search-pagination').hidden = !accountMode;
+    $('#search-previous').disabled = index === 0;
+    $('#search-next').disabled = data.cursor === null || index >= 63;
+    $('#search-page-label').textContent = `Page ${index + 1}`;
+    const skipped = data.skipped_files.binary + data.skipped_files.oversized;
+    status(data.complete ? `${data.matches.length} matches on this page. Search complete.` : data.cursor !== null ? (index >= 63 ? 'Navigation limit reached. Refine the query; coverage remains partial.' : 'More results are available. Choose Next to continue this exact query.') : `Partial results. ${skipped ? `${data.skipped_files.binary} binary and ${data.skipped_files.oversized} oversized files were skipped.` : 'The scan limit was reached.'}`);
     $('#document').focus({ preventScroll: true });
   } catch (error) {
-    if (!current(request) || error.name === 'AbortError') return;
-    if (error.requiresToken) $('#connection').open = true;
-    status(error.message, true);
+    showFailure(error, request, 'This search page is not available.');
   }
 }
 
 async function openFile(path, line = null, anchor = null) {
   if (!snapshot) return;
   closeSuggestions();
+  searchSession = null; $('#search-pagination').hidden = true;
   const request = beginRequest();
   const view = snapshot;
   $('#document-path').textContent = path;
@@ -248,7 +374,12 @@ async function openFile(path, line = null, anchor = null) {
   $('#document').className = '';
   empty('Opening this file…', path);
   try {
-    const data = accountMode ? await forge('read_file', { version: view.version, path }, request.signal) : await api('file', { repository: view.repository, revision: view.revision, path }, request.signal);
+    let data;
+    if (accountMode) {
+      const reply = await forge(7, { version: view.version, path }, request, view.view); data = reply.value;
+      if (!sameContext(data, view)) { const error = new Error('File view policy changed. Reopen the selected view.'); error.status = 409; throw error; }
+      if (reply.state !== 'complete' || !exact(data, ['account_id','view','view_version','revision','policy_epoch','root_prefix','path','content']) || !sameContext(data, view) || data.path !== path || typeof data.content !== 'string') throw new Error('Unexpected file/view response binding.');
+    } else data = await api('file', { repository: view.repository, revision: view.revision, path }, request.signal);
     if (!current(request)) return;
     const markdown = !line && /\.(md|markdown)$/i.test(path);
     $('#document').className = markdown ? 'markdown' : 'source-document';
@@ -261,13 +392,24 @@ async function openFile(path, line = null, anchor = null) {
       if (target && $('#document').contains(target)) target.scrollIntoView({ block: 'start' });
     }
   } catch (error) {
-    if (!current(request) || error.name === 'AbortError') return;
-    if (error.requiresToken) $('#connection').open = true;
-    status(error.message, true);
+    showFailure(error, request, 'This file is not available.');
   }
 }
 
-$('#repository-form').addEventListener('submit', (event) => { event.preventDefault(); if (wasm) openRepository(); });
+$('#search-next').addEventListener('click', () => {
+  const session = searchSession; if (!session?.next) return;
+  session.inputs[session.page + 1] = session.next;
+  loadSearchPage(session, session.page + 1);
+});
+$('#search-previous').addEventListener('click', () => {
+  if (searchSession && searchSession.page > 0) loadSearchPage(searchSession, searchSession.page - 1);
+});
+for (const input of [$('#account'), $('#reference')]) input.addEventListener('change', () => {
+  pinnedVersion = null; resetSnapshot();
+  const url = new URL(location.href); url.searchParams.delete('version'); history.replaceState(null, '', url);
+});
+
+$('#repository-form').addEventListener('submit', (event) => { event.preventDefault(); if (wasm) openRepository(true); });
 $('#connection-form').addEventListener('submit', (event) => { event.preventDefault(); if (wasm) connect(); });
 $('#disconnect').addEventListener('click', () => {
   token = ''; $('#token').value = ''; resetSnapshot();
@@ -278,7 +420,19 @@ $('#search-form').addEventListener('submit', (event) => {
   if (activeSuggestion >= 0) activateSuggestion(activeSuggestion);
   else searchContents($('#search').value);
 });
-$('#search').addEventListener('input', updateSuggestions);
+$('#search').addEventListener('input', () => {
+  const hadSearch = searchSession !== null;
+  if (hadSearch) { controller?.abort(); clearTimeout(requestTimer); requestSequence++; }
+  searchSession = null;
+  $('#search-pagination').hidden = true; $('#search-page-label').textContent = '';
+  $('#search-previous').disabled = true; $('#search-next').disabled = true;
+  if (hadSearch) {
+    $('#document').className = '';
+    empty('The search query changed.', 'Submit the new query to search this same pinned view.');
+    status('Query changed. Previous search cursors were cleared.');
+  }
+  updateSuggestions();
+});
 $('#search').addEventListener('focus', updateSuggestions);
 $('#search').addEventListener('keydown', (event) => {
   if (event.key === 'Escape') { event.preventDefault(); closeSuggestions(); }
@@ -301,7 +455,8 @@ document.addEventListener('keydown', (event) => {
   }
 });
 for (const button of [$('#readme-home'), $('#back-to-readme')]) button.addEventListener('click', () => {
-  showReadme();
+  if (accountMode && snapshot?.readme) openFile(snapshot.readme.path);
+  else showReadme();
 });
 $('#document').addEventListener('click', (event) => {
   const match = event.target.closest('[data-path]');
@@ -315,12 +470,13 @@ $('#document').addEventListener('click', (event) => {
 });
 
 if (accountMode) {
-  const option = document.createElement('option'); option.value = account; option.textContent = account;
-  $('#repository').replaceChildren(option); $('#repository').disabled = true;
-  $('label[for=repository]').textContent = 'Account'; $('label[for=reference]').textContent = 'View';
+  $('#repository-field').hidden = true; $('#account-field').hidden = false; $('#account').value = account;
+  $('label[for=reference]').textContent = 'View';
   $('#reference').value = locationContext.get('view') || ''; $('#reference').placeholder = 'Default public view';
-  document.title = `${account} · tinytree`;
+  $('#open-repository').title = 'Open the current selected view';
+  document.title = account ? `${account} · tinytree` : 'tinytree · choose an account';
 }
+
 try {
   const response = await fetch('/ui/tinytree_ui.wasm', { credentials: 'omit', redirect: 'error' });
   if (!response.ok) throw new Error('The browser module could not be loaded.');
