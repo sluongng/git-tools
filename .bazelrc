@@ -1,4 +1,6 @@
 common --noannounce_rc
+# Disable optional build-rule telemetry for hermetic repository setup.
+common --repo_env=DO_NOT_TRACK=1
 build --incompatible_strict_action_env
 build --compilation_mode=opt
 build --enable_platform_specific_config

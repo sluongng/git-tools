@@ -25,6 +25,7 @@ members = [
     "crates/tinytree-model",
     "crates/tinytree-landing",
     "crates/tinytree-cloud",
+    "crates/tinytree-cloudflare",
     "crates/tinytree-index",
     "crates/tinytree-search",
     "crates/tinytree-fixture",

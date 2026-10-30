@@ -1,0 +1,26 @@
+# Hermetic JavaScript tooling for the opt-in Worker backend.
+bazel_dep(name = "aspect_rules_js", version = "3.5.2")
+bazel_dep(name = "rules_nodejs", version = "6.7.7")
+
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "22.20.0")
+use_repo(node, "nodejs_toolchains")
+register_toolchains("@nodejs_toolchains//:all")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(
+    name = "cloudflare_pnpm",
+    pnpm_version = "10.22.0",
+    pnpm_version_integrity = "sha512-vwSe/plbKPUn/StBrgR0zikYb37cs79UUIe9Yfu+uyv3U2LRMH/aCcLSiOHkmXh6wS1Py2F6l0cYpgUfLu50HA==",
+)
+use_repo(pnpm, "cloudflare_pnpm")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "cloudflare_npm",
+    pnpm_lock = "//cloudflare:pnpm-lock.yaml",
+    data = ["//cloudflare:package.json"],
+    run_lifecycle_hooks = False,
+    use_pnpm = "@cloudflare_pnpm//:package/bin/pnpm.cjs",
+)
+use_repo(npm, "cloudflare_npm")

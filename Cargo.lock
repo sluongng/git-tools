@@ -5680,6 +5680,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinytree-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tinytree-model",
+ "tinytree-store",
+]
+
+[[package]]
 name = "tinytree-fixture"
 version = "0.1.0"
 dependencies = [

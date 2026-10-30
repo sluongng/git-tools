@@ -101,3 +101,5 @@ crate.annotation(
     crate = "protoc-bin-vendored-win32",
     extra_aliased_targets = {"protoc_windows": "bin/protoc.exe"},
 )
+
+include("//build_defs:cloudflare.MODULE.bazel")

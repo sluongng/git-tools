@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tinytree-experimental-repository",
+  "main": "worker.mjs",
+  "no_bundle": true,
+  "compatibility_date": "2026-07-08",
+  "workers_dev": false,
+  "preview_urls": false,
+  "find_additional_modules": true,
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
+  "durable_objects": { "bindings": [{ "name": "REPOSITORIES", "class_name": "AccountRepository" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRepository"] }],
+  "r2_buckets": [{ "binding": "OBJECTS", "bucket_name": "tinytree-experimental-objects" }]
+  // Deployment is opt-in: provision a bucket and configure PRINCIPALS_JSON as
+  // a secret and EXPERIMENTAL_RAW_BACKEND="enabled" before serving requests.
+  // No account, zone, route, credential, or deployed resource is selected here.
+}

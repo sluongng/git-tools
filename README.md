@@ -92,6 +92,7 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 | [`packblob`](crates/packblob) | Indexed immutable blob packs with bounded dictionary compression and selective verified reads. |
 | [`tinytree-landing`](crates/tinytree-landing) | Bounded linear-stack candidate construction; no publication or check orchestration. |
 | [`tinytree-model`](crates/tinytree-model) | Canonical jj-native objects, typed IDs and bounded verification. |
+| [`tinytree-cloudflare`](crates/tinytree-cloudflare) | Bounded canonical object and closure validation exported to WebAssembly for the experimental Worker backend. |
 | [`tinytree-index`](crates/tinytree-index) | Rebuildable commit DAG, scoped graph facts and bounded content-search records. |
 | [`tinytree-search`](crates/tinytree-search) | Shared bounded regex/literal matching and trigram candidate filters for server search and local overlays. |
 | [`tinytree-cloud`](crates/tinytree-cloud) | Verified jj operation/view recovery codecs; not an automatic backup service. |
@@ -118,6 +119,15 @@ entry points. Most also expose Rust libraries; `jj-native-cli` is executable-onl
 
 For native repository test seeds, [tinytree-fixture](crates/tinytree-fixture)
 provides a deterministic library and CLI without requiring Git conversion.
+
+### Alternative repository backend
+
+The opt-in [Cloudflare backend](cloudflare/README.md) stores raw native repository
+objects in R2 and authoritative references, replay receipts and pins in SQLite
+Durable Objects. It does not proxy to the local server. It is experimental and
+does not yet implement the Forge review/view/query APIs or the normal `tt`
+workflow. The existing local `tinytree-server` and filesystem/Fjall Store remain
+unchanged and are the default for the complete Forge workflow.
 
 ## Reference
 

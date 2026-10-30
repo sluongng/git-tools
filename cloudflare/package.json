@@ -1,0 +1,16 @@
+{
+  "name": "tinytree-cloudflare-experimental",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.22.0",
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260708.1",
+    "esbuild": "0.28.1",
+    "miniflare": "4.20260708.1",
+    "typescript": "5.9.3",
+    "wrangler": "4.110.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  }
+}

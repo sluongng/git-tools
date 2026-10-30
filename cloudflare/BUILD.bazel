@@ -1,0 +1,62 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
+load("@cloudflare_npm//:defs.bzl", "npm_link_all_packages")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["package.json", "pnpm-lock.yaml"])
+
+npm_link_all_packages(name = "node_modules")
+
+js_binary(
+    name = "bundle_tool",
+    entry_point = "tools/bundle.mjs",
+    data = [":node_modules/esbuild"],
+)
+
+js_run_binary(
+    name = "worker",
+    tool = ":bundle_tool",
+    srcs = glob(["src/**/*.ts"]) + ["//crates/tinytree-cloudflare:wasm"],
+    outs = ["worker.mjs", "core.wasm"],
+    args = [
+        "cloudflare/src/index.ts",
+        "$(execpath //crates/tinytree-cloudflare:wasm)",
+        "$(RULEDIR)/worker.mjs",
+        "$(RULEDIR)/core.wasm",
+    ],
+    mnemonic = "WorkerBundle",
+)
+
+js_test(
+    name = "typecheck",
+    include_types = True,
+    entry_point = "tools/typecheck.mjs",
+    data = glob(["src/**/*.ts", "tools/*.d.ts"]) + [
+        "tsconfig.json",
+        ":node_modules/typescript",
+        ":node_modules/@cloudflare/workers-types",
+    ],
+)
+
+# Real workerd runtime, SQLite Durable Objects and R2; no host Node or services.
+js_test(
+    name = "runtime_tests",
+    entry_point = "tools/runner.mjs",
+    args = ["$(rootpath //crates/tinytree-cloudflare:contract_fixture)"],
+    data = [
+        "tests/runtime.test.mjs",
+        ":worker",
+        ":node_modules/miniflare",
+        "//crates/tinytree-cloudflare:contract_fixture",
+    ],
+    timeout = "moderate",
+)
+
+# Explicit operator invocation only; this target is never a build/test action.
+js_binary(
+    name = "wrangler",
+    env = {"WRANGLER_SEND_METRICS": "false"},
+    entry_point = "tools/wrangler.mjs",
+    data = [":node_modules/wrangler", ":worker", "wrangler.jsonc"],
+    tags = ["manual"],
+)
