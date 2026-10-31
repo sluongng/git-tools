@@ -200,8 +200,50 @@ impl jj_lib::workspace::WorkspaceLoaderFactory for Loader {
         )
         .map_err(load_error)?;
         let binding = registry.lookup(root).map_err(load_error)?;
-        crate::commands::ensure_binding(&binding).map_err(load_error)?;
-        loader().map_err(load_error)?.create(root)
+        // jj eagerly selects this loader before parsing the command. Selection
+        // may resolve registered paths, but must not acquire a command lease or
+        // connect the projection for maintenance-only commands.
+        Ok(Box::new(SelectedLoader { binding }))
+    }
+}
+#[cfg(not(feature = "protocol-fixture"))]
+struct SelectedLoader {
+    binding: native_workspace_admin::Binding,
+}
+#[cfg(not(feature = "protocol-fixture"))]
+impl jj_lib::workspace::WorkspaceLoader for SelectedLoader {
+    fn workspace_root(&self) -> &Path {
+        &self.binding.root
+    }
+    fn repo_path(&self) -> &Path {
+        &self.binding.repo
+    }
+    fn get_working_copy_type(&self) -> Result<String, jj_lib::repo::StoreLoadError> {
+        Ok(jj_vfs::native::NAME.to_owned())
+    }
+    fn load(
+        &self,
+        settings: &UserSettings,
+        stores: &jj_lib::repo::StoreFactories,
+        working_copies: &jj_lib::workspace::WorkingCopyFactories,
+    ) -> Result<Workspace, jj_lib::workspace::WorkspaceLoadError> {
+        use jj_lib::workspace::WorkspaceLoaderFactory as _;
+        // Actual loading retains the original registry validation, command
+        // admission and live projection/mount attestation. Direct callers do
+        // not bypass the guard merely by skipping the ordinary dispatch hook.
+        let registry = native_workspace_admin::Registry::open_existing(
+            native_workspace_admin::Registry::default_path().map_err(load_error)?,
+        )
+        .map_err(load_error)?;
+        if registry.lookup(&self.binding.root).map_err(load_error)? != self.binding {
+            return Err(load_error(anyhow::anyhow!(
+                "native workspace selection changed before load"
+            )));
+        }
+        loader()
+            .map_err(load_error)?
+            .create(&self.binding.root)?
+            .load(settings, stores, working_copies)
     }
 }
 

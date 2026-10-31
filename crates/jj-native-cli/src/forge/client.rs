@@ -642,6 +642,39 @@ fn resume_descriptor(
     }
     Ok(Some((descriptor, scope, plan, None)))
 }
+/// Current authority for a maintenance-only control call. No repo loader,
+/// managed command, writer lease, snapshot or restore operation is admitted.
+pub(super) async fn maintenance_descriptor(root: &Path) -> Result<ClientDescriptor, CommandError> {
+    let registry = native_workspace_admin::Registry::open_existing(
+        native_workspace_admin::Registry::default_path().map_err(fail)?,
+    )
+    .map_err(fail)?;
+    let binding = registry.lookup(root).map_err(fail)?;
+    let scope = workspace::Scope::load_directory(&binding.working_copy)?;
+    let descriptor =
+        ClientDescriptor::load(scope.client_descriptor.as_deref().ok_or_else(mismatch)?)
+            .map_err(fail)?;
+    if descriptor.destination() != binding.root
+        || descriptor.registry_path() != registry.path()
+        || descriptor.store_alias() != binding.repository
+        || binding.endpoint.local()
+            != native_broker::LocalEndpoint::UnixSocket(descriptor.broker_socket())
+        || scope.view_version != descriptor.pin().view_version
+        || scope.policy_epoch != descriptor.pin().policy_epoch
+        || scope.context.account_id != descriptor.source().account_id
+        || scope.context.view != descriptor.source().view
+        || serde_json::to_vec(&scope.context.client_config().map_err(fail)?).map_err(fail)?
+            != serde_json::to_vec(&descriptor.source().client).map_err(fail)?
+    {
+        return Err(mismatch());
+    }
+    let ready = ensure_running(&descriptor).await?;
+    if scope.client_provider_identity != Some(ready.provider_identity) {
+        return Err(mismatch());
+    }
+    Ok(descriptor)
+}
+
 pub(crate) async fn resume(
     target: &Path,
     expected_version: Option<[u8; 32]>,

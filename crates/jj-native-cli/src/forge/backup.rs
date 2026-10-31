@@ -14,6 +14,95 @@ use tinytree_client::{
 };
 
 #[derive(clap::Args, Clone, Debug)]
+pub(super) struct BackupArgs {
+    #[command(subcommand)]
+    command: Option<BackupCommand>,
+}
+#[derive(clap::Subcommand, Clone, Debug)]
+enum BackupCommand {
+    /// Retire only saved older heads proven covered by the acknowledged latest head.
+    Prune {
+        #[arg(long, required = true)]
+        superseded: bool,
+    },
+}
+pub(super) async fn run(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    machine: bool,
+    args: BackupArgs,
+) -> Result<(), CommandError> {
+    match args.command {
+        None => backup(ui, command, machine).await,
+        Some(BackupCommand::Prune { superseded: true }) => {
+            client::with_runtime(prune(ui, command, machine)).await
+        }
+        Some(BackupCommand::Prune { superseded: false }) => {
+            Err(user_error("private backup pruning requires --superseded"))
+        }
+    }
+}
+async fn prune(ui: &Ui, command: &CommandHelper, machine: bool) -> Result<(), CommandError> {
+    if command
+        .matches()
+        .try_contains_id("repository")
+        .unwrap_or(false)
+    {
+        return Err(user_error(
+            "backup prune must run inside its intended workspace; omit --repository",
+        ));
+    }
+    // Do not load a Workspace/ReadonlyRepo: the managed loader admits a writer.
+    // Resolve only the supported marker and exact Ready registry binding.
+    let cwd = command.cwd().canonicalize().map_err(user_error)?;
+    let mut root = None;
+    for ancestor in cwd.ancestors().take(256) {
+        match std::fs::symlink_metadata(ancestor.join(".jj/native-workspace")) {
+            Ok(_) => {
+                root = Some(ancestor.to_owned());
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(user_error(error)),
+        }
+    }
+    let root = root
+        .ok_or_else(|| user_error("backup prune requires an existing derived Forge workspace"))?;
+    let descriptor = client::maintenance_descriptor(&root).await?;
+    let value = workspace_daemon::control::Client {
+        socket: descriptor.state_dir().join("control.sock"),
+    }
+    .call(workspace_daemon::control::Request::NativePrunePrivateCapsules { root })
+    .map_err(user_error)?;
+    let result: workspace_daemon::control::NativeCapsulesPruned = serde_json::from_value(value)
+        .map_err(|_| {
+            user_error("invalid private cleanup acknowledgement; pending state retained")
+        })?;
+    service::id::<32>(&result.current_capsule)?;
+    if machine {
+        output::write(
+            ui,
+            "backup_prune",
+            if result.pending == 0 {
+                "complete"
+            } else {
+                "pending"
+            },
+            result,
+        )?;
+    } else {
+        writeln!(
+            ui.stdout(),
+            "Private backup cleanup: {} retired, {} local files removed, {} pending. Current working copy was not backed up.",
+            result.retired,
+            result.local_files,
+            result.pending
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(clap::Args, Clone, Debug)]
 pub(super) struct RestoreArgs {
     pub destination: PathBuf,
     #[arg(long)]

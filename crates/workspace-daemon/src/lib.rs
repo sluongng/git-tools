@@ -25,6 +25,10 @@ mod native_capture;
 mod native_gc;
 #[cfg(unix)]
 mod native_private_capture;
+#[cfg(unix)]
+mod native_private_coverage;
+#[cfg(unix)]
+mod native_private_retention;
 
 #[cfg(unix)]
 mod native_capture_upload;

@@ -64,6 +64,14 @@ pub struct NativeCapsuleRestored {
     pub base: String,
     pub tree: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCapsulesPruned {
+    pub current_capsule: String,
+    pub retired: u32,
+    pub local_files: u32,
+    pub pending: u32,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -121,6 +129,10 @@ pub enum Request {
         expected_commit: String,
     },
     /// Owner-private WIP restore in a descriptor-bound native-only client.
+    /// Explicit cleanup in the exact derived Forge client, without a writer lease.
+    NativePrunePrivateCapsules {
+        root: PathBuf,
+    },
     NativeRestoreCapsule {
         root: PathBuf,
         capsule_id: [u8; 32],
@@ -189,7 +201,10 @@ impl Client {
     pub fn call(&self, request: Request) -> Result<Value> {
         let mut stream = UnixStream::connect(&self.socket)
             .context("workspace daemon unavailable; run workspace serve")?;
-        let seconds = if matches!(request, Request::NativeRestoreCapsule { .. }) {
+        let seconds = if matches!(
+            request,
+            Request::NativeRestoreCapsule { .. } | Request::NativePrunePrivateCapsules { .. }
+        ) {
             310
         } else {
             180

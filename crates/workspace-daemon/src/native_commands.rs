@@ -910,7 +910,7 @@ impl NativeCommandHost {
             .set(context)
             .map_err(|_| anyhow::anyhow!("private backup is already configured"))
     }
-    pub(crate) fn seed_private_backup(
+    pub(crate) async fn seed_private_backup(
         &self,
         source: &native_workspace_admin::private_bundle::VerifiedPrivateBundle,
         binding: &tinytree_client::private_capsule::CapsuleBinding,
@@ -919,7 +919,25 @@ impl NativeCommandHost {
             .private_backup
             .get()
             .context("private backup context unavailable")?
+            .clone()
             .seed_restored(source, binding)
+            .await
+    }
+    pub(crate) async fn prune_private_capsules(
+        &self,
+    ) -> Result<crate::control::NativeCapsulesPruned> {
+        let context = self
+            .inner
+            .private_backup
+            .get()
+            .cloned()
+            .context("private prune is unsupported by this host")?;
+        let registry = self.inner.registry.clone();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        // Accepted control work owns its full physical lifecycle after caller cancellation.
+        tokio::spawn(async move { context.prune(registry, deadline).await })
+            .await
+            .context("private prune worker failed")?
     }
     async fn select_private(
         &self,
@@ -1205,6 +1223,19 @@ impl NativeCommandHost {
             return Err(status(error));
         }
         session.backup_capture_done.store(true, Ordering::Release);
+        let pending = captured.map_err(status)?.into_pending();
+        context
+            .record_capture(
+                &self.inner.registry,
+                session.workspace.registration,
+                pending,
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                context.record_error("record_capture", &error);
+                Status::unavailable("private capture custody is not durably recorded")
+            })?;
         let receipt = context.upload(deadline).await.map_err(|error| {
             context.record_error("upload", &error);
             Status::unavailable(

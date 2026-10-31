@@ -1030,6 +1030,63 @@ fn dirty_captures_are_atomic_and_keep_independent_roots_through_newer_checkpoint
         for seed in [4, 5] {
             assert!(collector.roots().contains(&checkpoint(seed).roots[0]));
         }
+        drop(collector);
+        let other = reopened
+            .register(WorkspaceId([12; 16]), OpStoreId([13; 16]))
+            .await
+            .unwrap();
+        let owner = reopened.begin_command(other).await.unwrap();
+        let path = directory.path().to_owned();
+        let other_capture = reopened
+            .capture_dirty(owner.token(), move || async move {
+                Ok(staged_capture(&path, 14))
+            })
+            .await
+            .unwrap();
+        drop(owner);
+        let before = reopened.storage_stats();
+        // The count applies to this historical registration, not the larger
+        // global outbox, and returned rows retain complete checkpoint bindings.
+        assert_eq!(
+            reopened
+                .pending_captures_for_registration(registration, expected.len(), 64 * 1024)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened
+                .pending_captures_for_registration(other, 1, 64 * 1024)
+                .await
+                .unwrap(),
+            vec![other_capture]
+        );
+        assert!(matches!(
+            reopened
+                .pending_captures_for_registration(registration, expected.len() - 1, 64 * 1024)
+                .await,
+            Err(Error::Limit(_))
+        ));
+        assert!(matches!(
+            reopened
+                .pending_captures_for_registration(registration, expected.len(), 1)
+                .await,
+            Err(Error::Limit(_))
+        ));
+        let mut wrong = registration;
+        wrong.generation += 1;
+        assert!(
+            reopened
+                .pending_captures_for_registration(wrong, 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened.storage_stats(),
+            before,
+            "scoped inventory and rejected budgets never mutate custody"
+        );
     });
 }
 

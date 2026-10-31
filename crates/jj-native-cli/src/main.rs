@@ -422,7 +422,11 @@ fn main() -> std::process::ExitCode {
         );
         runner
             .add_dispatch_hook(async |ui, command, dispatch| {
-                if let Ok(loader) = command.workspace_loader() {
+                #[cfg(feature = "forge-cli")]
+                let maintenance = forge::is_backup_prune(command);
+                #[cfg(not(feature = "forge-cli"))]
+                let maintenance = false;
+                if !maintenance && let Ok(loader) = command.workspace_loader() {
                     let registry = native_workspace_admin::Registry::open_existing(
                         native_workspace_admin::Registry::default_path().map_err(|error| {
                             user_error_with_message("Cannot select native command registry", error)

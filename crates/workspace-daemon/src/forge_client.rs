@@ -638,7 +638,7 @@ pub async fn serve_forge_client(path: &Path) -> Result<()> {
     }
     let mut manager =
         crate::native_workspaces::Manager::open(config.clone(), cache.clone(), repositories)?
-            .with_commands(commands)?;
+            .with_commands(commands.clone())?;
     manager.require_forge_client_scope(&d.destination, ALIAS, &d.pin)?;
     // The owner lock proves no cooperating old process owns these endpoints;
     // an unrelated live socket still refuses replacement rather than being killed.
@@ -689,6 +689,7 @@ pub async fn serve_forge_client(path: &Path) -> Result<()> {
     Some(Request::Status)=>Ok(serde_json::json!({"mode":"forge_client","descriptor_digest":ready.descriptor_digest,"workspaces":manager.status()})),
     Some(Request::NativeMount{root,store,commit,workspace_id})=>{ensure!(root==d.destination&&store==ALIAS&&commit==hex(&d.pin.projected_commit),"Forge workspace selection differs");Ok(serde_json::to_value(manager.create(root,store,commit,workspace_id).await?)?)},
     Some(Request::NativeMountPlanned{root,store,commit,workspace_id,creation_plan})=>{ensure!(root==d.destination&&store==ALIAS&&commit==hex(&d.pin.projected_commit),"Forge workspace selection differs");Ok(serde_json::to_value(manager.create_planned(root,store,commit,workspace_id,creation_plan).await?)?)},
+    Some(Request::NativePrunePrivateCapsules{root})=>{ensure!(root==d.destination,"Forge prune destination differs");verify_session(&d,ca.clone()).await?;Ok(serde_json::to_value(commands.prune_private_capsules().await?)?)},
     Some(Request::NativeRestoreCapsule{root,capsule_id})=>{ensure!(root==d.destination,"Forge restore destination differs");verify_session(&d,ca.clone()).await?;Ok(serde_json::to_value(manager.restore_private_capsule(root,capsule_id,d.source.clone(),d.trust_digest,d.pin.clone()).await?)?)},
     Some(Request::NativeResume{root})=>{ensure!(root==d.destination,"Forge resume destination differs");Ok(serde_json::to_value(manager.resume_root(root).await?)?)},
     Some(Request::NativeMounted{workspace_id})=>Ok(serde_json::json!(manager.mounted(&workspace_id)?)),

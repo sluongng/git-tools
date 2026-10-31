@@ -731,17 +731,101 @@ impl Inner {
         capture.pending()
     }
     pub fn pending_capture_registrations(
-        &self, max_entries: usize, max_bytes: usize,
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
     ) -> Result<CaptureRegistrations> {
         self.check()?;
         let data = self.data.lock().map_err(|_| Error::Poisoned)?;
         let count = data.captures.len();
-        if count > max_entries || count.checked_mul(CaptureRegistrations::BYTES_PER_ENTRY)
-            .is_none_or(|bytes| bytes > max_bytes) {
+        if count > max_entries
+            || count
+                .checked_mul(CaptureRegistrations::BYTES_PER_ENTRY)
+                .is_none_or(|bytes| bytes > max_bytes)
+        {
             return Err(Error::Limit("capture registration census"));
         }
-        Ok(CaptureRegistrations { registrations: data.captures.values()
-            .map(|capture| capture.checkpoint.registration()).collect() })
+        Ok(CaptureRegistrations {
+            registrations: data
+                .captures
+                .values()
+                .map(|capture| capture.checkpoint.registration())
+                .collect(),
+        })
+    }
+    pub fn pending_captures_for_registration(
+        &self,
+        registration: Registration,
+        max_captures: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<PendingCapture>> {
+        self.check()?;
+        let data = self.data.lock().map_err(|_| Error::Poisoned)?;
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        // Only inspect lengths in this pass. No checkpoint clones, encoding,
+        // collection growth or partial result allocation precedes admission.
+        for capture in data
+            .captures
+            .values()
+            .filter(|c| c.checkpoint.registration() == registration)
+        {
+            count = count
+                .checked_add(1)
+                .ok_or(Error::Limit("scoped capture inventory"))?;
+            if count > max_captures {
+                return Err(Error::Limit("scoped capture inventory"));
+            }
+            let checkpoint = &capture.checkpoint;
+            let fixed = std::mem::size_of::<PendingCapture>()
+                .checked_add(512)
+                .ok_or(Error::Limit("scoped capture metadata"))?;
+            charge(&mut bytes, fixed, max_metadata_bytes)?;
+            // Account result vector slots, root conversion growth/allocator
+            // slack, nested operation-vector slots, byte payloads and WC data.
+            charge(
+                &mut bytes,
+                checkpoint
+                    .roots
+                    .len()
+                    .checked_mul(128)
+                    .ok_or(Error::Limit("scoped capture metadata"))?,
+                max_metadata_bytes,
+            )?;
+            charge(
+                &mut bytes,
+                checkpoint
+                    .op_heads
+                    .len()
+                    .checked_mul(64)
+                    .ok_or(Error::Limit("scoped capture metadata"))?,
+                max_metadata_bytes,
+            )?;
+            for operation in checkpoint
+                .op_heads
+                .iter()
+                .chain(checkpoint.working_copy_operation.iter())
+            {
+                charge(
+                    &mut bytes,
+                    operation
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(64))
+                        .ok_or(Error::Limit("scoped capture metadata"))?,
+                    max_metadata_bytes,
+                )?;
+            }
+        }
+        let mut result = Vec::with_capacity(count);
+        for capture in data
+            .captures
+            .values()
+            .filter(|c| c.checkpoint.registration() == registration)
+        {
+            result.push(capture.pending()?);
+        }
+        Ok(result)
     }
     pub fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         self.check()?;

@@ -2275,12 +2275,14 @@ impl Manager {
             );
         }
         prepared.revalidate_until(deadline.into_std()).await?;
-        commands.seed_private_backup(
-            prepared
-                .private_bundle()
-                .context("private restore semantic bundle missing")?,
-            capsule,
-        )?;
+        commands
+            .seed_private_backup(
+                prepared
+                    .private_bundle()
+                    .context("private restore semantic bundle missing")?,
+                capsule,
+            )
+            .await?;
         let receipt = private_restore_receipt(&identity, &seed)?;
         let record = Record {
             version: 2,

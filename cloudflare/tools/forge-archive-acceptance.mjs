@@ -17,9 +17,9 @@ const restoreToken = randomBytes(32).toString('hex'), archiveId = randomBytes(32
 const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
-let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay;
-let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, complete = false, cleaned = false;
-const fault = { export: true, restore: true };
+let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay, privateRelay;
+let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, pruneEvidence, complete = false, cleaned = false;
+const fault = { export: true, restore: true, retire: false };
 const events = [], physicalEvidence = [];
 const grants = token => JSON.stringify([{ principal: 'archive-target', token_sha256: sha(token), accounts: ['forge-check'], export: false, restore: true }]);
 const redact = value => [exportToken, otherExportToken, restoreToken, context?.token].filter(Boolean)
@@ -51,6 +51,48 @@ async function relay(upstream, action, enabled) {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
+}
+async function privateTransport(upstream) {
+  const server = createServer(async (request, response) => {
+    try {
+      assert.equal(request.method, 'POST');
+      assert.ok(request.url.startsWith('/api/v1/forge/') || request.url === '/api/v1/private-capsule/call');
+      const parts = []; let size = 0;
+      for await (const part of request) { size += part.length; assert.ok(size <= PAGE_LIMIT); parts.push(part); }
+      const body = Buffer.concat(parts), call = JSON.parse(body);
+      const result = await fetch(upstream() + request.url, { method: 'POST', signal: AbortSignal.timeout(60000),
+        headers: { authorization: request.headers.authorization, 'content-type': 'application/json' }, body });
+      const returned = await bytes(result), value = JSON.parse(returned);
+      const lost = fault.retire && request.url === '/api/v1/private-capsule/call' && call.action === 'retire'
+        && call.capsule_id === secondWip?.capsule_id && result.status === 200 && value.state === 'deleted';
+      if (lost) {
+        fault.retire = false;
+        events.push({ action: 'private_retire', capsule_id: call.capsule_id, state: value.state, lost_ack: true });
+        response.destroy(); return;
+      }
+      response.writeHead(result.status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); response.end(returned);
+    } catch { response.destroy(); }
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  return { server, origin: `http://127.0.0.1:${server.address().port}` };
+}
+async function capsuleCall(capsule, action, fields = {}) {
+  const response = await fetch(targetOrigin + '/api/v1/private-capsule/call', { method: 'POST', signal: AbortSignal.timeout(30000),
+    headers: { authorization: `Bearer ${context.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ schema: 1, account_id: context.source.account_id, capsule_id: capsule, action, ...fields }) });
+  const value = JSON.parse(await bytes(response)); assert.equal(response.status, 200, JSON.stringify(value)); return value;
+}
+const capsuleStatus = capsule => capsuleCall(capsule, 'status');
+async function privateSpool(descriptorPath) {
+  const directory = path.join(path.dirname(descriptorPath), 'private-backups');
+  const names = (await readdir(directory)).filter(name => name.endsWith('.private')).sort();
+  const result = [];
+  for (const name of names) {
+    const file = path.join(directory, name), info = await lstat(file);
+    assert.ok(info.isFile() && !info.isSymbolicLink()); assert.equal(info.mode & 0o077, 0);
+    result.push({ name, size: info.size, sha256: sha(await readFile(file)) });
+  }
+  return result;
 }
 async function archiveCall(origin, token, action, fields = {}, expected = 200, account = context.source.account_id) {
   const response = await fetch(origin + '/api/v1/archive/call', { method: 'POST', signal: AbortSignal.timeout(60000),
@@ -87,7 +129,7 @@ async function raw(client, args, { cwd = client.cwd, success = true } = {}) {
   try {
     const argv = args[0] === '__forge_client_stop' ? args : ['--no-pager', '--color=never', ...args];
     const result = await context.execute(tt, argv, { cwd, env: client.env,
-      encoding: 'utf8', timeout: 180000, maxBuffer: 2 * 1024 * 1024 });
+      encoding: 'utf8', timeout: args[0] === 'backup' && args[1] === 'prune' ? 330000 : 180000, maxBuffer: 2 * 1024 * 1024 });
     assert.ok(success, `unexpected CLI success: ${args[0]}`); return result.stdout.trim();
   } catch (error) {
     if (!success && typeof error.code === 'number') return error.stdout;
@@ -273,7 +315,8 @@ const workflow = {
       assert.equal(refused.error.code, 'target_not_empty');
       assert.deepEqual((await forgeCall(origin, 2)).value.main_revision, original.value.main_revision);
     } finally { await occupied.dispose(); }
-    await select(targetClient, targetOrigin);
+    privateRelay = await privateTransport(() => targetOrigin);
+    await select(targetClient, privateRelay.origin);
     workspace = path.join(targetClient.cwd, 'work');
     const work = await command(targetClient, ['work', workspace, '--capsule', firstWip.capsule_id]); descriptor = work.result.client_descriptor;
     assert.equal(work.state, 'ready'); assert.deepEqual(work.result.receipt, firstWip);
@@ -319,18 +362,62 @@ const workflow = {
     const nextBackup = await command(targetClient, ['backup'], { cwd: workspace });
     assert.equal(nextBackup.state, 'complete'); secondWip = nextBackup.result;
     assert.equal(secondWip.workspace_id, firstWip.workspace_id); assert.equal(secondWip.generation, firstWip.generation + 1);
+    await writeFile(path.join(workspace, 'before-local-prune.txt'), 'third acknowledged capture for real local retention cleanup\n');
+    const thirdBackup = await command(targetClient, ['backup'], { cwd: workspace });
+    assert.equal(thirdBackup.state, 'complete'); thirdWip = thirdBackup.result;
+    assert.equal(thirdWip.generation, secondWip.generation + 1); assert.equal(thirdWip.workspace_id, firstWip.workspace_id);
+    // A real independent whole-intent reservation fills the remaining byte
+    // allowance. Native capture4 is preserved locally when its Begin is denied.
+    const blocker = randomBytes(32).toString('hex'), blockerWorkspace = randomBytes(32).toString('hex');
+    const remainingBytes = 512 * 1024 * 1024 - firstWip.bytes - secondWip.bytes - thirdWip.bytes;
+    assert.ok(remainingBytes > 0);
+    const currentCapsule = await capsuleStatus(thirdWip.capsule_id);
+    await capsuleCall(blocker, 'begin', { workspace_id: blockerWorkspace, expected_generation: 0, selection: currentCapsule.selection,
+      descriptor: { format: 'tinytree-private-capture-v1', total_bytes: remainingBytes, chunk_count: Math.ceil(remainingBytes / 65536), chain_root: '9'.repeat(64) } });
+    await writeFile(path.join(workspace, 'pending-prune-input.txt'), 'quota-denied native source must remain pending and untouched\n');
+    const deniedBackup = await command(targetClient, ['backup'], { cwd: workspace, success: false });
+    assert.equal(deniedBackup.state, 'failed');
+    const operationBeforePrune = await raw(targetClient, ['--ignore-working-copy', 'op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
+    const beforeSpool = await privateSpool(descriptor); assert.ok(beforeSpool.length >= 3);
+    await writeFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'prune must leave unsnapshotted dirty bytes untouched\n');
+    fault.retire = true;
+    const firstPrune = await command(targetClient, ['backup', 'prune', '--superseded'], { cwd: workspace });
+    assert.ok(['pending', 'complete'].includes(firstPrune.state)); assert.equal(firstPrune.operation, 'backup_prune');
+    assert.ok(events.some(event => event.action === 'private_retire' && event.capsule_id === secondWip.capsule_id && event.lost_ack), 'actual predecessor Deleted ACK must be lost');
+    const pruned = await command(targetClient, ['backup', 'prune', '--superseded'], { cwd: workspace });
+    assert.equal(pruned.state, 'complete'); assert.equal(pruned.result.pending, 0); assert.equal(pruned.result.current_capsule, thirdWip.capsule_id);
+    const afterSpool = await privateSpool(descriptor), keptNames = new Set(afterSpool.map(item => item.name));
+    const removed = beforeSpool.filter(item => !keptNames.has(item.name));
+    assert.ok(removed.some(item => item.size === secondWip.bytes), 'genuine locally captured predecessor spool must be reclaimed');
+    assert.ok(afterSpool.some(item => item.size === thirdWip.bytes), 'latest acknowledged source remains local');
+    assert.equal((await capsuleStatus(firstWip.capsule_id)).state, 'deleted', 'remote-only restored predecessor retires without source-machine ticket');
+    assert.equal((await capsuleStatus(secondWip.capsule_id)).state, 'deleted');
+    assert.equal((await capsuleStatus(thirdWip.capsule_id)).state, 'sealed');
+    for (const old of beforeSpool.filter(item => !removed.some(gone => gone.name === item.name)))
+      assert.deepEqual(afterSpool.find(item => item.name === old.name), old, 'prune preserves every nonretired file including the quota-denied pending source');
+    assert.equal(await readFile(path.join(workspace, 'pending-prune-input.txt'), 'utf8'), 'quota-denied native source must remain pending and untouched\n');
+    assert.equal((await capsuleCall(blocker, 'retire')).state, 'deleted', 'release only this fixture-owned unused reservation');
+    assert.equal(await raw(targetClient, ['--ignore-working-copy', 'op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), operationBeforePrune, 'prune does not snapshot dirty working copy');
+    assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
+    const noWork = await command(targetClient, ['backup', 'prune', '--superseded'], { cwd: workspace });
+    assert.equal(noWork.state, 'complete'); assert.equal(noWork.result.retired, 0); assert.equal(noWork.result.local_files, 0); assert.equal(noWork.result.pending, 0);
+    pruneEvidence = { first_result: firstPrune.result, resumed_result: pruned.result, noop_result: noWork.result, before_spool: beforeSpool, after_spool: afterSpool,
+      old_retirement_ack_lost: true, real_local_predecessor_reclaimed: true, restored_predecessor_no_ticket_transplant: true, current_head_preserved: true, dirty_wip_not_snapshotted: true, quota_denied_pending_source_preserved: true };
     const sourceScope = (await command(targetClient, ['status'], { cwd: workspace })).result.workspace;
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
     await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined;
     const finalClient = await client('post-land-target', targetOrigin, restoreToken);
     const finalWorkspace = path.join(finalClient.cwd, 'work');
-    const final = await command(finalClient, ['work', finalWorkspace, '--capsule', secondWip.capsule_id]);
+    const final = await command(finalClient, ['work', finalWorkspace, '--capsule', thirdWip.capsule_id]);
     targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor;
-    assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, secondWip);
+    assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, thirdWip);
     assert.equal(final.result.base, sourceScope.base, 'post-Land mapped review base is not reset to enrollment');
-    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), secondWip.snapshot_commit);
-    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), secondWip.snapshot_operation);
+    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), thirdWip.snapshot_commit);
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), thirdWip.snapshot_operation);
     assert.equal(await readFile(path.join(workspace, 'after-land-private.txt'), 'utf8'), 'post-land unpublished backup input\n');
+    assert.equal(await readFile(path.join(workspace, 'before-local-prune.txt'), 'utf8'), 'third acknowledged capture for real local retention cleanup\n');
+    await assert.rejects(lstat(path.join(workspace, 'dirty-prune-do-not-snapshot.txt')), error => error.code === 'ENOENT');
+    await assert.rejects(lstat(path.join(workspace, 'pending-prune-input.txt')), error => error.code === 'ENOENT');
     await writeFile(path.join(workspace, 'after-restore-private.txt'), 'new work must survive normal restored resume\n');
     await raw(targetClient, ['status'], { cwd: workspace });
     const currentOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
@@ -340,12 +427,12 @@ const workflow = {
     assert.ok(await mounted(workspace));
     assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), currentOp, 'normal restored resume does not replay original backup over subsequent WIP');
     assert.equal(await readFile(path.join(workspace, 'after-restore-private.txt'), 'utf8'), 'new work must survive normal restored resume\n');
-    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, prune: pruneEvidence, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
     await this.cleanup({ success: true }); complete = true;
     return { production_worker: true, actual_sqlite_r2: true, source_archive_id: archiveId, build_id: manifest.build_id,
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
-      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip },
+      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, explicit_prune: pruneEvidence },
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
       tamper_and_missing_page_rejected: true, existing_target_preserved: true, legacy_orphan_target_rejected: true, incomplete_restore_fenced: true,
       owned_cleanup: true, deployed_recovery_proof: false };
@@ -357,7 +444,7 @@ const workflow = {
     if (workspace && await mounted(workspace)) await raw(targetClient, ['tinytree', 'unmount', workspace]);
     if (descriptor) { await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined; }
     if (workspace) assert.equal(await mounted(workspace), false);
-    for (const proxy of [sourceRelay, targetRelay]) if (proxy) { proxy.server.closeAllConnections(); await new Promise(resolve => proxy.server.close(resolve)); }
+    for (const proxy of [sourceRelay, targetRelay, privateRelay]) if (proxy) { proxy.server.closeAllConnections(); await new Promise(resolve => proxy.server.close(resolve)); }
     if (target) await target.dispose(); cleaned = true;
     // On failure retain the original archive and restore state for explicit
     // recovery; never infer that an incomplete import can be rolled back.

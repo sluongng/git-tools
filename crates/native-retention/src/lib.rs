@@ -188,7 +188,9 @@ pub struct CaptureRegistrations {
 impl CaptureRegistrations {
     /// Conservative admission includes the retained row and collection overhead.
     pub const BYTES_PER_ENTRY: usize = 128;
-    pub fn as_slice(&self) -> &[Registration] { &self.registrations }
+    pub fn as_slice(&self) -> &[Registration] {
+        &self.registrations
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceState {
@@ -1158,10 +1160,28 @@ impl Registry {
     /// Snapshot only loaded immutable registration fields, admitting count and
     /// conservative retained bytes before allocating the result vector.
     pub async fn pending_capture_registrations(
-        &self, max_entries: usize, max_bytes: usize,
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
     ) -> Result<CaptureRegistrations> {
         let inner = self.inner.clone();
-        storage::blocking(move || inner.pending_capture_registrations(max_entries,max_bytes)).await
+        storage::blocking(move || inner.pending_capture_registrations(max_entries, max_bytes)).await
+    }
+    /// One exact-registration immutable snapshot. Count and conservative owned
+    /// checkpoint bytes are admitted under the same storage lock, before any
+    /// result checkpoints are cloned. This returns no partial inventory and is
+    /// bookkeeping, not a registration, capture, or cleanup authority.
+    pub async fn pending_captures_for_registration(
+        &self,
+        registration: Registration,
+        max_captures: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<PendingCapture>> {
+        let inner = self.inner.clone();
+        storage::blocking(move || {
+            inner.pending_captures_for_registration(registration, max_captures, max_metadata_bytes)
+        })
+        .await
     }
     pub async fn pending_captures(&self) -> Result<Vec<PendingCapture>> {
         let inner = self.inner.clone();

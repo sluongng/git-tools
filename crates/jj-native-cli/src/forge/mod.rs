@@ -46,7 +46,7 @@ enum Command {
     /// Create a lazy native workspace from an authorized account/view snapshot.
     Work(workspace::WorkArgs),
     /// Snapshot and durably back up private, unpublished working-copy state.
-    Backup,
+    Backup(backup::BackupArgs),
     /// Submit an immutable patchset for server-side rebase and review, not main publication.
     Push(review::PushArgs),
     /// Inspect, discuss, approve or land exact review patchsets.
@@ -135,10 +135,15 @@ pub(crate) fn configure<'a>(runner: CliRunner<'a>) -> CliRunner<'a> {
             if let Err(error) = &result
                 && machine
             {
-                output::error(ui, operation, error)?;
+                output::error(ui, if is_backup_prune(command) { "backup_prune" } else { operation }, error)?;
             }
             result
         })
+}
+
+/// Recognize the parsed read/maintenance command before native writer admission.
+pub(crate) fn is_backup_prune(command: &CommandHelper) -> bool {
+    command.matches().subcommand_matches("backup").is_some_and(|args| args.subcommand_name() == Some("prune"))
 }
 
 fn machine(command: &CommandHelper) -> bool {
@@ -153,7 +158,7 @@ fn machine(command: &CommandHelper) -> bool {
 
 async fn run(ui: &mut Ui, command: &CommandHelper, args: Command) -> Result<(), CommandError> {
     match args {
-        Command::Backup => backup::backup(ui, command, machine(command)).await,
+        Command::Backup(args) => backup::run(ui, command, machine(command), args).await,
         Command::Copy(args) => {
             let result = crate::forge_paths::run(ui, command, args, false).await?;
             if machine(command) {
