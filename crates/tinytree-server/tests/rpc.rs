@@ -11231,7 +11231,8 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
         let inspection = inspected.recovery_inspection.unwrap();
         assert_eq!(inspection.transport, 4, "fixture wrapper is quiescent and eligible, not a production check verdict");
         assert_eq!(inspection.stdout, 3);
-        assert_eq!(inspection.runner, 3, "protocol fixture deliberately has no actual runner attempt directory");
+        assert_eq!(inspection.runner, l::CheckerRunnerInspection::CriUnavailable as i32,
+            "transport fixture markers are not a native runner admission catalog");
         assert_eq!(inspected.checker_progress.unwrap().recoveries, 2);
     }
     assert_eq!(std::fs::read_to_string(scratch.join("executions")).unwrap(), executions_before_inspect);

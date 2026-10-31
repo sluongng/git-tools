@@ -45,6 +45,7 @@ pub enum RecoveryInspection {
     ReceiptSaved = 9,
     ReadinessPresent = 10,
     Unavailable = 11,
+    RetainedAttemptQuotaFull = 12,
 }
 /// Never calls Attempt::open: no lock creation, save, cleanup, process probe,
 /// tool execution or binary rehash. Tool readiness is metadata-only, not proof.
@@ -60,7 +61,31 @@ pub fn inspect_recovery(config: &Config, request: &Request) -> RecoveryInspectio
     };
     let root = match PrivateDir::open_existing(scratch.path().join(request.workspace_id())) {
         Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AttemptMissing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Observe only current admission metadata, never private journals.
+            // This is not a historical failure explanation or a cleanup proof.
+            let entries = match fs::read_dir(scratch.path()) {
+                Ok(entries) => entries,
+                Err(_) => return Unavailable,
+            };
+            let mut retained = 0;
+            for entry in entries {
+                let Ok(entry) = entry else { return Unavailable };
+                if entry.file_name() == "admission.lock" {
+                    continue;
+                }
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    || !entry.file_name().to_str().is_some_and(crate::hex_id)
+                {
+                    return Unavailable;
+                }
+                retained += 1;
+                if retained >= config.max_attempts {
+                    return RetainedAttemptQuotaFull;
+                }
+            }
+            return AttemptMissing;
+        }
         Err(_) => return Unavailable,
     };
     let bytes = match root.read("attempt.json", 256 * 1024) {

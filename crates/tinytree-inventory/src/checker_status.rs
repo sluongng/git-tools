@@ -206,7 +206,7 @@ async fn run(args: Args) -> Result<Value, String> {
     let inspection = job.recovery_inspection().map(|p| -> Result<Value,String> {
         let transport = ["unspecified","missing","invalid","start_unconfirmed","quiescent_eligible","quiescent_ineligible"];
         let stdout = ["unspecified","missing","empty","receipt_valid","invalid","oversized"];
-        let runner = ["not_inspected","config_invalid","scratch_missing","attempt_missing","journal_missing","journal_invalid","binding_mismatch","environment_missing","tools_incomplete","receipt_saved","readiness_present","unavailable"];
+        let runner = ["not_inspected","config_invalid","scratch_missing","attempt_missing","journal_missing","journal_invalid","binding_mismatch","environment_missing","tools_incomplete","receipt_saved","readiness_present","unavailable","retained_attempt_quota_full"];
         Ok(json!({"transport":transport.get(p.transport as usize).ok_or("invalid_recovery_inspection")?,"stdout":stdout.get(p.stdout as usize).ok_or("invalid_recovery_inspection")?,"stderr_present":p.stderr_present,"runner":runner.get(p.runner as usize).ok_or("invalid_recovery_inspection")?}))
     }).transpose()?;
     let candidate = job

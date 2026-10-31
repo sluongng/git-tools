@@ -172,6 +172,7 @@ enum CheckerRunnerInspection {
   CRI_RECEIPT_SAVED = 9;
   CRI_READINESS_PRESENT = 10;
   CRI_UNAVAILABLE = 11;
+  CRI_RETAINED_ATTEMPT_QUOTA_FULL = 12;
 }
 message CheckerRecoveryInspection {
   CheckerTransportInspection transport = 1;

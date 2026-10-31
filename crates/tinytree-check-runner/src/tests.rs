@@ -357,6 +357,12 @@ async fn unavailable_attempt_replays_and_capacity_fails_closed() {
     absent_request.attempt_id = "98".repeat(32);
     assert_eq!(
         inspect_recovery(&config, &absent_request),
+        RecoveryInspection::RetainedAttemptQuotaFull
+    );
+    let mut room = config.clone();
+    room.max_attempts = 2;
+    assert_eq!(
+        inspect_recovery(&room, &absent_request),
         RecoveryInspection::AttemptMissing
     );
     #[cfg(unix)]
