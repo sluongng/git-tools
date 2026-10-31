@@ -95,6 +95,12 @@ struct PruneOutbox {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ResumeAck {
+    head: Head,
+    pending_source: [u8; 32],
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Journal {
     schema: u32,
     context: [u8; 32],
@@ -109,6 +115,8 @@ struct Journal {
     retained: Vec<Head>,
     prune: Option<PruneOutbox>,
     preserved_restored: Option<Head>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_ack: Option<ResumeAck>,
 }
 pub(crate) struct Context {
     directory: PrivateDir,
@@ -171,6 +179,7 @@ impl Context {
                 retained: vec![],
                 prune: None,
                 preserved_restored: None,
+                resume_ack: None,
             })?;
         }
         context.load()?;
@@ -249,6 +258,14 @@ impl Context {
                 "private backup head unavailable"
             ),
         }
+        if let Some(ack) = &j.resume_ack {
+            ensure!(
+                j.head.as_ref() == Some(&ack.head)
+                    && j.receipt.as_ref() == Some(&ack.head.receipt)
+                    && ack.pending_source == Self::completed_pending_binding(&ack.head)?,
+                "private resume acknowledgement head differs"
+            );
+        }
         if let Some(preserved) = &j.preserved_restored {
             ensure!(
                 preserved.local.is_none()
@@ -277,6 +294,18 @@ impl Context {
             );
         }
         Ok(j)
+    }
+    fn completed_pending_binding(head: &Head) -> Result<[u8; 32]> {
+        let pending = Pending {
+            binding: head.binding.clone(),
+            digest: head.bundle.descriptor.blake3,
+            file: head.bundle.name.clone(),
+            snapshot_commit: head.receipt.snapshot_commit.clone(),
+            snapshot_operation: head.receipt.snapshot_operation.clone(),
+            local: head.local.clone(),
+            intent: Some(head.intent.clone()),
+        };
+        Ok(*blake3::hash(&serde_json::to_vec(&pending)?).as_bytes())
     }
     fn pending_binding(j: &Journal) -> Result<Option<[u8; 32]>> {
         j.pending
@@ -942,11 +971,107 @@ impl Context {
             pending: remaining.retained.len() as u32,
         })
     }
+    pub(crate) async fn resume(
+        self: Arc<Self>,
+        registry: native_retention::Registry,
+        registration: Option<(native_retention::Registration, [u8; 32])>,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::control::NativePrivateBackupResumed> {
+        let _admission = self.admit(deadline).await?;
+        let j = self.load()?;
+        ensure!(
+            j.prune.is_none(),
+            "private resume requires completion of saved prune work"
+        );
+        if let Some(pending) = &j.pending {
+            let (registration, source_workspace) =
+                registration.context("private resume source registration unavailable")?;
+            let file = self.directory.open_existing_file(&pending.file, MAX)?;
+            let digest = pending.digest;
+            let verified = tokio::task::spawn_blocking(move || {
+                bundle::verify_file(file, digest, remaining_bundle_limits(deadline)?)
+            })
+            .await??;
+            self.verify_scope(&verified)?;
+            ensure!(
+                verified.manifest().source_workspace_id == source_workspace
+                    && verified.manifest().workspace_id == j.workspace
+                    && verified.manifest().exporter == j.exporter
+                    && verified.manifest().generation == pending.binding.generation
+                    && verified.size_bytes() == pending.binding.descriptor.total_bytes
+                    && hex(&verified.working_copy().snapshot_commit) == pending.snapshot_commit
+                    && verified.working_copy().wc_operation == pending.snapshot_operation,
+                "private resume saved semantic source differs"
+            );
+            let handle = if let Some(handle) = &pending.local {
+                ensure!(
+                    handle.registration == registration,
+                    "private resume registration changed"
+                );
+                handle.clone()
+            } else {
+                retention::reconcile(&registry, registration, &verified).await?
+            };
+            let actual = retention::resolve(&registry, &handle, &verified).await?;
+            // Only actual durable rows can fill the registry-commit/host-save gap.
+            self.record_capture(&registry, registration, actual, deadline)
+                .await?;
+            let receipt = self.upload_pending(deadline, true).await?;
+            return Ok(crate::control::NativePrivateBackupResumed {
+                receipt,
+                replayed: false,
+            });
+        }
+        let ack = j
+            .resume_ack
+            .as_ref()
+            .context("no saved pending private backup or explicit resume acknowledgement")?;
+        let head = j
+            .head
+            .as_ref()
+            .context("private resume acknowledged head unavailable")?;
+        ensure!(
+            head == &ack.head,
+            "private resume acknowledged head changed"
+        );
+        let _verified = self.verify_head(head, deadline).await?;
+        self.verify_session(deadline).await?;
+        let client = PrivateCapsuleClient::connect(self.config.clone(), self.trust).await?;
+        let status = client
+            .call_until(
+                CapsuleCall::new(
+                    &self.account,
+                    &head.binding.capsule_id,
+                    CapsuleAction::Status,
+                ),
+                Some(&head.binding),
+                deadline,
+            )
+            .await?;
+        ensure!(
+            status.state == CapsuleState::Sealed,
+            "private resume acknowledged capsule is not sealed"
+        );
+        self.verify_session(deadline).await?;
+        Ok(crate::control::NativePrivateBackupResumed {
+            receipt: ack.head.receipt.clone(),
+            replayed: true,
+        })
+    }
     pub(crate) async fn upload(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<PrivateBackupReceipt> {
+        self.upload_pending(deadline, false).await
+    }
+    async fn upload_pending(
+        &self,
+        deadline: tokio::time::Instant,
+        explicit_resume: bool,
+    ) -> Result<PrivateBackupReceipt> {
         let mut j = self.load()?;
+        let pending_source =
+            Self::pending_binding(&j)?.context("private backup pending source unavailable")?;
         let p = j
             .pending
             .clone()
@@ -988,6 +1113,14 @@ impl Context {
             intent: p.intent.clone().context("private intent unavailable")?,
             seal: predicted_seal,
             local: p.local.clone(),
+        };
+        admitted.resume_ack = if explicit_resume {
+            Some(ResumeAck {
+                head: predicted_head.clone(),
+                pending_source,
+            })
+        } else {
+            None
         };
         if let Some(old) = admitted.head.replace(predicted_head) {
             admitted.retained.push(old);
@@ -1093,6 +1226,14 @@ impl Context {
                 .context("private backup intent artifact unavailable")?,
             seal,
             local: p.local,
+        };
+        j.resume_ack = if explicit_resume {
+            Some(ResumeAck {
+                head: head.clone(),
+                pending_source,
+            })
+        } else {
+            None
         };
         if let Some(old) = j.head.replace(head) {
             j.retained.push(old);

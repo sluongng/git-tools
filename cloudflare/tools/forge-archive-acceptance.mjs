@@ -18,7 +18,7 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
 let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay, privateRelay;
-let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, pruneEvidence, complete = false, cleaned = false;
+let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, resumedWip, fifthWip, resumeEvidence, pruneEvidence, complete = false, cleaned = false;
 const fault = { export: true, restore: true, retire: false };
 const events = [], physicalEvidence = [];
 const grants = token => JSON.stringify([{ principal: 'archive-target', token_sha256: sha(token), accounts: ['forge-check'], export: false, restore: true }]);
@@ -129,7 +129,7 @@ async function raw(client, args, { cwd = client.cwd, success = true } = {}) {
   try {
     const argv = args[0] === '__forge_client_stop' ? args : ['--no-pager', '--color=never', ...args];
     const result = await context.execute(tt, argv, { cwd, env: client.env,
-      encoding: 'utf8', timeout: args[0] === 'backup' && args[1] === 'prune' ? 330000 : 180000, maxBuffer: 2 * 1024 * 1024 });
+      encoding: 'utf8', timeout: args[0] === 'backup' && ['prune', 'resume'].includes(args[1]) ? 330000 : 180000, maxBuffer: 2 * 1024 * 1024 });
     assert.ok(success, `unexpected CLI success: ${args[0]}`); return result.stdout.trim();
   } catch (error) {
     if (!success && typeof error.code === 'number') return error.stdout;
@@ -207,6 +207,8 @@ const workflow = {
     wipWorkspace = path.join(wipClient.cwd, 'work');
     const enrolled = await command(wipClient, ['work', wipWorkspace]); wipDescriptor = enrolled.result.client_descriptor;
     assert.ok(await mounted(wipWorkspace));
+    const noPending = await command(wipClient, ['backup', 'resume'], { cwd: wipWorkspace, success: false });
+    assert.equal(noPending.operation, 'backup_resume'); assert.equal(noPending.state, 'failed');
     await writeFile(path.join(wipWorkspace, 'src/source.txt'), 'unpublished private source before rename\n');
     await raw(wipClient, ['move', 'src/source.txt', 'src/renamed.txt'], { cwd: wipWorkspace });
     await rm(path.join(wipWorkspace, 'readme-link'));
@@ -378,6 +380,7 @@ const workflow = {
     const deniedBackup = await command(targetClient, ['backup'], { cwd: workspace, success: false });
     assert.equal(deniedBackup.state, 'failed');
     const operationBeforePrune = await raw(targetClient, ['--ignore-working-copy', 'op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
+    const commitBeforePrune = await raw(targetClient, ['--ignore-working-copy', 'log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace });
     const beforeSpool = await privateSpool(descriptor); assert.ok(beforeSpool.length >= 3);
     await writeFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'prune must leave unsnapshotted dirty bytes untouched\n');
     fault.retire = true;
@@ -403,21 +406,54 @@ const workflow = {
     assert.equal(noWork.state, 'complete'); assert.equal(noWork.result.retired, 0); assert.equal(noWork.result.local_files, 0); assert.equal(noWork.result.pending, 0);
     pruneEvidence = { first_result: firstPrune.result, resumed_result: pruned.result, noop_result: noWork.result, before_spool: beforeSpool, after_spool: afterSpool,
       old_retirement_ack_lost: true, real_local_predecessor_reclaimed: true, restored_predecessor_no_ticket_transplant: true, current_head_preserved: true, dirty_wip_not_snapshotted: true, quota_denied_pending_source_preserved: true };
+    // Restart the actual client with the saved pending4 and later dirty bytes.
+    // Its original restored capsule1 is now retired: resume must use CURRENT
+    // local state and saved pending custody, never replay that old capsule.
+    await raw(targetClient, ['tinytree', 'unmount', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]);
+    await raw(targetClient, ['tinytree', 'resume', workspace]);
+    assert.ok(await mounted(workspace));
+    assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
+    const resumed = await command(targetClient, ['backup', 'resume'], { cwd: workspace });
+    assert.equal(resumed.operation, 'backup_resume'); assert.equal(resumed.state, 'complete');
+    assert.equal(resumed.result.replayed, false); assert.equal(resumed.result.newer_working_copy_captured, false);
+    resumedWip = resumed.result.receipt;
+    assert.equal(resumedWip.generation, thirdWip.generation + 1); assert.equal(resumedWip.workspace_id, thirdWip.workspace_id);
+    assert.equal(resumedWip.snapshot_operation, operationBeforePrune); assert.equal(resumedWip.snapshot_commit, commitBeforePrune);
+    assert.equal(await raw(targetClient, ['--ignore-working-copy', 'op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), operationBeforePrune, 'saved resume never snapshots newer dirty work');
+    assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
+    const resumedAgain = await command(targetClient, ['backup', 'resume'], { cwd: workspace });
+    assert.equal(resumedAgain.state, 'complete'); assert.equal(resumedAgain.result.replayed, true);
+    assert.equal(resumedAgain.result.newer_working_copy_captured, false); assert.deepEqual(resumedAgain.result.receipt, resumedWip);
+    const fifth = await command(targetClient, ['backup'], { cwd: workspace });
+    assert.equal(fifth.state, 'complete'); fifthWip = fifth.result;
+    assert.equal(fifthWip.generation, resumedWip.generation + 1); assert.equal(fifthWip.workspace_id, firstWip.workspace_id);
+    assert.notEqual(fifthWip.snapshot_commit, resumedWip.snapshot_commit, 'normal new backup includes later dirty input');
+    const noResumeFallback = await command(targetClient, ['backup', 'resume'], { cwd: workspace, success: false });
+    assert.equal(noResumeFallback.operation, 'backup_resume'); assert.equal(noResumeFallback.state, 'failed', 'ordinary latest backup is not a saved-resume replay fallback');
+    const afterResumePrune = await command(targetClient, ['backup', 'prune', '--superseded'], { cwd: workspace });
+    assert.equal(afterResumePrune.state, 'complete'); assert.equal(afterResumePrune.result.current_capsule, fifthWip.capsule_id); assert.equal(afterResumePrune.result.pending, 0);
+    assert.equal((await capsuleStatus(thirdWip.capsule_id)).state, 'deleted');
+    assert.equal((await capsuleStatus(resumedWip.capsule_id)).state, 'deleted');
+    assert.equal((await capsuleStatus(fifthWip.capsule_id)).state, 'sealed');
+    resumeEvidence = { saved_receipt: resumedWip, replay_result: resumedAgain.result, next_receipt: fifthWip, after_resume_prune: afterResumePrune.result,
+      saved_pending_survived_client_restart: true, original_restored_source_retired_before_restart: true, exact_original_pending_resumed: true, newer_dirty_wip_not_captured_by_resume: true,
+      exact_resume_ack_replayed: true, ordinary_backup_invalidates_resume_fallback: true, subsequent_backup_captures_new_wip: true, subsequent_covered_prune: true };
     const sourceScope = (await command(targetClient, ['status'], { cwd: workspace })).result.workspace;
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
     await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined;
     const finalClient = await client('post-land-target', targetOrigin, restoreToken);
     const finalWorkspace = path.join(finalClient.cwd, 'work');
-    const final = await command(finalClient, ['work', finalWorkspace, '--capsule', thirdWip.capsule_id]);
+    const final = await command(finalClient, ['work', finalWorkspace, '--capsule', fifthWip.capsule_id]);
     targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor;
-    assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, thirdWip);
+    assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, fifthWip);
     assert.equal(final.result.base, sourceScope.base, 'post-Land mapped review base is not reset to enrollment');
-    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), thirdWip.snapshot_commit);
-    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), thirdWip.snapshot_operation);
+    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), fifthWip.snapshot_commit);
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), fifthWip.snapshot_operation);
     assert.equal(await readFile(path.join(workspace, 'after-land-private.txt'), 'utf8'), 'post-land unpublished backup input\n');
     assert.equal(await readFile(path.join(workspace, 'before-local-prune.txt'), 'utf8'), 'third acknowledged capture for real local retention cleanup\n');
-    await assert.rejects(lstat(path.join(workspace, 'dirty-prune-do-not-snapshot.txt')), error => error.code === 'ENOENT');
-    await assert.rejects(lstat(path.join(workspace, 'pending-prune-input.txt')), error => error.code === 'ENOENT');
+    assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
+    assert.equal(await readFile(path.join(workspace, 'pending-prune-input.txt'), 'utf8'), 'quota-denied native source must remain pending and untouched\n');
     await writeFile(path.join(workspace, 'after-restore-private.txt'), 'new work must survive normal restored resume\n');
     await raw(targetClient, ['status'], { cwd: workspace });
     const currentOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
@@ -427,12 +463,12 @@ const workflow = {
     assert.ok(await mounted(workspace));
     assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), currentOp, 'normal restored resume does not replay original backup over subsequent WIP');
     assert.equal(await readFile(path.join(workspace, 'after-restore-private.txt'), 'utf8'), 'new work must survive normal restored resume\n');
-    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, prune: pruneEvidence, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, resumed: resumedWip, fifth: fifthWip, resume: resumeEvidence, prune: pruneEvidence, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
     await this.cleanup({ success: true }); complete = true;
     return { production_worker: true, actual_sqlite_r2: true, source_archive_id: archiveId, build_id: manifest.build_id,
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
-      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, explicit_prune: pruneEvidence },
+      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, resumed_capsule: resumedWip, fifth_capsule: fifthWip, explicit_prune: pruneEvidence, exact_saved_resume: resumeEvidence },
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
       tamper_and_missing_page_rejected: true, existing_target_preserved: true, legacy_orphan_target_rejected: true, incomplete_restore_fenced: true,
       owned_cleanup: true, deployed_recovery_proof: false };

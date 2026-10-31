@@ -423,7 +423,7 @@ fn main() -> std::process::ExitCode {
         runner
             .add_dispatch_hook(async |ui, command, dispatch| {
                 #[cfg(feature = "forge-cli")]
-                let maintenance = forge::is_backup_prune(command);
+                let maintenance = forge::backup_maintenance_operation(command).is_some();
                 #[cfg(not(feature = "forge-cli"))]
                 let maintenance = false;
                 if !maintenance && let Ok(loader) = command.workspace_loader() {

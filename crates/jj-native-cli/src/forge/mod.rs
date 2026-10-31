@@ -135,15 +135,19 @@ pub(crate) fn configure<'a>(runner: CliRunner<'a>) -> CliRunner<'a> {
             if let Err(error) = &result
                 && machine
             {
-                output::error(ui, if is_backup_prune(command) { "backup_prune" } else { operation }, error)?;
+                output::error(ui, backup_maintenance_operation(command).unwrap_or(operation), error)?;
             }
             result
         })
 }
 
-/// Recognize the parsed read/maintenance command before native writer admission.
-pub(crate) fn is_backup_prune(command: &CommandHelper) -> bool {
-    command.matches().subcommand_matches("backup").is_some_and(|args| args.subcommand_name() == Some("prune"))
+/// Exact parsed maintenance mode, shared by writer admission and error output.
+pub(crate) fn backup_maintenance_operation(command: &CommandHelper) -> Option<&'static str> {
+    match command.matches().subcommand_matches("backup")?.subcommand_name()? {
+        "prune" => Some("backup_prune"),
+        "resume" => Some("backup_resume"),
+        _ => None,
+    }
 }
 
 fn machine(command: &CommandHelper) -> bool {

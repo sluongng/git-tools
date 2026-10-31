@@ -939,6 +939,40 @@ impl NativeCommandHost {
             .await
             .context("private prune worker failed")?
     }
+    pub(crate) async fn resume_private_backup(
+        &self,
+        root: &Path,
+    ) -> Result<crate::control::NativePrivateBackupResumed> {
+        let context = self
+            .inner
+            .private_backup
+            .get()
+            .cloned()
+            .context("private resume is unsupported by this host")?;
+        let registration = {
+            let workspaces = self
+                .inner
+                .workspaces
+                .read()
+                .map_err(|_| anyhow::anyhow!("private resume workspace map unavailable"))?;
+            let mut matches = workspaces
+                .values()
+                .filter(|workspace| workspace.binding.root.as_path() == root);
+            let selected = matches
+                .next()
+                .map(|workspace| (workspace.registration, workspace.binding.workspace_id));
+            ensure!(
+                matches.next().is_none(),
+                "private resume source registration is ambiguous"
+            );
+            selected
+        };
+        let registry = self.inner.registry.clone();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        tokio::spawn(async move { context.resume(registry, registration, deadline).await })
+            .await
+            .context("private resume worker failed")?
+    }
     async fn select_private(
         &self,
         mount: &str,

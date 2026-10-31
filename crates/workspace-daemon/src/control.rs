@@ -72,6 +72,12 @@ pub struct NativeCapsulesPruned {
     pub local_files: u32,
     pub pending: u32,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePrivateBackupResumed {
+    pub receipt: native_vfs_rpc::PrivateBackupReceipt,
+    pub replayed: bool,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -128,11 +134,15 @@ pub enum Request {
         workspace_id: String,
         expected_commit: String,
     },
-    /// Owner-private WIP restore in a descriptor-bound native-only client.
-    /// Explicit cleanup in the exact derived Forge client, without a writer lease.
+    /// Finish only the saved private intent in the exact derived Forge client.
+    NativeResumePrivateBackup {
+        root: PathBuf,
+    },
+    /// Explicit cleanup in the derived Forge client, without a writer lease.
     NativePrunePrivateCapsules {
         root: PathBuf,
     },
+    /// Owner-private WIP restore in a descriptor-bound native-only client.
     NativeRestoreCapsule {
         root: PathBuf,
         capsule_id: [u8; 32],
@@ -203,7 +213,9 @@ impl Client {
             .context("workspace daemon unavailable; run workspace serve")?;
         let seconds = if matches!(
             request,
-            Request::NativeRestoreCapsule { .. } | Request::NativePrunePrivateCapsules { .. }
+            Request::NativeRestoreCapsule { .. }
+                | Request::NativePrunePrivateCapsules { .. }
+                | Request::NativeResumePrivateBackup { .. }
         ) {
             310
         } else {

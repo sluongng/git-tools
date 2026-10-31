@@ -20,6 +20,8 @@ pub(super) struct BackupArgs {
 }
 #[derive(clap::Subcommand, Clone, Debug)]
 enum BackupCommand {
+    /// Finish only the exact saved immutable pending backup, without capturing newer WIP.
+    Resume,
     /// Retire only saved older heads proven covered by the acknowledged latest head.
     Prune {
         #[arg(long, required = true)]
@@ -34,6 +36,7 @@ pub(super) async fn run(
 ) -> Result<(), CommandError> {
     match args.command {
         None => backup(ui, command, machine).await,
+        Some(BackupCommand::Resume) => client::with_runtime(resume(ui, command, machine)).await,
         Some(BackupCommand::Prune { superseded: true }) => {
             client::with_runtime(prune(ui, command, machine)).await
         }
@@ -42,14 +45,16 @@ pub(super) async fn run(
         }
     }
 }
-async fn prune(ui: &Ui, command: &CommandHelper, machine: bool) -> Result<(), CommandError> {
+async fn maintenance_target(
+    command: &CommandHelper,
+) -> Result<(workspace_daemon::control::Client, PathBuf), CommandError> {
     if command
         .matches()
         .try_contains_id("repository")
         .unwrap_or(false)
     {
         return Err(user_error(
-            "backup prune must run inside its intended workspace; omit --repository",
+            "backup maintenance must run inside its intended workspace; omit --repository",
         ));
     }
     // Do not load a Workspace/ReadonlyRepo: the managed loader admits a writer.
@@ -66,14 +71,51 @@ async fn prune(ui: &Ui, command: &CommandHelper, machine: bool) -> Result<(), Co
             Err(error) => return Err(user_error(error)),
         }
     }
-    let root = root
-        .ok_or_else(|| user_error("backup prune requires an existing derived Forge workspace"))?;
+    let root = root.ok_or_else(|| {
+        user_error("backup maintenance requires an existing derived Forge workspace")
+    })?;
     let descriptor = client::maintenance_descriptor(&root).await?;
-    let value = workspace_daemon::control::Client {
-        socket: descriptor.state_dir().join("control.sock"),
+    Ok((
+        workspace_daemon::control::Client {
+            socket: descriptor.state_dir().join("control.sock"),
+        },
+        root,
+    ))
+}
+async fn resume(ui: &Ui, command: &CommandHelper, machine: bool) -> Result<(), CommandError> {
+    let (client, root) = maintenance_target(command).await?;
+    let value = client
+        .call(workspace_daemon::control::Request::NativeResumePrivateBackup { root })
+        .map_err(user_error)?;
+    let result: workspace_daemon::control::NativePrivateBackupResumed =
+        serde_json::from_value(value).map_err(|_| {
+            user_error("invalid saved backup acknowledgement; pending state retained")
+        })?;
+    result.receipt.validate().map_err(user_error)?;
+    if machine {
+        output::write(
+            ui,
+            "backup_resume",
+            "complete",
+            json!({"receipt":result.receipt,"replayed":result.replayed,"newer_working_copy_captured":false}),
+        )?;
+    } else {
+        writeln!(
+            ui.stdout(),
+            "Saved private backup sealed: {} generation {}, commit {}, operation {}. Newer working-copy changes were not captured.",
+            result.receipt.capsule_id,
+            result.receipt.generation,
+            result.receipt.snapshot_commit,
+            result.receipt.snapshot_operation
+        )?;
     }
-    .call(workspace_daemon::control::Request::NativePrunePrivateCapsules { root })
-    .map_err(user_error)?;
+    Ok(())
+}
+async fn prune(ui: &Ui, command: &CommandHelper, machine: bool) -> Result<(), CommandError> {
+    let (client, root) = maintenance_target(command).await?;
+    let value = client
+        .call(workspace_daemon::control::Request::NativePrunePrivateCapsules { root })
+        .map_err(user_error)?;
     let result: workspace_daemon::control::NativeCapsulesPruned = serde_json::from_value(value)
         .map_err(|_| {
             user_error("invalid private cleanup acknowledgement; pending state retained")
