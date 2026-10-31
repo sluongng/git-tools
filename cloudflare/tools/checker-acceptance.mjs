@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare } from 'miniflare';
 
-export async function runCheckerAcceptance({ inputs, clientWorkflow } = {}) {
+export async function runCheckerAcceptance({ inputs, clientWorkflow, archiveWorkflow } = {}) {
 assert.equal(inputs.length, 7, 'declared fixture, checker, readonly helper, Bazel, Worker, Wasm and tt arguments required');
 const [fixtureBinary, runner, helper, bazel, worker, wasm, tt] = inputs.map(value => path.resolve(value));
 const socket = process.env.TT_CHECKER_ACCEPT_RBE_SOCKET;
@@ -20,7 +20,11 @@ assert.ok(socket && path.isAbsolute(socket) && (await stat(socket)).isSocket(), 
 const instance = process.env.TT_CHECKER_ACCEPT_RBE_INSTANCE ?? '';
 const flags = JSON.parse(process.env.TT_CHECKER_ACCEPT_PROFILE_FLAGS_JSON ?? '[]');
 assert.ok(Array.isArray(flags) && flags.every(value => typeof value === 'string'));
-const artifacts = process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR;
+const artifactRoot = process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR;
+// Client and archive acceptance may run together; never overwrite one another's
+// physical receipts or execution evidence in a shared configured artifact root.
+const artifacts = artifactRoot && (archiveWorkflow ? path.join(artifactRoot, 'archive')
+  : clientWorkflow ? path.join(artifactRoot, 'client') : artifactRoot);
 if (artifacts) {
   assert.ok(path.isAbsolute(artifacts));
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
@@ -51,12 +55,14 @@ try {
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
     r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(root, 'do'), r2Persist: path.join(root, 'r2'),
     bindings: { FORGE_BACKEND: 'enabled', EXPERIMENTAL_RAW_BACKEND: 'disabled',
+      ...(archiveWorkflow?.configureBindings?.() ?? {}),
       PRINCIPALS_JSON: JSON.stringify([{ principal: 'check-owner', token_sha256: sha(token), accounts: ['forge-check', 'forge-input'], operator: true, kind: 'forge' }, ...(clientWorkflow?.configurePrincipals?.() ?? [])]) },
   };
   mf = new Miniflare(configuration);
   const origin = (await mf.ready).origin;
   assert.equal(new URL(origin).hostname, '127.0.0.1');
   configuration.port = Number(new URL(origin).port);
+  let checkerAuthorityOrigin = origin;
   // Test-only transport fault, not a Worker hook or a fabricated response:
   // forward the exact saved command to the production endpoint, then lose only
   // the first genuinely accepted passing Complete acknowledgement.
@@ -69,7 +75,7 @@ try {
       request.setTimeout(0);
       const bytes = Buffer.concat(parts);
       const call = JSON.parse(bytes);
-      const upstream = await fetch(origin + request.url, { method: 'POST', signal: AbortSignal.timeout(30000),
+      const upstream = await fetch(checkerAuthorityOrigin + request.url, { method: 'POST', signal: AbortSignal.timeout(30000),
         headers: { 'content-type': request.headers['content-type'], authorization: request.headers.authorization }, body: bytes });
       assert.ok(Number(upstream.headers.get('content-length') ?? 0) <= 1024 * 1024);
       const chunks = []; let length = 0;
@@ -150,7 +156,7 @@ force_remote_execution = true
   configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile, committer: { name: 'Checker Acceptance', email: 'fixture@example.invalid' } });
   configuration.bindings.FORGE_CHECK_POLICY_JSON = JSON.stringify({ profile, targets: ['//:smoke'], test: true });
   await mf.dispose(); mf = new Miniflare(configuration); assert.equal((await mf.ready).origin, origin);
-  const generated = await execute(fixtureBinary, ['--checker-profile-version', profileVersion, ...(clientWorkflow?.fixtureArgs ?? [])], { env: { HOME: home, PATH: emptyPath, TMPDIR: root }, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 });
+  const generated = await execute(fixtureBinary, ['--checker-profile-version', profileVersion, ...((clientWorkflow ?? archiveWorkflow)?.fixtureArgs ?? [])], { env: { HOME: home, PATH: emptyPath, TMPDIR: root }, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 });
   const source = JSON.parse(generated.stdout).checker;
   assert.deepEqual(source.profile, profile);
   const invoke = async (operation, payload = {}, id = '', expected = 200, view = 'public', selectedAccount = source.account_id) => {
@@ -178,7 +184,7 @@ force_remote_execution = true
   }
   assert.equal(imported.phase, 'ready');
   await invoke(44, { import_id: begin.import_id, expected_generation: imported.generation }, 'accept-bootstrap-finish');
-  await clientWorkflow?.beforePublish?.({ invoke, source });
+  await (clientWorkflow ?? archiveWorkflow)?.beforePublish?.({ invoke, source });
   await invoke(4, { spec: source.spec, expected_epoch: source.publish_epoch ?? 1, make_default: true, follow_main: source.client_workspace === true }, 'accept-view');
   let baseline = await invoke(6);
   for (let round = 0; round < 128 && baseline.state === 'pending'; round++) baseline = await invoke(6, { version: baseline.value.view_version, progress: baseline.value.progress });
@@ -569,8 +575,18 @@ force_remote_execution = true
     await writeFile(path.join(artifacts, 'cancellation-proc.json'), JSON.stringify(observation, null, 2), { mode: 0o600 });
   }
   assert.equal((await invoke(2)).value.main_generation, before.main_generation + 2);
+  if (archiveWorkflow) stage = 'archive-recovery';
+  const archiveEvidence = await archiveWorkflow?.afterPrimary?.({ root, origin, source, token, invoke, execute, profile, run,
+    restartWorker, configuration, baseline: baseline.value, before, evidence,
+    cancellationCandidate: cancelledCandidate,
+    retargetChecker(target) {
+      const endpoint = new URL(target);
+      assert.equal(endpoint.protocol, 'http:'); assert.equal(endpoint.hostname, '127.0.0.1');
+      assert.equal(endpoint.origin, target); checkerAuthorityOrigin = target;
+    },
+  });
   const clientEvidence = await workflow?.finish?.();
-  const summary = { ...(clientEvidence ? { client_workspaces: clientEvidence } : {}), schema: 1, production_worker: true, execution_only_linux: true, no_synthetic_verdict: true, evidence };
+  const summary = { ...(archiveEvidence ? { account_archive: archiveEvidence } : {}), ...(clientEvidence ? { client_workspaces: clientEvidence } : {}), schema: 1, production_worker: true, execution_only_linux: true, no_synthetic_verdict: true, evidence };
   if (artifacts) await writeFile(path.join(artifacts, 'checker-acceptance.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
   console.log(JSON.stringify(summary));
   acceptanceComplete = true;
@@ -602,6 +618,7 @@ force_remote_execution = true
   let disposed = false;
   try {
     await workflow?.cleanup?.();
+    await archiveWorkflow?.cleanup?.();
     if (relay) { relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve)); }
     if (mf) await mf.dispose(); disposed = true;
   }

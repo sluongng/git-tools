@@ -434,6 +434,56 @@ async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_sha
     task.await.unwrap();
 }
 #[tokio::test]
+async fn forge_archive_admission_limit_is_resource_exhausted_without_retry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tinytree_client::archive::{Action, ArchiveRequest};
+    // The existing Forge HTTP helper owns a different fixed route/envelope;
+    // keep this one bounded archive admission peer explicit.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0)); let received = calls.clone();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = tokio::select! { connection = listener.accept() => connection.unwrap(), _ = &mut stopped => break };
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0]; socket.read_exact(&mut byte).await.unwrap(); headers.push(byte[0]); assert!(headers.len() < 16384);
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("post /api/v1/archive/call http/1.1\r\n"));
+            assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+            let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+            assert!(size < 2048); let mut body = vec![0; size]; socket.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["schema"], 1); assert_eq!(request["account_id"], "alpha");
+            assert_eq!(request["archive_id"], "a".repeat(64)); assert_eq!(request["action"], "export_begin");
+            received.fetch_add(1, Ordering::SeqCst);
+            let body = br#"{"schema":1,"error":{"code":"account_admission_limit"}}"#;
+            socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        }
+    });
+    let mut config = Config::default(); config.transport = tinytree_client::Transport::ForgeHttpsV1; config.endpoint = endpoint;
+    config.rpc.operation_timeout_ms = 1000; config.rpc.rpc_timeout_ms = 1000; config.rpc.connect_timeout_ms = 100;
+    let client = tinytree_client::ArchiveClient::connect(config, "TINYTREE_CLIENT_TEST_TOKEN", None).await.unwrap();
+    let refused = client.call(ArchiveRequest::new("alpha", &"a".repeat(64), Action::ExportBegin)).await.err().expect("archive admission must refuse");
+    assert_eq!(refused.code(), Code::ResourceExhausted); assert_eq!(refused.message(), "account_admission_limit");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "429 is not an Unavailable retry signal");
+    stop.send(()).unwrap(); task.await.unwrap();
+}
+
+#[tokio::test]
+async fn forge_archive_transport_refuses_changed_captured_trust_before_dispatch() {
+    let mut config = Config::default();
+    config.transport = tinytree_client::Transport::ForgeHttpsV1;
+    config.endpoint = "https://example.invalid".into();
+    config.tls = Some(tinytree_client::Tls { ca_certificate: env!("TLS_CA_CERT").into(), domain_name: None });
+    let refused = tinytree_client::ArchiveClient::connect(config, "TINYTREE_CLIENT_TEST_TOKEN", Some([9;32])).await.err().expect("wrong expected trust digest must fail before network");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(refused.message(), "archive trust roots changed before dispatch");
+}
+#[tokio::test]
 async fn forge_session_decodes_strict_server_identity_and_requires_exact_result_account() {
     for (mode, anonymous, expected) in [
         (ForgeHttpMode::SessionAuthenticated, false, None),

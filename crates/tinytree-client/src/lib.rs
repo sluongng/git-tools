@@ -1,6 +1,8 @@
 //! Verifying native repository client. Receipts and presence are not retention
 //! leases. Git conversion, jj catalogs and mount residency are separate layers.
 mod client;
+pub mod archive;
+pub use archive::ArchiveClient;
 mod config;
 mod forge_http;
 mod transport;

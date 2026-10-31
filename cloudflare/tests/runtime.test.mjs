@@ -2214,3 +2214,19 @@ test('production alarm aborts missing strict roots before deletion, releases its
   assert.ok(activeGcJob(retried).deleted >= 1);
 });
 
+
+
+test('archive schema inventory matches every application DDL and identifies only the exact platform metadata table', async t => {
+  const runtime = await projectionRuntime(t);
+  const report = await runtime.control('archive-schema');
+  assert.ok(report.compiled_objects > 0 && report.actual_objects <= 512);
+  assert.ok(report.ddl_bytes <= 4 * 1024 * 1024);
+  assert.ok(Array.isArray(report.mismatches));
+  assert.ok(report.mismatches.every(row => typeof row.name === 'string' && typeof row.reason === 'string'
+    && (row.actual_hash === null || /^[0-9a-f]{64}$/.test(row.actual_hash))
+    && (row.expected_hash === null || /^[0-9a-f]{64}$/.test(row.expected_hash))));
+  assert.deepEqual(report.mismatches, [{
+    type: 'table', name: '_cf_METADATA', table: '_cf_METADATA', reason: 'unknown_object',
+    actual_hash: '4eb6b2780dfba9eda11272ea4816ae3e343a9c1290ee04c32c0029b70fb152c0', expected_hash: null,
+  }], 'every compiled application DDL must match; only the pinned workerd alarm/bookmark table is outside it');
+});

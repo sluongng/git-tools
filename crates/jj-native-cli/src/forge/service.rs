@@ -118,6 +118,10 @@ pub(super) struct LoginArgs {
 pub(super) enum AccountCommand {
     /// Import one exact native source snapshot into untouched account genesis.
     BootstrapImport(super::bootstrap::Args),
+    /// Export a complete private same-build account archive.
+    Backup(super::archive::BackupArgs),
+    /// Restore an archive into untouched same-account target state.
+    Restore(super::archive::RestoreArgs),
     Show,
     Provision {
         #[arg(long)]
@@ -266,6 +270,8 @@ pub(super) async fn account(
     let context = context()?;
     let (op, request, mutation) = match args {
         AccountCommand::BootstrapImport(args) => return super::bootstrap::run(ui, machine, args, context).await,
+        AccountCommand::Backup(args) => { let path=std::env::current_dir().map_err(user_error)?.join(&args.directory); return super::archive::backup(ui,machine,args,context,path).await; }
+        AccountCommand::Restore(args) => { let path=std::env::current_dir().map_err(user_error)?.join(&args.directory); return super::archive::restore(ui,machine,args,context,path).await; }
         AccountCommand::Show => (Op::GetAccount, None, false),
         AccountCommand::Provision { request_id } => (Op::ProvisionAccount, request_id, true),
     };

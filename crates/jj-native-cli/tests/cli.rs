@@ -857,6 +857,82 @@ mod forge_product {
         assert!(!client.home.join("config/tinytree/clients").exists(), "discovery denial starts no native client");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_archive_resumes_exact_pages_with_separate_credentials_and_validates_before_restore() {
+        use tinytree_client::archive::{self as a, ArchiveManifest, ArchivePage, Cell, Content, Row, Table};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Supporting HTTP/client durability fixture. Actual SQLite/R2 archive
+        // authority and fresh-target recovery run in the Worker acceptance.
+        let mut client = client();
+        const ARCHIVE_TOKEN: &str = "public-archive-fixture-token-not-a-secret";
+        client.extra_env.push(("ARCHIVE_TEST_TOKEN", ARCHIVE_TOKEN));
+        let archive_id = "a".repeat(64); let build = "b".repeat(64);
+        let mut first = ArchivePage { schema:1, account_id:"example".into(), archive_id:archive_id.clone(), build_id:build.clone(), sequence:0,
+            previous:a::ZERO_HASH.into(), hash:a::ZERO_HASH.into(), content:Content::Rows { table:"fixture_table".into(), columns:vec!["text".into(),"number".into(),"blob".into(),"real".into(),"empty".into()],
+                rows:vec![Row { rowid:1, cells:vec![Cell::Text{value:"archived source metadata".into()},Cell::Integer{value:7},Cell::Blob{hex:"cafe".into()},Cell::Real{value:"0.5".into()},Cell::Null{}] }] } };
+        first.hash = first.computed_hash().unwrap();
+        let bytes=b"verified archive payload\n"; let descriptor=tinytree_model::describe_file(bytes); let attempt="c".repeat(64); let object_id=a::hex(&descriptor.key.id.0);
+        let mut second=ArchivePage { schema:1,account_id:"example".into(),archive_id:archive_id.clone(),build_id:build.clone(),sequence:1,previous:first.hash.clone(),hash:a::ZERO_HASH.into(),
+            content:Content::Payload {attempt_id:attempt.clone(),object_kind:1,object_id:object_id.clone(),size:bytes.len() as u64,locator:format!("native/v2/example/1/{object_id}/{attempt}"),state:"written".into(),source_etag:Some("source-etag".into()),source_version:Some("source-version".into()),presence:"present".into(),bytes_hex:Some(a::hex(bytes))} };
+        second.hash=second.computed_hash().unwrap();
+        let manifest=ArchiveManifest { schema:1,account_id:"example".into(),archive_id:archive_id.clone(),build_id:build.clone(),tables:vec![Table{name:"fixture_table".into(),columns:vec!["text".into(),"number".into(),"blob".into(),"real".into(),"empty".into()],rows:1}],page_count:2,chain_root:second.hash.clone(),rows:1,bytes:(first.content_bytes().unwrap()+second.content_bytes().unwrap()) as u64,payloads:1 };
+        let manifest_json=serde_json::to_value(&manifest).unwrap();let pages=[serde_json::to_value(first).unwrap(),serde_json::to_value(second).unwrap()];
+        let archive_path=client.root.join("backup");let source_path=archive_path.clone();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}",listener.local_addr().unwrap());
+        let captured=std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));let seen=captured.clone();
+        let release_ack=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let admitted=release_ack.clone();
+        let (stop,mut stopped)=tokio::sync::oneshot::channel();
+        let server=tokio::spawn(async move {
+            let mut tasks=tokio::task::JoinSet::new();
+            loop {
+                let (mut socket,_)=tokio::select!{accepted=listener.accept()=>accepted.unwrap(),_=&mut stopped=>break};
+                let seen=seen.clone();let admitted=admitted.clone();let pages=pages.clone();let manifest=manifest_json.clone();let source_path=source_path.clone();let build=build.clone();
+                tasks.spawn(async move {
+                    let mut headers=Vec::new();while !headers.ends_with(b"\r\n\r\n"){let mut byte=[0];if socket.read_exact(&mut byte).await.is_err(){return;}headers.push(byte[0]);assert!(headers.len()<16384);}
+                    let headers=String::from_utf8(headers).unwrap().to_ascii_lowercase();assert!(headers.starts_with("post /api/v1/archive/call http/1.1\r\n"));assert!(headers.contains(&format!("authorization: bearer {ARCHIVE_TOKEN}\r\n")));assert!(!headers.contains("public-forge-fixture-token-not-a-secret"));
+                    let size:usize=headers.lines().find_map(|line|line.strip_prefix("content-length: ")).unwrap().parse().unwrap();assert!(size<=a::MAX_PAGE_BYTES+65536);let mut bytes=vec![0;size];socket.read_exact(&mut bytes).await.unwrap();let input:serde_json::Value=serde_json::from_slice(&bytes).unwrap();seen.lock().unwrap().push(input.clone());
+                    let mut reply=serde_json::json!({"schema":1,"account_id":input["account_id"],"archive_id":input["archive_id"],"build_id":build,"state":"exporting","next_sequence":0});
+                    match input["action"].as_str().unwrap(){
+                        "export_begin"=>{if admitted.load(std::sync::atomic::Ordering::SeqCst){reply["next_sequence"]=serde_json::json!(1);}},
+                        "export_next"=>{let n=input["sequence"].as_u64().unwrap();if n==0&&!admitted.load(std::sync::atomic::Ordering::SeqCst){return;}if n<2{reply["state"]=serde_json::json!("page");reply["next_sequence"]=serde_json::json!(n+1);reply["page"]=pages[n as usize].clone();}else{reply["state"]=serde_json::json!("exported");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest.clone();}},
+                        "export_abort"=>{reply["state"]=serde_json::json!("aborted");},
+                        "export_finish"=>{let durable:serde_json::Value=serde_json::from_slice(&fs::read(source_path.join("manifest.json")).unwrap()).unwrap();assert_eq!(durable,manifest,"complete local manifest precedes release of source barrier");assert_eq!(input["manifest"],manifest);reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest.clone();},
+                        "restore_begin"=>{assert_eq!(input["manifest"],manifest);reply["state"]=serde_json::json!("restoring");},
+                        "restore_page"=>{let n=input["page"]["sequence"].as_u64().unwrap();assert_eq!(input["page"],pages[n as usize]);reply["state"]=serde_json::json!("restoring");reply["next_sequence"]=serde_json::json!(n+1);},
+                        "status"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest;},
+                        "restore_finish"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest;},
+                        _=>panic!("unexpected archive action"),
+                    }
+                    let bytes=serde_json::to_vec(&reply).unwrap();socket.write_all(format!("HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await.unwrap();let _=socket.write_all(&bytes).await;
+                });
+            }
+            while let Some(result)=tasks.join_next().await{result.unwrap();}
+        });
+        client.success(&["context","set","--transport","forge-https-v1","--server",&endpoint,"--account","example","--token-env","FORGE_TEST_TOKEN","--json"]);
+        let context_path=client.home.join("config/tinytree/context.json");let context_bytes=fs::read(&context_path).unwrap();
+        let first=client.run(&["account","backup","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--archive-id",&archive_id,"--json"]);assert!(!first.status.success());
+        assert!(!archive_path.join("manifest.json").exists());assert!(!archive_path.join("page-00000000.json").exists());
+        let intent=fs::read(archive_path.join("intent.json")).unwrap();assert!(!String::from_utf8_lossy(&intent).contains(ARCHIVE_TOKEN));assert!(!String::from_utf8_lossy(&intent).contains("public-forge-fixture-token-not-a-secret"));
+        release_ack.store(true,std::sync::atomic::Ordering::SeqCst);
+        let completed:serde_json::Value=serde_json::from_str(&client.success(&["account","backup","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--json"])).unwrap();assert_eq!(completed["state"],"complete");assert_eq!(completed["result"]["archive_id"],archive_id);
+        let requests=captured.lock().unwrap().clone();let retries=requests.iter().filter(|r|r["action"]=="export_next"&&r["sequence"]==0).collect::<Vec<_>>();assert_eq!(retries.len(),4);assert!(retries.windows(2).all(|pair|pair[0]==pair[1]),"all lostACK retries/resume preserve exact archive request");
+        let page_path=archive_path.join("page-00000000.json");let original_page=fs::read(&page_path).unwrap();let mut tampered:serde_json::Value=serde_json::from_slice(&original_page).unwrap();tampered["hash"]=serde_json::json!("0".repeat(64));fs::write(&page_path,serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let count=captured.lock().unwrap().len();let refused=client.run(&["account","restore","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--json"]);assert!(!refused.status.success());assert_eq!(captured.lock().unwrap().len(),count,"tampered archive refused before target HTTP");
+        fs::write(&page_path,&original_page).unwrap();
+        let atomic_temp=archive_path.join(".private-123-77.tmp"); fs::write(&atomic_temp,b"partial page never acknowledged").unwrap();
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt as _; fs::set_permissions(&atomic_temp,fs::Permissions::from_mode(0o600)).unwrap(); }
+        let restored:serde_json::Value=serde_json::from_str(&client.success(&["account","restore","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--json"])).unwrap();assert_eq!(restored["state"],"complete");assert_eq!(restored["result"]["chain_root"],manifest.chain_root);
+        assert!(!atomic_temp.exists(), "recognized orphan atomic temp is discarded, never adopted");
+        assert_eq!(fs::read(&page_path).unwrap(),original_page);assert_eq!(fs::read(&context_path).unwrap(),context_bytes,"archive credentials never replace normal VCS context");
+        let count=captured.lock().unwrap().len();let complete_abort=client.run(&["account","backup","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--abort","--json"]);assert!(!complete_abort.status.success());assert_eq!(captured.lock().unwrap().len(),count,"completed backup cannot be aborted");
+        release_ack.store(false,std::sync::atomic::Ordering::SeqCst);
+        let partial=client.run(&["account","backup","aborted-backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--archive-id",&"d".repeat(64),"--json"]);assert!(!partial.status.success());
+        let partial_dir=client.root.join("aborted-backup");let bad_page=partial_dir.join("page-00000000.json");fs::write(&bad_page,b"corrupted incomplete page").unwrap();let partial_temp=partial_dir.join(".private-456-9.tmp");fs::write(&partial_temp,b"partial atomic intent").unwrap();
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt as _; fs::set_permissions(&bad_page,fs::Permissions::from_mode(0o600)).unwrap();fs::set_permissions(&partial_temp,fs::Permissions::from_mode(0o600)).unwrap(); }
+        let aborted:serde_json::Value=serde_json::from_str(&client.success(&["account","backup","aborted-backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--abort","--json"])).unwrap();assert_eq!(aborted["state"],"aborted");assert_eq!(aborted["result"]["archive_id"],"d".repeat(64));assert_eq!(fs::read(bad_page).unwrap(),b"corrupted incomplete page");assert!(!partial_temp.exists());assert_eq!(fs::read(context_path).unwrap(),context_bytes);
+        stop.send(()).unwrap();server.await.unwrap();
+    }
+
     #[test]
     fn forge_product_failed_mutation_keeps_exact_replay_identity() {
         let client = client();

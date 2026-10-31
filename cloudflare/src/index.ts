@@ -18,6 +18,10 @@ import { CHECKER_ROUTE, admitChecker, checkerReply, protectChecker, requireCheck
 import { DurableObject } from 'cloudflare:workers';
 import { requireDelegatedForgeCredential } from './protocol';
 import { ForgeTransforms, type TrustedAuth, type TransformRpcCommand, type TransformRpcResult } from './forge_transforms';
+import { AccountArchive, archiveBarrierInTx } from './account_archive';
+import { admitArchive, archiveResponse, protectArchive } from './archive_protocol';
+import { ARCHIVE_BUILD_ID, ARCHIVE_SCHEMA } from './archive_schema.generated';
+const ARCHIVE_ROUTE = '/api/v1/archive/call';
 
 interface Env {
   ASSETS?: Fetcher;
@@ -29,6 +33,7 @@ interface Env {
   FORGE_REVIEW_CONFIG_JSON?: string;
   FORGE_CHECK_POLICY_JSON?: string;
   CHECKERS_JSON?: string;
+  ARCHIVERS_JSON?: string;
 }
 interface TransformRpcFrame { schema: 1; account_id: string; auth: TrustedAuth | null; command: TransformRpcCommand }
 type TransformRpcEnvelope = { ok: true; value: TransformRpcResult } | { ok: false; status: number; code: string };
@@ -128,6 +133,15 @@ export default {
     const presentation = await staticUi(request, env.ASSETS);
     if (presentation) return presentation;
     const path = new URL(request.url).pathname;
+    if (path === ARCHIVE_ROUTE) {
+      return protectArchive(async () => {
+        // Admit a bounded clone for routing; the DO independently authenticates
+        // and parses the original body under its physical account queue.
+        const { call } = await admitArchive(request.clone(), env);
+        const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
+        return env.REPOSITORIES.get(id).fetch(request);
+      });
+    }
     if (path === CHECKER_ROUTE) {
       return protectChecker(async () => {
         const { call, bytes } = await admitChecker(request, env);
@@ -168,15 +182,14 @@ class RepositoryEngine {
   private sql: SqlStorage;
   private tail: Promise<unknown> = Promise.resolve();
   private active = 0;
+  private archiveActive = 0;
   private readonly storageCollectors = new WeakMap<ForgeStorage, ForgeGc>();
   constructor(private ctx: DurableObjectState, private env: Env) {
     this.sql = ctx.storage.sql;
     for (const statement of [
       'CREATE TABLE IF NOT EXISTS repository (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS forge_gc_schedule(singleton INTEGER PRIMARY KEY CHECK(singleton=1),requested INTEGER NOT NULL,last_started INTEGER NOT NULL,last_mutation INTEGER NOT NULL)',
-      'INSERT OR IGNORE INTO forge_gc_schedule(singleton,requested,last_started,last_mutation) VALUES(1,0,0,0)',
       'CREATE TABLE IF NOT EXISTS transform_recovery_schedule(singleton INTEGER PRIMARY KEY CHECK(singleton=1),due INTEGER NOT NULL)',
-      'INSERT OR IGNORE INTO transform_recovery_schedule(singleton,due) VALUES(1,0)',
       'CREATE TABLE IF NOT EXISTS forge_storage_terminal_owners(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,PRIMARY KEY(owner_kind,owner_id))',
       'CREATE TABLE IF NOT EXISTS objects (kind INTEGER NOT NULL, id TEXT NOT NULL, size INTEGER NOT NULL, inspection TEXT NOT NULL, visible INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(kind,id))',
       'CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, principal TEXT NOT NULL, fingerprint TEXT NOT NULL, status INTEGER, result TEXT)',
@@ -185,31 +198,49 @@ class RepositoryEngine {
       'CREATE TABLE IF NOT EXISTS forge_validated_roots(kind INTEGER NOT NULL, id TEXT NOT NULL, proof TEXT NOT NULL, PRIMARY KEY(kind,id))',
       'CREATE TABLE IF NOT EXISTS forge_retained_roots(owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, kind INTEGER NOT NULL, id TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN(0,1)), PRIMARY KEY(owner_kind,owner_id,kind,id))',
     ]) this.sql.exec(statement);
+    // An interrupted restore must not re-create even constructor defaults
+    // between metadata pages. Only the original fresh default may be consumed.
+    if (!archiveBarrierInTx(this.sql)) {
+      this.sql.exec('INSERT OR IGNORE INTO forge_gc_schedule(singleton,requested,last_started,last_mutation) VALUES(1,0,0,0)');
+      this.sql.exec('INSERT OR IGNORE INTO transform_recovery_schedule(singleton,due) VALUES(1,0)');
+    }
   }
   async fetch(request: Request): Promise<Response> {
-    // Includes R2 awaits: two admitted uploads cannot oversubscribe durable quota,
-    // and reads never observe an uncommitted payload. Eviction preserves SQL intents.
-    const forge = new URL(request.url).pathname.startsWith('/api/v1/forge/');
-    const checker = new URL(request.url).pathname === CHECKER_ROUTE;
+    // Every physical await is ordered before archive freeze. Never check the
+    // barrier only before enqueue: an earlier queued archive may establish it.
+    const path = new URL(request.url).pathname;
+    const forge = path.startsWith('/api/v1/forge/');
+    const checker = path === CHECKER_ROUTE;
+    const archive = path === ARCHIVE_ROUTE;
+    // Archive pages are much larger than ordinary product calls. Keep at
+    // most one physical archive page queued/running per account instance.
+    if (archive && (this.active >= 16 || this.archiveActive >= 1)) return protectArchive(async () => fail(429, 'resource_exhausted'));
     if (this.active >= 16 && checker) return json({ schema: 1, error: { code: 'resource_exhausted' } }, 429);
     if (this.active >= 16) return forge
       ? json({ version: 1, error: { code: 'resource_exhausted', message: 'account_admission_limit' } }, 429)
       : json({ error: 'account_admission_limit' }, 429);
-    return this.enqueue(() => checker ? protectChecker(() => this.handleChecker(request)) : forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request)));
+    const dispatch = async (): Promise<Response> => {
+      if (archive) return this.handleArchive(request);
+      if (archiveBarrierInTx(this.sql)) fail(503, 'unavailable');
+      return checker ? this.handleChecker(request) : forge ? this.handleForge(request) : this.handle(request);
+    };
+    return this.enqueue(() => archive ? protectArchive(dispatch) : checker ? protectChecker(dispatch) : forge ? protectForge(dispatch) : protect(dispatch), archive);
   }
-  private enqueue<T>(action: () => Promise<T>): Promise<T> {
-    this.active++;
+  private enqueue<T>(action: () => Promise<T>, archive = false): Promise<T> {
+    this.active++; if (archive) this.archiveActive++;
     const work = this.tail.then(async () => {
       try { return await action(); }
       finally { await this.maintainCollectionAlarm().catch(() => undefined); }
-    }).finally(() => { this.active--; });
+    }).finally(() => { this.active--; if (archive) this.archiveActive--; });
     this.tail = work.then(() => undefined, () => undefined);
     return work;
   }
+
   transformRpc(frame: TransformRpcFrame, maintainAlarm = true): Promise<TransformRpcResult> {
     if (this.active >= 16) fail(429, 'resource_exhausted');
     return this.enqueue(async () => {
       try {
+      if (archiveBarrierInTx(this.sql)) fail(503, 'unavailable');
       if (frame.schema !== 1 || identifier(frame.account_id) !== frame.account_id || !hasForgeAccount(this.sql)) fail(403, 'permission_denied');
       const repository = this.one('SELECT account FROM repository WHERE singleton=1');
       if (repository?.account !== frame.account_id) fail(403, 'permission_denied');
@@ -225,6 +256,7 @@ class RepositoryEngine {
   }
   recoveryAccount(): Promise<string | null> {
     return this.enqueue(async () => {
+      if (archiveBarrierInTx(this.sql)) return null;
       const due = Number(this.one('SELECT due FROM transform_recovery_schedule WHERE singleton=1')!.due);
       if (!due || Date.now() < due || !this.recoveryPendingInTx()) return null;
       const row = this.one('SELECT account FROM repository WHERE singleton=1');
@@ -235,6 +267,7 @@ class RepositoryEngine {
     return this.enqueue(() => this.updateRecoveryAlarm(delay, true));
   }
   private async updateRecoveryAlarm(delay: number, reset = false): Promise<void> {
+    if (archiveBarrierInTx(this.sql)) return;
     const pending = this.recoveryPendingInTx();
     this.sql.exec('UPDATE transform_recovery_schedule SET due=CASE WHEN ?=0 THEN 0 WHEN ?=1 OR due=0 THEN ? ELSE due END WHERE singleton=1',
       pending ? 1 : 0, reset ? 1 : 0, Date.now() + delay);
@@ -246,12 +279,63 @@ class RepositoryEngine {
       || !!(this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_drafts'")
       && this.one("SELECT 1 FROM transform_drafts WHERE phase NOT IN ('committed','aborted','limit') LIMIT 1"));
   }
+  private archive(accountId: string): AccountArchive {
+    const tables = ARCHIVE_SCHEMA.filter(entry => entry.kind === 'table');
+    // Identifiers are selected only from compiled source, never archive input.
+    const quoted = (name: string): string => { if (!/^[a-z_][a-z0-9_]*$/.test(name)) fail(503, 'archive_configuration_invalid'); return `"${name}"`; };
+    const exists = (name: string): boolean => !!this.one("SELECT name FROM sqlite_schema WHERE type='table' AND name=?", name);
+    const single = (): void => {
+      const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+      if (repository && repository.account !== accountId) fail(400, 'failed_precondition');
+      for (const table of tables) {
+        if (!exists(table.name)) continue;
+        // Cross-account transform/export custody needs a coherent related-
+        // account archive protocol. Do not silently serialize it independently.
+        if (table.name !== 'transform_recovery_schedule' && /^(?:transform_|export_)/.test(table.name) && this.one(`SELECT 1 AS present FROM ${quoted(table.name)} LIMIT 1`)) fail(400, 'failed_precondition');
+        const columns = this.rows(`PRAGMA table_info(${quoted(table.name)})`);
+        for (const column of columns) if (column.name === 'account' || column.name === 'account_id') {
+          if (this.one(`SELECT 1 AS foreign_account FROM ${quoted(table.name)} WHERE ${quoted(String(column.name))} IS NOT NULL AND ${quoted(String(column.name))}<>? LIMIT 1`, accountId)) fail(400, 'failed_precondition');
+        }
+      }
+    };
+    return new AccountArchive({
+      accountId, sql: this.sql, objects: this.env.OBJECTS, buildId: ARCHIVE_BUILD_ID, schema: ARCHIVE_SCHEMA,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback), nowSeconds: () => Math.floor(Date.now() / 1000),
+      requireFreshTargetInTx: () => {
+        for (const table of tables) {
+          if (!exists(table.name)) continue;
+          if (table.name === 'forge_gc_schedule') {
+            const rows = this.rows('SELECT singleton,requested,last_started,last_mutation FROM forge_gc_schedule LIMIT 2');
+            if (rows.length > 1 || rows.some(row => row.singleton !== 1 || row.requested !== 0 || row.last_started !== 0 || row.last_mutation !== 0)) fail(409, 'target_not_empty');
+          } else if (table.name === 'transform_recovery_schedule') {
+            const rows = this.rows('SELECT singleton,due FROM transform_recovery_schedule LIMIT 2');
+            if (rows.length > 1 || rows.some(row => row.singleton !== 1 || row.due !== 0)) fail(409, 'target_not_empty');
+          } else if (this.one(`SELECT 1 AS present FROM ${quoted(table.name)} LIMIT 1`)) fail(409, 'target_not_empty');
+        }
+        // Only these exact constructor defaults are consumed, never user/source state. The
+        // archive module then restores its exact source counterpart normally.
+        this.sql.exec('DELETE FROM forge_gc_schedule WHERE singleton=1 AND requested=0 AND last_started=0 AND last_mutation=0');
+        this.sql.exec('DELETE FROM transform_recovery_schedule WHERE singleton=1 AND due=0');
+      },
+      requireSingleAccountInTx: single,
+      onActivatedInTx: () => {
+        single();
+        if (!hasForgeAccount(this.sql) || !this.one('SELECT account FROM repository WHERE singleton=1') || !this.one("SELECT head FROM refs WHERE name='main'")) fail(400, 'failed_precondition');
+      },
+    }, () => this.env.ARCHIVERS_JSON);
+  }
+  private async handleArchive(request: Request): Promise<Response> {
+    const { call, auth } = await admitArchive(request, this.env);
+    if (call.action === 'export_begin' && (!hasForgeAccount(this.sql) || !this.one('SELECT account FROM repository WHERE singleton=1') || !this.one("SELECT head FROM refs WHERE name='main'"))) fail(400, 'failed_precondition');
+    return archiveResponse(await this.archive(call.account_id).handle(call, auth));
+  }
   /** Platform-only maintenance; there is no HTTP deletion or root-list route. */
   async alarm(): Promise<void> {
     if (this.active >= 16) throw new Error('account maintenance admission limit');
     this.active++;
     const work = this.tail.then(async () => {
       try {
+        if (archiveBarrierInTx(this.sql)) return;
         const repository = this.one('SELECT account FROM repository WHERE singleton=1');
         if (!repository || !hasForgeAccount(this.sql)) return;
         const account = String(repository.account), collector = this.forgeCollector(account);
@@ -287,6 +371,7 @@ class RepositoryEngine {
     this.tail = work.then(() => undefined, () => undefined); await work;
   }
   private async maintainCollectionAlarm(force = false): Promise<void> {
+    if (archiveBarrierInTx(this.sql)) { await this.ctx.storage.deleteAlarm(); return; }
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (!repository || !hasForgeAccount(this.sql)) return;
     const collector = this.forgeCollector(String(repository.account));

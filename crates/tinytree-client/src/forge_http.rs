@@ -61,8 +61,9 @@ fn transport_error(error: reqwest::Error) -> Status {
         Status::unavailable("Forge HTTPS transport failed")
     }
 }
-impl Client {
-    pub fn new(config: &Config, ca: Option<Arc<[u8]>>) -> Result<Self, Status> {
+// Fixed-protocol HTTP clients share trust/proxy/redirect policy, not a public
+// arbitrary-URL request API. Each caller owns its strict route and wire codec.
+pub(crate) fn configured_client(config: &Config, ca: Option<Arc<[u8]>>) -> Result<reqwest::Client, Status> {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -81,10 +82,12 @@ impl Client {
                 builder = builder.add_root_certificate(certificate);
             }
         }
+        builder.build().map_err(|_| Status::failed_precondition("cannot configure Forge HTTPS transport"))
+}
+impl Client {
+    pub fn new(config: &Config, ca: Option<Arc<[u8]>>) -> Result<Self, Status> {
         Ok(Self {
-            client: builder.build().map_err(|_| {
-                Status::failed_precondition("cannot configure Forge HTTPS transport")
-            })?,
+            client: configured_client(config, ca)?,
             endpoint: format!(
                 "{}/api/v1/forge/call",
                 config.endpoint.trim_end_matches('/')

@@ -11,7 +11,11 @@ npm_link_all_packages(name = "node_modules")
 js_binary(
     name = "bundle_tool",
     entry_point = "tools/bundle.mjs",
-    data = [":node_modules/esbuild"],
+    data = [
+        "tools/archive-schema.mjs",
+        ":node_modules/esbuild",
+        ":node_modules/typescript",
+    ],
 )
 
 js_run_binary(
@@ -24,7 +28,7 @@ js_run_binary(
         "$(execpath //crates/tinytree-cloudflare:wasm)",
         "$(RULEDIR)/worker.mjs",
         "$(RULEDIR)/core.wasm",
-    ],
+    ] + ["cloudflare/" + source for source in glob(["src/**/*.ts"])],
     mnemonic = "WorkerBundle",
 )
 
@@ -92,7 +96,7 @@ js_run_binary(
         "$(execpath //crates/tinytree-cloudflare:wasm)",
         "$(RULEDIR)/closure-harness/worker.mjs",
         "$(RULEDIR)/closure-harness/core.wasm",
-    ],
+    ] + ["cloudflare/" + source for source in glob(["src/**/*.ts"])],
     mnemonic = "ClosureHarnessBundle",
 )
 
@@ -108,7 +112,7 @@ js_run_binary(
         "$(execpath //crates/tinytree-cloudflare:wasm)",
         "$(RULEDIR)/projection-harness/worker.mjs",
         "$(RULEDIR)/projection-harness/core.wasm",
-    ],
+    ] + ["cloudflare/" + source for source in glob(["src/**/*.ts"])],
     mnemonic = "ProjectionHarnessBundle",
 )
 
@@ -165,6 +169,35 @@ js_test(
 js_test(
     name = "forge_client_acceptance",
     entry_point = "tools/forge-client-acceptance.mjs",
+    no_copy_to_bin = ["@checker_bazel_linux_x86_64//file"],
+    args = [
+        "$(rootpath //crates/tinytree-cloudflare:contract_fixture)",
+        "$(rootpath //crates/tinytree-check-runner:tinytree-check-runner-bin)",
+        "$(rootpath //crates/tinytree-check-runner:readonly_snapshot_helper)",
+        "$(rootpath @checker_bazel_linux_x86_64//file)",
+        "cloudflare/worker.mjs",
+        "cloudflare/core.wasm",
+        "$(rootpath //crates/jj-native-cli:tt)",
+    ],
+    data = [
+        ":worker",
+        ":node_modules/miniflare",
+        "tools/checker-acceptance.mjs",
+        "//crates/tinytree-cloudflare:contract_fixture",
+        "//crates/tinytree-check-runner:tinytree-check-runner-bin",
+        "//crates/tinytree-check-runner:readonly_snapshot_helper",
+        "//crates/jj-native-cli:tt",
+        "@checker_bazel_linux_x86_64//file",
+    ],
+    tags = ["local", "manual"],
+    target_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    timeout = "long",
+)
+
+# Whole-account SQL/object recovery with the shipped CLI and a real checker.
+js_test(
+    name = "forge_archive_acceptance",
+    entry_point = "tools/forge-archive-acceptance.mjs",
     no_copy_to_bin = ["@checker_bazel_linux_x86_64//file"],
     args = [
         "$(rootpath //crates/tinytree-cloudflare:contract_fixture)",

@@ -6,6 +6,48 @@ import { ClosureJobs } from '../src/closure_jobs';
 import { ForgeGc, type GcBinding } from '../src/forge_gc';
 import { Failure, fail } from '../src/protocol';
 import type { Descriptor, ObjectKey } from '../src/core';
+import { ARCHIVE_SCHEMA } from '../src/archive_schema.generated';
+// Bounded disposable-schema diagnostic: never reads an application or KV row.
+async function archiveSchemaProbe(ctx: DurableObjectState): Promise<unknown> {
+  ctx.storage.transactionSync(() => {
+    for (const kind of ['table', 'index']) for (const entry of ARCHIVE_SCHEMA) if (entry.kind === kind) ctx.storage.sql.exec(entry.sql);
+  });
+  const actual = [...ctx.storage.sql.exec('SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name LIMIT 513')] as { type: string; name: string; tbl_name: string; sql: string | null }[];
+  if (actual.length > 512) fail(413, 'fixture_schema_limit');
+  const normalize = (sql: string): string => {
+    const tokens: string[] = []; let at = 0;
+    while (at < sql.length) {
+      const c = sql[at]; if (/\s/.test(c)) { at++; continue; }
+      if (c === "'" || c === '"' || c === '`' || c === '[') {
+        const start = at++, close = c === '[' ? ']' : c; let closed = false;
+        while (at < sql.length) if (sql[at++] === close) { if (c !== '[' && sql[at] === close) { at++; continue; } closed = true; break; }
+        if (!closed) fail(400, 'fixture_schema_quote'); tokens.push(sql.slice(start, at)); continue;
+      }
+      const word = /^[A-Za-z_][A-Za-z_0-9]*/.exec(sql.slice(at));
+      if (word) { tokens.push(word[0].toUpperCase()); at += word[0].length; } else { tokens.push(c); at++; }
+    }
+    const pos = tokens[0] === 'CREATE' && tokens[1] === 'UNIQUE' && tokens[2] === 'INDEX' ? 3 : 2;
+    if (tokens.slice(pos, pos + 3).join(' ') === 'IF NOT EXISTS') tokens.splice(pos, 3);
+    if (tokens.at(-1) === ';') tokens.pop(); return JSON.stringify(tokens);
+  };
+  const expected = new Map(ARCHIVE_SCHEMA.map(entry => [entry.name, entry]));
+  const archive = new Set(['archive_job', 'archive_checkpoint', 'archive_payload_proofs', 'archive_audit_seen']);
+  const hash = async (text: string): Promise<string> => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))), b => b.toString(16).padStart(2, '0')).join('');
+  let ddlBytes = 0; const found = new Set<string>(), mismatches = [];
+  for (const row of actual) {
+    if (row.sql !== null) ddlBytes += new TextEncoder().encode(row.sql).length;
+    if (ddlBytes > 4 * 1024 * 1024) fail(413, 'fixture_schema_limit');
+    if (archive.has(row.name)) continue;
+    const entry = expected.get(row.name);
+    if (row.sql === null && row.type === 'index' && row.name.startsWith('sqlite_autoindex_') && (expected.get(row.tbl_name)?.kind === 'table' || archive.has(row.tbl_name))) continue;
+    let reason: string | null = !entry ? 'unknown_object' : row.type !== entry.kind || row.tbl_name !== entry.table ? 'object_identity' : row.sql === null ? 'missing_ddl' : normalize(row.sql) !== normalize(entry.sql) ? 'ddl_mismatch' : null;
+    if (entry) found.add(entry.name);
+    if (reason) mismatches.push({ type: row.type, name: row.name, table: row.tbl_name, reason,
+      actual_hash: row.sql === null ? null : await hash(normalize(row.sql)), expected_hash: entry ? await hash(normalize(entry.sql)) : null });
+  }
+  for (const entry of ARCHIVE_SCHEMA) if (!found.has(entry.name)) mismatches.push({ type: entry.kind, name: entry.name, table: entry.table, reason: 'missing_object', actual_hash: null, expected_hash: await hash(normalize(entry.sql)) });
+  return { actual_objects: actual.length, compiled_objects: ARCHIVE_SCHEMA.length, ddl_bytes: ddlBytes, mismatches };
+}
 interface Env {
   REPOSITORIES: DurableObjectNamespace<Base>; OBJECTS: R2Bucket;
   PRINCIPALS_JSON: string; EXPERIMENTAL_RAW_BACKEND: string; FORGE_BACKEND?: string;
@@ -140,6 +182,7 @@ export class AccountRepository extends Base {
     if (!url.pathname.startsWith('/__fixture/')) return super.fetch(request);
     try {
       const sql = this.fixtureCtx.storage.sql;
+      if (url.pathname === '/__fixture/archive-schema') return Response.json(await archiveSchemaProbe(this.fixtureCtx));
       const row = [...sql.exec('SELECT account FROM repository WHERE singleton=1')][0];
       const account = url.searchParams.get('account');
       if (!row || row.account !== account) fail(400, 'fixture_requires_provisioned_account');

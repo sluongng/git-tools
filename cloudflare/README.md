@@ -106,6 +106,43 @@ toward finite account limits. Pin release is not immediate deletion, and old
 replay receipts are not silently discarded to make room for new requests.
 Reaching a limit fails closed; there is no arbitrary object-deletion API.
 
+## Account archives
+
+Account backup is separate from private workspace backup. It captures the
+account's authoritative SQLite records and required R2 payloads, including
+review, check, replay, view, retention and storage-custody state. Unpublished
+files and operations that exist only in a local workspace are not included.
+
+Archive administration uses a separate `ARCHIVERS_JSON` secret. Each record has
+`principal`, `token_sha256`, `accounts`, `export` and `restore` fields. Normal
+Forge, raw and checker credentials, including provisioning operators, confer no
+archive permission. A restore administrator is trusted to select the completed
+private archive: its hash chain verifies integrity against the final manifest,
+not a signature proving the manifest's origin.
+
+Select the source `forge-https-v1` context for backup and the fresh target
+context for restore. Supply the archive credential independently through its
+environment reference:
+
+```sh
+tt account backup backup-directory --archive-token-env TT_ARCHIVE_TOKEN
+tt account restore backup-directory --archive-token-env TT_ARCHIVE_TOKEN
+```
+
+Backup freezes normal account traffic and collection across its bounded pages.
+Repeating the original command resumes its saved intent after interruption; it
+does not choose a new account or snapshot. Explicitly abandon an unfinished
+export with `tt account backup backup-directory --archive-token-env TT_ARCHIVE_TOKEN --abort`. This releases its server-side freeze and retains the
+local files; ordinary failure never implicitly aborts an export.
+
+Restore requires the same account identifier and compiled Worker/Wasm build in
+a fresh isolated namespace and bucket. It refuses existing application state
+and legacy or current-format payloads, and stays closed until every page and
+required payload is verified. Source and target R2 versions are independently
+verified, not assumed equal. Coordinated cross-account dependency recovery is
+not supported by this single-account archive format. Keep completed archives
+private and outside the deployment being recovered.
+
 ## Build and verify
 
 Use the repository's Bazel workflow; Cargo is dependency metadata only.

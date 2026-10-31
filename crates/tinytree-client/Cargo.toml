@@ -19,6 +19,7 @@ reapi = { path = "../reapi" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 tinytree-model = { path = "../tinytree-model" }
 tinytree-forge-core = { path = "../tinytree-forge-core" }
