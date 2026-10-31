@@ -5207,6 +5207,7 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
         receipt: None,
         conflict_path: None,
         preparation: l::PreparationAvailability::ProfileConfigured as i32,
+        checker_progress: None,
     };
     assert_eq!(
         LandingReport::checked(job.clone(), &intent, Arc::new(()))

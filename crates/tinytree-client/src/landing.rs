@@ -181,6 +181,7 @@ struct Job {
     handle: LandingHandle,
     phase: LandingPhase,
     preparation: LandingPreparation,
+    checker_progress: Option<l::CheckerProgress>,
     roots_retained: bool,
     expires_at_seconds: i64,
     candidate: Option<LandingCandidate>,
@@ -200,6 +201,10 @@ impl std::fmt::Debug for CheckedLandingJob {
     }
 }
 impl CheckedLandingJob {
+    /// Ephemeral server diagnostics only, never check or child-process evidence.
+    pub fn checker_progress(&self) -> Option<&l::CheckerProgress> {
+        self.0.checker_progress.as_ref()
+    }
     pub fn handle(&self) -> LandingHandle {
         self.0.handle.clone()
     }
@@ -313,6 +318,15 @@ fn checked(
         l::PreparationAvailability::PreparationDisabled => LandingPreparation::PreparationDisabled,
         _ => return Err(bad()),
     };
+    if let Some(progress) = &job.checker_progress {
+        if l::CheckerStage::try_from(progress.stage).is_err()
+            || l::CheckerStage::try_from(progress.error_stage).is_err()
+            || l::CheckerErrorCode::try_from(progress.error_code).is_err()
+            || progress.retry_at_seconds < 0
+        {
+            return Err(bad());
+        }
+    }
     let candidate = job
         .candidate
         .map(|c| -> Result<_, Status> {
@@ -390,6 +404,7 @@ fn checked(
         handle: handle.unwrap_or(LandingHandle { id, binding }),
         phase,
         preparation,
+        checker_progress: job.checker_progress,
         roots_retained: job.roots_retained,
         expires_at_seconds: job.expires_at_seconds,
         candidate,

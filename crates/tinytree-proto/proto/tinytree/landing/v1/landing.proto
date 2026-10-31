@@ -77,4 +77,40 @@ message LandingJob {
   // Current configuration readiness, not a check verdict. Accepted intent
   // authorization is frozen; removing a launch grant does not cancel the job.
   PreparationAvailability preparation = 10;
+  optional CheckerProgress checker_progress = 11;
+}
+
+// Ephemeral exact-job diagnostics, not execution evidence or a verdict.
+enum CheckerStage {
+  CHECKER_STAGE_UNSPECIFIED = 0;
+  RESERVATION = 1;
+  RESERVATION_DIRECTORY = 2;
+  AUTHORITY_REFRESH = 3;
+  CANDIDATE_PIN = 4;
+  RESERVATION_PERSIST = 5;
+  QUEUED = 6;
+  PREPARATION = 7;
+  BINARY_VERIFY = 8;
+  CONFIGURATION_VERIFY = 9;
+  ENVIRONMENT_BINDING = 10;
+  EXECUTION = 11;
+  RECEIPT_VERIFY = 12;
+  VERDICT_APPLY = 13;
+}
+enum CheckerErrorCode {
+  CHECKER_ERROR_NONE = 0;
+  RESERVATION_FAILED = 1;
+  PROCESS_FAILED = 2;
+  EXECUTION_UNCERTAIN = 3;
+  RECEIPT_INVALID = 4;
+}
+message CheckerProgress {
+  CheckerStage stage = 1;
+  // Owned host task only; does not assert that a child process was spawned.
+  bool active_task = 2;
+  uint32 attempts = 3;
+  uint32 recoveries = 4;
+  int64 retry_at_seconds = 5;
+  CheckerErrorCode error_code = 6;
+  CheckerStage error_stage = 7;
 }

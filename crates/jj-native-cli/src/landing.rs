@@ -108,10 +108,18 @@ mod native {
         p: &LandingPending,
         phase: &str,
         candidate: Option<&[u8]>,
+        checker: Option<&l::CheckerProgress>,
     ) -> Result<(), CommandError> {
         let report = serde_json::json!({"version":1,"request_id":p.request_id,"job_id":p.job_id,"phase":phase,
         "candidate":candidate.map(hex),"applied_operation":p.apply_operation,"acknowledged":p.acknowledged,
-        "publication":"native_tinytree_only"});
+        "publication":"native_tinytree_only",
+        "checker_progress":checker.map(|p| serde_json::json!({
+          "stage":l::CheckerStage::try_from(p.stage).map(|v|v.as_str_name()).unwrap_or("CHECKER_STAGE_UNSPECIFIED"),
+          "active_task":p.active_task,"attempts":p.attempts,"recoveries":p.recoveries,
+          "retry_at_seconds":p.retry_at_seconds,
+          "error_code":l::CheckerErrorCode::try_from(p.error_code).map(|v|v.as_str_name()).unwrap_or("CHECKER_ERROR_NONE"),
+          "error_stage":l::CheckerStage::try_from(p.error_stage).map(|v|v.as_str_name()).unwrap_or("CHECKER_STAGE_UNSPECIFIED")
+        }))});
         writeln!(ui.stdout(), "{report}")?;
         Ok(())
     }
@@ -241,6 +249,7 @@ mod native {
                             &display,
                             phase.as_str_name().to_ascii_lowercase().as_str(),
                             job.candidate.as_ref().map(|c| c.head.as_slice()),
+                            job.checker_progress.as_ref(),
                         );
                     }
                     let phase = verify_original_report(&pending, &report)?;
@@ -254,7 +263,13 @@ mod native {
                         // A captured ACK is historical bookkeeping, never a
                         // request to create another OP, snapshot or checkout.
                         classify_acknowledged_claims(command, &mut locked, job).await?;
-                        return print(ui, locked.state.landing.as_ref().unwrap(), "applied", None);
+                        return print(
+                            ui,
+                            locked.state.landing.as_ref().unwrap(),
+                            "applied",
+                            None,
+                            None,
+                        );
                     }
                     if phase == l::Phase::Committed {
                         resume_restored_committed(ui, command, &mut locked, &control, &report)
@@ -264,6 +279,7 @@ mod native {
                             locked.state.landing.as_ref().unwrap(),
                             "applied",
                             job.candidate.as_ref().map(|c| c.head.as_slice()),
+                            job.checker_progress.as_ref(),
                         );
                     }
                     let phase = if nonapplicable_phase(phase) {
@@ -278,6 +294,7 @@ mod native {
                         locked.state.landing.as_ref().unwrap(),
                         phase.as_str_name().to_ascii_lowercase().as_str(),
                         job.candidate.as_ref().map(|c| c.head.as_slice()),
+                        job.checker_progress.as_ref(),
                     );
                 }
                 Err(error)
@@ -298,6 +315,7 @@ mod native {
                             locked.state.landing.as_ref().unwrap(),
                             "applied",
                             report.job().candidate.as_ref().map(|c| c.head.as_slice()),
+                            report.job().checker_progress.as_ref(),
                         );
                     }
                     if nonapplicable_phase(phase) {
@@ -310,6 +328,7 @@ mod native {
                         locked.state.landing.as_ref().unwrap(),
                         phase.as_str_name().to_ascii_lowercase().as_str(),
                         report.job().candidate.as_ref().map(|c| c.head.as_slice()),
+                        report.job().checker_progress.as_ref(),
                     );
                 }
                 Err(error) => {
@@ -470,7 +489,13 @@ mod native {
                     .map_err(fail)?;
                 classify_acknowledged_claims(command, &mut locked, report.job()).await?;
             }
-            return print(ui, locked.state.landing.as_ref().unwrap(), "applied", None);
+            return print(
+                ui,
+                locked.state.landing.as_ref().unwrap(),
+                "applied",
+                None,
+                None,
+            );
         }
         if pending.fork_operation.is_none() {
             let mut helper =
@@ -498,6 +523,7 @@ mod native {
                 locked.state.landing.as_ref().unwrap(),
                 "applied",
                 job.candidate.as_ref().map(|c| c.head.as_slice()),
+                job.checker_progress.as_ref(),
             );
         }
         print(
@@ -505,6 +531,7 @@ mod native {
             locked.state.landing.as_ref().unwrap(),
             phase.as_str_name().to_ascii_lowercase().as_str(),
             job.candidate.as_ref().map(|c| c.head.as_slice()),
+            job.checker_progress.as_ref(),
         )
     }
     fn record_job(locked: &mut LockedState, job: &l::LandingJob) -> Result<l::Phase, CommandError> {

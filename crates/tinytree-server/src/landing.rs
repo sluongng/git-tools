@@ -960,6 +960,10 @@ fn response(
             receipt,
             conflict_path: job.conflict_path,
             preparation: availability as i32,
+            checker_progress: host
+                .checker
+                .as_ref()
+                .and_then(|checker| checker.progress(repo, job.id)),
         }),
     };
     if value.encoded_len() > host.config.max_response_bytes {

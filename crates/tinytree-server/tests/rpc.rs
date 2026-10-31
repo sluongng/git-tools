@@ -10666,6 +10666,44 @@ async fn wait_landing_phase(
 }
 
 #[tokio::test]
+async fn checker_status_explains_prelaunch_authority_failure_and_recovers() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, config, input, _scratch) = checked_landing_setup("pass");
+    let policy = config.service.landing.checker.as_ref().unwrap().config.clone();
+    let original = std::fs::read(&policy).unwrap();
+    let running = Running::start_landing(store.clone(), config.service, landing_principals(true), true).await;
+    // Change only this disposable fixture's pinned policy after startup. The
+    // request must remain Prepared, with a sanitized exact-job admission error.
+    let mut changed = original.clone(); changed.extend_from_slice(b"\n# fixture policy changed\n");
+    std::fs::write(&policy, changed).unwrap();
+    let mut client = running.landing_client().await;
+    client.start_landing(request(input.clone(), ALPHA)).await.unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let job = client.get_landing(request(l::GetLandingRequest {
+                repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            if job.checker_progress.as_ref().is_some_and(|p| p.error_code == l::CheckerErrorCode::ReservationFailed as i32) { break job; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(failed.phase, l::Phase::PreparedPendingChecks as i32);
+    let progress = failed.checker_progress.unwrap();
+    assert_eq!(progress.error_stage, l::CheckerStage::AuthorityRefresh as i32);
+    assert!(!progress.active_task);
+    assert_eq!(progress.attempts, 0);
+    assert!(failed.receipt.is_none());
+    assert_eq!(store.references("alpha", &["main".into()]).unwrap()[0].generation, 1);
+    std::fs::write(&policy, original).unwrap();
+    let complete = wait_landing_phase(&mut client, &input, l::Phase::Committed).await;
+    let progress = complete.checker_progress.unwrap();
+    assert_eq!(progress.error_code, 0);
+    assert!(progress.attempts >= 1);
+    assert_eq!(complete.id, failed.id);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn pinned_checker_receipts_publish_or_reject_and_recover_lost_reply() {
     use tinytree_proto::landing_v1 as l;
     for (mode, phase, generation, expect_recovery, runs, attempts) in [

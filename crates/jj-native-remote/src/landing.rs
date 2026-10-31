@@ -147,5 +147,6 @@ fn wire_job(job: &CheckedLandingJob) -> l::LandingJob {
             evidence: r.evidence.to_vec(),
         }),
         conflict_path: job.conflict_path().map(str::to_owned),
+        checker_progress: job.checker_progress().cloned(),
     }
 }

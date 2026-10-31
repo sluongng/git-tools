@@ -5005,6 +5005,7 @@ fn cleanup_job(
         receipt: None,
         conflict_path: None,
         preparation: l::PreparationAvailability::ProfileConfigured as i32,
+        checker_progress: None,
     };
     if committed {
         let head = cleanup_intent(p).request.source_head;

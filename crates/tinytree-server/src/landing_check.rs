@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 use tinytree_check_runner as runner;
+use tinytree_proto::landing_v1::{CheckerErrorCode, CheckerProgress, CheckerStage};
 use tinytree_store as s;
 use tokio::sync::{Notify, Semaphore, watch};
 
@@ -242,9 +243,12 @@ struct Slot {
     root: Option<s::RootReadGuard>,
     active: bool,
     handle: Option<s::LandingHandle>,
+    diagnostic: CheckerProgress,
 }
 struct State {
     slots: BTreeMap<Key, Slot>,
+    // One exact-keyed ephemeral admission failure, never a cross-job history.
+    reservation_error: Option<(Key, CheckerProgress)>,
 }
 
 struct Current {
@@ -476,6 +480,7 @@ impl CheckerHost {
                     root,
                     active: false,
                     handle: None,
+                    diagnostic: CheckerProgress::default(),
                 },
             );
         }
@@ -484,7 +489,10 @@ impl CheckerHost {
             store,
             directory,
             _owner: owner,
-            state: Mutex::new(State { slots }),
+            state: Mutex::new(State {
+                slots,
+                reservation_error: None,
+            }),
             current,
             policy: settings.clone(),
             profiles,
@@ -628,7 +636,12 @@ impl CheckerHost {
         fs::File::open(binaries.path())?.sync_all()?;
         Ok(path)
     }
-    fn reserve_new(&self, repo: &str, pending: &s::PendingLanding) -> Result<()> {
+    fn reserve_new(
+        &self,
+        repo: &str,
+        pending: &s::PendingLanding,
+        stage: &mut CheckerStage,
+    ) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -636,6 +649,7 @@ impl CheckerHost {
         if state.slots.contains_key(&(repo.to_owned(), pending.id)) {
             return Ok(());
         }
+        *stage = CheckerStage::ReservationDirectory;
         let jobs = PrivateDir::open_existing(self.directory.path().join("jobs"))?;
         recover_staging(&jobs)?;
         let published = jobs.path().join(job_name(repo, pending.id));
@@ -656,10 +670,12 @@ impl CheckerHost {
                     root: None,
                     active: false,
                     handle: Some(pending.handle.clone()),
+                    diagnostic: CheckerProgress::default(),
                 },
             );
             return Ok(());
         }
+        *stage = CheckerStage::AuthorityRefresh;
         let current = self.refresh(repo, &pending.profile)?;
         ensure!(
             state.slots.len() < current.config.max_jobs,
@@ -679,6 +695,7 @@ impl CheckerHost {
             job.state == s::LandingState::Prepared,
             "candidate is not prepared"
         );
+        *stage = CheckerStage::CandidatePin;
         let lease = pending.handle.pin_candidate(&self.store, now()?)?;
         let identity = lease.identity();
         let request = runner::Request {
@@ -720,6 +737,7 @@ impl CheckerHost {
             job_name(repo, pending.id),
             request.attempt_id
         );
+        *stage = CheckerStage::ReservationPersist;
         let directory = PrivateDir::create(jobs.path().join(&staging_name))?;
         let root = Some(self.store.pin_root(repo, candidate_key(&request)?)?);
         let mut slot = Slot {
@@ -728,6 +746,7 @@ impl CheckerHost {
             root,
             active: false,
             handle: Some(pending.handle.clone()),
+            diagnostic: CheckerProgress::default(),
         };
         Self::save(&slot)?;
         let target = jobs.path().join(job_name(repo, pending.id));
@@ -795,7 +814,19 @@ impl CheckerHost {
                 {
                     return true;
                 }
-                if self.reserve_new(repo, pending).is_err() {
+                let mut stage = CheckerStage::Reservation;
+                if self.reserve_new(repo, pending, &mut stage).is_err() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.reservation_error = Some((
+                            key.clone(),
+                            CheckerProgress {
+                                stage: stage as i32,
+                                error_stage: stage as i32,
+                                error_code: CheckerErrorCode::ReservationFailed as i32,
+                                ..Default::default()
+                            },
+                        ));
+                    }
                     return true;
                 }
             }
@@ -842,6 +873,10 @@ impl CheckerHost {
             return true;
         }
         slot.active = true;
+        slot.diagnostic = CheckerProgress {
+            stage: CheckerStage::Queued as i32,
+            ..Default::default()
+        };
         self.active.fetch_add(1, Ordering::AcqRel);
         drop(state);
         let work = CheckWork {
@@ -853,7 +888,9 @@ impl CheckerHost {
         let host = self.clone();
         drop(tokio::spawn(async move {
             let _work = work;
-            let _ = host.process(key).await;
+            if host.process(key.clone()).await.is_err() {
+                host.process_error(&key, CheckerErrorCode::ProcessFailed);
+            }
         }));
         true
     }
@@ -1026,13 +1063,47 @@ impl CheckerHost {
             changed.await;
         }
     }
+    pub(crate) fn progress(&self, repo: &str, id: [u8; 32]) -> Option<CheckerProgress> {
+        let state = self.state.lock().ok()?;
+        let key = (repo.to_owned(), id);
+        if let Some(slot) = state.slots.get(&key) {
+            let mut value = slot.diagnostic.clone();
+            value.active_task = slot.active;
+            value.attempts = slot.record.attempts.min(u32::MAX as usize) as u32;
+            value.recoveries = slot.record.recoveries.min(u32::MAX as usize) as u32;
+            value.retry_at_seconds = slot.record.retry_at;
+            return Some(value);
+        }
+        state
+            .reservation_error
+            .as_ref()
+            .filter(|(selected, _)| selected == &key)
+            .map(|(_, value)| value.clone())
+    }
+    fn diagnostic_stage(&self, key: &Key, stage: CheckerStage) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(slot) = state.slots.get_mut(key) {
+                slot.diagnostic.stage = stage as i32;
+            }
+        }
+    }
+    fn process_error(&self, key: &Key, code: CheckerErrorCode) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(slot) = state.slots.get_mut(key) {
+                slot.diagnostic.error_code = code as i32;
+                slot.diagnostic.error_stage = slot.diagnostic.stage;
+            }
+        }
+    }
     async fn process(self: &Arc<Self>, key: Key) -> Result<()> {
+        self.diagnostic_stage(&key, CheckerStage::Preparation);
         let host = self.clone();
         let selected = key.clone();
         let prepared = tokio::task::spawn_blocking(move || host.prepare_step(&selected)).await??;
         let Some((record, attempt, mode, _candidate)) = prepared else {
             return Ok(());
         };
+        self.diagnostic_stage(&key, CheckerStage::CandidatePin);
         let _root = self
             .store
             .pin_root(&record.repository, candidate_key(&record.request)?)?;
@@ -1041,11 +1112,13 @@ impl CheckerHost {
             .path()
             .join("binaries")
             .join(&record.authority.binary);
+        self.diagnostic_stage(&key, CheckerStage::BinaryVerify);
         runner::Binary {
             path: executable.clone(),
             sha256: record.authority.binary.clone(),
         }
         .verify()?;
+        self.diagnostic_stage(&key, CheckerStage::ConfigurationVerify);
         let config = attempt.path().join("checker.toml");
         let bytes = attempt.read("checker.toml", 65536)?;
         ensure!(
@@ -1061,6 +1134,7 @@ impl CheckerHost {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", attempt.path());
+        self.diagnostic_stage(&key, CheckerStage::EnvironmentBinding);
         for name in &record.authority.environment {
             command.env(
                 name,
@@ -1074,6 +1148,7 @@ impl CheckerHost {
             .path()
             .join(format!("{mode}-{}.stderr", record.recoveries));
         let input = serde_json::to_vec(&record.request)?;
+        self.diagnostic_stage(&key, CheckerStage::Execution);
         let output = crate::landing_check_process::execute(
             command,
             &input,
@@ -1084,6 +1159,10 @@ impl CheckerHost {
             self.cancel.subscribe(),
         )
         .await;
+        if output.is_err() {
+            self.process_error(&key, CheckerErrorCode::ExecutionUncertain);
+        }
+        self.diagnostic_stage(&key, CheckerStage::ReceiptVerify);
         let original_eligible =
             mode == "run" || crate::landing_check_process::allows_verdict(&attempt);
         let result = output.and_then(|output| {
@@ -1091,6 +1170,13 @@ impl CheckerHost {
             validate_receipt(&receipt, &record.request, &record.authority)?;
             Ok((receipt, output.eligible && original_eligible))
         });
+        if result.is_err()
+            && self
+                .progress(&key.0, key.1)
+                .is_some_and(|p| p.error_code == 0)
+        {
+            self.process_error(&key, CheckerErrorCode::ReceiptInvalid);
+        }
         {
             let mut state = self
                 .state
@@ -1123,6 +1209,7 @@ impl CheckerHost {
                 }
             }
         }
+        self.diagnostic_stage(&key, CheckerStage::VerdictApply);
         let host = self.clone();
         tokio::task::spawn_blocking(move || host.apply_verified(&key)).await?
     }
@@ -1204,6 +1291,11 @@ impl CheckerHost {
             let current = match self.refresh(&key.0, &profile) {
                 Ok(current) => current,
                 Err(_) => {
+                    // The state mutex is already held; report this swallowed
+                    // prelaunch failure without re-entering diagnostic helpers.
+                    slot.diagnostic.stage = CheckerStage::AuthorityRefresh as i32;
+                    slot.diagnostic.error_stage = CheckerStage::AuthorityRefresh as i32;
+                    slot.diagnostic.error_code = CheckerErrorCode::ProcessFailed as i32;
                     slot.record.phase = Phase::Terminal;
                     slot.root = None;
                     Self::save(slot)?;
