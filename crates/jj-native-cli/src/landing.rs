@@ -1432,25 +1432,61 @@ mod native {
         let mut parent = id(&p.expected_head)?;
         let mut pairs = Vec::new();
         let mut source_changes = Vec::with_capacity(p.source_stack.len());
-        // The original source stack is bounded at 128. Preserve the exact
-        // admitted, fully checked canonical chain for a frozen local overlay;
-        // never merge a moving public-root index into a restored checkpoint.
-        let mut admitted = Vec::with_capacity(p.source_stack.len());
-        for old in &p.source_stack {
-            let old_id = id(old)?;
-            let old_commit = reader.commit(&old_id).await?;
+        let selected = p
+            .source_stack
+            .iter()
+            .map(|old| {
+                let old_id = id(old)?;
+                let new_id = candidate
+                    .rewrites
+                    .iter()
+                    .find(|row| row.old_commit == old_id.as_bytes())
+                    .map(|row| CommitId::from_bytes(&row.new_commit))
+                    .unwrap_or_else(|| old_id.clone());
+                Ok((old_id, new_id))
+            })
+            .collect::<Result<Vec<_>, CommandError>>()?;
+        if selected
+            .last()
+            .is_none_or(|(_, new)| new.as_bytes() != candidate.head)
+        {
+            return Err(fail(
+                "canonical stack tip differs from the checked candidate",
+            ));
+        }
+        // Sparse head admission proves only direct edges. Read this exact
+        // bounded chain head-first so each canonical parent becomes known
+        // before fetching it; never walk arbitrary ancestry or add more holds.
+        // The same reader owns the deadline and aggregate source/result budget.
+        let mut prepared = Vec::with_capacity(selected.len());
+        for at in (0..selected.len()).rev() {
+            let new = reader.commit(&selected[at].1).await?;
+            let expected_parent = if at == 0 {
+                &parent
+            } else {
+                &selected[at - 1].1
+            };
+            if new.parent_ids() != [expected_parent.clone()] {
+                return Err(fail(
+                    "canonical landing candidate parent differs from the exact selected stack",
+                ));
+            }
+            prepared.push(new);
+        }
+        prepared.reverse();
+        // Preserve all forward source identity checks before any local mutation.
+        // Both retained model vectors together remain bounded by 128 commits.
+        let mut admitted = Vec::with_capacity(selected.len());
+        for ((old_id, new_id), new) in selected.into_iter().zip(prepared) {
+            let old_commit = if new_id == old_id {
+                new.clone()
+            } else {
+                reader.commit(&old_id).await?
+            };
             let row = candidate
                 .rewrites
                 .iter()
                 .find(|r| r.old_commit == old_id.as_bytes());
-            let new_id = row
-                .map(|r| CommitId::from_bytes(&r.new_commit))
-                .unwrap_or_else(|| old_id.clone());
-            let new = if new_id == old_id {
-                old_commit.clone()
-            } else {
-                reader.commit(&new_id).await?
-            };
             if new.parent_ids() != [parent.clone()]
                 || new.change_id() != old_commit.change_id()
                 || new.description() != old_commit.description()

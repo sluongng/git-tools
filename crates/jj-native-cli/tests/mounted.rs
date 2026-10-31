@@ -11857,6 +11857,9 @@ fn native_landing_selected_ancestor_working_copy_forks_and_rebases_at_that_ances
     fixture.success(&root, &["new"]);
     fs::write(root.join("second.txt"), b"second stack commit\n").unwrap();
     fixture.success(&root, &["describe", "-m", "second stack commit"]);
+    fixture.success(&root, &["new"]);
+    fs::write(root.join("third.txt"), b"third stack commit\n").unwrap();
+    fixture.success(&root, &["describe", "-m", "third stack commit"]);
     let tip = fixture.revision(&root, "@");
     fixture.success(&root, &["bookmark", "set", "draft-tip", "-r", &tip]);
     fixture.success(&root, &["edit", &first]);
@@ -11903,6 +11906,38 @@ fn native_landing_selected_ancestor_working_copy_forks_and_rebases_at_that_ances
     };
     let committed = upstream.finish_fixture_landing(prepared["request_id"].as_str().unwrap(), true);
     let candidate = committed.candidate.unwrap();
+    assert_eq!(
+        candidate.rewrites.len(),
+        3,
+        "exercise a rewritten grandparent, not only a direct parent"
+    );
+    // Restart the real mounted client with a cold canonical result chain.
+    // Inspect only this fixture-owned stopped store, never manufacture grants.
+    fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    fixture.stop_daemon();
+    let local = tinytree_store::Store::open_existing(
+        base.join("daemon/native/example/native-objects"),
+        jj_native_backend::Config::default().store,
+    )
+    .unwrap();
+    for rewrite in &candidate.rewrites {
+        assert!(
+            local
+                .descriptor(
+                    "local",
+                    m::ObjectKey {
+                        kind: m::Kind::Commit,
+                        id: m::ObjectId(rewrite.new.0),
+                    }
+                )
+                .unwrap()
+                .is_none(),
+            "rewritten canonical chain must be nonresident before resume"
+        );
+    }
+    drop(local);
+    fixture.start();
+    fixture.success(&base, &["tinytree", "resume", root.to_str().unwrap()]);
     let rewritten_first = candidate
         .rewrites
         .iter()
@@ -11935,6 +11970,12 @@ fn native_landing_selected_ancestor_working_copy_forks_and_rebases_at_that_ances
         !root.join("second.txt").exists(),
         "do not jump the workspace to the selected stack tip"
     );
+    assert!(
+        !root.join("third.txt").exists(),
+        "the selected ancestor remains the working-copy base"
+    );
+    let replay = landing_report(&mut fixture, &root, &["tinytree", "land", "--resume"]);
+    assert_eq!(replay["applied_operation"], applied["applied_operation"]);
     assert_eq!(upstream.file_reads(), 0);
     assert_eq!(upstream.historical_tree_reads(), 0);
     fixture.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);

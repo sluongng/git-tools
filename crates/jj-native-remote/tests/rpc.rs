@@ -12002,6 +12002,11 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
     second.change_id = m::ChangeId([42; 16]);
     second.description = "second private source".into();
     let second = put(m::Object::Commit(second));
+    let mut third = template.clone();
+    third.parents = vec![m::CommitId(second.descriptor.key.id.0)];
+    third.change_id = m::ChangeId([44; 16]);
+    third.description = "third private source".into();
+    let third = put(m::Object::Commit(third));
     let mut target = template.clone();
     target.parents = vec![base];
     target.change_id = m::ChangeId([43; 16]);
@@ -12038,7 +12043,7 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
     let request = LandingRequest {
         idempotency_key: "12".repeat(16),
         source_base: base,
-        source_head: m::CommitId(second.descriptor.key.id.0),
+        source_head: m::CommitId(third.descriptor.key.id.0),
         reference_name: "main".into(),
         expected_generation: 2,
         expected_head: m::CommitId(target.descriptor.key.id.0),
@@ -12056,7 +12061,7 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
         .prepare_landing("example", owner, &request.idempotency_key, now)
         .unwrap();
     let candidate = job.candidate.unwrap();
-    assert_eq!(candidate.rewrites.len(), 2);
+    assert_eq!(candidate.rewrites.len(), 3);
     let counts = Counters::new();
     let server = Server::start(store.clone(), counts.clone()).await;
     let directory = private_dir();
@@ -12074,7 +12079,7 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
     let intent = tinytree_cloud::PortableLanding {
         request_id: request.idempotency_key.clone(),
         source_base: hex(&base.0),
-        source_head: hex(&second.descriptor.key.id.0),
+        source_head: hex(&third.descriptor.key.id.0),
         reference: "main".into(),
         bookmark: "main".into(),
         generation: 2,
@@ -12085,6 +12090,7 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
         source_stack: vec![
             hex(&first.descriptor.key.id.0),
             hex(&second.descriptor.key.id.0),
+            hex(&third.descriptor.key.id.0),
         ],
         fork_operation: Some("00".repeat(64)),
         fork_acknowledged: true,
@@ -12110,10 +12116,81 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
     // No current landing and no preexisting local/cloud custody may stand in
     // for the archived retained job. This is the real backup frontier API.
     let remote = tinytree_cloud::PortableRemoteState {
-        observations: vec![], archived_pushes: vec![], landing: None,
+        observations: vec![],
+        archived_pushes: vec![],
+        landing: None,
         archived_landings: vec![intent.clone()],
     };
-    for key in &roots { assert!(direct.descriptor(*key).await.unwrap().is_none()); }
+    for key in &roots {
+        assert!(direct.descriptor(*key).await.unwrap().is_none());
+    }
+    // Head admission authorizes its immediate references, not arbitrary cold
+    // ancestors. Three rewrites expose the oldest-first caller error hidden by
+    // a two-commit stack. Use an independent provider/cache before frontier
+    // import makes any rewritten metadata resident in the backup provider.
+    let cold_directory = private_dir();
+    let (cold_direct, cold_repo) = local(
+        cold_directory.path(),
+        cache(cold_directory.path()),
+        config(&server),
+        true,
+    );
+    let rewritten = |old: m::ObjectKey| {
+        candidate
+            .rewrites
+            .iter()
+            .find(|row| row.old.0 == old.id.0)
+            .unwrap()
+            .new
+    };
+    let oldest = rewritten(first.descriptor.key);
+    let middle = rewritten(second.descriptor.key);
+    assert_eq!(rewritten(third.descriptor.key), candidate.head);
+    cold_repo
+        .control
+        .admit_commit(candidate.head)
+        .await
+        .unwrap();
+    let oldest_key = m::ObjectKey {
+        kind: m::Kind::Commit,
+        id: m::ObjectId(oldest.0),
+    };
+    assert!(cold_direct.descriptor(oldest_key).await.unwrap().is_none());
+    let denied_before = counts.metadata_keys.load(Ordering::SeqCst);
+    assert!(
+        cold_repo.io.read_metadata(oldest_key).await.is_err(),
+        "head admission must not grant its still-cold grandparent by availability"
+    );
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst),
+        denied_before,
+        "denied oldest-first reads must not fall back to remote ancestry hydration"
+    );
+    assert!(cold_direct.descriptor(oldest_key).await.unwrap().is_none());
+    let chain = [candidate.head, middle, oldest];
+    for (index, id) in chain.iter().enumerate() {
+        let key = m::ObjectKey {
+            kind: m::Kind::Commit,
+            id: m::ObjectId(id.0),
+        };
+        let m::Object::Commit(commit) =
+            cold_repo.io.read_metadata(key).await.unwrap().into_object()
+        else {
+            unreachable!()
+        };
+        let expected_parent = chain
+            .get(index + 1)
+            .copied()
+            .unwrap_or(m::CommitId(target.descriptor.key.id.0));
+        assert_eq!(commit.parents, vec![expected_parent]);
+    }
+    assert!(cold_direct.descriptor(oldest_key).await.unwrap().is_some());
+    assert_eq!(
+        counts.files.load(Ordering::SeqCst),
+        0,
+        "bounded head-to-parent proof walks do not hydrate FILE bodies"
+    );
+    cold_repo.wait_for_idle().await;
     let before = counts.metadata_keys.load(Ordering::SeqCst);
     let holds = counts.holds.load(Ordering::SeqCst);
     let observations = counts.reference_observations.load(Ordering::SeqCst);
@@ -12148,15 +12225,25 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
     let mut unrelated = intent.clone();
     unrelated.request_id = "34".repeat(16);
     unrelated.job_id = None;
-    unrelated.result_roots.clear(); unrelated.candidate_head = None;
+    unrelated.result_roots.clear();
+    unrelated.candidate_head = None;
     with_current.landing = Some(unrelated);
     let before_second = counts.metadata_keys.load(Ordering::SeqCst);
-    repo.control.transfer_native_capture_frontier_with_landings(
-        roots.clone(), with_current.landings().cloned().collect(), Arc::new(()), Default::default(),
-        tokio::time::Instant::now() + Duration::from_secs(10),
-    ).await.unwrap();
-    assert_eq!(counts.metadata_keys.load(Ordering::SeqCst)-before_second, result_roots.len(),
-        "a current intent without results must not hide archived fresh retention checks");
+    repo.control
+        .transfer_native_capture_frontier_with_landings(
+            roots.clone(),
+            with_current.landings().cloned().collect(),
+            Arc::new(()),
+            Default::default(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.metadata_keys.load(Ordering::SeqCst) - before_second,
+        result_roots.len(),
+        "a current intent without results must not hide archived fresh retention checks"
+    );
     store
         .expire_landing("example", owner, &request.idempotency_key, now + 3600)
         .unwrap();
