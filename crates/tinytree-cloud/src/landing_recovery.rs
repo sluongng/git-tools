@@ -41,6 +41,7 @@ pub enum HistoricalLandingPhase {
     CheckUnavailable,
     StaleTarget,
     Expired,
+    PublicationAbandoned,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +171,7 @@ impl HistoricalLandingJob {
             P::CheckUnavailable => Some("check_unavailable"),
             P::StaleTarget => Some("stale_target"),
             P::Expired => Some("expired"),
+            P::PublicationAbandoned => Some("publication_abandoned"),
             _ => None,
         };
         if intent.terminal.as_deref() != expected_terminal
@@ -177,7 +179,7 @@ impl HistoricalLandingJob {
             || (intent.apply_operation.is_some() && self.phase != P::Committed)
             || (matches!(
                 self.phase,
-                P::PreparedPendingChecks | P::Checked | P::Committed
+                P::PreparedPendingChecks | P::Checked | P::Committed | P::PublicationAbandoned
             ) && intent.candidate_head.is_none()
                 && !intent.acknowledged)
             || (intent.restored_lookup_only
@@ -192,7 +194,9 @@ impl HistoricalLandingJob {
         use HistoricalLandingPhase::*;
         let valid = match self.phase {
             Intent => !has && !receipt && !conflict && self.roots_retained,
-            PreparedPendingChecks | Checked => has && !receipt && !conflict && self.roots_retained,
+            PreparedPendingChecks | Checked | PublicationAbandoned => {
+                has && !receipt && !conflict && self.roots_retained
+            }
             Committed => has && receipt && !conflict,
             Conflict => !has && !receipt && conflict && !self.roots_retained,
             Unsupported => !has && !receipt && !conflict && !self.roots_retained,
@@ -332,6 +336,7 @@ impl PortableLanding {
                         | "check_unavailable"
                         | "stale_target"
                         | "expired"
+                        | "publication_abandoned"
                 )
             })
         {
@@ -371,4 +376,26 @@ impl PortableLanding {
             .chain(self.source_stack.iter().map(String::as_str))
             .chain(self.result_roots.iter().map(String::as_str))
     }
+}
+
+/// Retained abandoned intents are history, never authority to apply or release.
+pub fn validate_archived_landings(landings: &[PortableLanding]) -> io::Result<()> {
+    if landings.len() > 128 {
+        return Err(invalid());
+    }
+    let mut jobs = std::collections::HashSet::new();
+    for landing in landings {
+        landing.validate()?;
+        if landing.terminal.as_deref() != Some("publication_abandoned")
+            || landing.acknowledged
+            || landing.apply_operation.is_some()
+            || landing.observed.as_ref().is_none_or(|job| {
+                job.phase != HistoricalLandingPhase::PublicationAbandoned
+                    || !jobs.insert(job.job_id)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }

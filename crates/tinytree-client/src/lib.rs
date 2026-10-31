@@ -44,5 +44,5 @@ pub use verified::{
 
 pub use client::landing::{
     CheckedLandingJob, LandingCandidate, LandingHandle, LandingLimits, LandingPhase,
-    LandingPreparation, LandingReceipt, LandingRewrite, LandingStart,
+    LandingPreparation, LandingPublicationCancellation, LandingReceipt, LandingRewrite, LandingStart,
 };

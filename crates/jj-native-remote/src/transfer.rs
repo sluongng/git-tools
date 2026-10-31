@@ -235,14 +235,21 @@ impl RemoteRepositoryControl {
         &self,
         source: &dyn NativeObjectIo,
         limits: &NativeTransferLimits,
+        landing_count: usize,
     ) -> Result<ControlResources> {
+        ensure!(landing_count <= 129, "capture landing count bound");
         let mut resources = self.native_transfer_resources(source, limits)?;
         let remote = &self.inner.config.remote.limits;
         let landing = 256u64
             .checked_mul(1024 * 1024)
             .and_then(|n| n.checked_add(remote.max_buffered_bytes as u64))
             .and_then(|n| n.checked_add((remote.max_metadata_bytes as u64).checked_mul(8)?))
-            .and_then(|n| n.checked_add(tinytree_cloud::PortableLanding::MAX_WORKING_BYTES as u64))
+            .and_then(|n| {
+                n.checked_add(
+                    (tinytree_cloud::PortableLanding::MAX_WORKING_BYTES as u64)
+                        .checked_mul(landing_count as u64)?,
+                )
+            })
             .and_then(|n| n.checked_add((limits.max_roots as u64).checked_mul(256)?))
             .ok_or_else(limit)?;
         resources.memory_bytes = resources.memory_bytes.max(landing);
@@ -328,9 +335,9 @@ impl RemoteRepositoryControl {
         limits: NativeTransferLimits,
         originaldeadline: tokio::time::Instant,
     ) -> Result<NativeTransferReceipt> {
-        self.transfer_native_capture_frontier_with_landing(
+        self.transfer_native_capture_frontier_with_landings(
             roots,
-            None,
+            Vec::new(),
             owner,
             limits,
             originaldeadline,
@@ -338,18 +345,19 @@ impl RemoteRepositoryControl {
         .await
     }
 
-    /// The supplied intent is immutable capsule data, not authenticated job or
+    /// Current and archived intents are immutable capsule data, not authenticated job or
     /// retention authority. Exact lookup and canonical reads occur only inside
     /// the independently owned background transfer below.
-    pub async fn transfer_native_capture_frontier_with_landing(
+    pub async fn transfer_native_capture_frontier_with_landings(
         &self,
         roots: Vec<m::ObjectKey>,
-        landing: Option<tinytree_cloud::PortableLanding>,
+        landings: Vec<tinytree_cloud::PortableLanding>,
         owner: Owner,
         limits: NativeTransferLimits,
         originaldeadline: tokio::time::Instant,
     ) -> Result<NativeTransferReceipt> {
-        if let Some(intent) = &landing {
+        ensure!(landings.len() <= 129, "capture landing count bound");
+        for intent in &landings {
             intent.validate()?;
         }
         let deadline = io::bounded_deadline(originaldeadline);
@@ -360,8 +368,8 @@ impl RemoteRepositoryControl {
         let read_profile = crate::RemoteObjectIo {
             inner: self.inner.clone(),
         };
-        if landing.is_some() {
-            self.native_landing_capture_resources(&read_profile, &limits)?;
+        if !landings.is_empty() {
+            self.native_landing_capture_resources(&read_profile, &limits, landings.len())?;
         } else {
             self.native_transfer_resources(&read_profile, &limits)?;
         }
@@ -396,13 +404,7 @@ impl RemoteRepositoryControl {
                 tokio::time::timeout_at(deadline, async {
                     let physical: Owner = scope.clone();
                     let boundaries = control
-                        .capture_boundaries(
-                            &roots,
-                            landing.as_ref(),
-                            physical.clone(),
-                            &limits,
-                            deadline,
-                        )
+                        .capture_boundaries(&roots, &landings, physical.clone(), &limits, deadline)
                         .await
                         .map_err(|e| {
                             NativeCaptureFailure::at(NativeCaptureStage::BoundarySelection, e)

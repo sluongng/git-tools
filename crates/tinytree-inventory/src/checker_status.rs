@@ -1,9 +1,12 @@
 //! Operator diagnostics are read-only by default. Explicit recover-once admits
-//! one server-owned recovery quantum; it never supplies a verdict.
+//! one server-owned recovery quantum. Publication abandonment is a separate
+//! exact-intent operation; neither path supplies a verdict or cleanup proof.
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
-use tinytree_client::{Config, LandingPhase, LandingStart, NativeClient, Transport};
-use tinytree_model::CommitId;
+use tinytree_client::{
+    Config, LandingPhase, LandingPublicationCancellation, LandingStart, NativeClient, Transport,
+};
+use tinytree_model::{CommitId, TreeId};
 
 struct Args {
     config: PathBuf,
@@ -12,6 +15,7 @@ struct Args {
     timeout: u64,
     recover_once: bool,
     inspect_recovery: bool,
+    cancellation: Option<LandingPublicationCancellation>,
     expected_attempts: Option<u32>,
     expected_recoveries: Option<u32>,
 }
@@ -37,7 +41,15 @@ fn args() -> Result<Args, String> {
     let mut input = std::env::args().skip(1);
     let mut recover_once = false;
     let mut inspect_recovery = false;
+    let mut abandon_publication = false;
     while let Some(key) = input.next() {
+        if key == "--abandon-publication" {
+            if abandon_publication {
+                return Err("invalid_or_duplicate_argument".into());
+            }
+            abandon_publication = true;
+            continue;
+        }
         if key == "--inspect-recovery" {
             if inspect_recovery {
                 return Err("invalid_or_duplicate_argument".into());
@@ -67,6 +79,8 @@ fn args() -> Result<Args, String> {
                 | "--timeout-seconds"
                 | "--expected-attempts"
                 | "--expected-recoveries"
+                | "--candidate-head"
+                | "--candidate-root-tree"
         ) {
             return Err("unknown_argument".into());
         }
@@ -113,12 +127,42 @@ fn args() -> Result<Args, String> {
         .map(|v| v.parse::<u32>())
         .transpose()
         .map_err(|_| "invalid_recoveries")?;
-    if (recover_once && inspect_recovery)
-        || recover_once != (expected_attempts.is_some() && expected_recoveries.is_some())
-        || (!recover_once && (expected_attempts.is_some() || expected_recoveries.is_some()))
+    let candidate = fields
+        .remove("--candidate-head")
+        .map(|v| id(&v).map(CommitId))
+        .transpose()?;
+    let root_tree = fields
+        .remove("--candidate-root-tree")
+        .map(|v| id(&v).map(TreeId))
+        .transpose()?;
+    let mutating = recover_once || abandon_publication;
+    if u8::from(recover_once) + u8::from(inspect_recovery) + u8::from(abandon_publication) > 1
+        || mutating != (expected_attempts.is_some() && expected_recoveries.is_some())
+        || (!mutating && (expected_attempts.is_some() || expected_recoveries.is_some()))
+        || (abandon_publication != (candidate.is_some() && root_tree.is_some()))
+        || (!abandon_publication && (candidate.is_some() || root_tree.is_some()))
     {
-        return Err("invalid_recover_once_arguments".into());
+        return Err("invalid_checker_operation_arguments".into());
     }
+    let cancellation = if abandon_publication {
+        let cancellation = LandingPublicationCancellation {
+            job_id: job,
+            candidate: candidate.unwrap(),
+            root_tree: root_tree.unwrap(),
+            expected_attempts: expected_attempts.unwrap(),
+            expected_recoveries: expected_recoveries.unwrap(),
+        };
+        if cancellation.candidate == CommitId::ROOT
+            || cancellation.root_tree.0 == [0; 32]
+            || cancellation.expected_attempts != 1
+            || cancellation.expected_recoveries > 256
+        {
+            return Err("invalid_abandon_publication_arguments".into());
+        }
+        Some(cancellation)
+    } else {
+        None
+    };
     Ok(Args {
         config,
         job,
@@ -126,6 +170,7 @@ fn args() -> Result<Args, String> {
         timeout,
         recover_once,
         inspect_recovery,
+        cancellation,
         expected_attempts,
         expected_recoveries,
     })
@@ -171,6 +216,7 @@ fn phase(value: LandingPhase) -> &'static str {
         LandingPhase::CheckUnavailable => "check_unavailable",
         LandingPhase::StaleTarget => "stale_target",
         LandingPhase::Expired => "expired",
+        LandingPhase::PublicationAbandoned => "publication_abandoned",
     }
 }
 async fn run(args: Args) -> Result<Value, String> {
@@ -181,7 +227,11 @@ async fn run(args: Args) -> Result<Value, String> {
     let client = NativeClient::connect(config)
         .await
         .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
-    let job = if args.recover_once {
+    let job = if let Some(cancellation) = &args.cancellation {
+        client
+            .abandon_landing_publication(&args.intent, cancellation)
+            .await
+    } else if args.recover_once {
         client
             .recover_landing_once(
                 &args.intent,
@@ -213,7 +263,7 @@ async fn run(args: Args) -> Result<Value, String> {
         .candidate()
         .map(|c| json!({"head":hex(&c.head.0),"root_tree":hex(&c.root_tree.0)}));
     Ok(
-        json!({"schema_version":1,"mode":if args.recover_once {"recover_once_admission"} else {"read_only"},"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress,"recovery_inspection":inspection}),
+        json!({"schema_version":1,"mode":if args.cancellation.is_some() {"abandon_publication"} else if args.recover_once {"recover_once_admission"} else {"read_only"},"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"roots_retained":job.roots_retained(),"candidate":candidate,"checker_progress":progress,"recovery_inspection":inspection}),
     )
 }
 #[tokio::main]

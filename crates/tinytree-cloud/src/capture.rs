@@ -108,8 +108,15 @@ pub struct IndexRecord {
 pub struct PortableRemoteState {
     pub observations: Vec<RemoteObservation>,
     pub archived_pushes: Vec<ArchivedIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_landings: Vec<crate::PortableLanding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<crate::PortableLanding>,
+}
+impl PortableRemoteState {
+    pub fn landings(&self) -> impl Iterator<Item = &crate::PortableLanding> {
+        self.landing.iter().chain(&self.archived_landings)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -174,7 +181,11 @@ pub fn decode_data(
 pub fn validate_capture_data(data: &CaptureData, limits: &CaptureDataLimits) -> Result<()> {
     ensure!(
         matches!(data.version, 1 | 2)
-            && (data.version == 2) == data.remote.as_ref().is_some_and(|r| r.landing.is_some())
+            && (data.version == 2)
+                == data
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| r.landing.is_some() || !r.archived_landings.is_empty())
             && data.codec == c::CODEC,
         "unsupported capture data format"
     );
@@ -331,7 +342,8 @@ pub fn validate_capture_data(data: &CaptureData, limits: &CaptureDataLimits) -> 
         );
     }
     if let Some(remote) = &data.remote {
-        if let Some(landing) = &remote.landing {
+        crate::validate_archived_landings(&remote.archived_landings)?;
+        for landing in remote.landings() {
             landing.validate()?;
             for operation in landing.retained_operations() {
                 ensure!(

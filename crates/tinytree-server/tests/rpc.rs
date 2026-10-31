@@ -11143,6 +11143,233 @@ async fn recovery_setup_failure_spends_automatic_and_one_shot_admissions() {
 }
 
 #[tokio::test]
+async fn publication_abandonment_fences_uncertain_job_without_claiming_cleanup() {
+    use tinytree_proto::landing_v1 as l;
+    let (temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");
+    config.service.landing.job_ttl_seconds = 2;
+    config
+        .service
+        .landing
+        .checker
+        .as_mut()
+        .unwrap()
+        .max_attempts = 1;
+    config
+        .service
+        .landing
+        .checker
+        .as_mut()
+        .unwrap()
+        .max_recovery_attempts = 1;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service.clone(),
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    client
+        .start_landing(request(input.clone(), ALPHA))
+        .await
+        .unwrap();
+    let prepared = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
+    // Both the automatic cap and the one-shot recovery are real saved-attempt
+    // admissions. Neither receipt claims a successful check or cleanup.
+    for recoveries in [1, 2] {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let job = client
+                    .get_landing(request(
+                        l::GetLandingRequest {
+                            repository_id: input.repository_id.clone(),
+                            idempotency_key: input.idempotency_key.clone(),
+                            inspect_recovery: false,
+                        },
+                        ALPHA,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .job
+                    .unwrap();
+                if job.checker_progress.is_some_and(|p| {
+                    !p.active_task && p.automatic_recovery_blocked && p.recoveries == recoveries
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if recoveries == 1 {
+            client
+                .recover_landing(request(
+                    l::RecoverLandingRequest {
+                        repository_id: input.repository_id.clone(),
+                        idempotency_key: input.idempotency_key.clone(),
+                        expected_job_id: prepared.id.clone(),
+                        expected_attempts: 1,
+                        expected_recoveries: 1,
+                    },
+                    ALPHA,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    let candidate = prepared.candidate.clone().unwrap();
+    let abandon = l::AbandonLandingPublicationRequest {
+        repository_id: input.repository_id.clone(),
+        idempotency_key: input.idempotency_key.clone(),
+        expected_job_id: prepared.id.clone(),
+        expected_attempts: 1,
+        expected_recoveries: 2,
+        candidate_head: candidate.head.clone(),
+        candidate_root_tree: candidate.root_tree.clone(),
+        profile_name: prepared.profile_name.clone(),
+        expected_profile_version: prepared.profile_version.clone(),
+    };
+    assert_eq!(
+        client
+            .abandon_landing_publication(request(abandon.clone(), READER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .abandon_landing_publication(request(abandon.clone(), PEER))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let mut wrongs = Vec::new();
+    let mut wrong = abandon.clone();
+    wrong.expected_job_id[0] ^= 1;
+    wrongs.push(wrong);
+    let mut wrong = abandon.clone();
+    wrong.expected_recoveries = 1;
+    wrongs.push(wrong);
+    let mut wrong = abandon.clone();
+    wrong.candidate_head[0] ^= 1;
+    wrongs.push(wrong);
+    let mut wrong = abandon.clone();
+    wrong.candidate_root_tree[0] ^= 1;
+    wrongs.push(wrong);
+    let mut wrong = abandon.clone();
+    wrong.expected_profile_version.push('x');
+    wrongs.push(wrong);
+    let mut wrong = abandon.clone();
+    wrong.profile_name = "other".into();
+    wrongs.push(wrong);
+    for wrong in wrongs {
+        assert_eq!(
+            client
+                .abandon_landing_publication(request(wrong, ALPHA))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
+    let record_before = wait_checker_record(&store, &["Uncertain", "DispatchIntent"]).await;
+    let executions = std::fs::read_to_string(scratch.join("executions")).unwrap();
+    for _ in 0..2 {
+        let job = client
+            .abandon_landing_publication(request(abandon.clone(), ALPHA))
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap();
+        assert_eq!(job.phase, l::Phase::PublicationAbandoned as i32);
+        assert!(job.roots_retained);
+        assert!(job.receipt.is_none());
+        assert_eq!(job.checker_progress.unwrap().recoveries, 2);
+    }
+    assert_eq!(
+        wait_checker_record(&store, &["Uncertain", "DispatchIntent"]).await,
+        record_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("executions")).unwrap(),
+        executions
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    running.stop().await;
+    drop(client);
+    drop(store);
+    let store = Store::open_existing(
+        temporary.path(),
+        config.store.materialize(config.service.max_metadata_bytes),
+    )
+    .unwrap();
+    config.service.landing.checker = None;
+    let running = Running::start_landing(
+        store.clone(),
+        config.service,
+        landing_principals(true),
+        true,
+    )
+    .await;
+    let mut client = running.landing_client().await;
+    let job = client
+        .abandon_landing_publication(request(abandon.clone(), ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(job.phase, l::Phase::PublicationAbandoned as i32);
+    assert!(job.roots_retained);
+    // Genuine late cleanup may retire the physical journal, never the Store
+    // fence or its custody roots, even after TTL and a disabled-checker restart.
+    std::fs::write(scratch.join("release"), b"fixture cleanup now confirmed").unwrap();
+    wait_checker_record(&store, &["Terminal"]).await;
+    let job = client
+        .abandon_landing_publication(request(abandon, ALPHA))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_eq!(job.phase, l::Phase::PublicationAbandoned as i32);
+    assert!(job.roots_retained);
+    assert!(job.receipt.is_none());
+    store.gc("alpha", i64::MAX - 1).unwrap();
+    for bytes in [input.source_base, input.source_head, candidate.head] {
+        assert!(
+            store
+                .read_metadata(
+                    "alpha",
+                    ObjectKey {
+                        kind: Kind::Commit,
+                        id: ObjectId(bytes.try_into().unwrap())
+                    }
+                )
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        store.references("alpha", &["main".into()]).unwrap()[0].generation,
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("executions"))
+            .unwrap()
+            .lines()
+            .filter(|s| *s == "run")
+            .count(),
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
     use tinytree_proto::landing_v1 as l;
     let (temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");

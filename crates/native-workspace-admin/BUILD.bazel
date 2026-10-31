@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("//build_defs:fixture_test.bzl", "fixture_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -30,4 +31,15 @@ fixture_test(
     binary = ":unit_tests",
     args = ["--ignored", "native_capture_rejects_another_workspace_before_private_reads"],
     tags = ["local", "manual"],
+)
+
+# Disposable acceptance data only; not a product command or remote job authority.
+rust_binary(
+    name = "archived_landing_fixture",
+    testonly = True,
+    srcs = ["tests/archived_landing_fixture.rs"],
+    crate_root = "tests/archived_landing_fixture.rs",
+    edition = "2024",
+    aliases = aliases(),
+    deps = [":native-workspace-admin"] + all_crate_deps(normal = True),
 )

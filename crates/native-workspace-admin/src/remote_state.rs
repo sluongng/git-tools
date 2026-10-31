@@ -62,7 +62,7 @@ pub use tinytree_cloud::{
     HistoricalLandingJob, HistoricalLandingPhase, PortableLanding as LandingPending,
 };
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     version: u32,
@@ -72,6 +72,8 @@ pub struct State {
     pub pending: Option<Pending>,
     #[serde(default)]
     pub archived_pushes: Vec<Pending>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_landings: Vec<LandingPending>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<LandingPending>,
 }
@@ -84,17 +86,20 @@ impl State {
             observations: vec![],
             pending: None,
             archived_pushes: vec![],
+            archived_landings: vec![],
             landing: None,
         }
     }
     pub fn validate(&self, locator: &RemoteScope) -> io::Result<()> {
         if !matches!(self.version, VERSION | 2 | 3)
-            || (self.landing.is_some() && !matches!(self.version, 2 | 3))
+            || ((self.landing.is_some() || !self.archived_landings.is_empty())
+                && !matches!(self.version, 2 | 3))
             || (self.version == 2
-                && self
-                    .landing
-                    .as_ref()
-                    .is_some_and(|p| p.observed.is_some() || p.restored_lookup_only))
+                && (!self.archived_landings.is_empty()
+                    || self
+                        .landing
+                        .as_ref()
+                        .is_some_and(|p| p.observed.is_some() || p.restored_lookup_only)))
             || self.socket != locator.socket
             || self.store != locator.store
             || self.observations.len() > MAX_REFERENCES
@@ -104,6 +109,7 @@ impl State {
                 "native remote state scope/version mismatch",
             ));
         }
+        tinytree_cloud::validate_archived_landings(&self.archived_landings)?;
         if let Some(landing) = &self.landing {
             landing.validate()?;
         }
@@ -164,6 +170,41 @@ impl State {
     }
     /// Activate the fail-closed version fence before any landing dispatch. Once
     /// upgraded, removing a journal never silently restores legacy mutation.
+    /// Call only after a fresh checked abandoned-publication observation.
+    /// Preserve all original source/result claims; never evict on overflow.
+    pub fn archive_abandoned_landing(&mut self) -> io::Result<()> {
+        let landing = self
+            .landing
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no landing to archive"))?;
+        tinytree_cloud::validate_archived_landings(std::slice::from_ref(landing))?;
+        let mut next = self.clone();
+        if let Some(saved) = next
+            .archived_landings
+            .iter()
+            .find(|old| old.job_id == landing.job_id)
+        {
+            if saved != landing {
+                return Err(io::Error::other("archived landing binding differs"));
+            }
+        } else {
+            if next.archived_landings.len() >= 128 {
+                return Err(io::Error::other("archived landing retention limit reached"));
+            }
+            next.archived_landings.push(landing.clone());
+        }
+        next.landing = None;
+        tinytree_cloud::validate_archived_landings(&next.archived_landings)?;
+        if toml::to_string(&next).map_err(io::Error::other)?.len() > MAX_BYTES as usize {
+            return Err(io::Error::other(
+                "archived landing sidecar exceeds byte limit",
+            ));
+        }
+        // Admission and encoding succeeded. No failure path above clears the
+        // current intent, even in memory; callers then persist atomically.
+        *self = next;
+        Ok(())
+    }
     pub fn begin_landing(&mut self, intent: LandingPending) -> io::Result<()> {
         intent.validate()?;
         if self.landing.is_some() || self.pending.is_some() {
@@ -217,6 +258,10 @@ impl State {
                 confirmed_generation: r.confirmed_generation,
             })
             .collect();
+        state.archived_landings = remote.archived_landings.clone();
+        if !state.archived_landings.is_empty() {
+            state.version = 3;
+        }
         if let Some(landing) = &remote.landing {
             let mut landing = landing.clone();
             landing.restored_lookup_only = true;
@@ -328,11 +373,16 @@ impl State {
             .iter()
             .chain(&self.archived_pushes)
             .map(|intent| intent.base_operation.as_str())
-            .chain(self.landing.iter().flat_map(|intent| {
-                std::iter::once(intent.source_operation.as_str())
-                    .chain(intent.fork_operation.as_deref())
-                    .chain(intent.apply_operation.as_deref())
-            }))
+            .chain(
+                self.landing
+                    .iter()
+                    .chain(&self.archived_landings)
+                    .flat_map(|intent| {
+                        std::iter::once(intent.source_operation.as_str())
+                            .chain(intent.fork_operation.as_deref())
+                            .chain(intent.apply_operation.as_deref())
+                    }),
+            )
     }
     pub fn retained_commit_heads(&self) -> impl Iterator<Item = &str> {
         self.observations
@@ -344,16 +394,21 @@ impl State {
                     .chain(&self.archived_pushes)
                     .filter_map(|entry| entry.head.as_deref()),
             )
-            .chain(self.landing.iter().flat_map(|intent| {
-                std::iter::once(intent.source_head.as_str())
-                    .chain(std::iter::once(intent.expected_head.as_str()))
-                    .chain(
-                        (intent.source_base.bytes().any(|b| b != b'0'))
-                            .then_some(intent.source_base.as_str()),
-                    )
-                    .chain(intent.source_stack.iter().map(String::as_str))
-                    .chain(intent.result_roots.iter().map(String::as_str))
-            }))
+            .chain(
+                self.landing
+                    .iter()
+                    .chain(&self.archived_landings)
+                    .flat_map(|intent| {
+                        std::iter::once(intent.source_head.as_str())
+                            .chain(std::iter::once(intent.expected_head.as_str()))
+                            .chain(
+                                (intent.source_base.bytes().any(|b| b != b'0'))
+                                    .then_some(intent.source_base.as_str()),
+                            )
+                            .chain(intent.source_stack.iter().map(String::as_str))
+                            .chain(intent.result_roots.iter().map(String::as_str))
+                    }),
+            )
     }
 }
 
@@ -389,6 +444,7 @@ pub fn historical_landing_job(
             l::Phase::CheckUnavailable => c::HistoricalLandingPhase::CheckUnavailable,
             l::Phase::StaleTarget => c::HistoricalLandingPhase::StaleTarget,
             l::Phase::Expired => c::HistoricalLandingPhase::Expired,
+            l::Phase::PublicationAbandoned => c::HistoricalLandingPhase::PublicationAbandoned,
             _ => return Err(bad()),
         },
         preparation: match l::PreparationAvailability::try_from(job.preparation)

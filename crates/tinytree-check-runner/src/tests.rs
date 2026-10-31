@@ -427,10 +427,66 @@ async fn unavailable_attempt_replays_and_capacity_fails_closed() {
     fs::rename(&held_tool, &tool).unwrap();
     let mut other = request.clone();
     other.attempt_id = "99".repeat(32);
-    assert!(
-        run(&config, other, cancelled).await.is_err(),
-        "attempt quota must not overwrite existing recovery data"
+    let original_journal = fs::read(&journal_path).unwrap();
+    let refusal = run(&config, other.clone(), cancelled.clone())
+        .await
+        .unwrap();
+    assert_eq!(refusal.outcome, Outcome::Unavailable);
+    assert_eq!(refusal.reason, "admission_capacity");
+    assert!(refusal.cleanup_confirmed);
+    assert!(refusal.evidence.is_none());
+    refusal.validate_for(&other).unwrap();
+    assert!(!config.scratch.join(other.workspace_id()).exists());
+    assert_eq!(fs::read(&journal_path).unwrap(), original_journal);
+    assert_eq!(recover(&config, other.clone()).await.unwrap(), refusal);
+    // Freeing capacity cannot turn the saved exact refusal into execution.
+    let held_attempt = directory.path().join("held-original-attempt");
+    fs::rename(&attempt, &held_attempt).unwrap();
+    assert_eq!(
+        run(&config, other.clone(), cancelled.clone())
+            .await
+            .unwrap(),
+        refusal
     );
+    assert!(!config.scratch.join(other.workspace_id()).exists());
+    fs::rename(&held_attempt, &attempt).unwrap();
+    // A refusal plus an actual directory is a custody contradiction, not a
+    // no-work receipt. Existing genuine recovery still works at full quota.
+    let contradiction =
+        private_fs::PrivateDir::create(config.scratch.join(other.workspace_id())).unwrap();
+    assert!(
+        run(&config, other.clone(), cancelled.clone())
+            .await
+            .is_err()
+    );
+    assert!(recover(&config, other.clone()).await.is_err());
+    drop(contradiction);
+    fs::remove_dir(config.scratch.join(other.workspace_id())).unwrap();
+    assert_eq!(
+        recover(&config, request.clone()).await.unwrap().outcome,
+        Outcome::Unavailable
+    );
+    // Partial durable appends fail closed for new admission, without trapping
+    // cleanup of an actual original attempt behind unrelated receipt damage.
+    let ledger_path = config.scratch.join("admission.lock");
+    let ledger = fs::read(&ledger_path).unwrap();
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&ledger_path)
+        .unwrap()
+        .write_all(&[1])
+        .unwrap();
+    let mut fresh = other.clone();
+    fresh.attempt_id = "88".repeat(32);
+    assert!(run(&config, fresh.clone(), cancelled).await.is_err());
+    assert!(!config.scratch.join(fresh.workspace_id()).exists());
+    assert!(recover(&config, other).await.is_err());
+    assert_eq!(
+        recover(&config, request.clone()).await.unwrap().outcome,
+        Outcome::Unavailable
+    );
+    fs::write(&ledger_path, ledger).unwrap();
     let mut changed = config.clone();
     changed.profiles[0].targets = vec!["//app:other".into()];
     assert_ne!(

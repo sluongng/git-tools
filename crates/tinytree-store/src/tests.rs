@@ -9492,6 +9492,7 @@ fn cloud_rolling_window_keeps_only_live_pin_and_reader_exceptions() {
     )
     .unwrap();
     data.remote = Some(tinytree_cloud::PortableRemoteState {
+                archived_landings: vec![],
         observations: vec![],
         archived_pushes: vec![],
         landing: None,
@@ -10349,6 +10350,7 @@ fn cloud_retirement_compares_verified_observations_without_expiring_uncertain_in
         )
         .unwrap();
         let old_remote = c::PortableRemoteState {
+                archived_landings: vec![],
             observations: vec![c::RemoteObservation {
                 reference: "main".into(),
                 bookmark: "main".into(),
@@ -10849,6 +10851,7 @@ fn acknowledged_capture_selected_index_feature_is_atomic_and_enforced_on_reopen(
         }];
         data.version = 2;
         data.remote = Some(c::PortableRemoteState {
+                archived_landings: vec![],
             observations: vec![],
             archived_pushes: vec![],
             landing: Some(c::PortableLanding {
@@ -11020,6 +11023,7 @@ fn landing_capture_activates_its_atomic_feature_and_rejects_downgraded_reopen() 
         .unwrap();
         data.version = 2;
         data.remote = Some(c::PortableRemoteState {
+                archived_landings: vec![],
             observations: vec![],
             archived_pushes: vec![],
             landing: Some(c::PortableLanding {
@@ -14596,6 +14600,90 @@ fn landing_check_owner_survives_expiry_without_authorizing_a_late_verdict() {
 }
 
 #[test]
+fn landing_publication_abandonment_is_exact_terminal_and_preserves_roots_after_restart() {
+    let (directory, store) = open();
+    let owner = LandingOwner([39; 32]);
+    let (base, source, dest) = landing_fixture(&store, "demo");
+    let input = landing_request(base, source, dest, "abandon-publication");
+    let accepted = store.begin_landing("demo", owner, &input, 0).unwrap();
+    let prepared = store.prepare_landing("demo", owner, &input.idempotency_key, 1).unwrap();
+    let identity = landing_identity(&prepared);
+    let exact = LandingPublicationBinding { job_id: accepted.id, candidate: identity.candidate,
+        root_tree: identity.root_tree, profile: identity.profile.clone() };
+    let before = store.references("demo", &[input.reference_name.clone()]).unwrap();
+    for bad in [
+        LandingPublicationBinding {job_id:[99;32],..exact.clone()},
+        LandingPublicationBinding {candidate:CommitId([99;32]),..exact.clone()},
+        LandingPublicationBinding {root_tree:TreeId([99;32]),..exact.clone()},
+        LandingPublicationBinding {profile:LandingCheckProfile {name:exact.profile.name.clone(),version:"different".into()},..exact.clone()},
+    ] {
+        assert!(store.abandon_landing_publication("demo", owner, &input.idempotency_key, &bad).is_err());
+        assert_eq!(store.landing_job("demo", owner, &input.idempotency_key).unwrap().unwrap(), prepared);
+    }
+    assert!(store.abandon_landing_publication("demo", LandingOwner([40;32]), &input.idempotency_key, &exact).is_err());
+    assert!(store.abandon_landing_publication("demo", owner, "other-key", &exact).is_err());
+    let mut intent = input.clone();
+    intent.idempotency_key = "unprepared-abandon".into();
+    let unprepared = store.begin_landing("demo", owner, &intent, 0).unwrap();
+    assert!(store.abandon_landing_publication("demo", owner, &intent.idempotency_key,
+        &LandingPublicationBinding {job_id:unprepared.id,..exact.clone()}).is_err());
+    let handle = store.scan_pending_landings("demo", None, LandingScanLimits::default()).unwrap()
+        .jobs.into_iter().find(|job| job.id == exact.job_id).unwrap().handle;
+    // GC beyond the execution deadline cannot infer expiry, and explicit
+    // cancellation of this still-Prepared job needs neither a verdict nor time.
+    store.gc("demo", 10000).unwrap();
+    let abandoned = handle.abandon_publication(&store, &exact).unwrap();
+    assert_eq!(abandoned.state, LandingState::PublicationAbandoned);
+    assert!(abandoned.roots_retained);
+    assert_eq!(abandoned.candidate, prepared.candidate);
+    assert!(abandoned.receipt.is_none());
+    assert!(abandoned.conflict_path.is_none());
+    assert_eq!(handle.abandon_publication(&store, &exact).unwrap(), abandoned);
+    assert_eq!(store.inner.db.read_tx().get(&store.inner.spaces.meta,b"format").unwrap().as_deref(), Some(b"tinytree-store-13".as_slice()));
+    assert!(!store.scan_pending_landings("demo", None, LandingScanLimits::default()).unwrap().jobs.iter().any(|job| job.id == exact.job_id));
+    for passed in [false,true] {
+        assert!(handle.record_check(&store, &identity, LandingVerdict {passed,evidence:[7;32]}, 2).is_err());
+    }
+    assert!(handle.record_check_unavailable(&store, &identity, 2).is_err());
+    assert_eq!(handle.finalize(&store, 2).unwrap(), abandoned);
+    assert_eq!(handle.expire(&store, 10000).unwrap(), abandoned);
+    assert_eq!(store.references("demo", &[input.reference_name.clone()]).unwrap(), before);
+    // A different prepared job with a real passing check cannot be abandoned,
+    // nor can its committed receipt be changed into an abandonment.
+    let mut checked_request = input.clone();
+    checked_request.idempotency_key = "checked-not-abandoned".into();
+    store.begin_landing("demo", owner, &checked_request, 0).unwrap();
+    let checked_prepared = store.prepare_landing("demo", owner, &checked_request.idempotency_key, 1).unwrap();
+    let checked_identity = landing_identity(&checked_prepared);
+    let checked_binding = LandingPublicationBinding {job_id:checked_prepared.id,candidate:checked_identity.candidate,
+        root_tree:checked_identity.root_tree,profile:checked_identity.profile.clone()};
+    store.record_landing_check("demo", owner, &checked_request.idempotency_key,
+        &checked_identity, LandingVerdict {passed:true,evidence:[8;32]}, 2).unwrap();
+    assert!(store.abandon_landing_publication("demo", owner, &checked_request.idempotency_key, &checked_binding).is_err());
+    store.finalize_landing("demo", owner, &checked_request.idempotency_key, 3).unwrap();
+    assert!(store.abandon_landing_publication("demo", owner, &checked_request.idempotency_key, &checked_binding).is_err());
+    store.expire_landing("demo", owner, &intent.idempotency_key, 10000).unwrap();
+    store.gc("demo", 10000).unwrap();
+    let roots = [base.key,source.key,dest.key,
+        ObjectKey {kind:Kind::Commit,id:ObjectId(identity.candidate.0)},
+        ObjectKey {kind:Kind::Tree,id:ObjectId(identity.root_tree.0)},
+        tinytree_model::describe_file(b"source").key];
+    for key in roots { assert!(store.read("demo",key).is_ok()); }
+    drop(handle);
+    drop(store);
+    // No check host, process, or active lease is needed for the durable hold.
+    let store = Store::open_existing(directory.path(), config()).unwrap();
+    assert_eq!(store.abandon_landing_publication("demo", owner, &input.idempotency_key, &exact).unwrap(), abandoned);
+    assert_eq!(store.begin_landing("demo", owner, &input, 20000).unwrap(), abandoned);
+    assert_eq!(store.expire_landing("demo", owner, &input.idempotency_key, 20000).unwrap(), abandoned);
+    assert!(store.record_landing_check("demo", owner, &input.idempotency_key, &identity,
+        LandingVerdict {passed:true,evidence:[9;32]}, 20000).is_err());
+    assert_eq!(store.finalize_landing("demo", owner, &input.idempotency_key, 20000).unwrap(), abandoned);
+    store.gc("demo", 20000).unwrap();
+    for key in roots { assert!(store.read("demo",key).is_ok()); }
+}
+
+#[test]
 fn landing_committed_recovery_roots_survive_lost_ack_reference_move_gc_and_restart() {
     let (directory, store) = open();
     let owner = LandingOwner([18; 32]);
@@ -15405,6 +15493,7 @@ fn latest_capture_refuses_ambiguous_bindings_but_explicit_generations_remain_rea
             )
             .unwrap();
             data.remote = Some(tinytree_cloud::PortableRemoteState {
+                archived_landings: vec![],
                 observations: vec![],
                 archived_pushes: vec![],
                 landing: None,

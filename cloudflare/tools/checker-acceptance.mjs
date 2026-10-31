@@ -30,7 +30,16 @@ if (artifacts) {
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
   assert.equal((await stat(artifacts)).mode & 0o777, 0o700, 'acceptance artifacts must be private');
 }
-const temporary = await mkdtemp(path.join(tmpdir(), 'tinytree-checker-accept-'));
+const temporaryParent = process.env.TT_CHECKER_ACCEPT_TMP_ROOT ?? tmpdir();
+assert.ok(path.isAbsolute(temporaryParent), 'acceptance temporary parent must be absolute');
+if (process.env.TT_CHECKER_ACCEPT_TMP_ROOT) {
+  const info = await lstat(temporaryParent);
+  assert.ok(info.isDirectory() && !info.isSymbolicLink(), 'acceptance temporary parent must be a directory');
+  assert.equal(info.mode & 0o777, 0o700, 'acceptance temporary parent must be private');
+  assert.equal(info.uid, process.getuid(), 'acceptance temporary parent must be owned');
+  assert.equal(await realpath(temporaryParent), temporaryParent, 'acceptance temporary parent must be physical');
+}
+const temporary = await mkdtemp(path.join(temporaryParent, 'tinytree-checker-accept-'));
 const root = path.join(temporary, 'private');
 await mkdir(root, { mode: 0o700 });
 const home = path.join(root, 'home'), scratch = path.join(root, 'checks'), emptyPath = path.join(root, 'no-programs');

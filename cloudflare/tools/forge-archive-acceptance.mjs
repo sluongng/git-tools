@@ -10,7 +10,8 @@ import { Miniflare } from 'miniflare';
 import { runCheckerAcceptance } from './checker-acceptance.mjs';
 
 const inputs = process.argv.slice(2);
-assert.equal(inputs.length, 7, 'existing checker acceptance inputs plus shipped tt required');
+assert.equal(inputs.length, 8, 'existing checker inputs, shipped tt and historical-data fixture required');
+const historicalFixture = path.resolve(inputs.pop());
 const tt = path.resolve(inputs.pop());
 const exportToken = randomBytes(32).toString('hex'), otherExportToken = randomBytes(32).toString('hex');
 const restoreToken = randomBytes(32).toString('hex'), archiveId = randomBytes(32).toString('hex');
@@ -18,7 +19,8 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
 let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay, privateRelay;
-let destinationTransformRecovery;
+let destinationTransformRecovery, historicalData;
+let wipClientStopped = false, targetClientStopped = false;
 let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, resumedWip, fifthWip, resumeEvidence, pruneEvidence, markerRecovery, complete = false, cleaned = false;
 const fault = { export: true, restore: true, retire: false };
 const events = [], physicalEvidence = [];
@@ -124,6 +126,7 @@ async function fenced(origin) {
 async function client(name, server, archiveToken) {
   const home = path.join(localRoot, name), cwd = path.join(home, 'cwd'), tmp = path.join(home, 'tmp');
   await mkdir(home, { mode: 0o700 }); await mkdir(cwd, { mode: 0o700 }); await mkdir(tmp, { mode: 0o700 });
+  await writeFile(path.join(home, '.historical-data-fixture'), 'tinytree-archive-historical-data-fixture-v1\n', { mode: 0o600, flag: 'wx' });
   const jj = path.join(home, 'jj.toml');
   await writeFile(jj, '[user]\nname="Archive Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n[snapshot]\nmax-new-file-size=2097152\n', { mode: 0o600 });
   const value = { home, cwd, env: { HOME: home, XDG_CONFIG_HOME: path.join(home, 'config'), TMPDIR: tmp, JJ_CONFIG: jj,
@@ -141,6 +144,37 @@ async function raw(client, args, { cwd = client.cwd, success = true } = {}) {
     throw new Error(JSON.stringify({ operation: args[0], code: error.code, signal: error.signal,
       stdout: redact(error.stdout), stderr: redact(error.stderr) }));
   }
+}
+// Test-only historical metadata, not a native RPC result or publication grant.
+// The helper refuses running clients and non-fixture homes, uses normal State
+// validation, and reads original verified native metadata from its owned pool.
+async function historical(client, mode, workspace, descriptor, input, providerIdentity) {
+  const name = 'historical-data-input.json';
+  await writeFile(path.join(client.home, name), JSON.stringify(input), { mode: 0o600 });
+  const args = [mode, '--fixture-home', client.home, '--workspace', workspace,
+    '--descriptor', descriptor, '--input', name];
+  if (mode === 'verify') {
+    assert.match(providerIdentity, /^[0-9a-f]{64}$/);
+    args.push('--provider-identity', providerIdentity);
+  }
+  let result;
+  try {
+    result = await context.execute(historicalFixture, args, {
+      cwd: client.cwd, env: { HOME: client.home, XDG_CONFIG_HOME: client.env.XDG_CONFIG_HOME, TMPDIR: client.env.TMPDIR, PATH: '/usr/bin:/bin', TERM: 'dumb' },
+      encoding: 'utf8', timeout: 30000, maxBuffer: 128 * 1024,
+    });
+  } catch (error) {
+    throw new Error(JSON.stringify({ operation: 'historical_data_fixture', mode, code: error.code,
+      signal: error.signal, stdout: redact(error.stdout), stderr: redact(error.stderr) }));
+  }
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.schema_version, 1); assert.equal(value.kind, 'historical_data_fixture');
+  assert.equal(value.no_native_rpc_authority, true); assert.equal(value.mode, mode);
+  assert.equal(value.reader_version, 3, 'historical roots require the monotone local reader fence');
+  assert.equal(value.registry_binding, mode === 'verify' ? 'restored_current_state' : 'normal_ready');
+  assert.equal(value.landing.terminal, 'publication_abandoned');
+  assert.equal(value.landing.acknowledged, false); assert.equal(value.landing.apply_operation, null);
+  return value;
 }
 async function command(client, args, options = {}) {
   const report = JSON.parse(await raw(client, [...args, '--json'], options)); assert.equal(report.schema_version, 1);
@@ -202,6 +236,7 @@ const workflow = {
   },
   async afterPrimary(value) {
     context = value; localRoot = await mkdtemp('/tmp/tfa.');
+    await writeFile(path.join(localRoot, '.historical-fixture-root'), 'tinytree-archive-historical-data-fixture-v1\n', { mode: 0o600, flag: 'wx' });
     if (process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR) assert.equal(typeof context.artifacts, 'string', 'configured evidence directory must reach archive workflow');
     const directory = path.join(localRoot, 'archive');
     // Source authority is deliberately unavailable to the eventual fresh target.
@@ -223,6 +258,32 @@ const workflow = {
     assert.ok(await mounted(wipWorkspace));
     const noPending = await command(wipClient, ['backup', 'resume'], { cwd: wipWorkspace, success: false });
     assert.equal(noPending.operation, 'backup_resume'); assert.equal(noPending.state, 'failed');
+    // These commits and OPs are real local CLI objects, but the archived
+    // publication-abandoned record below is deliberately historical test DATA.
+    // Worker Forge has no NativeGet/Abandon endpoint; this does not fake one.
+    const originalWc = await raw(wipClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: wipWorkspace });
+    await raw(wipClient, ['new', originalWc, '-m', 'Historical data fixture source'], { cwd: wipWorkspace });
+    await writeFile(path.join(wipWorkspace, 'historical-abandoned.txt'), 'historical source canonical bytes\n');
+    await raw(wipClient, ['describe', '-m', 'Historical data fixture source'], { cwd: wipWorkspace });
+    const historicalSource = await raw(wipClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: wipWorkspace });
+    const historicalSourceOp = await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace });
+    await writeFile(path.join(wipWorkspace, 'historical-abandoned.txt'), 'historical candidate canonical bytes\n');
+    await raw(wipClient, ['describe', '-m', 'Historical data fixture candidate'], { cwd: wipWorkspace });
+    const historicalCandidate = await raw(wipClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: wipWorkspace });
+    const historicalCandidateOp = await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace });
+    assert.notEqual(historicalSource, historicalCandidate);
+    await raw(wipClient, ['edit', originalWc], { cwd: wipWorkspace });
+    const beforeHistoricalStopOp = await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace });
+    await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
+    await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipClientStopped = true;
+    const historicalInput = { source_base: originalWc, source_head: historicalSource, candidate_head: historicalCandidate,
+      source_operation: historicalSourceOp, candidate_operation: historicalCandidateOp };
+    historicalData = { input: historicalInput, seeded: await historical(wipClient, 'seed', wipWorkspace, wipDescriptor, historicalInput) };
+    await raw(wipClient, ['tinytree', 'resume', wipWorkspace]); wipClientStopped = false;
+    assert.equal(await raw(wipClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: wipWorkspace }), originalWc);
+    assert.equal(await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace }), beforeHistoricalStopOp,
+      'fixture metadata preparation must not rewrite OP/WC');
+    await assert.rejects(lstat(path.join(wipWorkspace, 'historical-abandoned.txt')), error => error.code === 'ENOENT');
     await writeFile(path.join(wipWorkspace, 'src/source.txt'), 'unpublished private source before rename\n');
     await raw(wipClient, ['move', 'src/source.txt', 'src/renamed.txt'], { cwd: wipWorkspace });
     await rm(path.join(wipWorkspace, 'readme-link'));
@@ -236,9 +297,10 @@ const workflow = {
     assert.equal(await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace }), firstWip.snapshot_operation);
     if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-backup.json'), JSON.stringify(firstWip, null, 2), { mode: 0o600 });
     await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
-    await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipDescriptor = undefined;
+    await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipClientStopped = true; wipDescriptor = undefined;
     assert.equal(await mounted(wipWorkspace), false);
     await rm(wipClient.home, { recursive: true, force: true });
+    await assert.rejects(lstat(wipClient.home), error => error.code === 'ENOENT');
     // Source descriptor, private object pool, OP store, CAS and config are gone.
     const acknowledged = (await context.invoke(2)).value;
     const positive = context.evidence.find(item => item.label === 'positive'); assert.ok(positive);
@@ -361,8 +423,13 @@ const workflow = {
     privateRelay = await privateTransport(() => targetOrigin);
     await select(targetClient, privateRelay.origin);
     workspace = path.join(targetClient.cwd, 'work');
-    const work = await command(targetClient, ['work', workspace, '--capsule', firstWip.capsule_id]); descriptor = work.result.client_descriptor;
+    const work = await command(targetClient, ['work', workspace, '--capsule', firstWip.capsule_id]); descriptor = work.result.client_descriptor; targetClientStopped = false;
     assert.equal(work.state, 'ready'); assert.deepEqual(work.result.receipt, firstWip);
+    // Preserve the actual returned current identity for a bounded guarded
+    // diagnostic; never recover an expected identity from captured seed data.
+    await writeFile(path.join(targetClient.home, 'historical-restore-ready.json'), JSON.stringify({
+      provider_identity: work.result.provider_identity, client_descriptor: descriptor, destination: workspace,
+    }), { mode: 0o600, flag: 'wx' });
     assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), firstWip.snapshot_commit);
     assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), firstWip.snapshot_operation);
     assert.equal(await readFile(path.join(workspace, 'src/renamed.txt'), 'utf8'), 'unpublished private source before rename\n');
@@ -372,6 +439,22 @@ const workflow = {
     assert.equal(await readFile(path.join(workspace, 'dirty-before-backup.txt'), 'utf8'), 'unsnapshotted private backup input\n');
     assert.ok(await mounted(workspace)); assert.equal(typeof descriptor, 'string');
     assert.deepEqual(await readFile(path.join(workspace, 'boundary.bin')), Buffer.alloc(1048576, 'K'));
+    const beforeHistoricalVerifyOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
+    await raw(targetClient, ['tinytree', 'unmount', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]); targetClientStopped = true;
+    historicalData.restored = await historical(targetClient, 'verify', workspace, descriptor, historicalData.input, work.result.provider_identity);
+    assert.deepEqual(historicalData.restored.landing, historicalData.seeded.landing,
+      'archived-only historical DTO must survive complete source HOME/cache loss and fresh service/capsule restore');
+    await raw(targetClient, ['tinytree', 'resume', workspace]); targetClientStopped = false;
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), beforeHistoricalVerifyOp);
+    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), firstWip.snapshot_commit);
+    const historicalSourceView = ['--at-op', historicalData.input.source_operation];
+    assert.equal(await raw(targetClient, [...historicalSourceView, 'log', '--no-graph', '-r', historicalData.input.source_head, '-T', 'commit_id'], { cwd: workspace }), historicalData.input.source_head);
+    assert.equal(await raw(targetClient, [...historicalSourceView, 'file', 'show', '-r', historicalData.input.source_head, 'historical-abandoned.txt'], { cwd: workspace }), 'historical source canonical bytes');
+    assert.equal(await raw(targetClient, ['--at-op', historicalData.input.candidate_operation, 'file', 'show', '-r', historicalData.input.candidate_head, 'historical-abandoned.txt'], { cwd: workspace }), 'historical candidate canonical bytes');
+    await assert.rejects(lstat(path.join(workspace, 'historical-abandoned.txt')), error => error.code === 'ENOENT');
+    historicalData.exact_archived_dto = true; historicalData.source_operation_and_view_restored = true;
+    historicalData.detached_source_and_candidate_bytes_restored = true;
     await writeFile(path.join(workspace, 'restored-receipt.txt'), 'genuine checked work after full account restore\n');
     await raw(targetClient, ['describe', '-m', 'Checked work after restored account'], { cwd: workspace });
     let pushed = await command(targetClient, ['push', '--request-id', 'restored-source'], { cwd: workspace });
@@ -455,8 +538,8 @@ const workflow = {
     // Its original restored capsule1 is now retired: resume must use CURRENT
     // local state and saved pending custody, never replay that old capsule.
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
-    await raw(targetClient, ['__forge_client_stop', descriptor]);
-    await raw(targetClient, ['tinytree', 'resume', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]); targetClientStopped = true;
+    await raw(targetClient, ['tinytree', 'resume', workspace]); targetClientStopped = false;
     assert.ok(await mounted(workspace));
     assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
     const resumed = await command(targetClient, ['backup', 'resume'], { cwd: workspace });
@@ -486,7 +569,7 @@ const workflow = {
       exact_resume_ack_replayed: true, ordinary_backup_invalidates_resume_fallback: true, subsequent_backup_captures_new_wip: true, subsequent_covered_prune: true };
     const sourceScope = (await command(targetClient, ['status'], { cwd: workspace })).result.workspace;
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
-    await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined;
+    await raw(targetClient, ['__forge_client_stop', descriptor]); targetClientStopped = true; descriptor = undefined;
     // Re-export the recovered account AFTER real marker compaction. Restore
     // into a second independent SQL/R2 service before recovering capsule5.
     const markerDirectory = path.join(localRoot, 'settled-marker-account');
@@ -524,7 +607,7 @@ const workflow = {
     const finalClient = await client('post-land-target', privateRelay.origin, restoreToken);
     const finalWorkspace = path.join(finalClient.cwd, 'work');
     const final = await command(finalClient, ['work', finalWorkspace, '--capsule', fifthWip.capsule_id]);
-    targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor;
+    targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor; targetClientStopped = false;
     assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, fifthWip);
     assert.equal(final.result.base, sourceScope.base, 'post-Land mapped review base is not reset to enrollment');
     assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), fifthWip.snapshot_commit);
@@ -564,16 +647,17 @@ const workflow = {
     await raw(targetClient, ['status'], { cwd: workspace });
     const currentOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
-    await raw(targetClient, ['__forge_client_stop', descriptor]);
-    await raw(targetClient, ['tinytree', 'resume', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]); targetClientStopped = true;
+    await raw(targetClient, ['tinytree', 'resume', workspace]); targetClientStopped = false;
     assert.ok(await mounted(workspace));
     assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), currentOp, 'normal restored resume does not replay original backup over subsequent WIP');
     assert.equal(await readFile(path.join(workspace, 'after-restore-private.txt'), 'utf8'), 'new work must survive normal restored resume\n');
-    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, resumed: resumedWip, fifth: fifthWip, resume: resumeEvidence, prune: pruneEvidence, marker_recovery: markerRecovery, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ historical_data_fixture: historicalData, first: firstWip, second: secondWip, third: thirdWip, resumed: resumedWip, fifth: fifthWip, resume: resumeEvidence, prune: pruneEvidence, marker_recovery: markerRecovery, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
     await this.cleanup({ success: true }); complete = true;
     return { production_worker: true, actual_sqlite_r2: true, source_archive_id: archiveId, build_id: manifest.build_id,
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
+      historical_data_fixture: { ...historicalData, no_native_rpc_authority: true, later_real_forge_check_land: true },
       native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, resumed_capsule: resumedWip, fifth_capsule: fifthWip, explicit_prune: pruneEvidence, exact_saved_resume: resumeEvidence, settled_marker_recovery: markerRecovery },
       destination_local_transform: destinationTransformRecovery,
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
@@ -582,13 +666,30 @@ const workflow = {
   },
   async cleanup({ success = false } = {}) {
     if (cleaned) return;
-    if (wipWorkspace && await mounted(wipWorkspace)) await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
-    if (wipDescriptor) { await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipDescriptor = undefined; }
-    if (workspace && await mounted(workspace)) await raw(targetClient, ['tinytree', 'unmount', workspace]);
-    if (descriptor) { await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined; }
-    if (workspace) assert.equal(await mounted(workspace), false);
-    for (const proxy of [sourceRelay, targetRelay, privateRelay]) if (proxy) { proxy.server.closeAllConnections(); await new Promise(resolve => proxy.server.close(resolve)); }
-    if (target) await target.dispose(); cleaned = true;
+    const failures = [];
+    const drain = async (phase, action) => {
+      try { await action(); } catch (error) { failures.push({ phase, error: redact(error.message).slice(0, 2048) }); }
+    };
+    await drain('source_client', async () => {
+      if (wipWorkspace && await mounted(wipWorkspace)) await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
+      if (wipDescriptor && !wipClientStopped) { await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipClientStopped = true; wipDescriptor = undefined; }
+    });
+    await drain('target_client', async () => {
+      if (workspace && await mounted(workspace)) await raw(targetClient, ['tinytree', 'unmount', workspace]);
+      if (descriptor && !targetClientStopped) { await raw(targetClient, ['__forge_client_stop', descriptor]); targetClientStopped = true; descriptor = undefined; }
+      if (workspace) assert.equal(await mounted(workspace), false);
+    });
+    for (const [index, proxy] of [sourceRelay, targetRelay, privateRelay].entries()) if (proxy) {
+      await drain(`relay_${index}`, async () => { proxy.server.closeAllConnections(); await new Promise(resolve => proxy.server.close(resolve)); });
+    }
+    if (target) await drain('target_worker', async () => target.dispose());
+    cleaned = failures.length === 0;
+    if (failures.length) {
+      console.error(JSON.stringify({ historical_fixture_cleanup_failures: failures }));
+      // Preserve the original failing phase; successful acceptance still must
+      // fail if owned resources did not drain. No failure permits deletion.
+      if (success) throw new Error('archive fixture cleanup incomplete');
+    }
     // On failure retain the original archive and restore state for explicit
     // recovery; never infer that an incomplete import can be rolled back.
     if (!success && localRoot) {

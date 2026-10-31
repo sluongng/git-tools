@@ -46,7 +46,7 @@ mod forge_review;
 pub use forge_review::{ForgeReviewLineageHint, ForgeReviewLineageOperation,ForgeReview, ForgeReviewCandidate, ForgeReviewComment, ForgeReviewDecision, ForgeReviewDependency, ForgeReviewPushRequest, ForgeReviewRewrite, ForgeReviewState};
 pub use landing::{
     LandingCandidate, LandingCandidateLease, LandingCheckIdentity, LandingCheckProfile,
-    LandingConfig, LandingHandle, LandingJob, LandingOwner, LandingReceipt, LandingRequest,
+    LandingConfig, LandingHandle, LandingJob, LandingOwner, LandingPublicationBinding, LandingReceipt, LandingRequest,
     LandingScanCursor, LandingScanLimits, LandingScanPage, LandingState, LandingVerdict,
     PendingLanding,
 };
@@ -504,6 +504,7 @@ fn store_feature(value: Option<&[u8]>) -> Result<u8> {
         Some(b"tinytree-store-10") => Ok(10),
         Some(b"tinytree-store-11") => Ok(11),
         Some(b"tinytree-store-12") => Ok(12),
+        Some(b"tinytree-store-13") => Ok(13),
         _ => Err(Error::Corrupt("store format")),
     }
 }
@@ -528,6 +529,7 @@ fn advance_feature(
             10 => b"tinytree-store-10".as_slice(),
             11 => b"tinytree-store-11".as_slice(),
             12 => b"tinytree-store-12".as_slice(),
+            13 => b"tinytree-store-13".as_slice(),
             _ => return Err(Error::Invalid("store feature")),
         };
         if forge {

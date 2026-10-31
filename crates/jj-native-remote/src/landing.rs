@@ -112,6 +112,7 @@ fn wire_job(job: &CheckedLandingJob) -> l::LandingJob {
             LandingPhase::CheckUnavailable => l::Phase::CheckUnavailable,
             LandingPhase::StaleTarget => l::Phase::StaleTarget,
             LandingPhase::Expired => l::Phase::Expired,
+            LandingPhase::PublicationAbandoned => l::Phase::PublicationAbandoned,
         } as i32,
         preparation: match job.preparation() {
             LandingPreparation::ProfileConfigured => l::PreparationAvailability::ProfileConfigured,

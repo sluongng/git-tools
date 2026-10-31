@@ -2333,6 +2333,7 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
             id: fixture.connector.projected.tree.terms[0],
         }],
         remote: Some(c::PortableRemoteState {
+                archived_landings: vec![],
             observations: vec![c::RemoteObservation {
                 reference: "main".into(),
                 bookmark: "main".into(),
@@ -3158,6 +3159,7 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
         "uncertain intent cannot be replaced"
     );
     let portable = tinytree_cloud::PortableRemoteState {
+                archived_landings: vec![],
         observations: vec![],
         archived_pushes: vec![],
         landing: Some(intent.clone()),
@@ -3175,6 +3177,47 @@ fn landing_intent_fences_legacy_readers_and_retains_frozen_and_unpublished_roots
         remote_state::decode(toml::to_string(&restored).unwrap().as_bytes(), &scope).is_err(),
         "restored sidecar binds current destination, not source socket"
     );
+    // A terminal publication abandonment retains source/candidate/OP claims
+    // through replacement and portable restore, without becoming an apply ACK.
+    let mut abandoned = intent.clone();
+    abandoned.apply_operation = None;
+    abandoned.terminal = Some("publication_abandoned".into());
+    abandoned.observed = Some(tinytree_cloud::HistoricalLandingJob {
+        job_id: [0x17;32], phase: tinytree_cloud::HistoricalLandingPhase::PublicationAbandoned,
+        preparation: tinytree_cloud::HistoricalLandingPreparation::ProfileConfigured,
+        roots_retained: true, expires_at_seconds: 1, profile_name: "checks".into(), profile_version: "v1".into(),
+        candidate: Some(tinytree_cloud::HistoricalLandingCandidate { head:[0x18;32], root_tree:[0x20;32],
+            rewrites:vec![tinytree_cloud::HistoricalLandingRewrite { old_commit:[0x13;32],new_commit:[0x18;32],change_id:[0x21;16] }] }),
+        receipt:None, conflict_path:None,
+    });
+    let mut retained = State::new(&scope); retained.begin_landing(abandoned.clone()).unwrap();
+    retained.archive_abandoned_landing().unwrap();
+    assert!(retained.landing.is_none()); assert_eq!(retained.archived_landings.len(),1);
+    retained.landing=Some(abandoned.clone()); retained.archive_abandoned_landing().unwrap();
+    assert_eq!(retained.archived_landings.len(),1,"exact replay must not duplicate retained history");
+    let decoded = remote_state::decode(toml::to_string(&retained).unwrap().as_bytes(),&scope).unwrap();
+    assert!(decoded.retained_commit_heads().any(|id|id=="13".repeat(32)));
+    assert!(decoded.retained_commit_heads().any(|id|id=="18".repeat(32)));
+    assert!(decoded.retained_operations().any(|id|id=="15".repeat(64)));
+    let archived = tinytree_cloud::PortableRemoteState { observations:vec![], archived_pushes:vec![], archived_landings:decoded.archived_landings.clone(), landing:None };
+    let restored_archive=State::from_portable(&destination,&archived).unwrap();
+    assert_eq!(restored_archive.archived_landings,vec![abandoned]);
+    assert!(restored_archive.landing.is_none());
+    assert!(!restored_archive.archived_landings[0].acknowledged);
+    let mut full = State::new(&scope);
+    for counter in 0u8..128 {
+        let mut history = restored_archive.archived_landings[0].clone();
+        history.request_id = format!("{counter:032x}");
+        let job_id = [counter + 64;32]; history.job_id = Some(job_id.iter().map(|byte| format!("{byte:02x}")).collect());
+        history.observed.as_mut().unwrap().job_id = job_id;
+        full.archived_landings.push(history);
+    }
+    full.landing = Some(restored_archive.archived_landings[0].clone());
+    let before_overflow = toml::to_string(&full).unwrap();
+    assert!(full.archive_abandoned_landing().is_err());
+    assert_eq!(toml::to_string(&full).unwrap(), before_overflow, "overflow preserves the exact current intent and all archived claims");
+    let mut invalid_archive=archived.clone(); invalid_archive.archived_landings[0].observed.as_mut().unwrap().roots_retained=false;
+    assert!(State::from_portable(&destination,&invalid_archive).is_err());
     let mut duplicate = intent.clone();
     duplicate.source_stack.push(duplicate.source_head.clone());
     assert!(State::new(&scope).begin_landing(duplicate).is_err());
@@ -5006,6 +5049,7 @@ fn cleanup_job(
         conflict_path: None,
         preparation: l::PreparationAvailability::ProfileConfigured as i32,
         checker_progress: None,
+        recovery_inspection: None,
     };
     if committed {
         let head = cleanup_intent(p).request.source_head;

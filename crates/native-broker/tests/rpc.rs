@@ -5208,6 +5208,7 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
         conflict_path: None,
         preparation: l::PreparationAvailability::ProfileConfigured as i32,
         checker_progress: None,
+        recovery_inspection: None,
     };
     assert_eq!(
         LandingReport::checked(job.clone(), &intent, Arc::new(()))
@@ -5223,6 +5224,17 @@ fn landing_reports_are_bound_to_original_intent_and_check_state() {
         rewrites: vec![],
     });
     LandingReport::checked(prepared.clone(), &intent, Arc::new(())).unwrap();
+    let mut abandoned = prepared.clone();
+    abandoned.phase = l::Phase::PublicationAbandoned as i32;
+    LandingReport::checked(abandoned.clone(), &intent, Arc::new(())).unwrap();
+    let mut released_abandoned = abandoned.clone();
+    released_abandoned.roots_retained = false;
+    assert!(LandingReport::checked(released_abandoned, &intent, Arc::new(())).is_err(),
+        "abandoned publication keeps its source/candidate hold");
+    let mut missing_abandoned_candidate = abandoned;
+    missing_abandoned_candidate.candidate = None;
+    assert!(LandingReport::checked(missing_abandoned_candidate, &intent, Arc::new(())).is_err(),
+        "abandoned publication remains bound to the exact prepared candidate");
     let mut unavailable = prepared.clone();
     unavailable.phase = l::Phase::CheckUnavailable as i32;
     unavailable.roots_retained = false;

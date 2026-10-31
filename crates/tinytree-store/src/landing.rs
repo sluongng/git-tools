@@ -74,6 +74,9 @@ pub enum LandingState {
     #[serde(rename = "Unavail")]
     CheckUnavailable,
     StaleTarget,
+    /// Publication permanently fenced; source/candidate recovery roots persist.
+    #[serde(rename = "Abandon")]
+    PublicationAbandoned,
     Expired,
 }
 impl LandingState {
@@ -91,6 +94,15 @@ pub struct LandingCandidate {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandingCheckIdentity {
+    pub candidate: CommitId,
+    pub root_tree: TreeId,
+    pub profile: LandingCheckProfile,
+}
+/// Exact observed prepared candidate selected by the authenticated owner.
+/// These structural bindings do not assert any checker cleanup or verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandingPublicationBinding {
+    pub job_id: [u8; 32],
     pub candidate: CommitId,
     pub root_tree: TreeId,
     pub profile: LandingCheckProfile,
@@ -239,7 +251,8 @@ struct Record {
 }
 impl Record {
     fn retains_roots(&self) -> bool {
-        self.state.live() || (self.state == LandingState::Committed && !self.roots_released)
+        self.state.live() || self.state == LandingState::PublicationAbandoned
+            || (self.state == LandingState::Committed && !self.roots_released)
     }
 }
 fn limits_record(l: tinytree_landing::Limits) -> [u64; 12] {
@@ -511,8 +524,8 @@ impl Inner {
                 return Err(Error::Corrupt("landing candidate stats"));
             }
         }
-        if (r.state.live() && r.roots_released)
-            || (!r.state.live() && r.state != LandingState::Committed && !r.roots_released)
+        if ((r.state.live() || r.state == LandingState::PublicationAbandoned) && r.roots_released)
+            || (!r.state.live() && !matches!(r.state, LandingState::Committed | LandingState::PublicationAbandoned) && !r.roots_released)
         {
             return Err(Error::Corrupt("landing root policy state"));
         }
@@ -523,7 +536,7 @@ impl Inner {
                     && r.reference.is_none()
                     && r.conflict.is_none()
             }
-            LandingState::Prepared => {
+            LandingState::Prepared | LandingState::PublicationAbandoned => {
                 r.candidate.is_some()
                     && r.check.is_none()
                     && r.reference.is_none()
@@ -686,7 +699,9 @@ impl Inner {
         advance_feature(
             &mut tx,
             &self.spaces.meta,
-            if r.state == LandingState::StaleTarget && r.candidate.is_none() {
+            if r.state == LandingState::PublicationAbandoned {
+                13
+            } else if r.state == LandingState::StaleTarget && r.candidate.is_none() {
                 10
             } else if r.state == LandingState::CheckUnavailable {
                 8
@@ -910,6 +925,9 @@ impl Inner {
                 return Err(Error::Corrupt(
                     "preparation-stale landing without store feature",
                 ));
+            }
+            if record.state == LandingState::PublicationAbandoned && feature < 13 {
+                return Err(Error::Corrupt("abandoned landing without store feature"));
             }
             if record.state == LandingState::CheckUnavailable && feature < 8 {
                 return Err(Error::Corrupt("unavailable landing without store feature"));
@@ -1431,6 +1449,42 @@ impl Store {
         self.inner.commit(tx)?;
         public(id, &r)
     }
+    /// Permanently fence publication of exactly one observed prepared job.
+    /// This is not physical checker cleanup or a verdict. ALL durable landing
+    /// roots remain retained regardless of deadline and checker availability.
+    pub fn abandon_landing_publication(
+        &self,
+        repo: &str,
+        owner: LandingOwner,
+        token: &str,
+        expected: &LandingPublicationBinding,
+    ) -> Result<LandingJob> {
+        request_token(token)?;
+        let id = job_id(repo, owner, token);
+        let gate = self.inner.lock()?;
+        self.inner.repository(repo)?;
+        let mut r = self.inner.landing_record(repo, id)?
+            .ok_or(Error::Invalid("unknown landing job"))?;
+        let c = r.candidate.as_ref().ok_or(Error::Invalid("landing candidate not prepared"))?;
+        if expected.job_id != id || expected.candidate.0 != c.head
+            || expected.root_tree.0 != c.tree || expected.profile != r.intent.profile {
+            return Err(Error::Invalid("landing publication binding"));
+        }
+        if r.state == LandingState::PublicationAbandoned {
+            return public(id, &r);
+        }
+        if r.state != LandingState::Prepared || r.check.is_some()
+            || r.reference.is_some() || r.conflict.is_some() || r.roots_released {
+            return Err(Error::Invalid("landing publication is not prepared"));
+        }
+        self.inner.validate_landing_candidate(repo, &r, &mut 0)?;
+        // Scalar feature 13 implies the earlier durable namespaces. Establish
+        // their layout only; this never dispatches or enables a checker service.
+        self.enable_external_checks_locked(&gate)?;
+        r.state = LandingState::PublicationAbandoned;
+        self.inner.landing_write(repo, id, &r)?;
+        public(id, &r)
+    }
     /// Explicit expiry policy. Committed receipts keep their result while their
     /// recovery roots are retired. Physical owners survive this transition too.
     pub fn expire_landing(
@@ -1448,6 +1502,9 @@ impl Store {
             .inner
             .landing_record(repo, id)?
             .ok_or(Error::Invalid("unknown landing job"))?;
+        if r.state == LandingState::PublicationAbandoned {
+            return public(id, &r);
+        }
         if r.retains_roots() {
             if now < r.intent.expires_at {
                 return Err(Error::Invalid("landing expiry not reached"));
@@ -1595,6 +1652,14 @@ impl LandingHandle {
             now,
         )
     }
+    pub fn abandon_publication(
+        &self,
+        store: &Store,
+        expected: &LandingPublicationBinding,
+    ) -> Result<LandingJob> {
+        self.scope(store)?;
+        store.abandon_landing_publication(&self.repository, self.owner, &self.token, expected)
+    }
     pub fn finalize(&self, store: &Store, now: i64) -> Result<LandingJob> {
         self.scope(store)?;
         store.finalize_landing(&self.repository, self.owner, &self.token, now)
@@ -1740,7 +1805,7 @@ impl Store {
                 .try_into()
                 .map_err(|_| Error::Corrupt("landing scan key"))?;
             let r = self.inner.decode_landing(repo, id, &v)?;
-            if r.retains_roots() {
+            if r.retains_roots() && r.state != LandingState::PublicationAbandoned {
                 let retained = repo.len()
                     + r.intent.token.len()
                     + r.intent.profile.name.len()

@@ -479,7 +479,10 @@ impl LandingHost {
                 .map_err(|_| Status::resource_exhausted("landing work budget exhausted"))
         };
         let call = if rpc { Some(slot(&self.calls)?) } else { None };
-        let heavy = if matches!(method, "StartLanding" | "Prepare") {
+        let heavy = if matches!(
+            method,
+            "StartLanding" | "Prepare" | "AbandonLandingPublication"
+        ) {
             Some(slot(&self.heavy)?)
         } else {
             None
@@ -914,6 +917,7 @@ fn response(
         s::LandingState::StaleTarget => p::Phase::StaleTarget,
         s::LandingState::Expired => p::Phase::Expired,
         s::LandingState::CheckUnavailable => p::Phase::CheckUnavailable,
+        s::LandingState::PublicationAbandoned => p::Phase::PublicationAbandoned,
     };
     let candidate = job.candidate.map(|c| p::Candidate {
         head: c.head.0.to_vec(),
@@ -1152,6 +1156,104 @@ impl p::landing_server::Landing for LandingService {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("checker unavailable"))?;
         checker.recover_once(&repo, expected, attempts, recoveries)?;
+        response(&host, job, work, &repo, &key)
+    }
+    async fn abandon_landing_publication(
+        &self,
+        request: Request<p::AbandonLandingPublicationRequest>,
+    ) -> Result<Response<p::LandingResponse>, Status> {
+        let work = work(&request)?;
+        let identity = self.repository.query_identity(request.metadata())?;
+        let host = self.repository.landing_host();
+        let input = request.into_inner();
+        token(&input.idempotency_key)?;
+        if !profile_name(&input.profile_name)
+            || input.expected_profile_version.is_empty()
+            || input.expected_profile_version.len() > 128
+        {
+            return Err(Status::invalid_argument("invalid landing profile binding"));
+        }
+        if input.expected_attempts != 1
+            || input.expected_recoveries == 0
+            || input.expected_recoveries > 256
+        {
+            return Err(Status::invalid_argument(
+                "invalid publication attempt binding",
+            ));
+        }
+        let binding = s::LandingPublicationBinding {
+            job_id: input
+                .expected_job_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("invalid landing job ID"))?,
+            candidate: commit(&input.candidate_head)?,
+            root_tree: tinytree_model::TreeId(
+                input
+                    .candidate_root_tree
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("invalid candidate tree ID"))?,
+            ),
+            profile: s::LandingCheckProfile {
+                name: input.profile_name.clone(),
+                version: input.expected_profile_version.clone(),
+            },
+        };
+        let owner = host.repository(&work, &identity, &input.repository_id, None)?;
+        let store = host.store.clone();
+        let repo = input.repository_id.clone();
+        let key = input.idempotency_key.clone();
+        let lookup_repo = repo.clone();
+        let lookup_key = key.clone();
+        let job = execute(work.clone(), move || {
+            store
+                .landing_job(&lookup_repo, owner, &lookup_key)
+                .map_err(crate::service::store_status)?
+                .ok_or_else(|| Status::not_found("landing job unavailable"))
+        })
+        .await?;
+        let candidate = job
+            .candidate
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("landing candidate unavailable"))?;
+        if job.id != binding.job_id
+            || job.profile != binding.profile
+            || candidate.head != binding.candidate
+            || candidate.root_tree != binding.root_tree
+        {
+            return Err(Status::failed_precondition(
+                "landing publication binding differs",
+            ));
+        }
+        identity.authorize_landing(&repo, &job.profile.name, &host.config.local_owner_profiles)?;
+        if !host.config.enabled
+            || !host
+                .config
+                .configured(&repo, &job.profile.name, &job.profile.version)
+        {
+            return Err(Status::failed_precondition(
+                "current landing profile unavailable",
+            ));
+        }
+        if job.state == s::LandingState::PublicationAbandoned {
+            return response(&host, job, work, &repo, &key);
+        }
+        let checker = host
+            .checker
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("checker unavailable"))?
+            .clone();
+        let mutation_repo = repo.clone();
+        let job = execute(work.clone(), move || {
+            checker.abandon_publication(
+                &mutation_repo,
+                &binding,
+                input.expected_attempts,
+                input.expected_recoveries,
+            )
+        })
+        .await?;
         response(&host, job, work, &repo, &key)
     }
 }

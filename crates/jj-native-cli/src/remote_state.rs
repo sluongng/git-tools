@@ -134,8 +134,9 @@ pub(crate) fn retained_roots(
     state.validate(&scope(&locator)?)?;
     if state
         .landing
-        .as_ref()
-        .is_some_and(|p| p.operation_writing.is_some())
+        .iter()
+        .chain(&state.archived_landings)
+        .any(|p| p.operation_writing.is_some())
     {
         return Err(io::Error::other(
             "landing operation receipt requires reconciliation before collection",
@@ -153,19 +154,24 @@ pub(crate) fn retained_roots(
             "native sidecar cannot retain an intrinsic commit as a publication target",
         ));
     }
-    // Archived publication replay heads remain protected, but their abandoned
-    // operation files are not active authority after local replay abandonment.
-    // A landing is different: exact source/fork/apply operations are required
-    // until reconciliation, and its saved journal remains a retention input.
+    // Abandoned push replay operations are optional orphan history. Landing
+    // source/fork/apply operations remain mandatory, including publication-only
+    // abandonment archives: none of those retained claims is an applied ACK.
     let active_operations = state
         .pending
         .iter()
         .map(|p| p.base_operation.as_str())
-        .chain(state.landing.iter().flat_map(|p| {
-            std::iter::once(p.source_operation.as_str())
-                .chain(p.fork_operation.as_deref())
-                .chain(p.apply_operation.as_deref())
-        }))
+        .chain(
+            state
+                .landing
+                .iter()
+                .chain(&state.archived_landings)
+                .flat_map(|p| {
+                    std::iter::once(p.source_operation.as_str())
+                        .chain(p.fork_operation.as_deref())
+                        .chain(p.apply_operation.as_deref())
+                }),
+        )
         .map(str::to_owned)
         .collect();
     Ok(Some(RetentionInput {

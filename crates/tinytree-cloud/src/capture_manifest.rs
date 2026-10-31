@@ -227,7 +227,10 @@ fn remote_intents(
 ) -> Result<Vec<c::IntentRoots>> {
     let mut roots = BTreeSet::new();
     if let Some(remote) = &data.remote {
-        if remote.observations.len() > 128 || remote.archived_pushes.len() > 128 {
+        if remote.observations.len() > 128
+            || remote.archived_pushes.len() > 128
+            || remote.archived_landings.len() > 128
+        {
             return Err(limit());
         }
         for head in remote
@@ -252,7 +255,7 @@ fn remote_intents(
             }
         }
     }
-    if let Some(landing) = data.remote.as_ref().and_then(|r| r.landing.as_ref()) {
+    for landing in data.remote.iter().flat_map(|remote| remote.landings()) {
         for head in landing.retained_commit_heads() {
             budget.work(1)?;
             let id = hex::<32>(head)?;
@@ -789,7 +792,7 @@ pub fn verify_capture_export_binding<'a>(
         CaptureCompatibility::None
     };
     let mut index_acknowledgement = None;
-    if let Some(landing) = data.remote.as_ref().and_then(|r| r.landing.as_ref()) {
+    for landing in data.remote.iter().flat_map(|remote| remote.landings()) {
         // Capsule fields are historical data; these checks bind their local
         // recovery claims to the independently decoded immutable OP inventory.
         for (operation, phase) in [
@@ -1432,6 +1435,7 @@ mod tests {
                 })
                 .collect(),
             remote: remote.then(|| c::PortableRemoteState {
+                archived_landings: vec![],
                 landing: None,
                 observations: vec![c::RemoteObservation {
                     reference: "refs/heads/main".into(),
@@ -1898,6 +1902,7 @@ mod tests {
             };
             data.version = 2;
             data.remote = Some(c::PortableRemoteState {
+                archived_landings: vec![],
                 observations: vec![],
                 archived_pushes: vec![],
                 landing: Some(c::PortableLanding {

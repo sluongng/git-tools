@@ -3413,7 +3413,7 @@ impl Worker {
                     .is_some_and(|n| n <= self.policy.max_memory_bytes),
                 "capture DATA decode memory unavailable"
             );
-            let landing = {
+            let landings = {
                 let data = c::decode_data(
                     &intent.capture,
                     decoded.capture.id.0,
@@ -3424,22 +3424,32 @@ impl Worker {
                 )?;
                 // Destructuring inside this scope physically drops all OP,
                 // index/blob/root inventories before background transfer starts.
-                // Only the separately bounded landing DTO escapes.
+                // Only the separately bounded current/history landing DTOs escape.
                 let c::CaptureData { remote, .. } = data;
-                remote.and_then(|r| r.landing)
+                let mut landings = Vec::new();
+                if let Some(remote) = remote {
+                    ensure!(
+                        remote.archived_landings.len() <= 128,
+                        "capture archived landing count bound"
+                    );
+                    landings.extend(remote.landing);
+                    landings.extend(remote.archived_landings);
+                }
+                ensure!(landings.len() <= 129, "capture landing count bound");
+                landings
             };
             let transfer = jj_native_remote::NativeTransferLimits {
                 max_memory_bytes: transfer
                     .max_memory_bytes
-                    .checked_sub(if landing.is_some() {
-                        c::PortableLanding::MAX_WORKING_BYTES as u64
-                    } else {
-                        0
-                    })
+                    .checked_sub(
+                        (c::PortableLanding::MAX_WORKING_BYTES as u64)
+                            .checked_mul(landings.len() as u64)
+                            .context("capture landing DTO charge overflow")?,
+                    )
                     .context("capture landing DTO memory unavailable")?,
                 ..transfer
             };
-            if landing.is_some() {
+            if !landings.is_empty() {
                 let capabilities = client
                     .capabilities(&[tinytree_client::CapabilityFeature::LandingRecoveryCloudWrite])
                     .await?;
@@ -3452,12 +3462,12 @@ impl Worker {
             }
 
             progress.at("native_frontier");
-            let receipt = if automatic || landing.is_some() {
+            let receipt = if automatic || !landings.is_empty() {
                 source
                     .control
-                    .transfer_native_capture_frontier_with_landing(
+                    .transfer_native_capture_frontier_with_landings(
                         roots,
-                        landing,
+                        landings,
                         owner.clone(),
                         transfer,
                         deadline,
@@ -3974,7 +3984,8 @@ impl Worker {
         owner: Owner,
         reserved: u64,
     ) -> Result<[u8; 32]> {
-        let reserved = reserved.checked_add(intent.original_manifest.as_ref().map_or(0, Vec::len) as u64)
+        let reserved = reserved
+            .checked_add(intent.original_manifest.as_ref().map_or(0, Vec::len) as u64)
             .context("capture original manifest charge overflow")?;
         let (objects, artifacts, roots, capture) = self.proofs_reserved(ticket, owner, reserved)?;
         ensure!(capture == intent.capture, "saved capture DATA differs");
@@ -4663,6 +4674,7 @@ max_manifest_members=1024
             if number == 0 {
                 if let Some(head) = dropped_head {
                     data.remote = Some(c::PortableRemoteState {
+                        archived_landings: vec![],
                         observations: vec![c::RemoteObservation {
                             reference: "heads/main".into(),
                             bookmark: "main".into(),
@@ -6641,8 +6653,7 @@ max_manifest_members=1024
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scheduled_retained_offload_uses_pins_without_the_legacy_contract() -> Result<()>
-    {
+    async fn scheduled_retained_offload_uses_pins_without_the_legacy_contract() -> Result<()> {
         let f = saved_uploads_with_roots_and_collection(1, true, None, false, true, false, false)
             .await?;
         // Durable source pins protect offload independently of the legacy contract.

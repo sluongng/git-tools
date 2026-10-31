@@ -948,9 +948,106 @@ mod tests {
             )
             .await
             .unwrap();
+            // A detached operation retained ONLY by an abandoned landing is
+            // mandatory, not an optional young/orphan operation file.
+            let op_store = workspace.repo_loader().op_store();
+            let simple = op_store.downcast_ref::<SimpleOpStore>().unwrap();
+            let mut archived_op = simple
+                .read_operation_bounded(
+                    workspace.working_copy().operation_id(),
+                    4 * 1024 * 1024,
+                    128 * 1024 * 1024,
+                )
+                .unwrap();
+            archived_op.metadata.description = "archived publication source".into();
+            let archived_op = op_store.write_operation(&archived_op).await.unwrap();
+            let locator = crate::broker::Locator::new(
+                directory.path().join("fixture.sock"),
+                "fixture".into(),
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.repo_path().join("store/native-broker.toml"),
+                toml::to_string(&locator).unwrap(),
+            )
+            .unwrap();
+            let scope = native_workspace_admin::remote_state::RemoteScope::new(
+                locator.socket.clone(),
+                locator.store.clone(),
+            )
+            .unwrap();
+            let mut remote = native_workspace_admin::remote_state::State::new(&scope);
+            remote
+                .begin_landing(tinytree_cloud::PortableLanding {
+                    request_id: "12".repeat(16),
+                    source_base: "00".repeat(32),
+                    source_head: "13".repeat(32),
+                    reference: "main".into(),
+                    bookmark: "main".into(),
+                    generation: 1,
+                    expected_head: "14".repeat(32),
+                    profile_name: "checks".into(),
+                    profile_version: "v1".into(),
+                    source_operation: archived_op.hex(),
+                    source_stack: vec!["13".repeat(32)],
+                    fork_operation: Some(archived_op.hex()),
+                    fork_acknowledged: true,
+                    job_id: Some("17".repeat(32)),
+                    result_roots: vec!["18".repeat(32)],
+                    candidate_head: Some("18".repeat(32)),
+                    apply_operation: None,
+                    operation_writing: None,
+                    acknowledged: false,
+                    terminal: Some("publication_abandoned".into()),
+                    restored_lookup_only: false,
+                    observed: Some(tinytree_cloud::HistoricalLandingJob {
+                        job_id: [0x17; 32],
+                        phase: tinytree_cloud::HistoricalLandingPhase::PublicationAbandoned,
+                        preparation:
+                            tinytree_cloud::HistoricalLandingPreparation::ProfileConfigured,
+                        roots_retained: true,
+                        expires_at_seconds: 1,
+                        profile_name: "checks".into(),
+                        profile_version: "v1".into(),
+                        candidate: Some(tinytree_cloud::HistoricalLandingCandidate {
+                            head: [0x18; 32],
+                            root_tree: [0x20; 32],
+                            rewrites: vec![tinytree_cloud::HistoricalLandingRewrite {
+                                old_commit: [0x13; 32],
+                                new_commit: [0x18; 32],
+                                change_id: [0x21; 16],
+                            }],
+                        }),
+                        receipt: None,
+                        conflict_path: None,
+                    }),
+                })
+                .unwrap();
+            remote.archive_abandoned_landing().unwrap();
+            remote.validate(&scope).unwrap();
+            let wc_state = workspace
+                .working_copy()
+                .downcast_ref::<LocalWorkingCopy>()
+                .unwrap()
+                .state_path();
+            std::fs::write(
+                wc_state.join("native-remote.toml"),
+                toml::to_string(&remote).unwrap(),
+            )
+            .unwrap();
             let original = collect(&workspace, &CollectorLimits::default())
                 .await
                 .unwrap();
+            assert!(original.intent_operations.contains(&archived_op));
+            assert!(!original.operation_heads.contains(&archived_op));
+            for id in [[0x13; 32], [0x18; 32]] {
+                assert!(
+                    original
+                        .object_roots
+                        .iter()
+                        .any(|root| root.kind == Kind::Commit && root.id.0 == id)
+                );
+            }
             let root = workspace
                 .repo_loader()
                 .op_store()
@@ -1000,6 +1097,7 @@ mod tests {
                 .unwrap()
                 .state_path()
                 .join("tree_state");
+            let tree_state = std::fs::read(&state_path).unwrap();
             std::fs::remove_file(&state_path).unwrap();
             assert!(
                 collect(&workspace, &CollectorLimits::default())
@@ -1009,6 +1107,26 @@ mod tests {
             assert!(
                 !state_path.exists(),
                 "read-only audit must not reinitialize missing WC state"
+            );
+            std::fs::write(&state_path, tree_state).unwrap();
+            let archived_path = workspace
+                .repo_path()
+                .join("op_store/operations")
+                .join(archived_op.hex());
+            std::fs::remove_file(&archived_path).unwrap();
+            let error = collect(&workspace, &CollectorLimits::default())
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("required operation is unavailable"),
+                "missing archived-only operation must fail closed: {error}"
+            );
+            assert!(
+                !archived_path.exists(),
+                "inventory must not synthesize missing operation authority"
             );
         });
     }

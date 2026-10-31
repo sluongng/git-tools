@@ -44,10 +44,16 @@ impl Service<http::Request<Body>> for LandingGrpcService {
                     "/tinytree.landing.v1.Landing/StartLanding" => "StartLanding",
                     "/tinytree.landing.v1.Landing/GetLanding" => "GetLanding",
                     "/tinytree.landing.v1.Landing/RecoverLanding" => "RecoverLanding",
+                    "/tinytree.landing.v1.Landing/AbandonLandingPublication" => {
+                        "AbandonLandingPublication"
+                    }
                     _ => return Err(Status::unimplemented("unknown landing method")),
                 };
                 let host = repository.landing_host();
-                if matches!(method, "StartLanding" | "RecoverLanding") {
+                if matches!(
+                    method,
+                    "StartLanding" | "RecoverLanding" | "AbandonLandingPublication"
+                ) {
                     if !host.config.enabled {
                         return Err(Status::unavailable("landing preparation is disabled"));
                     }
@@ -302,15 +308,21 @@ mod tests {
     async fn landing_auth_grants_and_compressed_wire_bounds_precede_protobuf() {
         let directory = tempfile::tempdir().unwrap();
         let (service, _, input) = service(directory.path());
-        for (token, expected) in [(None, "16"), (Some(NATIVE), "7")] {
-            let (request, polls) = request("StartLanding", token, frame(&input));
-            let response = service
-                .landing_grpc_service()
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(status(response).await, expected);
-            assert_eq!(polls.load(Ordering::SeqCst), 0);
+        for method in [
+            "StartLanding",
+            "RecoverLanding",
+            "AbandonLandingPublication",
+        ] {
+            for (token, expected) in [(None, "16"), (Some(NATIVE), "7")] {
+                let (request, polls) = request(method, token, frame(&input));
+                let response = service
+                    .landing_grpc_service()
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(status(response).await, expected, "{method}");
+                assert_eq!(polls.load(Ordering::SeqCst), 0, "{method}");
+            }
         }
         let mut oversized = vec![0];
         oversized.extend_from_slice(
@@ -380,12 +392,15 @@ mod tests {
         waiter.abort();
         let _ = waiter.await;
         assert_eq!(host.active_jobs(), 1);
-        let (rpc, polls) = request("StartLanding", Some(WRITER), frame(&input));
-        assert_eq!(
-            status(service.landing_grpc_service().oneshot(rpc).await.unwrap()).await,
-            "8"
-        );
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        for method in ["StartLanding", "AbandonLandingPublication"] {
+            let (rpc, polls) = request(method, Some(WRITER), frame(&input));
+            assert_eq!(
+                status(service.landing_grpc_service().oneshot(rpc).await.unwrap()).await,
+                "8",
+                "{method} must share heavy admission before polling a body"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+        }
         let get = p::GetLandingRequest {
             repository_id: "example".into(),
             idempotency_key: "cancel".into(),

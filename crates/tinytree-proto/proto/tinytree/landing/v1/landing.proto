@@ -8,6 +8,7 @@ service Landing {
   rpc StartLanding(StartLandingRequest) returns (LandingResponse);
   rpc GetLanding(GetLandingRequest) returns (LandingResponse);
   rpc RecoverLanding(RecoverLandingRequest) returns (LandingResponse);
+  rpc AbandonLandingPublication(AbandonLandingPublicationRequest) returns (LandingResponse);
 }
 message StartLandingRequest {
   string repository_id = 1;
@@ -34,6 +35,19 @@ message RecoverLandingRequest {
   uint32 expected_attempts = 4;
   uint32 expected_recoveries = 5;
 }
+// Irreversibly fence publication of an inactive uncertain first attempt.
+// This neither asserts cleanup nor releases durable source/candidate roots.
+message AbandonLandingPublicationRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+  bytes expected_job_id = 3;
+  uint32 expected_attempts = 4;
+  uint32 expected_recoveries = 5;
+  bytes candidate_head = 6;
+  bytes candidate_root_tree = 7;
+  string profile_name = 8;
+  string expected_profile_version = 9;
+}
 message LandingResponse {
   LandingJob job = 1;
   string repository_id = 2;
@@ -52,6 +66,8 @@ enum Phase {
   EXPIRED = 9;
   // Trusted checks permanently stopped without a verdict. No publication receipt.
   CHECK_UNAVAILABLE = 10;
+  // Publication is terminally disabled; uncertain custody remains retained.
+  PUBLICATION_ABANDONED = 11;
 }
 enum PreparationAvailability {
   PREPARATION_UNSPECIFIED = 0;

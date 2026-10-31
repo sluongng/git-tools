@@ -1013,7 +1013,8 @@ fn verify_semantics(
                 &roots,
             )?;
         }
-        if let Some(landing) = &remote.landing {
+        c::validate_archived_landings(&remote.archived_landings)?;
+        for landing in remote.landings() {
             landing.validate()?;
             for op in landing.retained_operations() {
                 ensure!(

@@ -194,15 +194,16 @@ impl RemoteRepositoryControl {
     async fn fresh_landing_capture_keys(
         &self,
         roots: &[m::ObjectKey],
-        landing: Option<&tinytree_cloud::PortableLanding>,
+        intent: &tinytree_cloud::PortableLanding,
+        metadata_bytes: &mut usize,
         owner: Owner,
         limits: &NativeTransferLimits,
         deadline: Instant,
     ) -> Result<HashSet<m::ObjectKey>> {
         let mut keys = HashSet::new();
-        let Some(intent) = landing.filter(|p| !p.result_roots.is_empty()) else {
+        if intent.result_roots.is_empty() {
             return Ok(keys);
-        };
+        }
         intent.validate()?;
         ensure!(
             intent.result_roots.len() <= 256 && intent.result_roots.len() <= limits.max_roots,
@@ -247,7 +248,6 @@ impl RemoteRepositoryControl {
                 && intent.candidate_head.as_deref() == Some(crate::hex(&candidate.head.0).as_str()),
             "capture landing candidate identity differs"
         );
-        let mut total = 0usize;
         for id in expected {
             io::check_deadline()?;
             let key = m::ObjectKey {
@@ -265,7 +265,7 @@ impl RemoteRepositoryControl {
                 _ => anyhow::bail!("landing canonical COMMIT unavailable"),
             };
             let descriptor = value.descriptor();
-            total = total
+            *metadata_bytes = metadata_bytes
                 .checked_add(
                     value
                         .canonical_bytes()
@@ -275,7 +275,7 @@ impl RemoteRepositoryControl {
                 )
                 .context("landing capture bytes overflow")?;
             ensure!(
-                total <= limits.closure.max_metadata_bytes,
+                *metadata_bytes <= limits.closure.max_metadata_bytes,
                 "landing capture metadata budget"
             );
             let m::Object::Commit(commit) = value.object() else {
@@ -321,7 +321,7 @@ impl RemoteRepositoryControl {
     pub(crate) async fn capture_boundaries(
         &self,
         roots: &[m::ObjectKey],
-        landing: Option<&tinytree_cloud::PortableLanding>,
+        landings: &[tinytree_cloud::PortableLanding],
         owner: Owner,
         limits: &NativeTransferLimits,
         originaldeadline: Instant,
@@ -350,11 +350,31 @@ impl RemoteRepositoryControl {
         );
         // Complete the temporary landing codec phase before retaining normal
         // boundary catalogs. The lookup pool never overlaps catalog/graph work.
-        let mut keys = self
-            .fresh_landing_capture_keys(roots, landing, owner.clone(), limits, deadline)
-            .await?;
-        for _ in &keys {
-            budget.charge(4 * std::mem::size_of::<m::ObjectKey>() + 64)?;
+        ensure!(landings.len() <= 129, "capture landing count bound");
+        let mut keys = HashSet::new();
+        let mut metadata_bytes = 0usize;
+        for intent in landings {
+            io::check_deadline()?;
+            let imported = self
+                .fresh_landing_capture_keys(
+                    roots,
+                    intent,
+                    &mut metadata_bytes,
+                    owner.clone(),
+                    limits,
+                    deadline,
+                )
+                .await?;
+            for key in imported {
+                if !keys.contains(&key) {
+                    ensure!(
+                        keys.len() < limits.max_roots && keys.len() < limits.closure.max_objects,
+                        "capture landing aggregate root bound"
+                    );
+                    budget.charge(4 * std::mem::size_of::<m::ObjectKey>() + 64)?;
+                    keys.insert(key);
+                }
+            }
         }
         let ledger = self.inner.ledger.clone();
         let max_count = limits.closure.max_objects;

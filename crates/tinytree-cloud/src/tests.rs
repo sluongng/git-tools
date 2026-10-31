@@ -1750,6 +1750,7 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
         }],
         roots: vec![],
         remote: Some(PortableRemoteState {
+                archived_landings: vec![],
             landing: None,
             observations: vec![],
             archived_pushes: vec![ArchivedIntent {
@@ -1963,6 +1964,22 @@ fn capture_data_is_bounded_portable_data_not_frontend_authority() {
             "{name}"
         );
     }
+    let mut abandoned = landing.clone();
+    abandoned.terminal = Some("publication_abandoned".into());
+    abandoned.candidate_head = Some("18".repeat(32));
+    abandoned.result_roots = vec!["18".repeat(32)];
+    abandoned.observed = Some(HistoricalLandingJob {
+        job_id:[23;32], phase:HistoricalLandingPhase::PublicationAbandoned,
+        preparation:HistoricalLandingPreparation::ProfileConfigured, roots_retained:true,
+        expires_at_seconds:12345,profile_name:"checks".into(),profile_version:"v1".into(),
+        candidate:Some(candidate),receipt:None,conflict_path:None,
+    });
+    let mut retained_data=data.clone();
+    let remote=retained_data.remote.as_mut().unwrap(); remote.landing=None; remote.archived_landings=vec![abandoned];
+    let retained_bytes=encode_capture_data(&retained_data,limits).unwrap();
+    assert_eq!(decode_data(&retained_bytes,data_digest(&retained_bytes),&limits).unwrap(),retained_data,"archived abandoned claims survive canonical capture encoding without an active intent");
+    retained_data.remote.as_mut().unwrap().archived_landings[0].observed.as_mut().unwrap().roots_retained=false;
+    assert!(encode_capture_data(&retained_data,limits).is_err(),"abandonment may not masquerade as released roots");
     let mut forged = data.clone();
     forged
         .remote

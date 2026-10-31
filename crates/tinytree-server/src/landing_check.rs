@@ -908,6 +908,66 @@ impl CheckerHost {
         }));
         true
     }
+    pub(crate) fn abandon_publication(
+        &self,
+        repo: &str,
+        expected: &s::LandingPublicationBinding,
+        attempts: u32,
+        recoveries: u32,
+    ) -> Result<s::LandingJob, tonic::Status> {
+        use tonic::Status;
+        if attempts != 1 || recoveries == 0 || recoveries > 256 {
+            return Err(Status::invalid_argument(
+                "invalid publication attempt binding",
+            ));
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("checker service is draining"));
+        }
+        // Same lock ordering as apply_verified: the Store CAS is the only
+        // durable publication fence; the uncertain physical record is untouched.
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Status::unavailable("checker admission unavailable"))?;
+        let handle = self
+            .store
+            .recover_landing_handle(repo, expected.job_id)
+            .map_err(crate::service::store_status)?
+            .ok_or_else(|| Status::not_found("landing job unavailable"))?;
+        let job = handle
+            .status(&self.store)
+            .map_err(crate::service::store_status)?;
+        if job.state == s::LandingState::PublicationAbandoned {
+            return handle
+                .abandon_publication(&self.store, expected)
+                .map_err(crate::service::store_status);
+        }
+        let slot = state
+            .slots
+            .get(&(repo.to_owned(), expected.job_id))
+            .ok_or_else(|| Status::failed_precondition("saved checker attempt unavailable"))?;
+        if self.policy.max_attempts != 1
+            || slot.active
+            || !slot.record.uncertain()
+            || slot.record.attempts != attempts as usize
+            || slot.record.recoveries != recoveries as usize
+            || slot.record.recoveries < self.policy.max_recovery_attempts
+            || slot.record.job != expected.job_id
+            || slot.record.repository != repo
+            || slot.record.request.candidate_commit != id(expected.candidate.0)
+            || slot.record.request.root_tree != id(expected.root_tree.0)
+            || slot.record.request.profile_name != expected.profile.name
+            || slot.record.request.profile_version != expected.profile.version
+        {
+            return Err(Status::failed_precondition(
+                "checker publication binding unavailable",
+            ));
+        }
+        handle
+            .abandon_publication(&self.store, expected)
+            .map_err(crate::service::store_status)
+    }
     pub(crate) fn recover_once(
         self: &Arc<Self>,
         repo: &str,
@@ -1022,19 +1082,28 @@ impl CheckerHost {
                         .find(|(key, slot)| {
                             !slot.active
                                 && !slot.record.uncertain()
-                                && (slot.record.phase == Phase::UnavailableReady
-                                    || (slot.record.phase == Phase::Terminal
-                                        && slot.record.version == 1
+                                && (slot.record.phase == Phase::Verified
+                                    || slot.record.phase == Phase::UnavailableReady
+                                    || (matches!(
+                                        slot.record.phase,
+                                        Phase::RetryReady | Phase::Terminal
+                                    ) && slot.record.version == 1
                                         && slot.record.safe_unavailable()))
                                 && unavailable_after.as_ref().is_none_or(|after| *key > after)
                         })
-                        .map(|(key, _)| key.clone())
+                        .map(|(key, slot)| (key.clone(), slot.record.phase == Phase::Verified))
                 });
-                if let Some(key) = unavailable {
+                if let Some((key, verified)) = unavailable {
                     let selected = key.clone();
                     let owned = host.clone();
-                    let _ = tokio::task::spawn_blocking(move || owned.apply_unavailable(&selected))
-                        .await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if verified {
+                            owned.apply_verified(&selected)
+                        } else {
+                            owned.apply_unavailable(&selected)
+                        }
+                    })
+                    .await;
                     unavailable_after = Some(key);
                 } else {
                     unavailable_after = None;
@@ -1591,7 +1660,10 @@ impl CheckerHost {
             "saved unavailable checker binding differs"
         );
         if !saved.safe_unavailable()
-            || !matches!(saved.phase, Phase::Terminal | Phase::UnavailableReady)
+            || !matches!(
+                saved.phase,
+                Phase::RetryReady | Phase::Terminal | Phase::UnavailableReady
+            )
             || (saved.phase == Phase::Terminal && saved.version == 2)
         {
             return Ok(());
@@ -1613,6 +1685,18 @@ impl CheckerHost {
                 && job.profile.version == saved.request.profile_version,
             "unavailable checker job binding differs"
         );
+        if job.state == s::LandingState::PublicationAbandoned {
+            slot.record = saved;
+            slot.record.version = 2;
+            slot.record.unavailable_reason = Some(UnavailableReason::PermanentUnavailability);
+            slot.record.phase = Phase::Terminal;
+            slot.root = None;
+            Self::save(slot)?;
+            return Ok(());
+        }
+        if saved.phase == Phase::RetryReady {
+            return Ok(()); // Ordinary jobs retain their existing retry policy.
+        }
         if !matches!(
             job.state,
             s::LandingState::Prepared
@@ -1649,9 +1733,6 @@ impl CheckerHost {
         Ok(())
     }
     fn apply_verified(&self, key: &Key) -> Result<()> {
-        if !self.landing_enabled {
-            return Ok(());
-        }
         let owner = self
             .admission
             .lock()
@@ -1671,9 +1752,10 @@ impl CheckerHost {
         if slot.record.phase != Phase::Verified || self.closing.load(Ordering::Acquire) {
             return Ok(());
         }
-        let Some(handle) = slot.handle.as_ref() else {
-            return Ok(());
-        };
+        let handle = self
+            .store
+            .recover_landing_handle(&key.0, key.1)?
+            .context("verified landing job disappeared")?;
         ensure!(
             slot.record.verdict_eligible,
             "checker verdict is not transport eligible"
@@ -1697,6 +1779,15 @@ impl CheckerHost {
                 && job.profile.version == slot.record.request.profile_version,
             "verified job binding differs"
         );
+        if job.state == s::LandingState::PublicationAbandoned {
+            slot.record.phase = Phase::Terminal;
+            slot.root = None;
+            Self::save(slot)?;
+            return Ok(());
+        }
+        if !self.landing_enabled {
+            return Ok(());
+        }
         if job.expires_at <= now()? {
             handle.expire(&self.store, now()?)?;
             slot.record.phase = Phase::Terminal;

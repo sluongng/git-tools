@@ -1111,7 +1111,7 @@ impl Store {
                     LandingState::CheckFailed | LandingState::CheckUnavailable => {
                         ForgeReviewState::CheckFailed
                     }
-                    LandingState::StaleTarget => ForgeReviewState::Stale,
+                    LandingState::StaleTarget | LandingState::PublicationAbandoned => ForgeReviewState::Stale,
                     LandingState::Expired => ForgeReviewState::Expired,
                 };
                 if !current_target && state != ForgeReviewState::Landed {

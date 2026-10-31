@@ -59,6 +59,18 @@ pub(super) fn decode_record(row: &[u8]) -> Result<CaptureRecord> {
 /// classifies untrusted historical data; it never creates landing authority.
 pub(super) fn minimum_store_feature(data: &tinytree_cloud::CaptureData) -> u8 {
     if data.version == 2 {
+        if data.remote.as_ref().is_some_and(|remote| {
+            !remote.archived_landings.is_empty()
+                || remote
+                    .landing
+                    .as_ref()
+                    .and_then(|landing| landing.observed.as_ref())
+                    .is_some_and(|job| {
+                        job.phase == tinytree_cloud::HistoricalLandingPhase::PublicationAbandoned
+                    })
+        }) {
+            return 13;
+        }
         if data
             .remote
             .as_ref()

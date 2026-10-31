@@ -165,6 +165,7 @@ fn checked(job: &l::LandingJob, intent: &LandingIntent) -> Result<(), Status> {
                 | P::Committed
                 | P::CheckFailed
                 | P::CheckUnavailable
+                | P::PublicationAbandoned
         ) && job.candidate.is_none()
         || matches!(phase, P::Intent | P::Conflict | P::Unsupported) && job.candidate.is_some()
     {
@@ -174,7 +175,9 @@ fn checked(job: &l::LandingJob, intent: &LandingIntent) -> Result<(), Status> {
     let conflict = job.conflict_path.is_some();
     let valid = match phase {
         P::Intent => !has && !conflict && job.roots_retained,
-        P::PreparedPendingChecks | P::Checked => has && !conflict && job.roots_retained,
+        P::PreparedPendingChecks | P::Checked | P::PublicationAbandoned => {
+            has && !conflict && job.roots_retained
+        }
         P::Committed => has && !conflict,
         P::Conflict => !has && conflict && !job.roots_retained,
         P::Unsupported => !has && !conflict && !job.roots_retained,

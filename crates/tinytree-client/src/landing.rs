@@ -113,6 +113,18 @@ pub enum LandingPhase {
     CheckUnavailable,
     StaleTarget,
     Expired,
+    /// Publication is terminally disabled; this asserts neither execution nor cleanup.
+    PublicationAbandoned,
+}
+/// Explicit publication-only cancellation, bound to one saved candidate and
+/// observed checker counters. This is not process cancellation or a verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandingPublicationCancellation {
+    pub job_id: [u8; 32],
+    pub candidate: CommitId,
+    pub root_tree: TreeId,
+    pub expected_attempts: u32,
+    pub expected_recoveries: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LandingPreparation {
@@ -313,6 +325,7 @@ fn checked(
         l::Phase::CheckUnavailable => LandingPhase::CheckUnavailable,
         l::Phase::StaleTarget => LandingPhase::StaleTarget,
         l::Phase::Expired => LandingPhase::Expired,
+        l::Phase::PublicationAbandoned => LandingPhase::PublicationAbandoned,
         _ => return Err(bad()),
     };
     let preparation = match l::PreparationAvailability::try_from(job.preparation)
@@ -399,9 +412,9 @@ fn checked(
     let conflict = job.conflict_path.is_some();
     let valid = match phase {
         LandingPhase::Intent => !has && !received && !conflict && job.roots_retained,
-        LandingPhase::PreparedPendingChecks | LandingPhase::Checked => {
-            has && !received && !conflict && job.roots_retained
-        }
+        LandingPhase::PreparedPendingChecks
+        | LandingPhase::Checked
+        | LandingPhase::PublicationAbandoned => has && !received && !conflict && job.roots_retained,
         LandingPhase::Committed => has && received && !conflict,
         LandingPhase::Conflict => !has && !received && conflict && !job.roots_retained,
         LandingPhase::Unsupported => !has && !received && !conflict && !job.roots_retained,
@@ -656,6 +669,65 @@ impl NativeClient {
         let limits = self.inner.config.landing.clone();
         blocking_owned(deadline, budget, None, move || {
             checked(wire, None, binding, memory, limits, Some(expected_id))
+        })
+        .await
+    }
+    /// Disable publication of this exact uncertain attempt. No execution,
+    /// teardown, Passed result or release of retained roots is implied.
+    pub async fn abandon_landing_publication(
+        &self,
+        start: &LandingStart,
+        cancel: &LandingPublicationCancellation,
+    ) -> Result<CheckedLandingJob, Status> {
+        start.validate()?;
+        if cancel.job_id == [0; 32]
+            || cancel.candidate == CommitId::ROOT
+            || cancel.root_tree.0 == [0; 32]
+            || cancel.expected_attempts != 1
+            || cancel.expected_recoveries > 256
+        {
+            return Err(Status::invalid_argument(
+                "invalid publication abandonment binding",
+            ));
+        }
+        let deadline = self.deadline();
+        let memory = self.landing_retained()?;
+        let binding = Arc::new(IntentBinding {
+            start: start.clone(),
+            repository: self.inner.config.repository_id.clone(),
+            client: Arc::downgrade(&self.inner),
+            _memory: memory.clone(),
+        });
+        let expected = cancel.clone();
+        let (wire, budget) = self
+            .landing_call(
+                deadline,
+                "/tinytree.landing.v1.Landing/AbandonLandingPublication",
+                || l::AbandonLandingPublicationRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    idempotency_key: start.idempotency_key.clone(),
+                    expected_job_id: cancel.job_id.to_vec(),
+                    expected_attempts: cancel.expected_attempts,
+                    expected_recoveries: cancel.expected_recoveries,
+                    candidate_head: cancel.candidate.0.to_vec(),
+                    candidate_root_tree: cancel.root_tree.0.to_vec(),
+                    profile_name: start.profile_name.clone(),
+                    expected_profile_version: start.expected_profile_version.clone(),
+                },
+            )
+            .await?;
+        let limits = self.inner.config.landing.clone();
+        blocking_owned(deadline, budget, None, move || {
+            let job = checked(wire, None, binding, memory, limits, Some(expected.job_id))?;
+            if job.phase() != LandingPhase::PublicationAbandoned
+                || job.candidate().is_none_or(|candidate| {
+                    candidate.head != expected.candidate
+                        || candidate.root_tree != expected.root_tree
+                })
+            {
+                return Err(bad());
+            }
+            Ok(job)
         })
         .await
     }

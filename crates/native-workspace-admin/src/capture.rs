@@ -1404,6 +1404,7 @@ async fn read_inventory(
             operations: operations.into_values().collect(),
             roots: roots.into_iter().collect(),
             remote: remote.as_ref().map(|(state, _)| PortableRemoteState {
+                archived_landings: state.archived_landings.clone(),
                 observations: state
                     .observations
                     .iter()
@@ -1456,7 +1457,10 @@ async fn read_inventory(
     }
     let exported = exported.context("portable capture requires native index export")?;
     let data = CaptureData {
-        version: if remote.as_ref().is_some_and(|(s, _)| s.landing.is_some()) {
+        version: if remote
+            .as_ref()
+            .is_some_and(|(s, _)| s.landing.is_some() || !s.archived_landings.is_empty())
+        {
             2
         } else {
             1
@@ -1490,6 +1494,7 @@ async fn read_inventory(
         blobs: blobs.into_values().collect(),
         roots: roots.into_iter().collect(),
         remote: remote.as_ref().map(|(state, _)| PortableRemoteState {
+            archived_landings: state.archived_landings.clone(),
             landing: state.landing.clone(),
             observations: state
                 .observations

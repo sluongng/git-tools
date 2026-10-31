@@ -284,6 +284,16 @@ mod native {
                             job.checker_progress.as_ref(),
                         );
                     }
+                    if phase == l::Phase::PublicationAbandoned {
+                        record_job(&mut locked, job)?;
+                        return print(
+                            ui,
+                            locked.state.landing.as_ref().unwrap(),
+                            "publication_abandoned",
+                            job.candidate.as_ref().map(|c| c.head.as_slice()),
+                            job.checker_progress.as_ref(),
+                        );
+                    }
                     let phase = if nonapplicable_phase(phase) {
                         settle_restored_terminal(command, &mut locked, &report).await?
                     } else {
@@ -385,6 +395,10 @@ mod native {
                 let phase = verify_original_report(&previous, &report)?;
                 if previous.acknowledged && phase == l::Phase::Committed {
                     classify_acknowledged_claims(command, &mut locked, report.job()).await?;
+                } else if phase == l::Phase::PublicationAbandoned {
+                    record_job(&mut locked, report.job())?;
+                    locked.state.archive_abandoned_landing().map_err(fail)?;
+                    locked.save().map_err(fail)?;
                 } else if nonapplicable_phase(phase) {
                     settle_restored_terminal(command, &mut locked, &report).await?;
                 } else {
@@ -481,6 +495,24 @@ mod native {
             .landing
             .clone()
             .ok_or_else(|| fail("no landing intent exists"))?;
+        if args.resume {
+            let control = client(&locator, loader.repo_path()).await?;
+            let report = control
+                .landing(wire(&pending)?, false)
+                .await
+                .map_err(fail)?;
+            let phase = verify_original_report(&pending, &report)?;
+            if phase == l::Phase::PublicationAbandoned {
+                record_job(&mut locked, report.job())?;
+                return print(
+                    ui,
+                    locked.state.landing.as_ref().unwrap(),
+                    "publication_abandoned",
+                    report.job().candidate.as_ref().map(|c| c.head.as_slice()),
+                    report.job().checker_progress.as_ref(),
+                );
+            }
+        }
         if pending.acknowledged {
             if !args.status || pending.candidate_head.is_some() || !pending.result_roots.is_empty()
             {
@@ -555,10 +587,17 @@ mod native {
             l::Phase::CheckUnavailable => Some("check_unavailable"),
             l::Phase::StaleTarget => Some("stale_target"),
             l::Phase::Expired => Some("expired"),
+            l::Phase::PublicationAbandoned => Some("publication_abandoned"),
             _ => None,
         }
         .map(str::to_owned);
-        if saved.terminal.is_some() {
+        if phase == l::Phase::PublicationAbandoned {
+            if !job.roots_retained || saved.apply_operation.is_some() || saved.acknowledged {
+                return Err(fail(
+                    "publication abandonment contradicts retained source or local apply; state preserved",
+                ));
+            }
+        } else if saved.terminal.is_some() {
             if job.roots_retained || saved.apply_operation.is_some() {
                 return Err(fail(
                     "reconciliation_required: terminal result contradicts a retained apply operation; state preserved",
@@ -2396,6 +2435,7 @@ mod native {
             l::Phase::CheckUnavailable => Some("check_unavailable"),
             l::Phase::StaleTarget => Some("stale_target"),
             l::Phase::Expired => Some("expired"),
+            l::Phase::PublicationAbandoned => Some("publication_abandoned"),
             _ => None,
         }
         .map(str::to_owned);

@@ -12896,6 +12896,9 @@ struct LandingProtocolBoundary {
 }
 #[tonic::async_trait]
 impl tinytree_proto::landing_v1::landing_server::Landing for LandingProtocolBoundary {
+    async fn abandon_landing_publication(&self, _request: Request<tinytree_proto::landing_v1::AbandonLandingPublicationRequest>) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
+        Err(Status::unimplemented("fixture does not abandon publication"))
+    }
     async fn recover_landing(&self, _request: Request<tinytree_proto::landing_v1::RecoverLandingRequest>) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
         Err(Status::unimplemented("fixture does not admit recovery"))
     }
@@ -13181,6 +13184,31 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
             "{name}"
         );
     }
+    // Protocol assertions only: abandonment is not Passed, cleanup or an
+    // applied receipt. Actual abandonment mutation is covered by Store/server.
+    let mut abandoned = prepared.clone();
+    abandoned.job.as_mut().unwrap().phase = l::Phase::PublicationAbandoned as i32;
+    *reply.lock().unwrap() = abandoned.clone();
+    let closed = client.lookup_landing(&input, Some([7;32]), false).await.unwrap();
+    assert_eq!(closed.phase(), tinytree_client::LandingPhase::PublicationAbandoned);
+    assert!(closed.roots_retained()); assert!(closed.candidate().is_some()); assert!(closed.receipt().is_none());
+    drop(closed);
+    for invalid in [
+        { let mut job = abandoned.clone(); job.job.as_mut().unwrap().roots_retained = false; job },
+        { let mut job = abandoned.clone(); job.job.as_mut().unwrap().candidate = None; job },
+        { let mut job = abandoned.clone(); job.job.as_mut().unwrap().conflict_path = Some("file.rs".into()); job },
+    ] {
+        *reply.lock().unwrap() = invalid;
+        assert_eq!(client.lookup_landing(&input, Some([7;32]), false).await.unwrap_err().code(), Code::DataLoss);
+    }
+    let cancel = tinytree_client::LandingPublicationCancellation { job_id:[7;32], candidate:CommitId([2;32]), root_tree:tinytree_model::TreeId([4;32]), expected_attempts:1, expected_recoveries:0 };
+    assert_eq!(client.abandon_landing_publication(&input,&cancel).await.unwrap_err().code(),Code::Unimplemented);
+    let mut invalid = cancel.clone(); invalid.expected_attempts=0;
+    assert_eq!(client.abandon_landing_publication(&input,&invalid).await.unwrap_err().code(),Code::InvalidArgument);
+    invalid=cancel.clone(); invalid.root_tree=tinytree_model::TreeId([0;32]);
+    assert_eq!(client.abandon_landing_publication(&input,&invalid).await.unwrap_err().code(),Code::InvalidArgument);
+    invalid=cancel; invalid.expected_recoveries=257;
+    assert_eq!(client.abandon_landing_publication(&input,&invalid).await.unwrap_err().code(),Code::InvalidArgument);
     let inspection = l::CheckerRecoveryInspection {
         transport: l::CheckerTransportInspection::CtiQuiescentIneligible as i32,
         stdout: l::CheckerOutputInspection::CoiEmpty as i32,

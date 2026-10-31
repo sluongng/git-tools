@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -343,6 +343,103 @@ pub(crate) fn derived_daemon(
     Ok(derived)
 }
 
+const MAX_REFUSAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REFUSALS: usize = 4096;
+const REFUSAL_MAGIC: &[u8; 8] = b"TTRF001\0";
+// The existing admission.lock inode is never replaced. Older frozen runners
+// ignore its contents, so their original attempt cleanup remains readable.
+fn refusal_ledger(file: &mut fs::File) -> Result<(Vec<Receipt>, bool)> {
+    ensure!(
+        file.metadata()?.len() <= MAX_REFUSAL_BYTES as u64,
+        "refusal ledger exceeds budget"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    (&mut *file)
+        .take(MAX_REFUSAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_REFUSAL_BYTES,
+        "refusal ledger exceeds budget"
+    );
+    if bytes.is_empty() {
+        return Ok((Vec::new(), true));
+    }
+    if !bytes.starts_with(REFUSAL_MAGIC) {
+        return Ok((Vec::new(), false));
+    }
+    let mut offset = REFUSAL_MAGIC.len();
+    let mut rows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    while offset < bytes.len() {
+        let frame = (|| -> Result<Receipt> {
+            ensure!(
+                rows.len() < MAX_REFUSALS && bytes.len() - offset >= 4,
+                "incomplete refusal ledger"
+            );
+            let size = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+            offset += 4;
+            ensure!(
+                size <= crate::MAX_RECEIPT_BYTES
+                    && size <= bytes.len() - offset
+                    && bytes.len() - offset - size >= 32,
+                "incomplete refusal frame"
+            );
+            let data = &bytes[offset..offset + size];
+            offset += size;
+            ensure!(
+                blake3::hash(data).as_bytes() == &bytes[offset..offset + 32],
+                "refusal checksum differs"
+            );
+            offset += 32;
+            let receipt: Receipt = serde_json::from_slice(data)?;
+            receipt.validate_for(&receipt.request)?;
+            ensure!(
+                receipt.outcome == Outcome::Unavailable
+                    && receipt.cleanup_confirmed
+                    && receipt.reason == "admission_capacity"
+                    && receipt.evidence.is_none()
+                    && seen.insert(receipt.workspace_id.clone()),
+                "invalid refusal receipt"
+            );
+            Ok(receipt)
+        })();
+        match frame {
+            Ok(receipt) => rows.push(receipt),
+            Err(_) => return Ok((rows, false)),
+        }
+    }
+    Ok((rows, true))
+}
+fn save_refusal(
+    directory: &PrivateDir,
+    file: &mut fs::File,
+    rows: usize,
+    receipt: &Receipt,
+) -> Result<()> {
+    ensure!(rows < MAX_REFUSALS, "refusal receipt quota reached");
+    let data = receipt.encode()?;
+    let length = file.metadata()?.len();
+    let extra = 4 + data.len() + 32 + if length == 0 { REFUSAL_MAGIC.len() } else { 0 };
+    ensure!(
+        extra <= MAX_REFUSAL_BYTES && length <= (MAX_REFUSAL_BYTES - extra) as u64,
+        "refusal byte quota reached"
+    );
+    file.seek(SeekFrom::End(0))?;
+    if length == 0 {
+        file.write_all(REFUSAL_MAGIC)?;
+    }
+    file.write_all(&(data.len() as u32).to_le_bytes())?;
+    file.write_all(&data)?;
+    file.write_all(blake3::hash(&data).as_bytes())?;
+    file.sync_all()?;
+    fs::File::open(directory.path())?.sync_all()?;
+    Ok(())
+}
+enum AttemptAdmission {
+    Ready(Attempt),
+    Refused(Receipt),
+}
 struct Attempt {
     root: PrivateDir,
     _lock: fs::File,
@@ -350,7 +447,7 @@ struct Attempt {
     environment: BTreeMap<String, String>,
 }
 impl Attempt {
-    fn open(config: &Config, request: &Request, recovery: bool) -> Result<Self> {
+    fn open(config: &Config, request: &Request, recovery: bool) -> Result<AttemptAdmission> {
         request.validate()?;
         config.validate()?;
         if !recovery {
@@ -378,8 +475,44 @@ impl Attempt {
         } else {
             PrivateDir::create(&config.scratch)?
         };
-        let admission = directory.open_lock("admission.lock")?;
+        let mut admission = directory.open_lock("admission.lock")?;
         admission.lock_exclusive()?;
+        let selected_path = directory.path().join(request.workspace_id());
+        let exists = match fs::symlink_metadata(&selected_path) {
+            Ok(metadata) => {
+                ensure!(metadata.is_dir(), "attempt path is not a directory");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let (refusals, ledger_complete) = match refusal_ledger(&mut admission) {
+            Ok(value) => value,
+            // A malformed unrelated refusal append cannot prevent cleanup of
+            // an actual original attempt with its own checked journal/owner.
+            Err(_) if recovery && exists => (Vec::new(), false),
+            Err(error) => return Err(error),
+        };
+        if let Some(refusal) = refusals
+            .iter()
+            .find(|r| r.workspace_id == request.workspace_id())
+        {
+            ensure!(
+                refusal.request == *request && !exists,
+                "refusal/attempt binding contradiction"
+            );
+            ensure!(ledger_complete, "incomplete refusal ledger");
+            // A previous append may have completed before its sync failed.
+            // Fence replay under this same admission lock; an opener's earlier
+            // sync cannot cover a concurrent append made before lock acquisition.
+            admission.sync_all()?;
+            fs::File::open(directory.path())?.sync_all()?;
+            return Ok(AttemptAdmission::Refused(refusal.clone()));
+        }
+        ensure!(
+            ledger_complete || (recovery && exists),
+            "incomplete refusal ledger"
+        );
         let mut count = 0;
         for entry in fs::read_dir(directory.path())? {
             let entry = entry?;
@@ -392,16 +525,26 @@ impl Attempt {
                 "unknown check scratch entry"
             );
             count += 1;
-            ensure!(
-                count <= if recovery { 4096 } else { config.max_attempts },
-                "check scratch attempt quota exceeded"
-            );
+            ensure!(count <= 4096, "check scratch attempt quota exceeded");
         }
-        ensure!(
-            directory.path().join(request.workspace_id()).exists()
-                || (!recovery && count < config.max_attempts),
-            "check scratch attempt quota reached"
-        );
+        if !exists && !recovery && count >= config.max_attempts {
+            // The admission lock proves no attempt/source/tools/child work
+            // exists for this exact request. Only this decision may assert
+            // cleanup without running the checker; all later errors stay Err.
+            let receipt = Receipt {
+                schema: 1,
+                request: request.clone(),
+                workspace_id: request.workspace_id(),
+                outcome: Outcome::Unavailable,
+                reason: "admission_capacity".into(),
+                cleanup_confirmed: true,
+                evidence: None,
+            };
+            receipt.validate_for(request)?;
+            save_refusal(&directory, &mut admission, refusals.len(), &receipt)?;
+            return Ok(AttemptAdmission::Refused(receipt));
+        }
+        ensure!(exists || !recovery, "recovery attempt is missing");
         let root = if recovery {
             PrivateDir::open_existing(directory.path().join(request.workspace_id()))?
         } else {
@@ -458,7 +601,7 @@ impl Attempt {
             environment,
         };
         attempt.save()?;
-        Ok(attempt)
+        Ok(AttemptAdmission::Ready(attempt))
     }
     fn save(&self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.journal)?;
@@ -710,7 +853,10 @@ async fn run_owned(
             "checker transport differs from frozen source configuration"
         );
     }
-    let mut attempt = Attempt::open(config, &request, false)?;
+    let mut attempt = match Attempt::open(config, &request, false)? {
+        AttemptAdmission::Ready(v) => v,
+        AttemptAdmission::Refused(receipt) => return Ok(receipt),
+    };
     if let Some((lease, _)) = &leased {
         lease.validate()?;
         ensure!(lease.request == request, "lease request differs");
@@ -930,7 +1076,10 @@ async fn run_owned(
 async fn recover_owned(config: &Config, request: Request) -> Result<Receipt> {
     #[cfg(not(target_os = "linux"))]
     anyhow::bail!("native check recovery requires Linux acceptance");
-    let mut attempt = Attempt::open(config, &request, true)?;
+    let mut attempt = match Attempt::open(config, &request, true)? {
+        AttemptAdmission::Ready(v) => v,
+        AttemptAdmission::Refused(receipt) => return Ok(receipt),
+    };
     if let Some(receipt) = &attempt.journal.receipt {
         if receipt.cleanup_confirmed {
             return Ok(receipt.clone());

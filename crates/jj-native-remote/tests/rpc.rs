@@ -12107,13 +12107,20 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
             })),
         })
         .collect::<Vec<_>>();
+    // No current landing and no preexisting local/cloud custody may stand in
+    // for the archived retained job. This is the real backup frontier API.
+    let remote = tinytree_cloud::PortableRemoteState {
+        observations: vec![], archived_pushes: vec![], landing: None,
+        archived_landings: vec![intent.clone()],
+    };
+    for key in &roots { assert!(direct.descriptor(*key).await.unwrap().is_none()); }
     let before = counts.metadata_keys.load(Ordering::SeqCst);
     let holds = counts.holds.load(Ordering::SeqCst);
     let observations = counts.reference_observations.load(Ordering::SeqCst);
     repo.control
-        .transfer_native_capture_frontier_with_landing(
+        .transfer_native_capture_frontier_with_landings(
             roots.clone(),
-            Some(intent.clone()),
+            remote.landings().cloned().collect(),
             Arc::new(()),
             Default::default(),
             tokio::time::Instant::now() + Duration::from_secs(10),
@@ -12137,15 +12144,28 @@ async fn landing_capture_reads_only_exact_candidate_commits_and_expired_cached_c
             "canonical candidate metadata is cached privately"
         );
     }
+    let mut with_current = remote.clone();
+    let mut unrelated = intent.clone();
+    unrelated.request_id = "34".repeat(16);
+    unrelated.job_id = None;
+    unrelated.result_roots.clear(); unrelated.candidate_head = None;
+    with_current.landing = Some(unrelated);
+    let before_second = counts.metadata_keys.load(Ordering::SeqCst);
+    repo.control.transfer_native_capture_frontier_with_landings(
+        roots.clone(), with_current.landings().cloned().collect(), Arc::new(()), Default::default(),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    ).await.unwrap();
+    assert_eq!(counts.metadata_keys.load(Ordering::SeqCst)-before_second, result_roots.len(),
+        "a current intent without results must not hide archived fresh retention checks");
     store
         .expire_landing("example", owner, &request.idempotency_key, now + 3600)
         .unwrap();
     let before = counts.metadata_keys.load(Ordering::SeqCst);
     let error = repo
         .control
-        .transfer_native_capture_frontier_with_landing(
+        .transfer_native_capture_frontier_with_landings(
             roots,
-            Some(intent.clone()),
+            with_current.landings().cloned().collect(),
             Arc::new(()),
             Default::default(),
             tokio::time::Instant::now() + Duration::from_secs(10),
