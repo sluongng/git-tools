@@ -104,6 +104,16 @@ enum CheckerErrorCode {
   EXECUTION_UNCERTAIN = 3;
   RECEIPT_INVALID = 4;
 }
+enum CheckerSavedPhase {
+  CHECKER_SAVED_PHASE_UNSPECIFIED = 0;
+  SAVED_RESERVED = 1;
+  SAVED_DISPATCH_INTENT = 2;
+  SAVED_UNCERTAIN = 3;
+  SAVED_VERIFIED = 4;
+  SAVED_RETRY_READY = 5;
+  SAVED_TERMINAL = 6;
+  SAVED_UNAVAILABLE_READY = 7;
+}
 message CheckerProgress {
   CheckerStage stage = 1;
   // Owned host task only; does not assert that a child process was spawned.
@@ -113,4 +123,8 @@ message CheckerProgress {
   int64 retry_at_seconds = 5;
   CheckerErrorCode error_code = 6;
   CheckerStage error_stage = 7;
+  // Current phase from the existing durable record, not a new stored field.
+  CheckerSavedPhase saved_phase = 8;
+  // Exact automatic uncertain-recovery budget stop; not permission to retry.
+  bool automatic_recovery_blocked = 9;
 }

@@ -116,6 +116,8 @@ mod native {
         "checker_progress":checker.map(|p| serde_json::json!({
           "stage":l::CheckerStage::try_from(p.stage).map(|v|v.as_str_name()).unwrap_or("CHECKER_STAGE_UNSPECIFIED"),
           "active_task":p.active_task,"attempts":p.attempts,"recoveries":p.recoveries,
+          "saved_phase":l::CheckerSavedPhase::try_from(p.saved_phase).map(|v|v.as_str_name()).unwrap_or("CHECKER_SAVED_PHASE_UNSPECIFIED"),
+          "automatic_recovery_blocked":p.automatic_recovery_blocked,
           "retry_at_seconds":p.retry_at_seconds,
           "error_code":l::CheckerErrorCode::try_from(p.error_code).map(|v|v.as_str_name()).unwrap_or("CHECKER_ERROR_NONE"),
           "error_stage":l::CheckerStage::try_from(p.error_stage).map(|v|v.as_str_name()).unwrap_or("CHECKER_STAGE_UNSPECIFIED")

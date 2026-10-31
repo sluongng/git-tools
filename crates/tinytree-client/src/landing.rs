@@ -322,6 +322,7 @@ fn checked(
         if l::CheckerStage::try_from(progress.stage).is_err()
             || l::CheckerStage::try_from(progress.error_stage).is_err()
             || l::CheckerErrorCode::try_from(progress.error_code).is_err()
+            || l::CheckerSavedPhase::try_from(progress.saved_phase).is_err()
             || progress.retry_at_seconds < 0
         {
             return Err(bad());

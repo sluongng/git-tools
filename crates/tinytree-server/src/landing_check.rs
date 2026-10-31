@@ -17,7 +17,9 @@ use std::{
     time::Duration,
 };
 use tinytree_check_runner as runner;
-use tinytree_proto::landing_v1::{CheckerErrorCode, CheckerProgress, CheckerStage};
+use tinytree_proto::landing_v1::{
+    CheckerErrorCode, CheckerProgress, CheckerSavedPhase, CheckerStage,
+};
 use tinytree_store as s;
 use tokio::sync::{Notify, Semaphore, watch};
 
@@ -1072,6 +1074,18 @@ impl CheckerHost {
             value.attempts = slot.record.attempts.min(u32::MAX as usize) as u32;
             value.recoveries = slot.record.recoveries.min(u32::MAX as usize) as u32;
             value.retry_at_seconds = slot.record.retry_at;
+            value.saved_phase = match slot.record.phase {
+                Phase::Reserved => CheckerSavedPhase::SavedReserved,
+                Phase::DispatchIntent => CheckerSavedPhase::SavedDispatchIntent,
+                Phase::Uncertain => CheckerSavedPhase::SavedUncertain,
+                Phase::Verified => CheckerSavedPhase::SavedVerified,
+                Phase::RetryReady => CheckerSavedPhase::SavedRetryReady,
+                Phase::Terminal => CheckerSavedPhase::SavedTerminal,
+                Phase::UnavailableReady => CheckerSavedPhase::SavedUnavailableReady,
+            } as i32;
+            value.automatic_recovery_blocked = slot.record.uncertain()
+                && slot.record.recoveries >= self.policy.max_recovery_attempts
+                && !slot.active;
             return Some(value);
         }
         state

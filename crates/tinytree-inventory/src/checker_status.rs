@@ -1,26 +1,50 @@
 //! Explicit operator read-only landing diagnostics. Never starts or advances work.
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use serde_json::{Value, json};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tinytree_client::{Config, LandingPhase, LandingStart, NativeClient, Transport};
 use tinytree_model::CommitId;
 
-struct Args { config: PathBuf, job: [u8; 32], intent: LandingStart, timeout: u64 }
+struct Args {
+    config: PathBuf,
+    job: [u8; 32],
+    intent: LandingStart,
+    timeout: u64,
+}
 fn id(value: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err("invalid_id".into());
     }
     let mut out = [0; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[i*2..i*2+2], 16).map_err(|_| "invalid_id")?;
+        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).map_err(|_| "invalid_id")?;
     }
     Ok(out)
 }
-fn hex(value: &[u8]) -> String { value.iter().map(|b| format!("{b:02x}")).collect() }
+fn hex(value: &[u8]) -> String {
+    value.iter().map(|b| format!("{b:02x}")).collect()
+}
 fn args() -> Result<Args, String> {
     let mut fields = BTreeMap::new();
     let mut input = std::env::args().skip(1);
     while let Some(key) = input.next() {
-        if !matches!(key.as_str(), "--config" | "--job" | "--request-id" | "--source-base" | "--source-head" | "--destination" | "--expected-generation" | "--expected-head" | "--profile" | "--profile-version" | "--timeout-seconds") {
+        if !matches!(
+            key.as_str(),
+            "--config"
+                | "--job"
+                | "--request-id"
+                | "--source-base"
+                | "--source-head"
+                | "--destination"
+                | "--expected-generation"
+                | "--expected-head"
+                | "--profile"
+                | "--profile-version"
+                | "--timeout-seconds"
+        ) {
             return Err("unknown_argument".into());
         }
         let value = input.next().ok_or("missing_argument_value")?;
@@ -28,7 +52,11 @@ fn args() -> Result<Args, String> {
             return Err("invalid_or_duplicate_argument".into());
         }
     }
-    let mut take = |key: &str| fields.remove(key).ok_or_else(|| "missing_argument".to_string());
+    let mut take = |key: &str| {
+        fields
+            .remove(key)
+            .ok_or_else(|| "missing_argument".to_string())
+    };
     let config = PathBuf::from(take("--config")?);
     let job = id(&take("--job")?)?;
     let intent = LandingStart {
@@ -36,60 +64,115 @@ fn args() -> Result<Args, String> {
         source_base: CommitId(id(&take("--source-base")?)?),
         source_head: CommitId(id(&take("--source-head")?)?),
         destination: take("--destination")?,
-        expected_generation: take("--expected-generation")?.parse().map_err(|_| "invalid_generation")?,
+        expected_generation: take("--expected-generation")?
+            .parse()
+            .map_err(|_| "invalid_generation")?,
         expected_head: CommitId(id(&take("--expected-head")?)?),
         profile_name: take("--profile")?,
         expected_profile_version: take("--profile-version")?,
     };
-    let timeout = fields.remove("--timeout-seconds").map(|v| v.parse::<u64>()).transpose().map_err(|_| "invalid_timeout")?.unwrap_or(10);
-    if !(1..=60).contains(&timeout) || job == [0;32] { return Err("invalid_argument".into()); }
-    Ok(Args {config,job,intent,timeout})
+    let timeout = fields
+        .remove("--timeout-seconds")
+        .map(|v| v.parse::<u64>())
+        .transpose()
+        .map_err(|_| "invalid_timeout")?
+        .unwrap_or(10);
+    if !(1..=60).contains(&timeout) || job == [0; 32] {
+        return Err("invalid_argument".into());
+    }
+    Ok(Args {
+        config,
+        job,
+        intent,
+        timeout,
+    })
 }
 fn stage(value: i32) -> Result<&'static str, String> {
     Ok(match value {
-        0 => "unspecified", 1 => "reservation", 2 => "reservation_directory", 3 => "authority_refresh",
-        4 => "candidate_pin", 5 => "reservation_persist", 6 => "queued", 7 => "preparation",
-        8 => "binary_verify", 9 => "configuration_verify", 10 => "environment_binding", 11 => "execution",
-        12 => "receipt_verify", 13 => "verdict_apply", _ => return Err("invalid_checker_progress".into()),
+        0 => "unspecified",
+        1 => "reservation",
+        2 => "reservation_directory",
+        3 => "authority_refresh",
+        4 => "candidate_pin",
+        5 => "reservation_persist",
+        6 => "queued",
+        7 => "preparation",
+        8 => "binary_verify",
+        9 => "configuration_verify",
+        10 => "environment_binding",
+        11 => "execution",
+        12 => "receipt_verify",
+        13 => "verdict_apply",
+        _ => return Err("invalid_checker_progress".into()),
     })
 }
 fn error_code(value: i32) -> Result<&'static str, String> {
-    Ok(match value {0 => "none",1 => "reservation_failed",2 => "process_failed",3 => "execution_uncertain",4 => "receipt_invalid",_ => return Err("invalid_checker_progress".into())})
+    Ok(match value {
+        0 => "none",
+        1 => "reservation_failed",
+        2 => "process_failed",
+        3 => "execution_uncertain",
+        4 => "receipt_invalid",
+        _ => return Err("invalid_checker_progress".into()),
+    })
 }
 fn phase(value: LandingPhase) -> &'static str {
     match value {
-        LandingPhase::Intent => "intent", LandingPhase::PreparedPendingChecks => "prepared_pending_checks",
-        LandingPhase::Checked => "checked", LandingPhase::Committed => "committed", LandingPhase::Conflict => "conflict",
-        LandingPhase::Unsupported => "unsupported", LandingPhase::CheckFailed => "check_failed",
-        LandingPhase::CheckUnavailable => "check_unavailable", LandingPhase::StaleTarget => "stale_target", LandingPhase::Expired => "expired",
+        LandingPhase::Intent => "intent",
+        LandingPhase::PreparedPendingChecks => "prepared_pending_checks",
+        LandingPhase::Checked => "checked",
+        LandingPhase::Committed => "committed",
+        LandingPhase::Conflict => "conflict",
+        LandingPhase::Unsupported => "unsupported",
+        LandingPhase::CheckFailed => "check_failed",
+        LandingPhase::CheckUnavailable => "check_unavailable",
+        LandingPhase::StaleTarget => "stale_target",
+        LandingPhase::Expired => "expired",
     }
 }
 async fn run(args: Args) -> Result<Value, String> {
     let config = Config::load(&args.config).map_err(|_| "configuration_load_failed")?;
-    if config.transport != Transport::Grpc { return Err("unsupported_transport".into()); }
-    let client = NativeClient::connect(config).await.map_err(|s| format!("rpc_{:?}",s.code()).to_ascii_lowercase())?;
+    if config.transport != Transport::Grpc {
+        return Err("unsupported_transport".into());
+    }
+    let client = NativeClient::connect(config)
+        .await
+        .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
     // Opaque handles cannot be synthesized from an ID. This existing method
     // performs GetLanding only and binds the observed job to the exact intent.
-    let job = client.lookup_landing(&args.intent, Some(args.job)).await
-        .map_err(|s| format!("rpc_{:?}",s.code()).to_ascii_lowercase())?;
+    let job = client
+        .lookup_landing(&args.intent, Some(args.job))
+        .await
+        .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
     let progress = job.checker_progress().map(|p| -> Result<Value,String> {
         if p.retry_at_seconds < 0 { return Err("invalid_checker_progress".into()); }
         Ok(json!({"stage":stage(p.stage)?,"active_task":p.active_task,"attempts":p.attempts,
-            "recoveries":p.recoveries,"retry_at_seconds":p.retry_at_seconds,"error_code":error_code(p.error_code)?,"error_stage":stage(p.error_stage)?}))
+            "recoveries":p.recoveries,"retry_at_seconds":p.retry_at_seconds,
+            "saved_phase":match p.saved_phase {0=>"unspecified",1=>"reserved",2=>"dispatch_intent",3=>"uncertain",4=>"verified",5=>"retry_ready",6=>"terminal",7=>"unavailable_ready",_=>return Err("invalid_checker_progress".into())},
+            "automatic_recovery_blocked":p.automatic_recovery_blocked,"error_code":error_code(p.error_code)?,"error_stage":stage(p.error_stage)?}))
     }).transpose()?;
-    let candidate = job.candidate().map(|c| json!({"head":hex(&c.head.0),"root_tree":hex(&c.root_tree.0)}));
-    Ok(json!({"schema_version":1,"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress}))
+    let candidate = job
+        .candidate()
+        .map(|c| json!({"head":hex(&c.head.0),"root_tree":hex(&c.root_tree.0)}));
+    Ok(
+        json!({"schema_version":1,"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress}),
+    )
 }
 #[tokio::main]
 async fn main() {
     let result = match args() {
-        Ok(args) => match tokio::time::timeout(Duration::from_secs(args.timeout), run(args)).await {
-            Ok(result) => result, Err(_) => Err("deadline_exceeded".into()),
-        },
+        Ok(args) => {
+            match tokio::time::timeout(Duration::from_secs(args.timeout), run(args)).await {
+                Ok(result) => result,
+                Err(_) => Err("deadline_exceeded".into()),
+            }
+        }
         Err(error) => Err(error),
     };
     let failed = result.is_err();
     let value = result.unwrap_or_else(|code| json!({"schema_version":1,"error":{"code":code}}));
     println!("{}", value);
-    if failed { std::process::exit(1); }
+    if failed {
+        std::process::exit(1);
+    }
 }

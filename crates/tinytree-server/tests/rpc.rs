@@ -11071,6 +11071,7 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
     use tinytree_proto::landing_v1 as l;
     let (temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");
     config.service.landing.job_ttl_seconds = 2;
+    config.service.landing.checker.as_mut().unwrap().max_recovery_attempts = 1;
     let running = Running::start_landing(
         store.clone(),
         config.service.clone(),
@@ -11091,6 +11092,25 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
     })
     .await
     .unwrap();
+    // Observe the exact saved-record recovery stop through the authorized RPC,
+    // rather than inferring it from private checker files or elapsed time.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client.get_landing(request(l::GetLandingRequest {
+                repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            if let Some(progress) = status.checker_progress {
+                if progress.automatic_recovery_blocked {
+                    assert!(!progress.active_task);
+                    assert_eq!(progress.recoveries, 1);
+                    assert!(matches!(l::CheckerSavedPhase::try_from(progress.saved_phase).unwrap(),
+                        l::CheckerSavedPhase::SavedDispatchIntent | l::CheckerSavedPhase::SavedUncertain));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     let retained = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
     assert!(retained.roots_retained);
