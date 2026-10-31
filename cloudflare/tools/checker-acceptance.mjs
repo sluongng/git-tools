@@ -576,7 +576,7 @@ force_remote_execution = true
   }
   assert.equal((await invoke(2)).value.main_generation, before.main_generation + 2);
   if (archiveWorkflow) stage = 'archive-recovery';
-  const archiveEvidence = await archiveWorkflow?.afterPrimary?.({ root, origin, source, token, invoke, execute, profile, run,
+  const archiveEvidence = await archiveWorkflow?.afterPrimary?.({ root, origin, source, token, invoke, execute, profile, run, artifacts,
     restartWorker, configuration, baseline: baseline.value, before, evidence,
     cancellationCandidate: cancelledCandidate,
     retargetChecker(target) {

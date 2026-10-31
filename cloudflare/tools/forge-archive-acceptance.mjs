@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, readFile, writeFile, readdir, stat, lstat, rm, cp } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, readdir, stat, lstat, rm, cp, copyFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Miniflare } from 'miniflare';
@@ -134,6 +134,12 @@ async function verifyPhysical(claim, expectedCandidate) {
   assert.equal(bep.filter(event => event.started).length, 1);
   assert.ok(bep.some(event => event.id?.testSummary?.label === '//:smoke' && event.testSummary?.overallStatus === (receipt.outcome === 'passed' ? 'PASSED' : 'FAILED')));
   assert.ok((await stat(path.join(attempt, 'execution.compact'))).size > 0);
+  if (context.artifacts) {
+    assert.match(claim, /^archive-restored-[01]$/);
+    for (const name of ['bep.jsonl', 'execution.compact', 'snapshot-proof.json']) {
+      await copyFile(path.join(attempt, name), path.join(context.artifacts, `${claim}-${name}`));
+    }
+  }
   physicalEvidence.push({ claim, receipt, namespace_proof: proof });
   return receipt;
 }
@@ -149,6 +155,7 @@ const workflow = {
   },
   async afterPrimary(value) {
     context = value; localRoot = await mkdtemp('/tmp/tfa.');
+    if (process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR) assert.equal(typeof context.artifacts, 'string', 'configured evidence directory must reach archive workflow');
     const directory = path.join(localRoot, 'archive');
     const acknowledged = (await context.invoke(2)).value;
     const positive = context.evidence.find(item => item.label === 'positive'); assert.ok(positive);
@@ -169,6 +176,7 @@ const workflow = {
     const backup = await command(sourceClient, ['account', 'backup', directory, '--archive-token-env', 'TT_ARCHIVE_TOKEN']);
     assert.equal(backup.state, 'complete'); assert.equal(backup.result.archive_id, archiveId);
     const manifest = await privateJson(path.join(directory, 'manifest.json'));
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'account-manifest.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 });
     assert.equal(manifest.account_id, context.source.account_id); assert.equal(manifest.archive_id, archiveId);
     assert.equal(manifest.page_count, backup.result.page_count); assert.equal(manifest.chain_root, backup.result.chain_root);
     assert.ok(manifest.page_count > 1 && manifest.payloads > 0);
