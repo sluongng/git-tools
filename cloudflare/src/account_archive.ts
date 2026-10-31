@@ -157,8 +157,22 @@ export class AccountArchive {
  }
  private validatePrivateCoverage():void {
   const totals=this.one<{capsules:number;chunks:number;bytes:number}>("SELECT (SELECT COUNT(*) FROM private_capsules) AS capsules,COUNT(*) AS chunks,COALESCE(SUM(CASE WHEN state<>'tombstoned' THEN size ELSE 0 END),0) AS bytes FROM private_capsule_chunks")!;
-  const usage=this.one<{account:string;bytes:number;chunks:number;capsules:number}>('SELECT account,bytes,chunks,capsules FROM private_capsule_usage WHERE singleton=1');
-  if(totals.capsules>4096||totals.chunks>32768||totals.bytes>512*1024*1024||totals.bytes<0||(usage?(usage.account!==this.host.accountId||usage.bytes!==totals.bytes||usage.chunks!==totals.chunks||usage.capsules!==totals.capsules):(totals.capsules!==0||totals.chunks!==0)))fail(503,'archive_private_invalid');
+  if(![totals.capsules,totals.chunks,totals.bytes].every(n=>safe(n)&&n>=0)||totals.capsules>4096||totals.chunks>32768||totals.bytes>512*1024*1024)fail(503,'archive_private_invalid');
+  // Reservation is the unattempted suffix of each whole uploading intent.
+  // Pending physical custody already consumed admission even without its ACK;
+  // next_offset/next_sequence therefore cannot reconstruct this accounting.
+  const uploading=this.rows<{id:string;descriptor:string;attempted_bytes:number;attempted_chunks:number}>("SELECT r.id,r.descriptor,COALESCE(SUM(c.size),0) AS attempted_bytes,COUNT(c.attempt_id) AS attempted_chunks FROM private_capsules r LEFT JOIN private_capsule_chunks c ON c.capsule=r.id WHERE r.state='uploading' GROUP BY r.id ORDER BY r.id LIMIT 4097");
+  if(uploading.length>4096)fail(503,'archive_private_invalid');
+  let reserved_bytes=0,reserved_chunks=0;
+  for(const r of uploading){
+   let descriptor;try{descriptor=parseCapsuleDescriptor(JSON.parse(r.descriptor));}catch{fail(503,'archive_private_invalid');}
+   if(![r.attempted_bytes,r.attempted_chunks].every(n=>safe(n)&&n>=0)||r.attempted_bytes>descriptor.total_bytes||r.attempted_chunks>descriptor.chunk_count)fail(503,'archive_private_invalid');
+   reserved_bytes+=descriptor.total_bytes-r.attempted_bytes;
+   reserved_chunks+=descriptor.chunk_count-r.attempted_chunks;
+   if(!safe(reserved_bytes)||!safe(reserved_chunks)||totals.bytes+reserved_bytes>512*1024*1024||totals.chunks+reserved_chunks>32768)fail(503,'archive_private_invalid');
+  }
+  const usage=this.one<{account:string;bytes:number;chunks:number;capsules:number;reserved_bytes:number;reserved_chunks:number}>('SELECT account,bytes,chunks,capsules,reserved_bytes,reserved_chunks FROM private_capsule_usage WHERE singleton=1');
+  if(usage?usage.account!==this.host.accountId||![usage.bytes,usage.chunks,usage.capsules,usage.reserved_bytes,usage.reserved_chunks].every(n=>safe(n)&&n>=0)||usage.bytes!==totals.bytes||usage.chunks!==totals.chunks||usage.capsules!==totals.capsules||usage.reserved_bytes!==reserved_bytes||usage.reserved_chunks!==reserved_chunks||usage.bytes+usage.reserved_bytes>512*1024*1024||usage.chunks+usage.reserved_chunks>32768:totals.capsules!==0||totals.chunks!==0||reserved_bytes!==0||reserved_chunks!==0)fail(503,'archive_private_invalid');
   const capsules=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsules WHERE account<>? OR state NOT IN ('uploading','sealed','retiring','deleted')",this.host.accountId)!;
   if(capsules.n)fail(503,'archive_private_invalid');
   const bad=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_chunks c LEFT JOIN private_capsules r ON r.id=c.capsule LEFT JOIN archive_payload_proofs p ON p.attempt_id='private:'||c.attempt_id WHERE r.id IS NULL OR r.account<>? OR c.state NOT IN ('pending','written','retiring','tombstoned') OR p.attempt_id IS NULL OR (c.state IN ('written','tombstoned') AND p.presence<>'present') OR (r.state='deleted' AND c.state<>'tombstoned')",this.host.accountId);

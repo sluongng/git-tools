@@ -2336,18 +2336,77 @@ test('private capsules enforce owner integrity, monotone generation CAS and curr
   const source = Buffer.alloc(131073); for (let i = 0; i < source.length; i++) source[i] = i % 251;
   const body = capsuleDescriptor(source), begin = { workspace_id: workspace, expected_generation: 0, selection: h.selection, descriptor: body.descriptor };
   const main = (await h.forge(2)).value, originalNative = (await h.control()).objects;
+  // Whole-intent admission is genuine HTTP/SQLite accounting, not a giant
+  // allocation or fabricated quota row. Only one small real chunk is uploaded.
+  const quotaBefore = (await h.control()).private_capsule_usage[0] ?? { bytes: 0, chunks: 0, capsules: 0, reserved_bytes: 0, reserved_chunks: 0 };
+  const largeBytes = 300 * 1024 * 1024, largeChunks = largeBytes / 65536;
+  const contenders = ['large-a', 'large-b'].map(name => ({ id: sha(`capsule-${name}`),
+    fields: { workspace_id: sha(`workspace-${name}`), expected_generation: 0, selection: h.selection,
+      descriptor: { format: 'tinytree-private-capture-v1', total_bytes: largeBytes, chunk_count: largeChunks, chain_root: sha(`chain-${name}`) } } }));
+  const admissions = await Promise.all(contenders.map(async intent => {
+    const response = await h.rawCapsule('begin', intent.id, intent.fields);
+    return { intent, status: response.status, result: await response.json() };
+  }));
+  assert.deepEqual(admissions.map(result => result.status).sort(), [200, 429], 'combined descriptors exceed the account allowance; exactly one whole intent is admitted');
+  const admitted = admissions.find(result => result.status === 200), denied = admissions.find(result => result.status === 429);
+  assert.equal(denied.result.error.code, 'resource_exhausted');
+  const reserved = await h.control();
+  assert.equal(reserved.private_capsule_usage[0].reserved_bytes, quotaBefore.reserved_bytes + largeBytes);
+  assert.equal(reserved.private_capsule_usage[0].reserved_chunks, quotaBefore.reserved_chunks + largeChunks);
+  assert.equal(reserved.private_capsule_usage[0].capsules, quotaBefore.capsules + 1);
+  assert.ok(!reserved.private_capsules.some(row => row.id === denied.intent.id), 'denied BEGIN has no durable intent');
+  assert.ok(!reserved.forge_retained_roots.some(row => row.owner_kind === 'private-capsule' && row.owner_id === denied.intent.id), 'denied BEGIN has no retention owner');
+  assert.ok(!reserved.private_capsule_chunks.some(row => row.capsule === denied.intent.id));
+  assert.equal((await (await h.bucket()).list({ prefix: `private/v1/${h.account}/${denied.intent.id}/` })).objects.length, 0, 'denied BEGIN has no physical custody');
+  await h.reload();
+  assert.deepEqual(await h.capsule('begin', admitted.intent.id, admitted.intent.fields), admitted.result);
+  assert.deepEqual((await h.control()).private_capsule_usage, reserved.private_capsule_usage, 'exact BEGIN replay after restart cannot reserve twice');
+  const firstChunk = Buffer.alloc(65536, 37);
+  await h.capsule('append', admitted.intent.id, { sequence: 0, bytes_hex: firstChunk.toString('hex') });
+  const converted = await h.control(), usage = converted.private_capsule_usage[0];
+  assert.equal(usage.bytes, quotaBefore.bytes + firstChunk.length);
+  assert.equal(usage.chunks, quotaBefore.chunks + 1);
+  assert.equal(usage.reserved_bytes, quotaBefore.reserved_bytes + largeBytes - firstChunk.length);
+  assert.equal(usage.reserved_chunks, quotaBefore.reserved_chunks + largeChunks - 1);
+  await h.capsule('append', admitted.intent.id, { sequence: 0, bytes_hex: firstChunk.toString('hex') });
+  assert.deepEqual((await h.control()).private_capsule_usage, converted.private_capsule_usage, 'append replay cannot convert reservation twice');
+  assert.equal((await h.capsule('retire', admitted.intent.id)).state, 'deleted');
+  const released = await h.control(), marker = released.private_capsule_chunks.find(row => row.capsule === admitted.intent.id);
+  assert.equal(released.private_capsule_usage[0].bytes, quotaBefore.bytes);
+  assert.equal(released.private_capsule_usage[0].reserved_bytes, quotaBefore.reserved_bytes);
+  assert.equal(released.private_capsule_usage[0].reserved_chunks, quotaBefore.reserved_chunks);
+  assert.equal(released.private_capsule_usage[0].chunks, quotaBefore.chunks + 1, 'permanent marker remains charged as historical chunk capacity');
+  assert.equal(marker.state, 'tombstoned');
+  assert.equal((await (await h.bucket()).get(marker.locator)).size, 0);
+  await h.reload();
+  assert.equal((await h.capsule('retire', admitted.intent.id)).state, 'deleted');
+  assert.deepEqual((await h.control()).private_capsule_usage, released.private_capsule_usage, 'retirement release survives restart and is exact once');
+  await h.capsule('begin', denied.intent.id, denied.intent.fields);
+  assert.equal((await h.capsule('retire', denied.intent.id)).state, 'deleted', 'released capacity admits the formerly denied intent without uploading its body');
+  assert.equal((await h.control()).private_capsule_usage[0].reserved_bytes, quotaBefore.reserved_bytes);
   const readable = await h.forge(6, { version: Array.from(Buffer.from(h.selection.view_version, 'hex')) }, { auth: h.reader });
   assert.equal(readable.state, 'complete');
   assert.equal(capsuleHex(readable.value.projected_commit), h.selection.projected_commit, 'real read-only member can resolve the role-allowed exported view');
   const beforeReader = await h.control();
-  const bucketBeforeReader = await (await h.bucket()).list({ prefix: `private/v1/${h.account}/` });
+  const privateCustody = async () => {
+    const bucket = await h.bucket(), listed = await bucket.list({ prefix: `private/v1/${h.account}/` });
+    assert.equal(listed.truncated, false, 'bounded negative fixture must inspect every private locator');
+    return Promise.all(listed.objects.map(async entry => {
+      const object = await bucket.get(entry.key); assert.ok(object);
+      assert.equal(object.size, 0, 'the legitimate preexisting custody is a permanent retirement marker');
+      return { key: entry.key, etag: object.etag, version: object.version, size: object.size,
+        metadata: { ...object.customMetadata }, bytes_hex: Buffer.from(await object.arrayBuffer()).toString('hex') };
+    }));
+  };
+  const bucketBeforeReader = await privateCustody();
   await h.capsule('begin', sha('private-capsule-readonly'), { ...begin, workspace_id: sha('readonly-private-workspace') }, { auth: h.reader, expected: 403, code: 'permission_denied' });
   const afterReader = await h.control();
-  for (const field of ['bytes', 'chunks', 'capsules']) assert.equal(afterReader.private_capsule_usage[0]?.[field] ?? 0, beforeReader.private_capsule_usage[0]?.[field] ?? 0, `read-only denial cannot allocate ${field}`);
+  for (const field of ['bytes', 'chunks', 'capsules', 'reserved_bytes', 'reserved_chunks']) assert.equal(afterReader.private_capsule_usage[0]?.[field] ?? 0, beforeReader.private_capsule_usage[0]?.[field] ?? 0, `read-only denial cannot allocate ${field}`);
   assert.deepEqual(afterReader.private_capsules, beforeReader.private_capsules);
   assert.deepEqual(afterReader.private_capsule_chunks, beforeReader.private_capsule_chunks);
   assert.deepEqual(afterReader.private_capsule_heads, beforeReader.private_capsule_heads);
-  assert.deepEqual((await (await h.bucket()).list({ prefix: `private/v1/${h.account}/` })).objects, bucketBeforeReader.objects, 'read-only begin cannot stage a physical payload');
+  assert.deepEqual(afterReader.forge_retained_roots, beforeReader.forge_retained_roots, 'read-only denial cannot allocate retention authority');
+  assert.deepEqual(await privateCustody(), bucketBeforeReader, 'read-only begin cannot add or alter physical custody, including the legitimate permanent marker');
   const initial = await h.capsule('begin', ids.first, begin);
   assert.deepEqual(await h.capsule('begin', ids.first, begin), initial);
   await h.capsule('begin', ids.first, { ...begin, expected_generation: 1 }, { expected: 409, code: 'capsule_conflict' });
@@ -2471,7 +2530,12 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   assert.equal((await h.capsule('retire', settledId)).state, 'deleted');
   const held = await h.control({ action: 'held-put' });
   assert.equal(held.current.size, 0); assert.equal(held.current.metadata.retired, '1');
+  const partialId = sha('archive-partially-uploaded-reservation'), partialBytes = Buffer.alloc(65553, 61), partialBody = capsuleDescriptor(partialBytes);
+  await h.capsule('begin', partialId, { workspace_id: sha('archive-partial-workspace'), expected_generation: 0, selection: h.selection, descriptor: partialBody.descriptor });
+  await h.capsule('append', partialId, { sequence: 0, bytes_hex: partialBody.chunks[0].toString('hex') });
   const before = await h.control(), account = (await h.forge(2)).value;
+  assert.equal(before.private_capsule_usage[0].reserved_bytes, 17);
+  assert.equal(before.private_capsule_usage[0].reserved_chunks, 1);
   const pending = before.private_capsule_chunks.find(chunk => chunk.capsule === pendingId);
   assert.equal(pending.state, 'pending'); assert.equal(await (await h.bucket()).get(pending.locator), null);
   const archiveId = sha('opaque-private-full-account-archive');
@@ -2565,6 +2629,20 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   for (const chunk of afterRetire.private_capsule_chunks.filter(chunk => chunk.capsule === sealedId)) {
     const object = await (await target.bucket()).get(chunk.locator); assert.ok(object); assert.equal(object.size, 0); assert.equal(object.customMetadata.retired, '1');
   }
+  const beforePartial = (await target.control()).private_capsule_usage[0];
+  await target.reload();
+  const partialStatus = await target.capsule('status', partialId);
+  assert.equal(partialStatus.state, 'uploading'); assert.equal(partialStatus.next_offset, 65536);
+  await target.capsule('append', partialId, { sequence: 1, bytes_hex: partialBody.chunks[1].toString('hex') });
+  const completedReservation = (await target.control()).private_capsule_usage[0];
+  assert.equal(completedReservation.reserved_bytes, beforePartial.reserved_bytes - 17);
+  assert.equal(completedReservation.reserved_chunks, beforePartial.reserved_chunks - 1);
+  assert.equal(completedReservation.bytes, beforePartial.bytes + 17);
+  assert.equal(completedReservation.chunks, beforePartial.chunks + 1);
+  await target.capsule('append', partialId, { sequence: 1, bytes_hex: partialBody.chunks[1].toString('hex') });
+  assert.deepEqual((await target.control()).private_capsule_usage[0], completedReservation);
+  assert.equal((await target.capsule('finish', partialId)).state, 'sealed');
+  assert.equal((await target.capsule('read', partialId, { sequence: 1 })).bytes_hex, partialBody.chunks[1].toString('hex'));
   assert.deepEqual(await h.capsule('status', sealedId), sealed, 'target byte retirement cannot mutate the separate source bucket or account');
   assert.equal((await h.control()).private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes);
 });
