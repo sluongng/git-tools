@@ -122,10 +122,36 @@ pub(super) enum AccountCommand {
     Backup(super::archive::BackupArgs),
     /// Restore an archive into untouched same-account target state.
     Restore(super::archive::RestoreArgs),
+    /// Set an account member's explicit permissions using an epoch CAS.
+    Member {
+        #[command(subcommand)]
+        command: MemberCommand,
+    },
     Show,
     Provision {
         #[arg(long)]
         request_id: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Clone, Debug)]
+pub(super) enum MemberCommand {
+    /// Replace one member's permissions; omitted grants are false.
+    Set {
+        principal: String,
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        review: bool,
+        #[arg(long)]
+        admin: bool,
+        /// Explicit view role; repeat for multiple roles.
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        #[arg(long)]
+        expected_epoch: u64,
+        #[arg(long)]
+        request_id: String,
     },
 }
 
@@ -268,17 +294,62 @@ pub(super) async fn account(
     args: AccountCommand,
 ) -> Result<(), CommandError> {
     let context = context()?;
-    let (op, request, mutation) = match args {
-        AccountCommand::BootstrapImport(args) => return super::bootstrap::run(ui, machine, args, context).await,
-        AccountCommand::Backup(args) => { let path=std::env::current_dir().map_err(user_error)?.join(&args.directory); return super::archive::backup(ui,machine,args,context,path).await; }
-        AccountCommand::Restore(args) => { let path=std::env::current_dir().map_err(user_error)?.join(&args.directory); return super::archive::restore(ui,machine,args,context,path).await; }
-        AccountCommand::Show => (Op::GetAccount, None, false),
-        AccountCommand::Provision { request_id } => (Op::ProvisionAccount, request_id, true),
+    let (op, body, request, mutation) = match args {
+        AccountCommand::BootstrapImport(args) => {
+            return super::bootstrap::run(ui, machine, args, context).await;
+        }
+        AccountCommand::Backup(args) => {
+            let path = std::env::current_dir()
+                .map_err(user_error)?
+                .join(&args.directory);
+            return super::archive::backup(ui, machine, args, context, path).await;
+        }
+        AccountCommand::Restore(args) => {
+            let path = std::env::current_dir()
+                .map_err(user_error)?
+                .join(&args.directory);
+            return super::archive::restore(ui, machine, args, context, path).await;
+        }
+        AccountCommand::Member {
+            command:
+                MemberCommand::Set {
+                    principal,
+                    write,
+                    review,
+                    admin,
+                    roles,
+                    expected_epoch,
+                    request_id,
+                },
+        } => {
+            let member = tinytree_forge_core::accounts::ForgeMember {
+                principal,
+                can_write: write,
+                can_review: review,
+                is_admin: admin,
+                roles,
+            };
+            tinytree_forge_core::account_commands::validate_member(&member).map_err(user_error)?;
+            let payload = tinytree_forge_core::account_commands::SetMemberRequest {
+                member,
+                expected_epoch,
+            };
+            (
+                Op::SetMember,
+                serde_json::to_value(payload).map_err(user_error)?,
+                Some(request_id),
+                true,
+            )
+        }
+        AccountCommand::Show => (Op::GetAccount, json!({}), None, false),
+        AccountCommand::Provision { request_id } => {
+            (Op::ProvisionAccount, json!({}), request_id, true)
+        }
     };
     rpc::print(
         ui,
         machine,
-        rpc::call(&context, op, json!({}), request, mutation, None).await?,
+        rpc::call(&context, op, body, request, mutation, None).await?,
     )
 }
 

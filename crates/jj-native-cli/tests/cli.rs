@@ -1188,9 +1188,115 @@ mod forge_product {
         ]))
         .unwrap();
         assert_eq!(provision["result"]["value"]["monorepo_id"], "forge-example");
-        let epoch = provision["result"]["value"]["policy_epoch"]
+        let provision_epoch = provision["result"]["value"]["policy_epoch"]
             .as_u64()
             .unwrap();
+        let provision_epoch_text = provision_epoch.to_string();
+        let member_args = [
+            "account",
+            "member",
+            "set",
+            "collaborator",
+            "--expected-epoch",
+            &provision_epoch_text,
+            "--request-id",
+            "member-read-only",
+            "--json",
+        ];
+        let added = service_value(&client, &member_args);
+        assert_eq!(added["policy_epoch"], provision_epoch + 1);
+        assert_eq!(
+            service_value(&client, &member_args),
+            added,
+            "same key replays despite the old expected epoch"
+        );
+        let member_path = client
+            .home
+            .join("config/tinytree/requests/request-member-read-only.json");
+        let original_member_intent = fs::read(&member_path).unwrap();
+        let member_intent: serde_json::Value =
+            serde_json::from_slice(&original_member_intent).unwrap();
+        assert_eq!(member_intent["operation"], 3);
+        assert_eq!(
+            member_intent["payload"],
+            serde_json::json!({
+                "member":{"principal":"collaborator","can_write":false,"can_review":false,"is_admin":false,"roles":[]},
+                "expected_epoch":provision_epoch,
+            })
+        );
+        let rebound = client.run(&[
+            "account",
+            "member",
+            "set",
+            "collaborator",
+            "--admin",
+            "--expected-epoch",
+            &provision_epoch.to_string(),
+            "--request-id",
+            "member-read-only",
+            "--json",
+        ]);
+        assert!(
+            !rebound.status.success(),
+            "changed privileges must not reuse the saved intent"
+        );
+        assert_eq!(fs::read(&member_path).unwrap(), original_member_intent);
+        let stale = client.run(&[
+            "account",
+            "member",
+            "set",
+            "collaborator",
+            "--write",
+            "--expected-epoch",
+            &provision_epoch.to_string(),
+            "--request-id",
+            "member-stale-epoch",
+            "--json",
+        ]);
+        assert!(
+            !stale.status.success(),
+            "a new request cannot bypass current epoch CAS"
+        );
+        assert_eq!(
+            service_value(&client, &["account", "show", "--json"])["policy_epoch"],
+            added["policy_epoch"]
+        );
+        let granted = service_value(
+            &client,
+            &[
+                "account",
+                "member",
+                "set",
+                "collaborator",
+                "--write",
+                "--review",
+                "--admin",
+                "--role",
+                "developer",
+                "--expected-epoch",
+                &added["policy_epoch"].as_u64().unwrap().to_string(),
+                "--request-id",
+                "member-explicit-grants",
+                "--json",
+            ],
+        );
+        let granted_intent: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                client
+                    .home
+                    .join("config/tinytree/requests/request-member-explicit-grants.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            granted_intent["payload"]["member"],
+            serde_json::json!({
+                "principal":"collaborator","can_write":true,"can_review":true,"is_admin":true,"roles":["developer"],
+            })
+        );
+        let epoch = granted["policy_epoch"].as_u64().unwrap();
+        assert_eq!(epoch, provision_epoch + 2);
         let repo = "forge-example";
         let original = store.references(repo, &["main".into()]).unwrap().remove(0);
         let file = |bytes: &[u8]| {

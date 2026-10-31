@@ -68,7 +68,7 @@ enum Command {
     Lineage(transform::LineageArgs),
     /// Authenticate a configured account and save its routing context.
     Login(service::LoginArgs),
-    /// Provision or inspect the account's single canonical monorepo.
+    /// Provision, inspect or administer the account's single canonical monorepo.
     Account {
         #[command(subcommand)]
         command: service::AccountCommand,
