@@ -964,6 +964,7 @@ fn response(
                 .checker
                 .as_ref()
                 .and_then(|checker| checker.progress(repo, job.id)),
+            recovery_inspection: None,
         }),
     };
     if value.encoded_len() > host.config.max_response_bytes {
@@ -1080,14 +1081,31 @@ impl p::landing_server::Landing for LandingService {
         let store = host.store.clone();
         let repo = input.repository_id.clone();
         let key = input.idempotency_key.clone();
-        let job = execute(work.clone(), move || {
-            store
+        let checker = host.checker.clone();
+        let inspect = input.inspect_recovery;
+        let (job, inspection) = execute(work.clone(), move || {
+            let job = store
                 .landing_job(&input.repository_id, owner, &input.idempotency_key)
                 .map_err(crate::service::store_status)?
-                .ok_or_else(|| Status::not_found("landing job unavailable"))
+                .ok_or_else(|| Status::not_found("landing job unavailable"))?;
+            let inspection = if inspect {
+                checker
+                    .as_ref()
+                    .and_then(|c| c.inspect_recovery(&input.repository_id, job.id))
+            } else {
+                None
+            };
+            Ok((job, inspection))
         })
         .await?;
-        response(&host, job, work, &repo, &key)
+        let mut response = response(&host, job, work, &repo, &key)?;
+        response.get_mut().job.as_mut().unwrap().recovery_inspection = inspection;
+        if response.get_ref().encoded_len() > host.config.max_response_bytes {
+            return Err(Status::resource_exhausted(
+                "landing response exceeds budget",
+            ));
+        }
+        Ok(response)
     }
     async fn recover_landing(
         &self,

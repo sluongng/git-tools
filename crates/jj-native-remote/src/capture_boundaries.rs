@@ -223,7 +223,7 @@ impl RemoteRepositoryControl {
         // catalogs/closure allocation. No persistent pool or verdict is created.
         let landing_client = client.clone().with_landing_budget(256 * 1024 * 1024)?;
         let observed = intent.job_id.as_deref().map(crate::unhex).transpose()?;
-        let job = io::network(landing_client.lookup_landing(&start, observed)).await?;
+        let job = io::network(landing_client.lookup_landing(&start, observed, false)).await?;
         if !job.roots_retained() {
             return Err(tonic::Status::failed_precondition("landing result roots no longer retained; capture remains pending until explicit intent reconciliation").into());
         }

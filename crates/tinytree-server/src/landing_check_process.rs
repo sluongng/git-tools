@@ -61,6 +61,33 @@ pub(crate) fn allows_verdict(directory: &PrivateDir) -> bool {
     })();
     result.unwrap_or(false)
 }
+/// Fixed current wrapper-record category only. Does not inspect or signal PIDs.
+pub(crate) fn inspect_transport(directory: &PrivateDir, name: &str) -> i32 {
+    let bytes = match directory.read(name, 1024) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 1,
+        Err(_) => return 2,
+    };
+    let Ok(envelope) = serde_json::from_slice::<ProcessEnvelope>(&bytes) else {
+        return 2;
+    };
+    let Ok(encoded) = serde_json::to_vec(&envelope.state) else {
+        return 2;
+    };
+    if envelope.state.schema != 1
+        || envelope.state.group.is_some_and(|group| group <= 0)
+        || envelope.checksum != blake3::hash(&encoded).to_hex().to_string()
+    {
+        return 2;
+    }
+    if !envelope.state.quiescent {
+        3
+    } else if envelope.state.eligible {
+        4
+    } else {
+        5
+    }
+}
 pub(crate) struct Output {
     pub bytes: Vec<u8>,
     pub eligible: bool,

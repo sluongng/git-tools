@@ -320,6 +320,105 @@ async fn unavailable_attempt_replays_and_capacity_fails_closed() {
             .join("attempt.json")
             .is_file()
     );
+    let attempt = directory.path().join("checks").join(request.workspace_id());
+    let journal_path = attempt.join("attempt.json");
+    let journal_before = fs::read(&journal_path).unwrap();
+    let entries_before: std::collections::BTreeSet<_> = fs::read_dir(&attempt)
+        .unwrap()
+        .map(|v| v.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        inspect_recovery(&config, &request),
+        RecoveryInspection::ReadinessPresent
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+    assert_eq!(
+        fs::read_dir(&attempt)
+            .unwrap()
+            .map(|v| v.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        entries_before
+    );
+    // Read-only inspection distinguishes absent paths from rejected artifacts.
+    let mut unavailable = config.clone();
+    unavailable.scratch = directory.path().join("absent-checks");
+    assert_eq!(
+        inspect_recovery(&unavailable, &request),
+        RecoveryInspection::ScratchMissing
+    );
+    unavailable.scratch = directory.path().join("not-a-directory");
+    fs::write(&unavailable.scratch, b"not a directory").unwrap();
+    assert_eq!(
+        inspect_recovery(&unavailable, &request),
+        RecoveryInspection::Unavailable
+    );
+    assert_eq!(fs::read(&unavailable.scratch).unwrap(), b"not a directory");
+    let mut absent_request = request.clone();
+    absent_request.attempt_id = "98".repeat(32);
+    assert_eq!(
+        inspect_recovery(&config, &absent_request),
+        RecoveryInspection::AttemptMissing
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let held_attempt = attempt.with_file_name("held-attempt");
+        fs::rename(&attempt, &held_attempt).unwrap();
+        symlink(&held_attempt, &attempt).unwrap();
+        assert_eq!(
+            inspect_recovery(&config, &request),
+            RecoveryInspection::Unavailable
+        );
+        assert!(
+            fs::symlink_metadata(&attempt)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&attempt).unwrap();
+        fs::rename(&held_attempt, &attempt).unwrap();
+        fs::set_permissions(&attempt, fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(
+            inspect_recovery(&config, &request),
+            RecoveryInspection::Unavailable
+        );
+        assert_eq!(
+            fs::metadata(&attempt).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        fs::set_permissions(&attempt, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+    let held = attempt.join("held-journal");
+    fs::rename(&journal_path, &held).unwrap();
+    assert_eq!(
+        inspect_recovery(&config, &request),
+        RecoveryInspection::JournalMissing
+    );
+    fs::write(&journal_path, b"invalid journal").unwrap();
+    assert_eq!(
+        inspect_recovery(&config, &request),
+        RecoveryInspection::JournalInvalid
+    );
+    let mut rebound: serde_json::Value = serde_json::from_slice(&journal_before).unwrap();
+    rebound["request"]["candidate_commit"] = json!("99".repeat(32));
+    fs::write(&journal_path, serde_json::to_vec(&rebound).unwrap()).unwrap();
+    assert_eq!(
+        inspect_recovery(&config, &request),
+        RecoveryInspection::BindingMismatch
+    );
+    fs::remove_file(&journal_path).unwrap();
+    fs::rename(&held, &journal_path).unwrap();
+    let (tool, held_tool) = (
+        attempt.join("tools/workspace"),
+        attempt.join("held-workspace"),
+    );
+    fs::rename(&tool, &held_tool).unwrap();
+    assert_eq!(
+        inspect_recovery(&config, &request),
+        RecoveryInspection::ToolsIncomplete
+    );
+    fs::rename(&held_tool, &tool).unwrap();
     let mut other = request.clone();
     other.attempt_id = "99".repeat(32);
     assert!(

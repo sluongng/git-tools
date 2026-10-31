@@ -29,6 +29,142 @@ struct Journal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease: Option<CheckerLease>,
 }
+/// Read-only current readiness categories, not execution/cleanup evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RecoveryInspection {
+    NotInspected = 0,
+    ConfigInvalid = 1,
+    ScratchMissing = 2,
+    AttemptMissing = 3,
+    JournalMissing = 4,
+    JournalInvalid = 5,
+    BindingMismatch = 6,
+    EnvironmentMissing = 7,
+    ToolsIncomplete = 8,
+    ReceiptSaved = 9,
+    ReadinessPresent = 10,
+    Unavailable = 11,
+}
+/// Never calls Attempt::open: no lock creation, save, cleanup, process probe,
+/// tool execution or binary rehash. Tool readiness is metadata-only, not proof.
+pub fn inspect_recovery(config: &Config, request: &Request) -> RecoveryInspection {
+    use RecoveryInspection::*;
+    if request.validate().is_err() || config.validate().is_err() {
+        return ConfigInvalid;
+    }
+    let scratch = match PrivateDir::open_existing(&config.scratch) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScratchMissing,
+        Err(_) => return Unavailable,
+    };
+    let root = match PrivateDir::open_existing(scratch.path().join(request.workspace_id())) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AttemptMissing,
+        Err(_) => return Unavailable,
+    };
+    let bytes = match root.read("attempt.json", 256 * 1024) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return JournalMissing,
+        Err(_) => return JournalInvalid,
+    };
+    let journal: Journal = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return JournalInvalid,
+    };
+    if journal.schema != 1 || journal.config.validate().is_err() {
+        return JournalInvalid;
+    }
+    if journal.request != *request
+        || journal.workspace_id != request.workspace_id()
+        || journal.config.scratch != config.scratch
+    {
+        return BindingMismatch;
+    }
+    if journal
+        .config
+        .workspace_environment
+        .iter()
+        .any(|name| std::env::var(name).is_err())
+    {
+        return EnvironmentMissing;
+    }
+    if let Some(receipt) = &journal.receipt {
+        if receipt.validate_for(request).is_err() {
+            return JournalInvalid;
+        }
+        if receipt.cleanup_confirmed {
+            return ReceiptSaved;
+        }
+    }
+    let tools = match PrivateDir::open_existing(root.path().join("tools")) {
+        Ok(v) => v,
+        Err(_) => return ToolsIncomplete,
+    };
+    let names = if journal.config.https_snapshot.is_some() {
+        ["bazel", "readonly-snapshot"]
+    } else {
+        ["workspace", "bazel"]
+    };
+    for name in names {
+        if !fs::symlink_metadata(tools.path().join(name))
+            .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= 1024 * 1024 * 1024)
+        {
+            return ToolsIncomplete;
+        }
+    }
+    if let Some(snapshot) = &journal.config.https_snapshot {
+        let Some(lease) = &journal.lease else {
+            return BindingMismatch;
+        };
+        if lease.validate().is_err()
+            || lease.request != *request
+            || journal
+                .config
+                .profile_version(&request.profile_name)
+                .ok()
+                .as_deref()
+                != Some(request.profile_version.as_str())
+            || snapshot.limits.validate().is_err()
+        {
+            return BindingMismatch;
+        }
+    } else {
+        let frozen = match root.read("daemon-template.toml", 65536) {
+            Ok(v) => v,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && forge_repository(&journal.config, request).ok() == Some(false) =>
+            {
+                match root.read("daemon.toml", 65536) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BindingMismatch,
+                    Err(_) => return Unavailable,
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BindingMismatch,
+            Err(_) => return Unavailable,
+        };
+        if journal
+            .config
+            .profile_version_for_daemon(&request.profile_name, &frozen)
+            .ok()
+            .as_deref()
+            != Some(request.profile_version.as_str())
+        {
+            return BindingMismatch;
+        }
+        match (
+            derived_daemon(&journal.config, request, root.path(), &frozen),
+            root.read("daemon.toml", 65536),
+        ) {
+            (Ok(expected), Ok(actual)) if expected == actual => (),
+            (_, Err(e)) if e.kind() != std::io::ErrorKind::NotFound => return Unavailable,
+            _ => return BindingMismatch,
+        }
+    }
+    ReadinessPresent
+}
 fn forge_repository(config: &Config, request: &Request) -> Result<bool> {
     let profile = config.profile(&request.profile_name)?;
     Ok(profile.forge_accounts

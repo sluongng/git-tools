@@ -182,6 +182,7 @@ struct Job {
     phase: LandingPhase,
     preparation: LandingPreparation,
     checker_progress: Option<l::CheckerProgress>,
+    recovery_inspection: Option<l::CheckerRecoveryInspection>,
     roots_retained: bool,
     expires_at_seconds: i64,
     candidate: Option<LandingCandidate>,
@@ -204,6 +205,10 @@ impl CheckedLandingJob {
     /// Ephemeral server diagnostics only, never check or child-process evidence.
     pub fn checker_progress(&self) -> Option<&l::CheckerProgress> {
         self.0.checker_progress.as_ref()
+    }
+    /// Opt-in current artifact observations, not a verdict or cleanup proof.
+    pub fn recovery_inspection(&self) -> Option<&l::CheckerRecoveryInspection> {
+        self.0.recovery_inspection.as_ref()
     }
     pub fn handle(&self) -> LandingHandle {
         self.0.handle.clone()
@@ -328,6 +333,14 @@ fn checked(
             return Err(bad());
         }
     }
+    if let Some(inspection) = &job.recovery_inspection {
+        if l::CheckerTransportInspection::try_from(inspection.transport).is_err()
+            || l::CheckerOutputInspection::try_from(inspection.stdout).is_err()
+            || l::CheckerRunnerInspection::try_from(inspection.runner).is_err()
+        {
+            return Err(bad());
+        }
+    }
     let candidate = job
         .candidate
         .map(|c| -> Result<_, Status> {
@@ -406,6 +419,7 @@ fn checked(
         phase,
         preparation,
         checker_progress: job.checker_progress,
+        recovery_inspection: job.recovery_inspection,
         roots_retained: job.roots_retained,
         expires_at_seconds: job.expires_at_seconds,
         candidate,
@@ -576,6 +590,7 @@ impl NativeClient {
         &self,
         start: &LandingStart,
         expected_id: Option<[u8; 32]>,
+        inspect_recovery: bool,
     ) -> Result<CheckedLandingJob, Status> {
         start.validate()?;
         if expected_id == Some([0; 32]) {
@@ -594,6 +609,7 @@ impl NativeClient {
                 l::GetLandingRequest {
                     repository_id: self.inner.config.repository_id.clone(),
                     idempotency_key: start.idempotency_key.clone(),
+                    inspect_recovery,
                 }
             })
             .await?;
@@ -658,6 +674,7 @@ impl NativeClient {
                 l::GetLandingRequest {
                     repository_id: self.inner.config.repository_id.clone(),
                     idempotency_key: handle.binding.start.idempotency_key.clone(),
+                    inspect_recovery: false,
                 }
             })
             .await?;

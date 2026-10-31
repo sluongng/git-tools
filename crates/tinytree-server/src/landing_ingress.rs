@@ -389,6 +389,8 @@ mod tests {
         let get = p::GetLandingRequest {
             repository_id: "example".into(),
             idempotency_key: "cancel".into(),
+
+            inspect_recovery: false,
         };
         let (rpc, _) = request("GetLanding", Some(WRITER), frame(&get));
         assert_eq!(
@@ -500,6 +502,8 @@ mod compression_window_tests {
         let payload = tinytree_proto::landing_v1::GetLandingRequest {
             repository_id: "example".into(),
             idempotency_key: "absent".into(),
+
+            inspect_recovery: false,
         }
         .encode_to_vec();
         for (window, accepted) in [(27, true), (28, false)] {

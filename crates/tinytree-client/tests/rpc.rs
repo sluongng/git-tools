@@ -12540,7 +12540,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     // remains light; wait for that physical work before replaying acceptance.
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let status = client.lookup_landing(&start, Some(id)).await.unwrap();
+        let status = client.lookup_landing(&start, Some(id), false).await.unwrap();
         let ready = status.phase() != LandingPhase::Intent;
         drop(status);
         if ready {
@@ -12552,7 +12552,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     let replay = client.start_landing(&start).await.unwrap();
     assert_eq!(replay.handle().id(), id);
     drop(replay);
-    let status = client.lookup_landing(&start, Some(id)).await.unwrap();
+    let status = client.lookup_landing(&start, Some(id), false).await.unwrap();
     let handle = status.handle();
     drop(status);
     // The independent next result has headroom with the ordinary default pool.
@@ -12563,7 +12563,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
         "handles cannot change authenticated client transport"
     );
     drop(handle);
-    let mut job = ordinary.lookup_landing(&start, Some(id)).await.unwrap();
+    let mut job = ordinary.lookup_landing(&start, Some(id), false).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while job.phase() == LandingPhase::Intent {
         let h = job.handle();
@@ -12612,7 +12612,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
             now,
         )
         .unwrap();
-    let checked = ordinary.lookup_landing(&start, Some(id)).await.unwrap();
+    let checked = ordinary.lookup_landing(&start, Some(id), false).await.unwrap();
     assert_eq!(checked.phase(), LandingPhase::Checked);
     assert!(checked.receipt().is_none());
     drop(lease);
@@ -12636,7 +12636,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     let stale_expiry = stale.expires_at_seconds();
     drop(stale);
     let replay = ordinary
-        .lookup_landing(&preparation_stale, Some(stale_id))
+        .lookup_landing(&preparation_stale, Some(stale_id), false)
         .await
         .unwrap();
     assert_eq!(replay.phase(), LandingPhase::StaleTarget);
@@ -12675,7 +12675,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let ready = loop {
         let job = ordinary
-            .lookup_landing(&unavailable_start, Some(unavailable_id))
+            .lookup_landing(&unavailable_start, Some(unavailable_id), false)
             .await
             .unwrap();
         if job.phase() != LandingPhase::Intent {
@@ -12770,7 +12770,7 @@ async fn landing_compressed_preparation_replay_and_retained_results_are_checked(
     assert_eq!(candidate.rewrites.len(), 1);
     assert_eq!(candidate.rewrites[0].old, candidate.rewrites[0].new);
     let observed = ordinary
-        .lookup_landing(&unchanged, Some(begun.id))
+        .lookup_landing(&unchanged, Some(begun.id), false)
         .await
         .unwrap();
     assert_eq!(observed.phase(), LandingPhase::PreparedPendingChecks);
@@ -12849,7 +12849,7 @@ async fn landing_lost_start_response_recovers_read_only_after_launch_grant_and_p
         client.start_landing(&start).await.unwrap_err().code(),
         Code::PermissionDenied
     );
-    let recovered = client.lookup_landing(&start, None).await.unwrap();
+    let recovered = client.lookup_landing(&start, None, false).await.unwrap();
     assert_eq!(
         recovered.preparation(),
         LandingPreparation::ProfileUnavailable
@@ -12857,7 +12857,7 @@ async fn landing_lost_start_response_recovers_read_only_after_launch_grant_and_p
     let id = recovered.handle().id();
     assert_eq!(
         client
-            .lookup_landing(&start, Some([99; 32]))
+            .lookup_landing(&start, Some([99; 32]), false)
             .await
             .unwrap_err()
             .code(),
@@ -12867,7 +12867,7 @@ async fn landing_lost_start_response_recovers_read_only_after_launch_grant_and_p
     wrong.expected_profile_version = "v2".into();
     assert_eq!(
         client
-            .lookup_landing(&wrong, Some(id))
+            .lookup_landing(&wrong, Some(id), false)
             .await
             .unwrap_err()
             .code(),
@@ -12889,6 +12889,7 @@ async fn landing_lost_start_response_recovers_read_only_after_launch_grant_and_p
 // the real service and Store, never this fabricated assertion producer.
 #[derive(Clone)]
 struct LandingProtocolBoundary {
+    inspection_requested: Arc<AtomicUsize>,
     response: Arc<std::sync::Mutex<tinytree_proto::landing_v1::LandingResponse>>,
     delay: Arc<AtomicUsize>,
     entered: Arc<tokio::sync::Notify>,
@@ -12923,6 +12924,7 @@ impl tinytree_proto::landing_v1::landing_server::Landing for LandingProtocolBoun
             format!("Bearer {TOKEN}").as_str()
         );
         assert_eq!(request.get_ref().repository_id, "example");
+        self.inspection_requested.store(usize::from(request.get_ref().inspect_recovery), Ordering::SeqCst);
         self.entered.notify_one();
         tokio::time::sleep(Duration::from_millis(
             self.delay.load(Ordering::SeqCst) as u64
@@ -12971,7 +12973,9 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
     let reply = Arc::new(std::sync::Mutex::new(prepared.clone()));
     let delay = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
+    let inspection_requested = Arc::new(AtomicUsize::new(0));
     let service = LandingProtocolBoundary {
+        inspection_requested: inspection_requested.clone(),
         response: reply.clone(),
         delay: delay.clone(),
         entered: entered.clone(),
@@ -13002,7 +13006,7 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         ..Default::default()
     };
     let client = NativeClient::connect(config).await.unwrap();
-    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 19] = [
+    let cases: [(&str, Box<dyn Fn(&mut l::LandingResponse)>); 22] = [
         (
             "preparation stale with retained roots",
             Box::new(|r| {
@@ -13028,6 +13032,36 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         (
             "unknown readiness",
             Box::new(|r| r.job.as_mut().unwrap().preparation = 999),
+        ),
+        (
+            "unknown recovery transport observation",
+            Box::new(|r| {
+                r.job.as_mut().unwrap().recovery_inspection =
+                    Some(l::CheckerRecoveryInspection {
+                        transport: 999,
+                        ..Default::default()
+                    });
+            }),
+        ),
+        (
+            "unknown recovery output observation",
+            Box::new(|r| {
+                r.job.as_mut().unwrap().recovery_inspection =
+                    Some(l::CheckerRecoveryInspection {
+                        stdout: 999,
+                        ..Default::default()
+                    });
+            }),
+        ),
+        (
+            "unknown recovery runner observation",
+            Box::new(|r| {
+                r.job.as_mut().unwrap().recovery_inspection =
+                    Some(l::CheckerRecoveryInspection {
+                        runner: 999,
+                        ..Default::default()
+                    });
+            }),
         ),
         (
             "wrong job width",
@@ -13147,6 +13181,29 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
             "{name}"
         );
     }
+    let inspection = l::CheckerRecoveryInspection {
+        transport: l::CheckerTransportInspection::CtiQuiescentIneligible as i32,
+        stdout: l::CheckerOutputInspection::CoiEmpty as i32,
+        stderr_present: true,
+        runner: l::CheckerRunnerInspection::CriJournalMissing as i32,
+    };
+    let mut observed = prepared.clone();
+    observed.job.as_mut().unwrap().recovery_inspection = Some(inspection.clone());
+    *reply.lock().unwrap() = observed;
+    let status = client
+        .lookup_landing(&input, Some([7; 32]), true)
+        .await
+        .unwrap();
+    assert_eq!(inspection_requested.load(Ordering::SeqCst), 1);
+    assert_eq!(status.recovery_inspection(), Some(&inspection));
+    assert_eq!(status.phase(), tinytree_client::LandingPhase::PreparedPendingChecks);
+    drop(status);
+    let status = client
+        .lookup_landing(&input, Some([7; 32]), false)
+        .await
+        .unwrap();
+    assert_eq!(inspection_requested.load(Ordering::SeqCst), 0);
+    drop(status);
     let mut oversized = prepared.clone();
     oversized
         .job
@@ -13198,7 +13255,7 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
         .with_rpc_lifetime_guard(Arc::new(LifetimeProbe(dropped.clone())));
     let _ = futures_util::FutureExt::now_or_never(entered.notified());
     let input_copy = input.clone();
-    let task = tokio::spawn(async move { transient.lookup_landing(&input_copy, None).await });
+    let task = tokio::spawn(async move { transient.lookup_landing(&input_copy, None, false).await });
     entered.notified().await;
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     task.abort();
@@ -13210,7 +13267,7 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
     let began = std::time::Instant::now();
     assert_eq!(
         bounded
-            .lookup_landing(&input, None)
+            .lookup_landing(&input, None, false)
             .await
             .unwrap_err()
             .code(),
@@ -13220,7 +13277,7 @@ async fn landing_rejects_malformed_and_overbudget_assertions_and_cancellation_re
     delay.store(0, Ordering::SeqCst);
     // A following call proves the cancelled operation did not strand shared
     // physical memory or inflight admission, independently of result ownership.
-    assert!(client.lookup_landing(&input, None).await.is_ok());
+    assert!(client.lookup_landing(&input, None, false).await.is_ok());
     let _ = stop.send(());
     server.await.unwrap();
 }
@@ -13406,7 +13463,7 @@ async fn landing_independent_pool_reuses_authenticated_transport_and_preserves_o
     );
     assert_eq!(
         budgeted
-            .lookup_landing(&start, Some(id))
+            .lookup_landing(&start, Some(id), false)
             .await
             .unwrap()
             .handle()

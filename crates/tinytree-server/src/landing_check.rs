@@ -1171,6 +1171,96 @@ impl CheckerHost {
             .filter(|(selected, _)| selected == &key)
             .map(|(_, value)| value.clone())
     }
+    /// Explicit, bounded current-state inspection. No state-lock-held I/O and
+    /// no authority to retry, clean up, save records or consume a receipt.
+    pub(crate) fn inspect_recovery(
+        &self,
+        repo: &str,
+        id: [u8; 32],
+    ) -> Option<tinytree_proto::landing_v1::CheckerRecoveryInspection> {
+        let key = (repo.to_owned(), id);
+        let (record, path) = {
+            let state = self.state.lock().ok()?;
+            let slot = state.slots.get(&key)?;
+            if slot.active || !slot.record.uncertain() {
+                return None;
+            }
+            (slot.record.clone(), slot.directory.path().to_path_buf())
+        };
+        let mut result = tinytree_proto::landing_v1::CheckerRecoveryInspection::default();
+        let inspected = (|| -> Result<()> {
+            let directory = PrivateDir::open_existing(path.join(&record.request.attempt_id))?;
+            let mode = if record.recoveries == 0 {
+                "run"
+            } else {
+                "recover"
+            };
+            let output = format!("{mode}-{}.stdout", record.recoveries);
+            result.transport = crate::landing_check_process::inspect_transport(
+                &directory,
+                &format!("{output}.process.json"),
+            );
+            result.stdout = match directory.read(&output, runner::MAX_RECEIPT_BYTES) {
+                Ok(bytes) if bytes.is_empty() => 2,
+                Ok(bytes) => match serde_json::from_slice::<runner::Receipt>(&bytes) {
+                    Ok(receipt)
+                        if validate_receipt(&receipt, &record.request, &record.authority)
+                            .is_ok() =>
+                    {
+                        3
+                    }
+                    _ => 4,
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
+                Err(_) => {
+                    if std::fs::symlink_metadata(directory.path().join(&output))
+                        .is_ok_and(|m| m.is_file() && m.len() > runner::MAX_RECEIPT_BYTES as u64)
+                    {
+                        5
+                    } else {
+                        4
+                    }
+                }
+            };
+            result.stderr_present = std::fs::symlink_metadata(
+                directory
+                    .path()
+                    .join(format!("{mode}-{}.stderr", record.recoveries)),
+            )
+            .is_ok_and(|m| m.is_file() && m.len() > 0);
+            let bytes = directory.read("checker.toml", 65536)?;
+            if digest(&bytes) != record.authority.configuration {
+                result.runner = 1;
+                return Ok(());
+            }
+            let config: runner::Config = match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| toml::from_str(s).ok())
+            {
+                Some(v) => v,
+                None => {
+                    result.runner = 1;
+                    return Ok(());
+                }
+            };
+            result.runner = runner::inspect_recovery(&config, &record.request) as i32;
+            Ok(())
+        })();
+        if inspected.is_err() {
+            result.runner = 11;
+        }
+        let state = self.state.lock().ok()?;
+        let slot = state.slots.get(&key)?;
+        if slot.active
+            || !slot.record.uncertain()
+            || slot.record.request != record.request
+            || slot.record.recoveries != record.recoveries
+            || slot.record.attempts != record.attempts
+        {
+            return None;
+        }
+        Some(result)
+    }
     fn diagnostic_stage(&self, key: &Key, stage: CheckerStage) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(slot) = state.slots.get_mut(key) {

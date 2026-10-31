@@ -1757,8 +1757,9 @@ async fn unix_listener_requires_private_real_parent_and_preserves_replacement() 
         landing
             .get_landing(tinytree_proto::landing_v1::GetLandingRequest {
                 repository_id: "alpha".into(),
-                idempotency_key: "absent".into()
-            })
+                idempotency_key: "absent".into(),
+                        inspect_recovery: false,
+})
             .await
             .unwrap_err()
             .code(),
@@ -10646,7 +10647,9 @@ async fn wait_landing_phase(
                     tinytree_proto::landing_v1::GetLandingRequest {
                         repository_id: input.repository_id.clone(),
                         idempotency_key: input.idempotency_key.clone(),
-                    },
+                    
+                        inspect_recovery: false,
+},
                     ALPHA,
                 ))
                 .await
@@ -10683,7 +10686,9 @@ async fn checker_status_explains_prelaunch_authority_failure_and_recovers() {
         loop {
             let job = client.get_landing(request(l::GetLandingRequest {
                 repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
-            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            
+                        inspect_recovery: false,
+}, ALPHA)).await.unwrap().into_inner().job.unwrap();
             if job.checker_progress.as_ref().is_some_and(|p| p.error_code == l::CheckerErrorCode::ReservationFailed as i32) { break job; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -10989,7 +10994,9 @@ async fn target_movement_before_start_is_terminal_without_checker_dispatch() {
     let get = l::GetLandingRequest {
         repository_id: "alpha".into(),
         idempotency_key: input.idempotency_key,
-    };
+    
+                        inspect_recovery: false,
+};
     assert_eq!(
         client
             .get_landing(request(get, ALPHA))
@@ -11096,7 +11103,9 @@ async fn recovery_setup_failure_spends_automatic_and_one_shot_admissions() {
         loop {
             let status = client.get_landing(request(l::GetLandingRequest {
                 repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
-            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            
+                        inspect_recovery: false,
+}, ALPHA)).await.unwrap().into_inner().job.unwrap();
             if status.checker_progress.as_ref().is_some_and(|p| p.automatic_recovery_blocked && p.recoveries == 1) { break status; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -11110,7 +11119,9 @@ async fn recovery_setup_failure_spends_automatic_and_one_shot_admissions() {
         loop {
             let status = client.get_landing(request(l::GetLandingRequest {
                 repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
-            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            
+                        inspect_recovery: false,
+}, ALPHA)).await.unwrap().into_inner().job.unwrap();
             if status.checker_progress.as_ref().is_some_and(|p| !p.active_task && p.recoveries == 2) { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -11164,7 +11175,9 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
         loop {
             let status = client.get_landing(request(l::GetLandingRequest {
                 repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
-            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            
+                        inspect_recovery: false,
+}, ALPHA)).await.unwrap().into_inner().job.unwrap();
             if let Some(progress) = status.checker_progress {
                 if progress.automatic_recovery_blocked {
                     assert!(!progress.active_task);
@@ -11192,7 +11205,9 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
         loop {
             let status = client.get_landing(request(l::GetLandingRequest {
                 repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
-            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            
+                        inspect_recovery: false,
+}, ALPHA)).await.unwrap().into_inner().job.unwrap();
             let p = status.checker_progress.unwrap();
             if !p.active_task && p.recoveries == 2 {
                 assert_eq!(p.attempts, 1);
@@ -11208,6 +11223,18 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
     let executions_after = std::fs::read_to_string(scratch.join("executions")).unwrap();
     assert_eq!(executions_after.lines().filter(|v| *v == "run").count(), 1);
     assert_eq!(executions_after.lines().filter(|v| *v == "recover").count(), executions_before.lines().filter(|v| *v == "recover").count() + 1);
+    let executions_before_inspect = std::fs::read_to_string(scratch.join("executions")).unwrap();
+    for _ in 0..2 {
+        let inspected = client.get_landing(request(l::GetLandingRequest {
+            repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(), inspect_recovery: true,
+        }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+        let inspection = inspected.recovery_inspection.unwrap();
+        assert_eq!(inspection.transport, 4, "fixture wrapper is quiescent and eligible, not a production check verdict");
+        assert_eq!(inspection.stdout, 3);
+        assert_eq!(inspection.runner, 3, "protocol fixture deliberately has no actual runner attempt directory");
+        assert_eq!(inspected.checker_progress.unwrap().recoveries, 2);
+    }
+    assert_eq!(std::fs::read_to_string(scratch.join("executions")).unwrap(), executions_before_inspect);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let retained = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
     assert!(retained.roots_retained);
@@ -11359,7 +11386,9 @@ async fn landing_preparation_is_owner_scoped_compressed_replayable_and_never_pub
     let get = l::GetLandingRequest {
         repository_id: "alpha".into(),
         idempotency_key: input.idempotency_key.clone(),
-    };
+    
+                        inspect_recovery: false,
+};
     let echo = client
         .get_landing(request(get.clone(), ALPHA))
         .await
@@ -11448,8 +11477,9 @@ async fn landing_preparation_is_owner_scoped_compressed_replayable_and_never_pub
             .get_landing(request(
                 l::GetLandingRequest {
                     repository_id: "alpha".into(),
-                    idempotency_key: "decompression-cap".into()
-                },
+                    idempotency_key: "decompression-cap".into(),
+                        inspect_recovery: false,
+},
                 ALPHA
             ))
             .await
@@ -11551,7 +11581,9 @@ async fn landing_restart_discovers_intents_revalidates_profiles_and_preserves_ow
     let get = l::GetLandingRequest {
         repository_id: "alpha".into(),
         idempotency_key: input.idempotency_key.clone(),
-    };
+    
+                        inspect_recovery: false,
+};
     tokio::time::sleep(Duration::from_millis(30)).await;
     let unchanged = client
         .get_landing(request(get.clone(), ALPHA))
@@ -11659,8 +11691,9 @@ async fn landing_local_owner_launch_requires_explicit_scoped_opt_in_and_disabled
             .get_landing(request(
                 l::GetLandingRequest {
                     repository_id: "alpha".into(),
-                    idempotency_key: input.idempotency_key.clone()
-                },
+                    idempotency_key: input.idempotency_key.clone(),
+                        inspect_recovery: false,
+},
                 ALPHA
             ))
             .await
@@ -11676,7 +11709,9 @@ async fn landing_local_owner_launch_requires_explicit_scoped_opt_in_and_disabled
         .get_landing(l::GetLandingRequest {
             repository_id: "alpha".into(),
             idempotency_key: input.idempotency_key,
-        })
+        
+                        inspect_recovery: false,
+})
         .await
         .unwrap()
         .into_inner()
@@ -11791,7 +11826,9 @@ async fn landing_poison_intent_does_not_starve_later_jobs_or_expiry_under_one_he
                     l::GetLandingRequest {
                         repository_id: "alpha".into(),
                         idempotency_key: valid.idempotency_key.clone(),
-                    },
+                    
+                        inspect_recovery: false,
+},
                     ALPHA,
                 ))
                 .await
@@ -11812,7 +11849,9 @@ async fn landing_poison_intent_does_not_starve_later_jobs_or_expiry_under_one_he
             l::GetLandingRequest {
                 repository_id: "alpha".into(),
                 idempotency_key: first_poison,
-            },
+            
+                        inspect_recovery: false,
+},
             ALPHA,
         ))
         .await
@@ -11828,7 +11867,9 @@ async fn landing_poison_intent_does_not_starve_later_jobs_or_expiry_under_one_he
                     l::GetLandingRequest {
                         repository_id: "alpha".into(),
                         idempotency_key: due.idempotency_key.clone(),
-                    },
+                    
+                        inspect_recovery: false,
+},
                     ALPHA,
                 ))
                 .await

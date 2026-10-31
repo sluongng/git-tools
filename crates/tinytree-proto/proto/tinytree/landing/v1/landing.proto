@@ -23,6 +23,8 @@ message StartLandingRequest {
 message GetLandingRequest {
   string repository_id = 1;
   string idempotency_key = 2;
+  // Opt-in bounded read-only artifact inspection. Does not dispatch recovery.
+  bool inspect_recovery = 3;
 }
 // One recover-only quantum of the server's exact first saved attempt.
 message RecoverLandingRequest {
@@ -87,6 +89,7 @@ message LandingJob {
   // authorization is frozen; removing a launch grant does not cancel the job.
   PreparationAvailability preparation = 10;
   optional CheckerProgress checker_progress = 11;
+  optional CheckerRecoveryInspection recovery_inspection = 12;
 }
 
 // Ephemeral exact-job diagnostics, not execution evidence or a verdict.
@@ -136,4 +139,43 @@ message CheckerProgress {
   CheckerSavedPhase saved_phase = 8;
   // Exact automatic uncertain-recovery budget stop; not permission to retry.
   bool automatic_recovery_blocked = 9;
+}
+
+// Current saved-artifact observations, never historical failure attribution,
+// execution evidence, a check verdict, or authorization to release custody.
+enum CheckerTransportInspection {
+  CTI_UNSPECIFIED = 0;
+  CTI_MISSING = 1;
+  CTI_INVALID = 2;
+  CTI_START_UNCONFIRMED = 3;
+  CTI_QUIESCENT_ELIGIBLE = 4;
+  CTI_QUIESCENT_INELIGIBLE = 5;
+}
+enum CheckerOutputInspection {
+  COI_UNSPECIFIED = 0;
+  COI_MISSING = 1;
+  COI_EMPTY = 2;
+  COI_RECEIPT_VALID = 3;
+  COI_INVALID = 4;
+  COI_OVERSIZED = 5;
+}
+enum CheckerRunnerInspection {
+  CRI_NOT_INSPECTED = 0;
+  CRI_CONFIG_INVALID = 1;
+  CRI_SCRATCH_MISSING = 2;
+  CRI_ATTEMPT_MISSING = 3;
+  CRI_JOURNAL_MISSING = 4;
+  CRI_JOURNAL_INVALID = 5;
+  CRI_BINDING_MISMATCH = 6;
+  CRI_ENVIRONMENT_MISSING = 7;
+  CRI_TOOLS_INCOMPLETE = 8;
+  CRI_RECEIPT_SAVED = 9;
+  CRI_READINESS_PRESENT = 10;
+  CRI_UNAVAILABLE = 11;
+}
+message CheckerRecoveryInspection {
+  CheckerTransportInspection transport = 1;
+  CheckerOutputInspection stdout = 2;
+  bool stderr_present = 3;
+  CheckerRunnerInspection runner = 4;
 }

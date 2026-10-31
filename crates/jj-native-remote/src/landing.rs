@@ -48,7 +48,9 @@ impl RemoteRepositoryControl {
         // NotFound alone permits the exact original Start to be attempted.
         let existing = self
             .run_owned(deadline, owner.clone(), async {
-                Ok(client.lookup_landing(&start, intent.observed_job).await?)
+                Ok(client
+                    .lookup_landing(&start, intent.observed_job, false)
+                    .await?)
             })
             .await;
         let stages;
@@ -148,5 +150,6 @@ fn wire_job(job: &CheckedLandingJob) -> l::LandingJob {
         }),
         conflict_path: job.conflict_path().map(str::to_owned),
         checker_progress: job.checker_progress().cloned(),
+        recovery_inspection: None,
     }
 }

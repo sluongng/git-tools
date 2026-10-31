@@ -11,6 +11,7 @@ struct Args {
     intent: LandingStart,
     timeout: u64,
     recover_once: bool,
+    inspect_recovery: bool,
     expected_attempts: Option<u32>,
     expected_recoveries: Option<u32>,
 }
@@ -35,7 +36,15 @@ fn args() -> Result<Args, String> {
     let mut fields = BTreeMap::new();
     let mut input = std::env::args().skip(1);
     let mut recover_once = false;
+    let mut inspect_recovery = false;
     while let Some(key) = input.next() {
+        if key == "--inspect-recovery" {
+            if inspect_recovery {
+                return Err("invalid_or_duplicate_argument".into());
+            }
+            inspect_recovery = true;
+            continue;
+        }
         if key == "--recover-once" {
             if recover_once {
                 return Err("invalid_or_duplicate_argument".into());
@@ -104,7 +113,8 @@ fn args() -> Result<Args, String> {
         .map(|v| v.parse::<u32>())
         .transpose()
         .map_err(|_| "invalid_recoveries")?;
-    if recover_once != (expected_attempts.is_some() && expected_recoveries.is_some())
+    if (recover_once && inspect_recovery)
+        || recover_once != (expected_attempts.is_some() && expected_recoveries.is_some())
         || (!recover_once && (expected_attempts.is_some() || expected_recoveries.is_some()))
     {
         return Err("invalid_recover_once_arguments".into());
@@ -115,6 +125,7 @@ fn args() -> Result<Args, String> {
         intent,
         timeout,
         recover_once,
+        inspect_recovery,
         expected_attempts,
         expected_recoveries,
     })
@@ -180,7 +191,9 @@ async fn run(args: Args) -> Result<Value, String> {
             )
             .await
     } else {
-        client.lookup_landing(&args.intent, Some(args.job)).await
+        client
+            .lookup_landing(&args.intent, Some(args.job), args.inspect_recovery)
+            .await
     }
     .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
     let progress = job.checker_progress().map(|p| -> Result<Value,String> {
@@ -190,11 +203,17 @@ async fn run(args: Args) -> Result<Value, String> {
             "saved_phase":match p.saved_phase {0=>"unspecified",1=>"reserved",2=>"dispatch_intent",3=>"uncertain",4=>"verified",5=>"retry_ready",6=>"terminal",7=>"unavailable_ready",_=>return Err("invalid_checker_progress".into())},
             "automatic_recovery_blocked":p.automatic_recovery_blocked,"error_code":error_code(p.error_code)?,"error_stage":stage(p.error_stage)?}))
     }).transpose()?;
+    let inspection = job.recovery_inspection().map(|p| -> Result<Value,String> {
+        let transport = ["unspecified","missing","invalid","start_unconfirmed","quiescent_eligible","quiescent_ineligible"];
+        let stdout = ["unspecified","missing","empty","receipt_valid","invalid","oversized"];
+        let runner = ["not_inspected","config_invalid","scratch_missing","attempt_missing","journal_missing","journal_invalid","binding_mismatch","environment_missing","tools_incomplete","receipt_saved","readiness_present","unavailable"];
+        Ok(json!({"transport":transport.get(p.transport as usize).ok_or("invalid_recovery_inspection")?,"stdout":stdout.get(p.stdout as usize).ok_or("invalid_recovery_inspection")?,"stderr_present":p.stderr_present,"runner":runner.get(p.runner as usize).ok_or("invalid_recovery_inspection")?}))
+    }).transpose()?;
     let candidate = job
         .candidate()
         .map(|c| json!({"head":hex(&c.head.0),"root_tree":hex(&c.root_tree.0)}));
     Ok(
-        json!({"schema_version":1,"mode":if args.recover_once {"recover_once_admission"} else {"read_only"},"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress}),
+        json!({"schema_version":1,"mode":if args.recover_once {"recover_once_admission"} else {"read_only"},"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress,"recovery_inspection":inspection}),
     )
 }
 #[tokio::main]

@@ -11,7 +11,7 @@ pub mod snapshot_linux;
 mod remote;
 
 pub use config::{Binary, Config, HttpsSnapshotConfig, Mode, Profile};
-pub use runner::{RunningCheck, recover, run, start, run_leased, start_leased};
+pub use runner::{inspect_recovery, RecoveryInspection, RunningCheck, recover, run, start, run_leased, start_leased};
 pub use remote::{RemoteReport, run_remote, recover_remote};
 
 pub use tinytree_forge_core::check::{
