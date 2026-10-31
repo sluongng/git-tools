@@ -5,6 +5,12 @@ export interface ObjectKey { kind: number; id: string }
 export interface Descriptor extends ObjectKey { size_bytes: number; format_version: number }
 export interface Inspection extends Descriptor { references: ObjectKey[] }
 interface CoreExports {
+  tt_forge_transform_command(pointer: number, length: number): number;
+  tt_forge_transform_format(pointer: number, length: number): number;
+  tt_forge_transform_identity(pointer: number, length: number): number;
+  tt_forge_transform_selection(pointer: number, length: number): number;
+  tt_forge_transform_lineage(pointer: number, length: number): number;
+  tt_forge_transform_build(pointer: number, length: number): number;
   memory: WebAssembly.Memory;
   tt_alloc(length: number): number;
   tt_dealloc(pointer: number, length: number): void;
@@ -41,6 +47,22 @@ interface CoreExports {
   tt_output_len(): number;
 }
 const core = new WebAssembly.Instance(coreModule, {}).exports as unknown as CoreExports;
+/** Internal typed construction only. SQL/current policy establish authority;
+ * none of these pure results is an export, upload or publication grant. */
+function transformCore(input: unknown, method: (pointer: number, length: number) => number): unknown {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => method(pointer, bytes.byteLength));
+}
+export function normalizeForgeTransformCommand(input: Pick<ForgeCall, 'account_id' | 'operation' | 'view' | 'request_id' | 'payload_json'>): import('./forge_transforms').TransformCommand {
+  return transformCore(input, core.tt_forge_transform_command) as import('./forge_transforms').TransformCommand;
+}
+export function formatForgeTransform(input: unknown): { state: string; value: unknown } {
+  return transformCore(input, core.tt_forge_transform_format) as { state: string; value: unknown };
+}
+export function deriveForgeTransformIdentity(input: unknown): unknown { return transformCore(input, core.tt_forge_transform_identity); }
+export function mapForgeTransformSelection(input: unknown): unknown { return transformCore(input, core.tt_forge_transform_selection); }
+export function verifyForgeTransformLineage(input: unknown): unknown { return transformCore(input, core.tt_forge_transform_lineage); }
+export function buildForgeTransform(input: unknown): unknown { return transformCore(input, core.tt_forge_transform_build); }
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
 

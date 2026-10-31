@@ -15,6 +15,8 @@ mod uploads;
 mod reviews;
 mod review_admission;
 mod checker;
+mod transforms;
+mod transform_commands;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -403,6 +405,30 @@ pub extern "C" fn tt_forge_parse_call(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_account_command(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, accounts::normalize)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_command(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transform_commands::normalize)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_format(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transform_commands::format)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_identity(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transforms::derive_identity)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_selection(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transforms::map_selection)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_lineage(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transforms::verify_lineage)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_transform_build(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, transforms::build)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_build_candidate(ptr: *const u8, len: usize) -> u32 {

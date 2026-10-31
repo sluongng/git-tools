@@ -139,6 +139,11 @@ enum ForgeHttpMode {
     AdmissionBadShape,
     AdmissionStuck,
     AdmissionAccepted,
+    TransformPending,
+    TransformRebound,
+    TransformRegression,
+    TransformAckRebound,
+    TransformStuck,
 }
 async fn forge_http_fixture(
     mode: ForgeHttpMode,
@@ -216,6 +221,27 @@ async fn forge_http_fixture(
                     reply["result_json"]=serde_json::json!(value.to_string());
                     if matches!(mode,ForgeHttpMode::AdmissionPending)&&call==2{status=503;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost admission acknowledgement"}});}
                 }
+                if matches!(mode,ForgeHttpMode::TransformPending|ForgeHttpMode::TransformRebound|ForgeHttpMode::TransformRegression|ForgeHttpMode::TransformAckRebound|ForgeHttpMode::TransformStuck) {
+                    use tinytree_forge_core::transform_commands as transform;
+                    let intent:transform::StartIntent=serde_json::from_str(input["payload_json"].as_str().unwrap()).unwrap();
+                    let operation=input["operation"].as_i64().unwrap() as i32;
+                    let fingerprint=transform::start_fingerprint(operation,"alpha","public",&intent).unwrap();
+                    let mut value=serde_json::json!({"schema_version":1,"request_id":input["request_id"],"intent_fingerprint":fingerprint,
+                        "source_before_view":intent.source_before_view,"source_after_view":intent.source_after_view,"change_id":intent.change_id,
+                        "destination_view":"1".repeat(64),"destination_base":"2".repeat(64),"job_id":"3".repeat(64),"generation":call,"phase":"prepare"});
+                    reply["state"]=serde_json::json!("transform_pending");
+                    if matches!(mode,ForgeHttpMode::TransformRebound)&&call>1 {value["destination_view"]=serde_json::json!("4".repeat(64));}
+                    if matches!(mode,ForgeHttpMode::TransformRegression)&&call>1 {value["generation"]=serde_json::json!(0);}
+                    if matches!(mode,ForgeHttpMode::TransformPending|ForgeHttpMode::TransformAckRebound)&&call>=4 {
+                        value=serde_json::json!({"transform":{"id":"5".repeat(64),"destination_account":"alpha","destination_view":"1".repeat(64),"destination_base":"2".repeat(64),"output_head":"6".repeat(64),
+                            "pin":{"id":"5".repeat(64),"artifact":"7".repeat(64),"reference":"retained-pin","generation":1,"retired":false,"protected_roots":["transform-owned"]},"origin":null},
+                            "review":{"state":"rebase_pending","change_id":intent.change_id,"source_base":"2".repeat(64),"source_head":"6".repeat(64),"view_version":"1".repeat(64),"provenance":"5".repeat(64),"patchset_id":"8".repeat(64)}});
+                        reply["state"]=serde_json::json!("rebase_pending");
+                        if matches!(mode,ForgeHttpMode::TransformAckRebound){value["transform"]["destination_base"]=serde_json::json!("4".repeat(64));}
+                    }
+                    reply["result_json"]=serde_json::json!(value.to_string());
+                    if matches!(mode,ForgeHttpMode::TransformPending)&&call==2 {status=503;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost transform acknowledgement"}});}
+                }
                 let body=serde_json::to_vec(&reply).unwrap();
                 if matches!(mode,ForgeHttpMode::ChunkedResponseLimit) {
                     socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
@@ -243,7 +269,7 @@ async fn forge_http_fixture(
         compression: false,
         ..Default::default()
     };
-    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck | ForgeHttpMode::AdmissionStuck) {
+    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck | ForgeHttpMode::AdmissionStuck | ForgeHttpMode::TransformStuck) {
         config.rpc.operation_timeout_ms = 80;
         config.rpc.rpc_timeout_ms = 80;
         config.rpc.connect_timeout_ms = 50;
@@ -316,6 +342,29 @@ async fn forge_push_review_continues_only_exact_pre_admission_intent_with_one_de
         let seen=inputs.lock().unwrap().clone();
         if let Some(calls)=calls {assert_eq!(seen.len(),calls,"{mode:?}");}else{assert!(!seen.is_empty()&&seen.len()<16);}
         for request in &seen {assert_eq!(request,&seen[0],"every retry/quantum retains original envelope bytes");assert_eq!(request["payload_json"],String::from_utf8(input.payload_json.clone()).unwrap());}
+        stop.send(()).unwrap();task.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn forge_transform_preserves_original_intent_and_pins_optional_destination_across_preparation() {
+    use tinytree_client::forge_protocol::ForgeOperation as Op;
+    for (mode,operation,expected,calls) in [
+        (ForgeHttpMode::TransformPending,Op::StartTransform,None,Some(4)),
+        (ForgeHttpMode::TransformPending,Op::SetPin,None,Some(4)),
+        (ForgeHttpMode::TransformRebound,Op::StartTransform,Some(Code::DataLoss),Some(2)),
+        (ForgeHttpMode::TransformRegression,Op::StartTransform,Some(Code::DataLoss),Some(2)),
+        (ForgeHttpMode::TransformAckRebound,Op::StartTransform,Some(Code::DataLoss),Some(4)),
+        (ForgeHttpMode::TransformStuck,Op::StartTransform,Some(Code::DeadlineExceeded),None),
+    ] {
+        let (client,inputs,stop,task)=forge_http_fixture(mode).await;
+        let mut input=forge_http_input();input.operation=operation as i32;
+        input.payload_json=serde_json::to_vec(&serde_json::json!({"source_account":"upstream","source_view":"public","source_before_view":"a".repeat(64),"source_after_view":"b".repeat(64),"change_id":"c".repeat(32),"spec":{"mappings":[{"source_prefix":"","destination_prefix":"vendor"}]}})).unwrap();
+        let result=client.forge_transform(input.clone()).await;
+        assert_eq!(result.as_ref().err().map(Status::code),expected,"{mode:?}");
+        if let Ok(reply)=result {assert_eq!(reply.state,"rebase_pending");}
+        let seen=inputs.lock().unwrap().clone();
+        if let Some(calls)=calls {assert_eq!(seen.len(),calls,"{mode:?}");}else{assert!(!seen.is_empty()&&seen.len()<16);}
+        for request in &seen {assert_eq!(request,&seen[0]);assert_eq!(request["payload_json"],String::from_utf8(input.payload_json.clone()).unwrap());}
         stop.send(()).unwrap();task.await.unwrap();
     }
 }

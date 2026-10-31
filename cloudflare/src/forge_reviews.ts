@@ -18,6 +18,7 @@ export interface ForgeReviewsHost {
   describeObjectInTx(key: ObjectKey): Descriptor | undefined;
   readVerifiedObject(key: ObjectKey): Promise<{ descriptor: Descriptor; bytes: Uint8Array }>;
   requireOwnedCommitInTx(view: ResolvedView, descriptor: Descriptor, now: number): number;
+  requireTransformReviewInTx(view: ResolvedView, runId: string, base: string, head: string): void;
   requireScopedReferenceInTx(view: ResolvedView, path: string, descriptor: Descriptor, now: number): number;
   requireRetainedClosureInTx(root: ObjectKey): { proof_job: string };
   retainReviewInputInTx(ownerId: string, root: ObjectKey, proofJob: string): void;
@@ -134,6 +135,7 @@ export class ForgeReviews {
   }
   private ownedHead(operation: Operation, view: ResolvedView): void {
     const intent = JSON.parse(operation.intent) as PushIntent;
+    if (intent.provenance !== null) { this.host.requireTransformReviewInTx(view, hex(intent.provenance), hex(intent.source_base), hex(intent.source_head)); return; }
     const d = this.host.describeObjectInTx({ kind: 3, id: hex(intent.source_head) }); if (!d) fail(403, 'permission_denied');
     const expiry = this.host.requireOwnedCommitInTx(view, d, this.now()); if (!safe(expiry) || expiry <= this.now()) fail(403, 'permission_denied');
   }
@@ -160,12 +162,13 @@ export class ForgeReviews {
         this.host.views.resolveInTx(call.view, array(old.version));
         if (old.phase === 'admission') this.current(old); else this.readable(this.patchset(old.change_id!, old.patchset_id!)); return old;
       }
-      if (intent.provenance !== null) fail(501, 'unimplemented');
       const view = this.host.views.resolveInTx(call.view, intent.view_version); this.host.views.checkInTx(view);
       const d = view.description, base = hex(intent.source_base), head = hex(intent.source_head), version = hex(intent.view_version);
       if (d.policy_epoch !== access.epoch || version !== hex(d.view_version)) fail(409, 'aborted');
       const descriptor = this.host.describeObjectInTx({ kind: 3, id: head }); if (!descriptor) fail(403, 'permission_denied');
-      const expiry = this.host.requireOwnedCommitInTx(view, descriptor, this.now());
+      let expiry: number;
+      if (intent.provenance !== null) { this.host.requireTransformReviewInTx(view, hex(intent.provenance), base, head); expiry = this.now() + TTL; }
+      else expiry = this.host.requireOwnedCommitInTx(view, descriptor, this.now());
       let mode: Operation['source_mode'] = 'canonical', mapped: string | null = null;
       if (intent.predecessor) {
         const p = this.patchset(hex(intent.predecessor.change_id, 16), hex(intent.predecessor.patchset_id));
@@ -817,6 +820,13 @@ export class ForgeReviews {
   private requirement(operation: Operation, view: ResolvedView, requirement: Requirement): void {
     for (const path of this.requirementPaths(requirement)) this.pathAllowed(view, path);
     if (requirement.kind === 'path') return;
+    const intent = JSON.parse(operation.intent) as PushIntent;
+    if (intent.provenance !== null) {
+      // This exact head is service-produced, strict-closure proved and retained
+      // by a real destination-owned pin. It is not an actor upload receipt or
+      // a hash-only grant. Every changed path remains current-policy checked.
+      this.host.requireTransformReviewInTx(view, hex(intent.provenance), hex(intent.source_base), hex(intent.source_head)); return;
+    }
     let key: ObjectKey;
     if (requirement.kind === 'copy_origin') {
       const origin = this.host.projections.projectedCopyOriginInTx(view, requirement.copy_id);

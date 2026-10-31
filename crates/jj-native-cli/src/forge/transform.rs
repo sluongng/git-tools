@@ -4,10 +4,10 @@ use jj_cli::{
     command_error::{CommandError, user_error},
     ui::Ui,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{io::Read as _, path::PathBuf};
 use tinytree_client::forge_protocol::ForgeOperation as Op;
+use tinytree_forge_core::transform_commands::{self as wire, Command as TransformIntent};
 #[derive(clap::Subcommand, Clone, Debug)]
 pub(super) enum TransformCommand {
     Start {
@@ -51,44 +51,6 @@ pub(super) enum PinCommand {
 pub(super) struct LineageArgs {
     run_id: String,
 }
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Plan {
-    source_account: String,
-    source_view: String,
-    source_before_view: String,
-    source_after_view: String,
-    destination_view: Option<String>,
-    spec: Spec,
-    change_id: String,
-    #[serde(default)]
-    lineage: Vec<Lineage>,
-    expected_patchset: Option<String>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Spec {
-    mappings: Vec<Mapping>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Mapping {
-    source_prefix: String,
-    destination_prefix: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Lineage {
-    operation: LineageOperation,
-    source_path: String,
-    target_path: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LineageOperation {
-    Rename,
-    Copy,
-}
 fn checked<const N: usize>(value: String) -> Result<String, CommandError> {
     service::id::<N>(&value)?;
     Ok(value)
@@ -97,30 +59,13 @@ fn plan(path: PathBuf) -> Result<serde_json::Value, CommandError> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(user_error)?
-        .take(262145)
+        .take(wire::MAX_PAYLOAD_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(user_error)?;
-    if bytes.len() > 262144 {
-        return Err(user_error("transform plan exceeds 256 KiB"));
-    }
-    let value: Plan =
-        serde_json::from_slice(&bytes).map_err(|_| user_error("invalid typed transform plan"))?;
-    service::id::<32>(&value.source_before_view)?;
-    service::id::<32>(&value.source_after_view)?;
-    service::id::<16>(&value.change_id)?;
-    if let Some(id) = &value.destination_view {
-        service::id::<32>(id)?;
-    }
-    if let Some(id) = &value.expected_patchset {
-        service::id::<32>(id)?;
-    }
-    if value.spec.mappings.is_empty()
-        || value.spec.mappings.len() > 256
-        || value.lineage.len() > 4096
-    {
-        return Err(user_error("transform plan mapping/lineage limit exceeded"));
-    }
-    serde_json::to_value(value).map_err(user_error)
+    let Some(TransformIntent::Start(intent)) = wire::parse(30, &bytes).map_err(user_error)? else {
+        return Err(user_error("invalid typed transform plan"));
+    };
+    serde_json::to_value(intent).map_err(user_error)
 }
 async fn call(
     ui: &Ui,
@@ -130,6 +75,7 @@ async fn call(
     key: Option<String>,
     mutation: bool,
 ) -> Result<(), CommandError> {
+    wire::parse(op as i32, &serde_json::to_vec(&body).map_err(user_error)?).map_err(user_error)?;
     rpc::print(
         ui,
         machine,
@@ -194,11 +140,6 @@ pub(super) async fn pin(ui: &Ui, machine: bool, args: PinCommand) -> Result<(), 
             after_path,
             limit,
         } => {
-            if max_bytes.is_some_and(|n| n == 0 || n > 65536)
-                || limit.is_some_and(|n| n == 0 || n > 256)
-            {
-                return Err(user_error("pin read exceeds chunk/page limits"));
-            }
             call(ui,machine,Op::ResolvePin,json!({"run_id":checked::<32>(run_id)?,"path":path,"offset":offset,"max_bytes":max_bytes,"after_path":after_path,"limit":limit}),None,false).await
         }
     }

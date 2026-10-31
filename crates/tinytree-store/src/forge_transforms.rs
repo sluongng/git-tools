@@ -6,127 +6,33 @@
 use super::*;
 use crate::forge_accounts::{AccountId, ForgeAction, ForgeActor, ResolvedView};
 use std::collections::{BTreeMap, BTreeSet};
-use tinytree_model::{
-    ChangeId, Commit, FileId, Object, Signature, Timestamp, Tree, TreeEntry, TreeId, TreeMerge,
-    TreeValue,
-};
+use tinytree_model::{ChangeId, Commit, FileId, Object, Signature, TreeId, TreeValue};
+#[cfg(test)]
+use tinytree_model::{Timestamp, Tree, TreeEntry, TreeMerge};
 
 const PREFIX: &[u8] = b"forge/transforms/v1/";
 const MAX_RUNS: usize = 1024;
-const MAX_FILES: usize = 4096;
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 1024 * 1024;
-// Bound path storage independently from payload bytes. A shared deep prefix
-// must not multiply suffix allocations at every tree construction level.
-const MAX_TREE_PATH_BYTES: usize = 1024 * 1024;
-// Canonical file paths must fit the same depth as Forge views/uploads.
-const MAX_TREE_DEPTH: usize = 64;
-const MAX_TREE_DIRECTORIES: usize = MAX_FILES;
-const MAX_TREE_NODES: usize = MAX_FILES * 2;
-
-#[derive(Default)]
-struct TransformPathBudget {
-    bytes: usize,
-}
-impl TransformPathBudget {
-    fn observe(&mut self, value: &str) -> Result<()> {
-        path(value, false)?;
-        if value.split('/').count() > MAX_TREE_DEPTH {
-            return Err(Error::Limit("transform tree depth"));
+const RETIRE: &[u8] = b"forge/transform-retire/v1/";
+use tinytree_forge_core::transforms::{
+    self as transforms, FrozenCommitter as Person, MAX_BYTES, MAX_FILE_BYTES, MAX_FILES,
+    MAX_RECORD_BYTES, ProjectedFile, TransformIdentityInput as Input, join_path as join,
+    validate_path as path,
+};
+pub use tinytree_forge_core::transforms::{
+    ForgeDependencyPin, ForgeLineageEdge, ForgeLineageHint, ForgeLineageOperation,
+    ForgePathMapping, ForgePinChunk, ForgePinFile, ForgePinPage, ForgeTransformOrigin,
+    ForgeTransformRun, ForgeTransformSpec, ForgeTransformView,
+};
+impl From<transforms::Error> for Error {
+    fn from(error: transforms::Error) -> Self {
+        match error {
+            transforms::Error::Invalid(reason) => Self::Invalid(reason),
+            transforms::Error::Limit(reason) => Self::Limit(reason),
+            transforms::Error::Corrupt(reason) => Self::Corrupt(reason),
+            transforms::Error::Model(error) => Self::Model(error),
         }
-        self.bytes = self
-            .bytes
-            .checked_add(value.len())
-            .ok_or(Error::Limit("transform tree path bytes"))?;
-        if self.bytes > MAX_TREE_PATH_BYTES {
-            return Err(Error::Limit("transform tree path bytes"));
-        }
-        Ok(())
     }
 }
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgePathMapping {
-    pub source_prefix: String,
-    pub destination_prefix: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeTransformSpec {
-    pub mappings: Vec<ForgePathMapping>,
-}
-
-impl ForgeTransformSpec {
-    pub fn validate(&self) -> Result<()> {
-        if self.mappings.is_empty() || self.mappings.len() > 64 {
-            return Err(Error::Limit("transform mappings"));
-        }
-        for (index, mapping) in self.mappings.iter().enumerate() {
-            path(&mapping.source_prefix, true)?;
-            path(&mapping.destination_prefix, true)?;
-            for other in &self.mappings[..index] {
-                if overlap(&mapping.source_prefix, &other.source_prefix)
-                    || overlap(&mapping.destination_prefix, &other.destination_prefix)
-                {
-                    return Err(Error::Invalid("ambiguous transform mapping"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn id(&self) -> Result<[u8; 32]> {
-        self.validate()?;
-        Ok(digest(
-            b"tinytree-forge-transform-spec-v1\0",
-            &encode(self)?,
-        ))
-    }
-
-    pub fn map_path(&self, source: &str) -> Result<Option<String>> {
-        self.validate()?;
-        path(source, false)?;
-        for mapping in &self.mappings {
-            if let Some(suffix) = relative(&mapping.source_prefix, source) {
-                let mapped = join(&mapping.destination_prefix, suffix);
-                path(&mapped, false)?;
-                return Ok(Some(mapped));
-            }
-        }
-        Ok(None)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeLineageOperation {
-    Rename,
-    Copy,
-    ImportedOrigin,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeLineageHint {
-    pub operation: ForgeLineageOperation,
-    pub source_path: String,
-    pub target_path: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeLineageEdge {
-    pub operation: ForgeLineageOperation,
-    pub source_account: String,
-    pub source_revision: [u8; 32],
-    pub source_path: String,
-    pub destination_path: String,
-    pub destination_revision: [u8; 32],
-}
-
 #[derive(Clone)]
 pub struct ForgeTransformRequest {
     pub request_id: String,
@@ -136,102 +42,6 @@ pub struct ForgeTransformRequest {
     pub spec: ForgeTransformSpec,
     pub change_id: ChangeId,
     pub lineage: Vec<ForgeLineageHint>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeDependencyPin {
-    pub id: [u8; 32],
-    pub artifact: [u8; 32],
-    pub reference: String,
-    pub generation: u64,
-    pub retired: bool,
-    /// Authoritative service-owned references, not arbitrary caller labels.
-    pub protected_roots: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ForgeTransformRun {
-    pub id: [u8; 32],
-    pub spec: [u8; 32],
-    pub source_account: String,
-    pub source_before: [u8; 32],
-    pub source_after: [u8; 32],
-    pub source_before_view: [u8; 32],
-    pub source_after_view: [u8; 32],
-    pub destination_account: String,
-    pub destination_view: [u8; 32],
-    pub destination_base: [u8; 32],
-    pub output_head: [u8; 32],
-    pub lineage: Vec<ForgeLineageEdge>,
-    pub destination_paths: Vec<String>,
-    pub pin: ForgeDependencyPin,
-}
-
-/// Caller-visible provenance. An unavailable origin does not reveal account,
-/// revision or path identifiers from the private source record.
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeTransformView {
-    pub id: [u8; 32],
-    pub destination_account: String,
-    pub destination_base: [u8; 32],
-    pub output_head: [u8; 32],
-    pub pin: ForgeDependencyPin,
-    pub origin: Option<ForgeTransformOrigin>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgeTransformOrigin {
-    pub account: String,
-    pub before: [u8; 32],
-    pub after: [u8; 32],
-    pub lineage: Vec<ForgeLineageEdge>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgePinFile {
-    pub path: String,
-    pub file_id: [u8; 32],
-    pub size_bytes: u64,
-    pub executable: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgePinPage {
-    pub pin_id: [u8; 32],
-    pub artifact: [u8; 32],
-    pub files: Vec<ForgePinFile>,
-    pub next_path: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ForgePinChunk {
-    pub pin_id: [u8; 32],
-    pub file_id: [u8; 32],
-    pub offset: u64,
-    pub bytes: Vec<u8>,
-    pub next_offset: u64,
-    pub eof: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Input {
-    spec: [u8; 32],
-    source_account: String,
-    before: [u8; 32],
-    after: [u8; 32],
-    before_view: [u8; 32],
-    after_view: [u8; 32],
-    before_view_name: String,
-    after_view_name: String,
-    destination_account: String,
-    destination_view: [u8; 32],
-    destination_view_name: String,
-    destination_base: [u8; 32],
-    change_id: [u8; 16],
-    lineage: Vec<ForgeLineageHint>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -244,38 +54,27 @@ struct Record {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Person {
-    name: String,
-    email: String,
-    millis: i64,
-    offset: i32,
+struct RetireReplay {
+    account: String,
+    principal: String,
+    view: String,
+    request: String,
+    id: [u8; 32],
+    fingerprint: [u8; 32],
+    pin: ForgeDependencyPin,
 }
-impl Person {
-    fn capture(value: &Signature) -> Self {
-        Self {
-            name: value.name.clone(),
-            email: value.email.clone(),
-            millis: value.timestamp.millis_since_epoch,
-            offset: value.timestamp.tz_offset_minutes,
-        }
-    }
-    fn signature(&self) -> Signature {
-        Signature {
-            name: self.name.clone(),
-            email: self.email.clone(),
-            timestamp: Timestamp {
-                millis_since_epoch: self.millis,
-                tz_offset_minutes: self.offset,
-            },
-        }
-    }
+fn retire_prefix(repo: &str) -> Vec<u8> {
+    [RETIRE, repo.as_bytes(), b"/"].concat()
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProjectedFile {
-    id: FileId,
-    size: u64,
-    executable: bool,
+fn retire_key(repo: &str, principal: &str, request: &str) -> Vec<u8> {
+    [
+        retire_prefix(repo),
+        hex(&tinytree_forge_core::identity::operation_id(
+            principal, request,
+        ))
+        .into_bytes(),
+    ]
+    .concat()
 }
 
 impl Inner {
@@ -297,11 +96,7 @@ impl Inner {
             .get(&self.spaces.meta, record_key(&repo, &run_id))?
             .ok_or(Error::ForgeAccessDenied)?;
         let record: Record = bounded_decode(&bytes)?;
-        if digest(
-            b"tinytree-forge-transform-run-v1\0",
-            &encode(&record.input)?,
-        ) != run_id
-        {
+        if transforms::run_id(&record.input)? != run_id {
             return Err(Error::Corrupt("transform record identity"));
         }
         let run = record.run.ok_or(Error::ForgeAccessDenied)?;
@@ -393,7 +188,7 @@ impl Store {
         // Reject unsupported canonical paths before persisting an intent or
         // copying any source bytes. The destination root contributes depth.
         for source in [&request.before, &request.after] {
-            let mut paths = TransformPathBudget::default();
+            let mut paths = transforms::TransformPathBudget::default();
             for file in self.forge_view_files(source, MAX_FILES)? {
                 if let Some(mapped) = request.spec.map_path(&file.path)? {
                     let canonical = join(request.destination.root_prefix(), &mapped);
@@ -420,7 +215,7 @@ impl Store {
             change_id: request.change_id.0,
             lineage: request.lineage.clone(),
         };
-        let id = digest(b"tinytree-forge-transform-run-v1\0", &encode(&input)?);
+        let id = transforms::run_id(&input)?;
         let repo = request.destination.repository();
         let run_key = record_key(repo, &id);
         let record = {
@@ -496,9 +291,9 @@ impl Store {
         };
 
         let mut guards = Vec::new();
-        let (before, before_tree) =
+        let before =
             self.project_transform_input(&request.before, &request.spec, repo, now, &mut guards)?;
-        let (after, after_tree) =
+        let after =
             self.project_transform_input(&request.after, &request.spec, repo, now, &mut guards)?;
         let target = self.read_commit(repo, CommitId(record.input.destination_base))?;
         if target.root_tree.terms.len() != 1 {
@@ -511,32 +306,16 @@ impl Store {
                 id: ObjectId(record.input.destination_base),
             },
         )?;
-        let mut destination = self.flatten_tree(repo, target.root_tree.terms[0])?;
-        let changed: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
-        let mut lineage = self.verify_transform_lineage(request)?;
-        for mapped in changed {
-            let canonical = join(request.destination.root_prefix(), &mapped);
-            if !request.destination.allows_path(&canonical) {
+        let destination = self.flatten_tree(repo, target.root_tree.terms[0])?;
+        for mapped in before.keys().chain(after.keys()) {
+            if !request
+                .destination
+                .allows_path(&join(request.destination.root_prefix(), mapped))
+            {
                 return Err(Error::Invalid("transform destination path denied"));
             }
-            if before.get(&mapped) == after.get(&mapped) {
-                continue;
-            }
-            let expected = before.get(&mapped).map(projected_value);
-            let replacement = after.get(&mapped).map(projected_value);
-            let current = destination.get(&canonical).map(strip_copy);
-            if current != expected && current != replacement {
-                return Err(Error::Invalid("transform destination conflict"));
-            }
-            match replacement {
-                Some(value) => {
-                    destination.insert(canonical, value);
-                }
-                None => {
-                    destination.remove(&canonical);
-                }
-            }
         }
+        let mut lineage = self.verify_transform_lineage(request)?;
         for file in self.forge_view_files(&request.after, MAX_FILES)? {
             if let Some(mapped) = request.spec.map_path(&file.path)? {
                 lineage.push(ForgeLineageEdge {
@@ -549,55 +328,39 @@ impl Store {
                 });
             }
         }
-        let output_tree = self.write_tree(repo, &destination, now, &mut guards)?;
-        let output = Commit {
-            parents: vec![CommitId(record.input.destination_base)],
-            predecessors: vec![],
-            root_tree: TreeMerge {
-                terms: vec![output_tree],
-                labels: vec![String::new()],
-            },
-            change_id: request.change_id,
-            description: "Update transformed source".into(),
-            author: record.committer.signature(),
-            committer: record.committer.signature(),
-            secure_signature: None,
-        };
-        let output_head = self.write_object(repo, Object::Commit(output), now, &mut guards)?;
-        for edge in &mut lineage {
-            edge.destination_revision = output_head.key.id.0;
-        }
-        let artifact_tree = self.write_object(
-            repo,
-            Object::Tree(Tree {
-                entries: vec![
-                    TreeEntry {
-                        name: "after".into(),
-                        value: TreeValue::Tree(after_tree),
-                    },
-                    TreeEntry {
-                        name: "before".into(),
-                        value: TreeValue::Tree(before_tree),
-                    },
-                ],
-            }),
-            now,
-            &mut guards,
+        let build = transforms::build_transform(
+            &record.input,
+            &record.committer,
+            request.destination.root_prefix(),
+            &before,
+            &after,
+            &destination,
+            lineage,
+            self.inner.config.model_limits,
         )?;
-        let artifact = Commit {
-            parents: vec![CommitId::ROOT],
-            predecessors: vec![],
-            root_tree: TreeMerge {
-                terms: vec![TreeId(artifact_tree.key.id.0)],
-                labels: vec![String::new()],
-            },
-            change_id: ChangeId(id[..16].try_into().unwrap()),
-            description: "Retained transformed dependency".into(),
-            author: record.committer.signature(),
-            committer: record.committer.signature(),
-            secure_signature: None,
-        };
-        let artifact = self.write_object(repo, Object::Commit(artifact), now, &mut guards)?;
+        for object in &build.objects {
+            self.put(repo, object.descriptor, &object.bytes, now)?;
+            guards.push(self.pin_root(repo, object.descriptor.key)?);
+        }
+        let run = build.run;
+        let output_head = self
+            .descriptor(
+                repo,
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(run.output_head),
+                },
+            )?
+            .ok_or(Error::Corrupt("transform output missing"))?;
+        let artifact = self
+            .descriptor(
+                repo,
+                ObjectKey {
+                    kind: Kind::Commit,
+                    id: ObjectId(run.pin.artifact),
+                },
+            )?
+            .ok_or(Error::Corrupt("transform artifact missing"))?;
         self.forge_authorize_view_export(&request.before)?;
         self.forge_authorize_view_export(&request.after)?;
         self.forge_authorize(
@@ -606,36 +369,7 @@ impl Store {
             ForgeAction::Write,
             Some(request.destination.epoch()),
         )?;
-        let reference_name = format!("_tinytree/forge/pins/v1/{}", hex(&id));
-        let run = ForgeTransformRun {
-            id,
-            spec: record.input.spec,
-            source_account: record.input.source_account.clone(),
-            source_before: record.input.before,
-            source_after: record.input.after,
-            source_before_view: record.input.before_view,
-            source_after_view: record.input.after_view,
-            destination_account: record.input.destination_account.clone(),
-            destination_view: record.input.destination_view,
-            destination_base: record.input.destination_base,
-            output_head: output_head.key.id.0,
-            lineage,
-            destination_paths: before
-                .keys()
-                .chain(after.keys())
-                .map(|path| join(request.destination.root_prefix(), path))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            pin: ForgeDependencyPin {
-                id,
-                artifact: artifact.key.id.0,
-                reference: reference_name.clone(),
-                generation: 1,
-                retired: false,
-                protected_roots: BTreeSet::from([format!("transform-{}", hex(&id))]),
-            },
-        };
+        let reference_name = run.pin.reference.clone();
         let _guard = self.inner.lock()?;
         let view = self.inner.db.read_tx();
         self.inner
@@ -742,6 +476,7 @@ impl Store {
         Ok(ForgeTransformView {
             id: run.id,
             destination_account: run.destination_account,
+            destination_view: run.destination_view,
             destination_base: run.destination_base,
             output_head: run.output_head,
             pin: run.pin,
@@ -969,50 +704,101 @@ impl Store {
         &self,
         account: &AccountId,
         actor: &ForgeActor,
+        view_name: &str,
         id: [u8; 32],
+        request_id: &str,
     ) -> Result<ForgeDependencyPin> {
-        self.forge_authorize(account, actor, ForgeAction::Admin, None)?;
+        request_token(request_id)?;
+        if !view_name.is_empty() {
+            tinytree_forge_core::accounts::validate_name(view_name)?;
+        }
+        let fingerprint =
+            transforms::retire_fingerprint(&account.0, &actor.principal, view_name, id)?;
         let repo = account.repository_id();
         let _guard = self.inner.lock()?;
+        let db = self.inner.db.read_tx();
+        self.inner
+            .forge_authorize_in(&db, account, actor, ForgeAction::Admin, None)?;
+        let replay_key = retire_key(&repo, &actor.principal, request_id);
+        let replay = db
+            .get(&self.inner.spaces.meta, &replay_key)?
+            .map(|bytes| bounded_decode::<RetireReplay>(&bytes))
+            .transpose()?;
+        if replay
+            .as_ref()
+            .is_some_and(|r| r.fingerprint != fingerprint)
+        {
+            return Err(Error::IdempotencyConflict);
+        }
         let mut record = self.transform_record(&repo, &id)?;
-        self.inner.forge_authorize_in(
-            &self.inner.db.read_tx(),
+        let selected = self.inner.forge_resolve_view_in(
+            &db,
             account,
-            actor,
-            ForgeAction::Admin,
-            None,
+            Some(actor),
+            crate::forge_accounts::ViewVersion(record.input.destination_view),
         )?;
+        if !view_name.is_empty() && view_name != selected.name() {
+            return Err(Error::ForgeAccessDenied);
+        }
         let run = record
             .run
             .as_mut()
             .ok_or(Error::Invalid("transform not prepared"))?;
-        if run.pin.retired {
-            return Ok(run.pin.clone());
+        if run
+            .destination_paths
+            .iter()
+            .any(|p| !selected.allows_path(p))
+        {
+            return Err(Error::ForgeAccessDenied);
         }
-        if !run.pin.protected_roots.is_empty() {
-            return Err(Error::Invalid("dependency pin still referenced"));
+        if let Some(replay) = replay {
+            return Ok(replay.pin);
         }
-        run.pin.retired = true;
-        run.pin.generation = run
-            .pin
-            .generation
-            .checked_add(1)
-            .ok_or(Error::Limit("dependency pin generation"))?;
+        if db
+            .prefix(&self.inner.spaces.meta, retire_prefix(&repo))
+            .take(MAX_RUNS * 4)
+            .count()
+            >= MAX_RUNS * 4
+        {
+            return Err(Error::Limit("transform retirement records"));
+        }
+        if !run.pin.retired {
+            if !run.pin.protected_roots.is_empty() {
+                return Err(Error::Invalid("dependency pin still referenced"));
+            }
+            run.pin.retired = true;
+            run.pin.generation = run
+                .pin
+                .generation
+                .checked_add(1)
+                .ok_or(Error::Limit("dependency pin generation"))?;
+        }
         let result = run.pin.clone();
+        let replay = RetireReplay {
+            account: account.0.clone(),
+            principal: actor.principal.clone(),
+            view: view_name.into(),
+            request: request_id.into(),
+            id,
+            fingerprint,
+            pin: result.clone(),
+        };
+        let replay_bytes = bounded_encode(&replay)?;
+        let record_bytes = bounded_encode(&record)?;
         let mut tx = self
             .inner
             .db
             .write_tx()
             .durability(Some(PersistMode::SyncAll));
         for reference in [
-            &run.pin.reference,
+            &result.reference,
             &format!("_tinytree/forge/output/v1/{}", hex(&id)),
         ] {
             tx.insert(
                 &self.inner.spaces.refs,
                 key(&repo, reference.as_bytes()),
                 encode(&StoredReference {
-                    generation: run.pin.generation,
+                    generation: result.generation,
                     commit: None,
                 })?,
             );
@@ -1020,8 +806,9 @@ impl Store {
         tx.insert(
             &self.inner.spaces.meta,
             record_key(&repo, &id),
-            bounded_encode(&record)?,
+            record_bytes,
         );
+        tx.insert(&self.inner.spaces.meta, replay_key, replay_bytes);
         self.inner.commit(tx)?;
         Ok(result)
     }
@@ -1090,44 +877,52 @@ impl Store {
             let target = after
                 .get(&hint.target_path)
                 .ok_or(Error::Invalid("transform lineage target"))?;
-            if before.contains_key(&hint.target_path) {
-                return Err(Error::Invalid("transform lineage overwrites existing path"));
-            }
-            match hint.operation {
-                ForgeLineageOperation::Rename if after.contains_key(&hint.source_path) => {
-                    return Err(Error::Invalid("transform rename retained source"));
-                }
-                ForgeLineageOperation::Copy if !after.contains_key(&hint.source_path) => {
-                    return Err(Error::Invalid("transform copy removed source"));
-                }
+            use tinytree_forge_core::transform_lineage::{
+                self, Endpoint, Operation, RelationInput,
+            };
+            let operation = match hint.operation {
+                ForgeLineageOperation::Rename => Operation::Rename,
+                ForgeLineageOperation::Copy => Operation::Copy,
                 ForgeLineageOperation::ImportedOrigin => {
                     return Err(Error::Invalid("import origin is service derived"));
                 }
-                _ => {}
-            }
-            let source_copy = source
-                .copy_id
-                .ok_or(Error::Invalid("unverified transform copy source"))?;
+            };
             let target_copy = target
                 .copy_id
                 .ok_or(Error::Invalid("unverified transform copy target"))?;
-            let (_, payload) = self.read_metadata(
+            let (descriptor, payload) = self.read_metadata(
                 request.after.repository(),
                 ObjectKey {
                     kind: Kind::CopyHistory,
                     id: ObjectId(target_copy),
                 },
             )?;
-            let Object::CopyHistory(copy) =
-                tinytree_model::decode(&payload, self.inner.config.model_limits)?
-            else {
-                return Err(Error::Corrupt("transform copy history kind"));
-            };
-            if copy.current_path != target.canonical_path
-                || !copy.parents.contains(&tinytree_model::CopyId(source_copy))
-            {
-                return Err(Error::Invalid("unverified transform copy relation"));
-            }
+            transform_lineage::verify_relation_bytes(
+                &RelationInput {
+                    operation,
+                    source_path: hint.source_path.clone(),
+                    target_path: hint.target_path.clone(),
+                    source: Endpoint {
+                        canonical_path: source.canonical_path.clone(),
+                        file: source.descriptor,
+                        canonical_copy: source.copy_id.map(tinytree_model::CopyId),
+                    },
+                    target: Endpoint {
+                        canonical_path: target.canonical_path.clone(),
+                        file: target.descriptor,
+                        canonical_copy: target.copy_id.map(tinytree_model::CopyId),
+                    },
+                    target_existed_before: before.contains_key(&hint.target_path),
+                    source_exists_after: after.contains_key(&hint.source_path),
+                },
+                descriptor,
+                &payload,
+                self.inner.config.model_limits,
+            )
+            .map_err(|error| match error {
+                transform_lineage::LineageError::Invalid(reason) => Error::Invalid(reason),
+                transform_lineage::LineageError::Model(error) => Error::Model(error),
+            })?;
             let mapped = request
                 .spec
                 .map_path(&hint.target_path)?
@@ -1153,6 +948,42 @@ impl Store {
         let mut count = 0usize;
         let mut total_bytes = 0u64;
         let mut expected_refs = BTreeSet::new();
+        for item in view.prefix(&self.inner.spaces.meta, RETIRE) {
+            let (stored_key, bytes) = item.into_inner()?;
+            count += 1;
+            total_bytes = total_bytes
+                .checked_add((stored_key.len() + bytes.len()) as u64)
+                .ok_or(Error::Limit("forge transform reopen bytes"))?;
+            if count > self.inner.config.max_retention_validation_records
+                || total_bytes > self.inner.config.max_retention_validation_bytes
+            {
+                return Err(Error::Limit("forge transform reopen records"));
+            }
+            let replay: RetireReplay = bounded_decode(&bytes)?;
+            let account = AccountId(replay.account.clone());
+            account.validate()?;
+            request_token(&replay.request)?;
+            let repo = account.repository_id();
+            let record: Record = bounded_decode(
+                &view
+                    .get(&self.inner.spaces.meta, record_key(&repo, &replay.id))?
+                    .ok_or(Error::Corrupt("transform retirement target missing"))?,
+            )?;
+            if stored_key.as_ref() != retire_key(&repo, &replay.principal, &replay.request)
+                || replay.fingerprint
+                    != transforms::retire_fingerprint(
+                        &replay.account,
+                        &replay.principal,
+                        &replay.view,
+                        replay.id,
+                    )?
+                || record.run.as_ref().map(|run| &run.pin) != Some(&replay.pin)
+                || !replay.pin.retired
+                || replay.pin.id != replay.id
+            {
+                return Err(Error::Corrupt("transform retirement identity"));
+            }
+        }
         for item in view.prefix(&self.inner.spaces.meta, PREFIX) {
             let (stored_key, bytes) = item.into_inner()?;
             count += 1;
@@ -1185,10 +1016,7 @@ impl Store {
                 continue;
             }
             let record: Record = bounded_decode(&bytes)?;
-            let id = digest(
-                b"tinytree-forge-transform-run-v1\0",
-                &encode(&record.input)?,
-            );
+            let id = transforms::run_id(&record.input)?;
             let account = AccountId(record.input.destination_account.clone());
             account.validate()?;
             let repo = account.repository_id();
@@ -1279,53 +1107,44 @@ impl Store {
         repo: &str,
         now: i64,
         guards: &mut Vec<RootReadGuard>,
-    ) -> Result<(BTreeMap<String, ProjectedFile>, TreeId)> {
+    ) -> Result<BTreeMap<String, ProjectedFile>> {
         let files = self.forge_view_files(source, MAX_FILES)?;
+        let selected = files
+            .into_iter()
+            .map(|file| transforms::SelectedSourceFile {
+                relative_path: file.path,
+                canonical_path: file.canonical_path,
+                descriptor: file.descriptor,
+                executable: file.executable,
+                copy_id: file.copy_id,
+            })
+            .collect::<Vec<_>>();
+        let mut state = transforms::SelectionState::default();
         let mut result = BTreeMap::new();
-        let mut total = 0u64;
-        let mut paths = TransformPathBudget::default();
-        for file in files {
-            let Some(mapped) = spec.map_path(&file.path)? else {
-                continue;
-            };
-            // Admission precedes payload reads, puts and retaining this path.
-            paths.observe(&mapped)?;
-            if file.descriptor.key.kind != Kind::File {
-                return Err(Error::Invalid("transform supports regular files only"));
-            }
-            total = total
-                .checked_add(file.descriptor.size_bytes)
-                .ok_or(Error::Limit("transform input bytes"))?;
-            if total > MAX_BYTES {
-                return Err(Error::Limit("transform input bytes"));
-            }
-            let bytes = self.forge_read_view_file(source, &file.path, MAX_FILE_BYTES)?;
-            let receipt = self.put(repo, file.descriptor, &bytes, now)?;
-            guards.push(self.pin_root(repo, receipt.descriptor.key)?);
-            if result
-                .insert(
-                    mapped,
-                    ProjectedFile {
-                        id: FileId(file.descriptor.key.id.0),
-                        size: file.descriptor.size_bytes,
-                        executable: file.executable,
-                    },
-                )
-                .is_some()
-            {
-                return Err(Error::Invalid("duplicate mapped transform path"));
+        for page in selected.chunks(128) {
+            let mapped = transforms::map_selection_page(spec, "", page, state)?;
+            state = mapped.state;
+            for file in mapped.files {
+                let bytes =
+                    self.forge_read_view_file(source, &file.source_relative_path, MAX_FILE_BYTES)?;
+                let receipt = self.put(repo, file.descriptor, &bytes, now)?;
+                guards.push(self.pin_root(repo, receipt.descriptor.key)?);
+                if result
+                    .insert(
+                        file.mapped_path,
+                        ProjectedFile {
+                            id: FileId(file.descriptor.key.id.0),
+                            size: file.descriptor.size_bytes,
+                            executable: file.executable,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(Error::Invalid("duplicate mapped transform path"));
+                }
             }
         }
-        let tree = self.write_tree(
-            repo,
-            &result
-                .iter()
-                .map(|(path, file)| (path.clone(), projected_value(file)))
-                .collect(),
-            now,
-            guards,
-        )?;
-        Ok((result, tree))
+        Ok(result)
     }
 
     fn read_commit(&self, repo: &str, id: CommitId) -> Result<Commit> {
@@ -1342,6 +1161,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     fn write_object(
         &self,
         repo: &str,
@@ -1399,6 +1219,7 @@ impl Store {
         Ok(result)
     }
 
+    #[cfg(test)]
     fn write_tree(
         &self,
         repo: &str,
@@ -1406,181 +1227,15 @@ impl Store {
         now: i64,
         guards: &mut Vec<RootReadGuard>,
     ) -> Result<TreeId> {
-        // Validate the complete shape before allocating a trie or writing any
-        // directory objects. Each component then borrows its one input path;
-        // recursion never clones remaining suffixes or keeps ancestor maps.
-        if files.len() > MAX_FILES {
-            return Err(Error::Limit("transform tree files"));
+        let tree = transforms::build_tree(files, self.inner.config.model_limits)?;
+        for object in tree.objects {
+            self.put(repo, object.descriptor, &object.bytes, now)?;
+            guards.push(self.pin_root(repo, object.descriptor.key)?);
         }
-        let mut paths = TransformPathBudget::default();
-        for name in files.keys() {
-            paths.observe(name)?;
-        }
-        #[derive(Default)]
-        struct Directory<'a> {
-            entries: BTreeMap<&'a str, Entry<'a>>,
-        }
-        enum Entry<'a> {
-            Leaf(&'a TreeValue),
-            Directory(Directory<'a>),
-        }
-        struct Shape {
-            nodes: usize,
-            directories: usize,
-        }
-        impl Shape {
-            fn reserve(&mut self, directory: bool) -> Result<()> {
-                if self.nodes >= MAX_TREE_NODES
-                    || (directory && self.directories >= MAX_TREE_DIRECTORIES)
-                {
-                    return Err(Error::Limit("transform tree nodes"));
-                }
-                self.nodes += 1;
-                if directory {
-                    self.directories += 1;
-                }
-                Ok(())
-            }
-        }
-        impl<'a> Directory<'a> {
-            fn insert(
-                &mut self,
-                name: &'a str,
-                value: &'a TreeValue,
-                shape: &mut Shape,
-            ) -> Result<()> {
-                use std::collections::btree_map::Entry as Slot;
-                match name.split_once('/') {
-                    Some((component, rest)) => {
-                        let entry = match self.entries.entry(component) {
-                            Slot::Vacant(slot) => {
-                                shape.reserve(true)?;
-                                slot.insert(Entry::Directory(Directory::default()))
-                            }
-                            Slot::Occupied(slot) => slot.into_mut(),
-                        };
-                        match entry {
-                            Entry::Directory(directory) => directory.insert(rest, value, shape),
-                            Entry::Leaf(_) => {
-                                Err(Error::Invalid("transform file-directory collision"))
-                            }
-                        }
-                    }
-                    None => match self.entries.entry(name) {
-                        Slot::Vacant(slot) => {
-                            shape.reserve(false)?;
-                            slot.insert(Entry::Leaf(value));
-                            Ok(())
-                        }
-                        Slot::Occupied(_) => {
-                            Err(Error::Invalid("transform file-directory collision"))
-                        }
-                    },
-                }
-            }
-            fn write(
-                self,
-                store: &Store,
-                repo: &str,
-                now: i64,
-                guards: &mut Vec<RootReadGuard>,
-            ) -> Result<TreeId> {
-                let mut entries = Vec::with_capacity(self.entries.len());
-                for (name, entry) in self.entries {
-                    let value = match entry {
-                        Entry::Leaf(value) => value.clone(),
-                        Entry::Directory(directory) => {
-                            TreeValue::Tree(directory.write(store, repo, now, guards)?)
-                        }
-                    };
-                    entries.push(TreeEntry {
-                        name: name.to_owned(),
-                        value,
-                    });
-                }
-                let tree = store.write_object(repo, Object::Tree(Tree { entries }), now, guards)?;
-                Ok(TreeId(tree.key.id.0))
-            }
-        }
-        let mut directory = Directory::default();
-        let mut shape = Shape {
-            nodes: 1,
-            directories: 1,
-        };
-        for (name, value) in files {
-            directory.insert(name, value, &mut shape)?;
-        }
-        directory.write(self, repo, now, guards)
+        Ok(tree.root)
     }
 }
 
-fn projected_value(file: &ProjectedFile) -> TreeValue {
-    TreeValue::File {
-        id: file.id,
-        executable: file.executable,
-        size_bytes: file.size,
-        copy_id: None,
-    }
-}
-fn strip_copy(value: &TreeValue) -> TreeValue {
-    match value {
-        TreeValue::File {
-            id,
-            executable,
-            size_bytes,
-            ..
-        } => TreeValue::File {
-            id: *id,
-            executable: *executable,
-            size_bytes: *size_bytes,
-            copy_id: None,
-        },
-        value => value.clone(),
-    }
-}
-fn relative<'a>(prefix: &str, value: &'a str) -> Option<&'a str> {
-    if prefix.is_empty() {
-        Some(value)
-    } else if value == prefix {
-        Some("")
-    } else {
-        value
-            .strip_prefix(prefix)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-    }
-}
-fn overlap(left: &str, right: &str) -> bool {
-    relative(left, right).is_some() || relative(right, left).is_some()
-}
-fn join(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() {
-        suffix.into()
-    } else if suffix.is_empty() {
-        prefix.into()
-    } else {
-        format!("{prefix}/{suffix}")
-    }
-}
-fn path(value: &str, root: bool) -> Result<()> {
-    if (value.is_empty() && !root)
-        || value.len() > 4096
-        || value.contains(['\\', '\0'])
-        || value.chars().any(char::is_control)
-        || (!value.is_empty()
-            && value
-                .split('/')
-                .any(|part| part.is_empty() || matches!(part, "." | ".." | ".jj" | ".git")))
-    {
-        return Err(Error::Invalid("transform path"));
-    }
-    Ok(())
-}
-fn digest(domain: &[u8], value: &[u8]) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(domain);
-    hash.update(value);
-    *hash.finalize().as_bytes()
-}
 fn record_prefix(repo: &str) -> Vec<u8> {
     [PREFIX, repo.as_bytes(), b"/run/"].concat()
 }
@@ -2181,7 +1836,13 @@ mod tests {
         );
         assert!(
             store
-                .forge_retire_pin(&destination, &actor, run.id)
+                .forge_retire_pin(
+                    &destination,
+                    &actor,
+                    request.destination.name(),
+                    run.id,
+                    "retire-fixture"
+                )
                 .is_err()
         );
         store
@@ -2194,8 +1855,39 @@ mod tests {
             )
             .unwrap();
         store
-            .forge_retire_pin(&destination, &actor, run.id)
+            .forge_retire_pin(
+                &destination,
+                &actor,
+                request.destination.name(),
+                run.id,
+                "retire-fixture",
+            )
             .unwrap();
+        let retired = store
+            .forge_retire_pin(
+                &destination,
+                &actor,
+                request.destination.name(),
+                run.id,
+                "retire-fixture",
+            )
+            .unwrap();
+        assert_eq!(retired.generation, 2);
+        assert!(retired.retired);
+        assert!(matches!(
+            store.forge_retire_pin(
+                &destination,
+                &actor,
+                request.destination.name(),
+                [9; 32],
+                "retire-fixture"
+            ),
+            Err(Error::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            store.forge_retire_pin(&destination, &actor, "other", run.id, "retire-fixture"),
+            Err(Error::IdempotencyConflict)
+        ));
         store.gc(&destination.repository_id(), 10000).unwrap();
         assert!(matches!(
             store.forge_resolve_pin(&destination, &actor, run.id),
@@ -2208,6 +1900,21 @@ mod tests {
                 .is_none()
         );
         store.forge_validate_transforms_on_reopen().unwrap();
+        drop(store);
+        let reopened = Store::open_existing(_directory.path(), Config::default()).unwrap();
+        let replay = reopened
+            .forge_retire_pin(
+                &destination,
+                &actor,
+                request.destination.name(),
+                run.id,
+                "retire-fixture",
+            )
+            .unwrap();
+        assert_eq!(
+            replay, retired,
+            "retirement replay owns no collected payload and must remain exact after restart"
+        );
     }
 
     #[test]

@@ -713,9 +713,84 @@ fn search_fixture(store: &Store) -> Value {
 }
 
 
+
+// Real native cross-account selection/copy/lineage oracle. Runtime consumers
+// import these immutable roots with the shipped bootstrap API, not fixture RPCs.
+fn transform_fixture(store: &Store, profile_version: &str) -> Value {
+    use tinytree_store::forge_transforms::{ForgeTransformRequest, ForgeTransformSpec, ForgePathMapping, ForgeLineageHint, ForgeLineageOperation};
+    fn put(store:&Store, repo:&str, objects:&mut Vec<Value>, object:Option<Object>, body:&[u8])->Descriptor {
+        let (descriptor,bytes)=if let Some(object)=object {let encoded=tinytree_model::encode(&object,Limits::default()).unwrap();(encoded.descriptor,encoded.bytes)}else{(tinytree_model::describe_file(body),body.to_vec())};
+        store.put(repo,descriptor,&bytes,0).unwrap();objects.push(json!({"kind":descriptor.key.kind as u8,"id":hex(&descriptor.key.id.0),"size_bytes":descriptor.size_bytes,"format_version":descriptor.format_version,"bytes":bytes}));descriptor
+    }
+    fn file(name:&str,descriptor:Descriptor,copy:Option<CopyId>)->TreeEntry {TreeEntry{name:name.into(),value:TreeValue::File{id:FileId(descriptor.key.id.0),size_bytes:descriptor.size_bytes,executable:false,copy_id:copy}}}
+    fn root(store:&Store,repo:&str,objects:&mut Vec<Value>,library:Descriptor,private:Descriptor,parent:CommitId,change:u8)->Descriptor {
+        let tree=put(store,repo,objects,Some(Object::Tree(Tree{entries:vec![TreeEntry{name:"library".into(),value:TreeValue::Tree(TreeId(library.key.id.0))},TreeEntry{name:"private".into(),value:TreeValue::Tree(TreeId(private.key.id.0))}]})),&[]);
+        let signature=Signature{name:"Transform Fixture".into(),email:"fixture@example.invalid".into(),timestamp:Timestamp{millis_since_epoch:0,tz_offset_minutes:0}};
+        put(store,repo,objects,Some(Object::Commit(Commit{parents:vec![parent],predecessors:vec![],root_tree:TreeMerge{terms:vec![TreeId(tree.key.id.0)],labels:vec![String::new()]},change_id:ChangeId([change;16]),description:"Immutable transform source".into(),author:signature.clone(),committer:signature,secure_signature:None})),&[])
+    }
+    let actor=ForgeActor{principal:"check-owner".into()};
+    let source=AccountId("forge-input".into());let destination=AccountId("forge-output".into());
+    store.forge_mutate_account(&source,&actor,"transform-source-provision",ForgeAccountMutation::Provision).unwrap();
+    store.forge_mutate_account(&destination,&actor,"transform-destination-provision",ForgeAccountMutation::Provision).unwrap();
+    let source_repo=source.repository_id();let destination_repo=destination.repository_id();
+    let mut source_objects=Vec::new();
+    let original_rename=put(store,&source_repo,&mut source_objects,None,b"Original rename export\n");
+    let original_copy=put(store,&source_repo,&mut source_objects,None,b"Original copy export\n");
+    let edited_rename=put(store,&source_repo,&mut source_objects,None,b"Edited rename export\n");
+    let edited_copy=put(store,&source_repo,&mut source_objects,None,b"Edited copy export\n");
+    let seed_rename=put(store,&source_repo,&mut source_objects,Some(Object::CopyHistory(CopyHistory{current_path:"library/rename-me.txt".into(),parents:vec![],salt:b"transform-rename-seed".to_vec()})),&[]);
+    let seed_copy=put(store,&source_repo,&mut source_objects,Some(Object::CopyHistory(CopyHistory{current_path:"library/copy-me.txt".into(),parents:vec![],salt:b"transform-copy-seed".to_vec()})),&[]);
+    let rename_history=put(store,&source_repo,&mut source_objects,Some(Object::CopyHistory(CopyHistory{current_path:"library/renamed.txt".into(),parents:vec![CopyId(seed_rename.key.id.0)],salt:b"transform-renamed".to_vec()})),&[]);
+    let copy_history=put(store,&source_repo,&mut source_objects,Some(Object::CopyHistory(CopyHistory{current_path:"library/copied.txt".into(),parents:vec![CopyId(seed_copy.key.id.0)],salt:b"transform-copied".to_vec()})),&[]);
+    let before_tree=put(store,&source_repo,&mut source_objects,Some(Object::Tree(Tree{entries:vec![file("copy-me.txt",original_copy,Some(CopyId(seed_copy.key.id.0))),file("rename-me.txt",original_rename,Some(CopyId(seed_rename.key.id.0)))]})),&[]);
+    let after_tree=put(store,&source_repo,&mut source_objects,Some(Object::Tree(Tree{entries:vec![file("copied.txt",edited_copy,Some(CopyId(copy_history.key.id.0))),file("copy-me.txt",original_copy,Some(CopyId(seed_copy.key.id.0))),file("renamed.txt",edited_rename,Some(CopyId(rename_history.key.id.0)))]})),&[]);
+    let secret=put(store,&source_repo,&mut source_objects,None,b"private source export must never be copied\n");
+    let private=put(store,&source_repo,&mut source_objects,Some(Object::Tree(Tree{entries:vec![file("secret.txt",secret,None)]})),&[]);
+    let before=root(store,&source_repo,&mut source_objects,before_tree,private,CommitId::ROOT,170);
+    let after=root(store,&source_repo,&mut source_objects,after_tree,private,CommitId(before.key.id.0),171);
+    let before_spec=ViewSpec{name:"public".into(),root_prefix:String::new(),include_prefixes:vec![String::new()],exclude_prefixes:vec!["private".into()],visibility:ForgeViewVisibility::Public,revision:before.key.id.0,export_allowed:true};
+    let after_spec=ViewSpec{revision:after.key.id.0,..before_spec.clone()};
+    let before_published=store.forge_mutate_account(&source,&actor,"transform-before-view",ForgeAccountMutation::PublishView{spec:before_spec.clone(),expected_epoch:PolicyEpoch(1),make_default:true,follow_main:false}).unwrap();
+    let after_published=store.forge_mutate_account(&source,&actor,"transform-after-view",ForgeAccountMutation::PublishView{spec:after_spec.clone(),expected_epoch:PolicyEpoch(2),make_default:true,follow_main:false}).unwrap();
+    let mut destination_objects=Vec::new();
+    for descriptor in [original_copy,original_rename] {let mut read=store.read(&source_repo,descriptor.key).unwrap();let mut bytes=Vec::new();std::io::Read::read_to_end(&mut read,&mut bytes).unwrap();put(store,&destination_repo,&mut destination_objects,None,&bytes);}
+    let vendor=put(store,&destination_repo,&mut destination_objects,Some(Object::Tree(Tree{entries:vec![file("copy-me.txt",original_copy,None),file("rename-me.txt",original_rename,None)]})),&[]);
+    let readme=put(store,&destination_repo,&mut destination_objects,None,b"Destination preserves its own monorepo\n");
+    let destination_secret=put(store,&destination_repo,&mut destination_objects,None,b"private destination parent survives transform\n");
+    let destination_private=put(store,&destination_repo,&mut destination_objects,Some(Object::Tree(Tree{entries:vec![file("secret.txt",destination_secret,None)]})),&[]);
+    let destination_tree=put(store,&destination_repo,&mut destination_objects,Some(Object::Tree(Tree{entries:vec![file("README.md",readme,None),TreeEntry{name:"private".into(),value:TreeValue::Tree(TreeId(destination_private.key.id.0))},TreeEntry{name:"vendor".into(),value:TreeValue::Tree(TreeId(vendor.key.id.0))}]})),&[]);
+    let mut destination_commit=tinytree_model::synthetic_root();destination_commit.parents=vec![CommitId::ROOT];destination_commit.change_id=ChangeId([172;16]);destination_commit.root_tree.terms=vec![TreeId(destination_tree.key.id.0)];
+    let destination_root=put(store,&destination_repo,&mut destination_objects,Some(Object::Commit(destination_commit)),&[]);
+    let destination_spec=ViewSpec{name:"public".into(),root_prefix:String::new(),include_prefixes:vec![String::new()],exclude_prefixes:vec!["private".into()],visibility:ForgeViewVisibility::Public,revision:destination_root.key.id.0,export_allowed:false};
+    store.forge_mutate_account(&destination,&actor,"transform-destination-view",ForgeAccountMutation::PublishView{spec:destination_spec.clone(),expected_epoch:PolicyEpoch(1),make_default:true,follow_main:false}).unwrap();
+    let before_version: [u8;32]=serde_json::from_value(before_published["view_version"].clone()).unwrap();
+    let after_version: [u8;32]=serde_json::from_value(after_published["view_version"].clone()).unwrap();
+    let before_view=store.forge_resolve_view(&source,Some(&actor),"public",Some(ViewVersion(before_version))).unwrap();
+    let after_view=store.forge_resolve_view(&source,Some(&actor),"public",Some(ViewVersion(after_version))).unwrap();
+    let destination_view=store.forge_resolve_view(&destination,Some(&actor),"public",None).unwrap();
+    let spec=ForgeTransformSpec{mappings:vec![ForgePathMapping{source_prefix:"library".into(),destination_prefix:"vendor".into()}]};
+    let lineage=vec![ForgeLineageHint{operation:ForgeLineageOperation::Rename,source_path:"library/rename-me.txt".into(),target_path:"library/renamed.txt".into()},ForgeLineageHint{operation:ForgeLineageOperation::Copy,source_path:"library/copy-me.txt".into(),target_path:"library/copied.txt".into()}];
+    let request=ForgeTransformRequest{request_id:"native-cross-account-transform".into(),before:before_view,after:after_view,destination:destination_view,spec:spec.clone(),change_id:ChangeId([173;16]),lineage:lineage.clone()};
+    let committer=Signature{name:"Transform Fixture".into(),email:"fixture@example.invalid".into(),timestamp:Timestamp{millis_since_epoch:0,tz_offset_minutes:0}};
+    let run=store.forge_prepare_transform(&actor,&request,&committer,0).unwrap();
+    assert_eq!(store.forge_prepare_transform(&actor,&request,&committer,1).unwrap(),run);
+    let profile=tinytree_store::LandingCheckProfile{name:"checks".into(),version:profile_version.into()};
+    let review=store.forge_push_review(&destination,&actor,&tinytree_store::ForgeReviewPushRequest{request_id:format!("transform-{}",hex(&run.id)),source_base:CommitId(run.destination_base),source_head:CommitId(run.output_head),view_version:run.destination_view,expected_patchset:None,predecessor:None,provenance:Some(run.id),lineage:vec![],check_profile:profile.clone()},&committer,1).unwrap();
+    let (_, output_bytes)=store.read_metadata(&destination_repo,tinytree_model::ObjectKey{kind:Kind::Commit,id:tinytree_model::ObjectId(run.output_head)}).unwrap();
+    let Object::Commit(output)=tinytree_model::decode(&output_bytes,Limits::default()).unwrap() else {panic!("transform output commit")};
+    let pin=store.forge_pin_files(&destination,&actor,run.id,None,256).unwrap();
+    let protected=store.forge_retire_pin(&destination,&actor,"public",run.id,"native-protected-transform-pin");assert!(matches!(protected,Err(Error::Invalid("dependency pin still referenced"))));
+    assert!(store.descriptor(&destination_repo,secret.key).unwrap().is_none());
+    json!({"owner":actor.principal,"source":{"account_id":source.0,"objects":source_objects,"root":{"kind":3,"id":hex(&after.key.id.0)},"before_spec":before_spec,"after_spec":after_spec,"before_view":before_version,"after_view":after_version,"before_files":[{"name":"copy-me.txt","bytes":b"Original copy export\n".as_slice()},{"name":"rename-me.txt","bytes":b"Original rename export\n".as_slice()}],"private_file":{"kind":1,"id":hex(&secret.key.id.0)}},
+        "destination":{"account_id":destination.0,"objects":destination_objects,"root":{"kind":3,"id":hex(&destination_root.key.id.0)},"spec":destination_spec,"view_version":run.destination_view,"private_file":{"kind":1,"id":hex(&destination_secret.key.id.0)}},
+        "plan":{"source_account":source.0,"source_view":"public","source_before_view":hex(&before_version),"source_after_view":hex(&after_version),"destination_view":hex(&run.destination_view),"spec":spec,"change_id":hex(&[173;16]),"lineage":lineage,"expected_patchset":null},
+        "native":{"run_id":hex(&run.id),"spec_id":hex(&run.spec),"output_root":hex(&output.root_tree.terms[0].0),"pin_files":tinytree_forge_core::transform_commands::format_page(&pin),"lineage":run.lineage,"review_admitted":review.change_id==[173;16],"candidate_state_parity":false,"head_clock_dependent":true},
+        "pin_bytes":[{"path":"vendor/copied.txt","bytes":b"Edited copy export\n".as_slice()},{"path":"vendor/copy-me.txt","bytes":b"Original copy export\n".as_slice()},{"path":"vendor/renamed.txt","bytes":b"Edited rename export\n".as_slice()}]})
+}
+
 // Disposable, genuinely executable Bazel repository for the trusted checker
 // process acceptance. This fixture supplies bytes/identities, never a verdict.
-fn checker_fixture(store: &Store, profile_version: &str) -> Value {
+fn checker_fixture(store: &Store, profile_version: &str, transform: &Value) -> Value {
     let account = AccountId("forge-check".into());
     let actor = ForgeActor { principal: "check-owner".into() };
     store.forge_mutate_account(&account, &actor, "checker-provision", ForgeAccountMutation::Provision).unwrap();
@@ -753,6 +828,14 @@ smoke_test = rule(implementation = _smoke, attrs = {"src": attr.label(allow_sing
         let descriptor = put(None, body);
         TreeEntry { name: name.into(), value: TreeValue::File { id: FileId(descriptor.key.id.0), size_bytes: descriptor.size_bytes, executable: false, copy_id: None } }
     }).collect() };
+    let mut vendor_entries = Vec::new();
+    for file in transform["source"]["before_files"].as_array().unwrap() {
+        let bytes: Vec<u8> = serde_json::from_value(file["bytes"].clone()).unwrap();
+        let descriptor = put(None, &bytes);
+        vendor_entries.push(TreeEntry { name: file["name"].as_str().unwrap().into(), value: TreeValue::File { id: FileId(descriptor.key.id.0), size_bytes: descriptor.size_bytes, executable: false, copy_id: None } });
+    }
+    let vendor = put(Some(Object::Tree(Tree { entries: vendor_entries })), &[]);
+    canonical.entries.push(TreeEntry { name: "vendor".into(), value: TreeValue::Tree(TreeId(vendor.key.id.0)) });
     let secret = put(None, b"excluded canonical checker fixture bytes\n");
     let private = put(Some(Object::Tree(Tree { entries: vec![TreeEntry { name: "secret.txt".into(), value: TreeValue::File { id: FileId(secret.key.id.0), size_bytes: secret.size_bytes, executable: false, copy_id: None } }] })), &[]);
     canonical.entries.push(TreeEntry { name: "private".into(), value: TreeValue::Tree(TreeId(private.key.id.0)) });
@@ -773,7 +856,7 @@ smoke_test = rule(implementation = _smoke, attrs = {"src": attr.label(allow_sing
     let profile = tinytree_store::LandingCheckProfile { name: "checks".into(), version: profile_version.into() };
     let mut reviews = Vec::new();
     let mut cancellation = None;
-    let mut expected = canonical;
+    let mut expected = canonical.clone();
     for (label, path, body, change) in [("positive", "receipt.txt", b"real checked source receipt\n".as_slice(), 151), ("negative", "status.txt", b"1\n".as_slice(), 152)] {
         let file = tinytree_model::describe_file(body);
         let mut selected = projected_tree.clone();
@@ -827,7 +910,34 @@ smoke_test = rule(implementation = _smoke, attrs = {"src": attr.label(allow_sing
                 "push":{"source_base":hex(&amendment.source_base.0),"source_head":hex(&amendment.source_head.0),"view_version":hex(&amendment.view_version),"expected_patchset":hex(&review.patchset_id),"predecessor":null,"provenance":null,"lineage":[]}}));
         }
     }
-    json!({"account_id":account.0,"owner":actor.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"view_version":view.version().0,"projected_base":hex(&projection.projected_commit),"profile":profile,"private_file":{"kind":1,"id":hex(&secret.key.id.0)},"reviews":reviews,"cancellation":cancellation.unwrap()})
+    let source_account = AccountId(transform["source"]["account_id"].as_str().unwrap().into());
+    let source_before: [u8;32] = serde_json::from_value(transform["source"]["before_view"].clone()).unwrap();
+    let source_after: [u8;32] = serde_json::from_value(transform["source"]["after_view"].clone()).unwrap();
+    let cross = tinytree_store::forge_transforms::ForgeTransformRequest {
+        request_id: "native-checker-transform".into(),
+        before: store.forge_resolve_view(&source_account, Some(&actor), "public", Some(ViewVersion(source_before))).unwrap(),
+        after: store.forge_resolve_view(&source_account, Some(&actor), "public", Some(ViewVersion(source_after))).unwrap(),
+        destination: view.clone(),
+        spec: serde_json::from_value(transform["plan"]["spec"].clone()).unwrap(),
+        change_id: ChangeId([174;16]), lineage: serde_json::from_value(transform["plan"]["lineage"].clone()).unwrap(),
+    };
+    let committer = projected_commit.committer.clone();
+    let cross_run = store.forge_prepare_transform(&actor, &cross, &committer, 0).unwrap();
+    let (_, cross_bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey { kind: Kind::Commit, id: tinytree_model::ObjectId(cross_run.output_head) }).unwrap();
+    let Object::Commit(cross_commit) = tinytree_model::decode(&cross_bytes, Limits::default()).unwrap() else {panic!("checker transform commit")};
+    let (_, cross_tree_bytes) = store.read_metadata(&repository, tinytree_model::ObjectKey { kind: Kind::Tree, id: tinytree_model::ObjectId(cross_commit.root_tree.terms[0].0) }).unwrap();
+    let Object::Tree(mut cross_tree) = tinytree_model::decode(&cross_tree_bytes, Limits::default()).unwrap() else {panic!("checker transform tree")};
+    let marker = tinytree_model::describe_file(b"real checked source receipt\n");
+    cross_tree.entries.push(TreeEntry { name: "receipt.txt".into(), value: TreeValue::File { id: FileId(marker.key.id.0), size_bytes: marker.size_bytes, executable: false, copy_id: None } });
+    cross_tree.entries.sort_by(|a,b|a.name.cmp(&b.name));
+    let physical_transform_tree = tinytree_model::encode(&Object::Tree(cross_tree.clone()), Limits::default()).unwrap();
+    let failed_status = tinytree_model::describe_file(b"1\n");
+    cross_tree.entries.iter_mut().find(|entry|entry.name=="status.txt").unwrap().value = TreeValue::File { id: FileId(failed_status.key.id.0), size_bytes: failed_status.size_bytes, executable: false, copy_id: None };
+    let cancellation_after_transform = tinytree_model::encode(&Object::Tree(cross_tree), Limits::default()).unwrap();
+    cancellation.as_mut().unwrap()["expected_canonical_tree_after_transform"] = json!(hex(&cancellation_after_transform.descriptor.key.id.0));
+    let mut cross_plan = transform["plan"].clone();
+    cross_plan["destination_view"] = json!(hex(&view.version().0)); cross_plan["change_id"] = json!(hex(&[174;16]));
+    json!({"account_id":account.0,"owner":actor.principal,"objects":objects,"root":{"kind":3,"id":hex(&root.key.id.0)},"spec":spec,"view_version":view.version().0,"projected_base":hex(&projection.projected_commit),"profile":profile,"private_file":{"kind":1,"id":hex(&secret.key.id.0)},"reviews":reviews,"cancellation":cancellation.unwrap(),"transform":{"source":transform["source"],"plan":cross_plan,"native":{"run_id":hex(&cross_run.id),"expected_candidate_tree":hex(&physical_transform_tree.descriptor.key.id.0)},"pin_bytes":transform["pin_bytes"]}})
 }
 
 fn main() {
@@ -1067,12 +1177,14 @@ fn main() {
     let projection_fixture = projection_fixture(&store);
     let bootstrap_fixture = bootstrap_fixture(&store);
     let search_fixture = search_fixture(&store);
-    let checker_fixture = checker_fixture(&store, &checker_profile);
+    let transform_fixture = transform_fixture(&store, &checker_profile);
+    let checker_fixture = checker_fixture(&store, &checker_profile, &transform_fixture);
     let value = json!({"schema_version":1,"account":"example","repository":REPOSITORY,
         "projection":projection_fixture,
         "bootstrap":bootstrap_fixture,
         "search":search_fixture,
         "checker":checker_fixture,
+        "transform":transform_fixture,
         "forge":{"account_id":account.0,"provisioned":provisioned,"added":added,"unchanged":unchanged,"revoked":revoked,"views":{"public_spec":public_spec,"public":public,"locked_spec":locked_spec,"locked":locked,"retired":retired}},
         "closure":{"root":{"kind":3,"id":hex(&history_head.key.id.0)},"objects":history,"native_publication":reference(&history_publication.reference)},
         "objects":objects,"native":{"initial":initial,"first":reference(&first_result.reference),

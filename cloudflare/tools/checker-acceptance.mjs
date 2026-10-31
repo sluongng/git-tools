@@ -12,8 +12,8 @@ import path from 'node:path';
 import { Miniflare } from 'miniflare';
 
 const inputs = process.argv.slice(2);
-assert.equal(inputs.length, 6, 'declared fixture, checker, readonly helper, Bazel, Worker and Wasm arguments required');
-const [fixtureBinary, runner, helper, bazel, worker, wasm] = inputs.map(value => path.resolve(value));
+assert.equal(inputs.length, 7, 'declared fixture, checker, readonly helper, Bazel, Worker, Wasm and tt arguments required');
+const [fixtureBinary, runner, helper, bazel, worker, wasm, tt] = inputs.map(value => path.resolve(value));
 const socket = process.env.TT_CHECKER_ACCEPT_RBE_SOCKET;
 assert.ok(socket && path.isAbsolute(socket) && (await stat(socket)).isSocket(), 'explicit execution-only RBE socket required');
 const instance = process.env.TT_CHECKER_ACCEPT_RBE_INSTANCE ?? '';
@@ -50,7 +50,7 @@ try {
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
     r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(root, 'do'), r2Persist: path.join(root, 'r2'),
     bindings: { FORGE_BACKEND: 'enabled', EXPERIMENTAL_RAW_BACKEND: 'disabled',
-      PRINCIPALS_JSON: JSON.stringify([{ principal: 'check-owner', token_sha256: sha(token), accounts: ['forge-check'], operator: true, kind: 'forge' }]) },
+      PRINCIPALS_JSON: JSON.stringify([{ principal: 'check-owner', token_sha256: sha(token), accounts: ['forge-check', 'forge-input'], operator: true, kind: 'forge' }]) },
   };
   mf = new Miniflare(configuration);
   const origin = (await mf.ready).origin;
@@ -152,14 +152,14 @@ force_remote_execution = true
   const generated = await execute(fixtureBinary, ['--checker-profile-version', profileVersion], { env: { HOME: home, PATH: emptyPath, TMPDIR: root }, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 });
   const source = JSON.parse(generated.stdout).checker;
   assert.deepEqual(source.profile, profile);
-  const invoke = async (operation, payload = {}, id = '', expected = 200) => {
+  const invoke = async (operation, payload = {}, id = '', expected = 200, selectedAccount = source.account_id) => {
     const response = await mf.dispatchFetch(origin + '/api/v1/forge/call', { signal: AbortSignal.timeout(30000), method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 1, operation, account_id: source.account_id, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
+      body: JSON.stringify({ version: 1, operation, account_id: selectedAccount, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
     });
     const envelope = await response.json(); assert.equal(response.status, expected, JSON.stringify(envelope));
     if (expected !== 200) return envelope;
-    assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id); assert.equal(envelope.account_id, source.account_id); assert.equal(envelope.view, 'public');
+    assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id); assert.equal(envelope.account_id, selectedAccount); assert.equal(envelope.view, 'public');
     return { state: envelope.state, value: JSON.parse(envelope.result_json) };
   };
   stage = 'bootstrap';
@@ -292,9 +292,91 @@ force_remote_execution = true
       for (const name of ['bep.jsonl', 'execution.compact', 'snapshot-proof.json']) await copyFile(path.join(attempt, name), path.join(artifacts, `${selected.label}-${name}`));
     }
   }
+  assert.equal((await invoke(2)).value.main_generation, before.main_generation + 1);
+  // Cross-account transformation uses the same shipped source bootstrap/views,
+  // the actual tt façade and a real new check before its independent landing.
+  stage = 'transform-source-bootstrap';
+  const dependency = source.transform;
+  const upstream = dependency.source;
+  const sourceAccount = (await invoke(1, {}, 'accept-source-provision', 200, upstream.account_id)).value;
+  const sourceBegin = (await invoke(40, { root: upstream.root,
+    source: { repository_id: 'native-transform-source', reference: 'main', generation: 1, head: upstream.root.id },
+    destination: { generation: 1, head: Buffer.from(sourceAccount.main_revision).toString('hex') } }, 'accept-source-bootstrap', 200, upstream.account_id)).value;
+  for (const object of upstream.objects) await invoke(41, { import_id: sourceBegin.import_id,
+    descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version },
+    data_base64: Buffer.from(object.bytes).toString('base64') }, `io-${sourceBegin.import_id}-${object.kind}-${object.id}`, 200, upstream.account_id);
+  let sourceStatus = sourceBegin.status;
+  for (let step = 0; step < 128 && !sourceStatus.complete; step++) {
+    sourceStatus = (await invoke(42, { import_id: sourceBegin.import_id, expected_generation: sourceStatus.generation },
+      `ia-${sourceBegin.import_id}-${sourceStatus.generation}`, 200, upstream.account_id)).value.status;
+    assert.equal(sourceStatus.error, null);
+  }
+  assert.equal(sourceStatus.phase, 'ready');
+  await invoke(44, { import_id: sourceBegin.import_id, expected_generation: sourceStatus.generation }, 'accept-source-finish', 200, upstream.account_id);
+  await invoke(4, { spec: upstream.before_spec, expected_epoch: 1, make_default: true, follow_main: false }, 'accept-source-before', 200, upstream.account_id);
+  await invoke(4, { spec: upstream.after_spec, expected_epoch: 2, make_default: true, follow_main: false }, 'accept-source-after', 200, upstream.account_id);
+  const ttConfig = path.join(root, 'tt-user.toml');
+  await writeFile(ttConfig, '[user]\nname="Acceptance Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
+  const ttEnvironment = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: ttConfig,
+    PATH: emptyPath, TERM: 'dumb', TT_FORGE_TOKEN: token };
+  const ttCommand = async args => {
+    const result = await execute(tt, ['--no-pager', '--color=never', ...args, '--json'],
+      { env: ttEnvironment, cwd: root, encoding: 'utf8', timeout: 70000, maxBuffer: 2 * 1024 * 1024 });
+    const report = JSON.parse(result.stdout); assert.equal(report.schema_version, 1); return report;
+  };
+  await ttCommand(['context', 'set', '--transport', 'forge-https-v1', '--server', origin, '--account', source.account_id, '--view', 'public', '--token-env', 'TT_FORGE_TOKEN']);
+  const transformPlan = path.join(root, 'dependency-plan.json');
+  await writeFile(transformPlan, JSON.stringify(dependency.plan), { mode: 0o600 });
+  stage = 'transform-tt-submit';
+  const transformed = (await ttCommand(['transform', 'start', '--plan', transformPlan, '--request-id', 'accept-transform'])).result.value;
+  assert.equal(transformed.transform.id, dependency.native.run_id);
+  let transformedReview = transformed.review;
+  const transformDeadline = Date.now() + 120000;
+  for (let step = 0; step < 128 && !transformedReview.projected_head; step++) {
+    assert.ok(Date.now() < transformDeadline);
+    transformedReview = (await invoke(30, dependency.plan, 'accept-transform')).value.review;
+  }
+  assert.ok(transformedReview.candidate && transformedReview.projected_head);
+  const transformCandidate = transformedReview.candidate;
+  assert.equal(transformCandidate.root_tree, dependency.native.expected_candidate_tree, 'transform preserves private parent and prior landed receipt');
+  const transformMain = (await invoke(2)).value;
+  stage = 'transform-physical-check';
+  const transformReport = JSON.parse((await run(['run-remote', '--account', source.account_id, '--profile', 'checks', '--claim-id', 'accept-transform-check'])).stdout);
+  assert.equal(transformReport.result.state, 'completed'); assert.equal(transformReport.result.completion.outcome, 'passed');
+  let transformJournal;
+  for (const name of (await readdir(scratch + '-remote')).filter(name => /^remote-[0-9a-f]{64}\.json$/.test(name))) {
+    const record = JSON.parse(await readFile(path.join(scratch + '-remote', name), 'utf8'));
+    if (record.binding.claim === 'accept-transform-check') transformJournal = record;
+  }
+  assert.ok(transformJournal); const transformReceipt = transformJournal.receipt;
+  assert.equal(transformReceipt.cleanup_confirmed, true); assert.equal(transformReceipt.request.job_id, transformCandidate.id);
+  assert.equal(transformReceipt.request.candidate_commit, transformCandidate.head); assert.equal(transformReceipt.evidence.bazel_exit_code, 0);
+  assert.equal(transformReceipt.evidence.tests_verified, true); assert.deepEqual(transformReceipt.evidence.requested_targets, ['//:smoke']);
+  assert.match(transformReceipt.evidence.execution_log_blake3, /^[0-9a-f]{64}$/);
+  const transformAttempt = path.join(scratch, transformReceipt.workspace_id);
+  const transformProof = JSON.parse(await readFile(path.join(transformAttempt, 'snapshot-proof.json'), 'utf8'));
+  for (const field of ['before_verified', 'after_verified', 'readonly_superblock', 'capabilities_dropped', 'no_new_privs', 'teardown_confirmed', 'pid_namespace_contained']) assert.equal(transformProof[field], true);
+  const transformBep = await readFile(path.join(transformAttempt, 'bep.jsonl'), 'utf8');
+  const transformEvents = transformBep.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(transformEvents.filter(event => event.started).length, 1);
+  assert.ok(transformEvents.some(event => event.id?.testSummary?.label === '//:smoke' && event.testSummary?.overallStatus === 'PASSED'));
+  assert.ok(!transformBep.includes(token) && !transformBep.includes(checkerToken));
+  const transformSelector = { change_id: dependency.plan.change_id, patchset_id: transformedReview.patchset_id, candidate_id: transformCandidate.id };
+  await ttCommand(['review', 'approve', transformSelector.change_id, '--patchset', transformSelector.patchset_id, '--candidate', transformCandidate.id, '--request-id', 'approve-transform']);
+  const transformLanded = await ttCommand(['review', 'land', transformSelector.change_id, '--patchset', transformSelector.patchset_id, '--candidate', transformCandidate.id, '--request-id', 'land-transform']);
+  assert.equal(transformLanded.state, 'landed');
+  assert.deepEqual((await ttCommand(['review', 'land', transformSelector.change_id, '--patchset', transformSelector.patchset_id, '--candidate', transformCandidate.id, '--request-id', 'land-transform'])).result.value, transformLanded.result.value);
+  assert.equal((await invoke(2)).value.main_generation, transformMain.main_generation + 1);
+  for (const file of dependency.pin_bytes) {
+    const retained = await ttCommand(['pin', 'resolve', transformed.transform.id, '--path', file.path]); assert.deepEqual(retained.result.value.bytes, file.bytes);
+  }
+  assert.equal((await invoke(34, { run_id: transformed.transform.id }, 'protect-landed-transform', 400)).error.code, 'failed_precondition');
+  evidence.push({ label: 'transform', receipt: transformReceipt, completion: transformReport.result.completion,
+    candidate: transformCandidate, namespace_proof: transformProof, run_id: transformed.transform.id, actual_tt_transform: true });
+  if (artifacts) for (const name of ['bep.jsonl', 'execution.compact', 'snapshot-proof.json']) await copyFile(path.join(transformAttempt, name), path.join(artifacts, `transform-${name}`));
   // A Failed candidate is not eligible for another execution lease. Submit
   // the explicit native metadata-only amendment instead of silently reusing it.
-  const amendment = source.cancellation;
+  const amendment = { ...source.cancellation, expected_canonical_tree: source.cancellation.expected_canonical_tree_after_transform };
   assert.equal(amendment.metadata_only, true);
   const cancellationReview = await prepareReview(amendment);
   const cancelledCandidate = cancellationReview.value.candidate;
@@ -477,7 +559,7 @@ force_remote_execution = true
     await writeFile(path.join(artifacts, 'cancellation-control.json'), JSON.stringify(cancelledJournal, null, 2), { mode: 0o600 });
     await writeFile(path.join(artifacts, 'cancellation-proc.json'), JSON.stringify(observation, null, 2), { mode: 0o600 });
   }
-  assert.equal((await invoke(2)).value.main_generation, before.main_generation + 1);
+  assert.equal((await invoke(2)).value.main_generation, before.main_generation + 2);
   const summary = { schema: 1, production_worker: true, execution_only_linux: true, no_synthetic_verdict: true, evidence };
   if (artifacts) await writeFile(path.join(artifacts, 'checker-acceptance.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
   console.log(JSON.stringify(summary));

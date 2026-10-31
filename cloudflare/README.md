@@ -52,7 +52,26 @@ with a fresh accepted passing check, required approvals, verified closure and
 matching main head and generation. Dependent candidates must satisfy the same
 obligations. Approval votes alone never publish a change.
 
-General queries, transforms and workspace backup remain unsupported. The
+Operations 30–35 prepare typed cross-account transforms, inspect retained runs,
+resolve dependency pins, retire unprotected pins and read authorized lineage.
+A transform uses exact before/after source views with export permission and a
+destination view with write permission. One configured credential must admit
+both account scopes; separate credentials naming the same principal do not
+combine their ceilings. The native mapping and CopyHistory verifier constructs
+a destination-owned artifact without copying source ancestry. Preparation
+creates an ordinary destination review, not a main update.
+
+Large preparation returns `transform_pending`; the SDK and `tt` replay the same
+saved intent against its frozen destination selection. Private staged bytes do
+not acquire public read or view-publication authority. Once publication is
+permitted, the pin, retained output and exact outcome commit together. Source
+policy changes can transiently refuse while that publication outcome is being
+reconciled; an expired timeout alone does not release the authorization fence.
+Published pin bytes remain destination-owned after source revocation, while
+inaccessible origin metadata is redacted. Pin reads still enforce current
+destination policy, and retirement refuses service-protected roots.
+
+General queries and workspace backup remain unsupported. The
 complete `tt` Forge workflow is not yet supported by this target. Unsupported
 operations fail explicitly; there is no fallback to the local backend. Do not
 expose it as an equivalent public Forge service or switch an existing account

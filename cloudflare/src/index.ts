@@ -14,10 +14,13 @@ import { ForgeUploads, requireOwnedUploadInTx } from './forge_uploads';
 import { ForgeReviews, requireReviewProjectionSourceInTx, reviewCheckSelectionsInTx, requireReviewCheckCandidateInTx } from './forge_reviews';
 import { ForgeChecks, type CheckProfile, type ExecutionPolicy, type ReviewCheckCandidate } from './forge_checks';
 import { CHECKER_ROUTE, admitChecker, checkerReply, protectChecker, requireCheckerProfile } from './checker';
+import { DurableObject } from 'cloudflare:workers';
+import { requireDelegatedForgeCredential } from './protocol';
+import { ForgeTransforms, type TrustedAuth, type TransformRpcCommand, type TransformRpcResult } from './forge_transforms';
 
 interface Env {
   ASSETS?: Fetcher;
-  REPOSITORIES: DurableObjectNamespace;
+  REPOSITORIES: DurableObjectNamespace<AccountRepository>;
   OBJECTS: R2Bucket;
   PRINCIPALS_JSON: string;
   EXPERIMENTAL_RAW_BACKEND: string;
@@ -25,6 +28,44 @@ interface Env {
   FORGE_REVIEW_CONFIG_JSON?: string;
   FORGE_CHECK_POLICY_JSON?: string;
   CHECKERS_JSON?: string;
+}
+interface TransformRpcFrame { schema: 1; account_id: string; auth: TrustedAuth | null; command: TransformRpcCommand }
+type TransformRpcEnvelope = { ok: true; value: TransformRpcResult } | { ok: false; status: number; code: string };
+
+async function transformHop(env: Env, account: string, auth: TrustedAuth | null, command: TransformRpcCommand): Promise<TransformRpcResult> {
+  const id = env.REPOSITORIES.idFromName(`native-account-v1:${identifier(account)}`);
+  const reply = record(await env.REPOSITORIES.get(id).transformRpc({ schema: 1, account_id: account, auth, command }), ['ok', 'value', 'status', 'code'], ['ok']);
+  if (reply.ok === true) {
+    record(reply, ['ok', 'value']);
+    return record(reply.value, ['result', 'next', 'evidence'], []) as TransformRpcResult;
+  }
+  record(reply, ['ok', 'status', 'code']);
+  if (reply.ok !== false || typeof reply.status !== 'number' || !Number.isInteger(reply.status)
+      || reply.status < 400 || reply.status > 599 || typeof reply.code !== 'string' || !/^[a-z_]{1,80}$/.test(reply.code)) fail(503, 'unavailable');
+  fail(reply.status, reply.code);
+}
+/** No account queue is held across this peer hop. A request advances only one
+ * peer quantum; all authority and continuation state live in the account SQL. */
+async function transformQuantum(env: Env, account: string, auth: TrustedAuth | null, command: TransformRpcCommand): Promise<TransformRpcResult> {
+  const local = await transformHop(env, account, auth, command);
+  return applyTransformPeer(env, auth, local, command => transformHop(env, account, auth, command));
+}
+async function applyTransformPeer(env: Env, auth: TrustedAuth | null, local: TransformRpcResult,
+  apply: (command: TransformRpcCommand) => Promise<TransformRpcResult>): Promise<TransformRpcResult> {
+  if (!local.next) return local;
+  const next = local.next;
+  let peer: TransformRpcResult;
+  try { peer = await transformHop(env, next.account_id, auth, next.command); }
+  catch (error) {
+    if (next.command.action !== 'authorize_origin') throw error;
+    // Denied or unavailable source metadata is redacted, not replaced with a
+    // source identifier or a claim that retained destination bytes are gone.
+    peer = { evidence: { kind: 'origin', binding: next.command.binding, available: false } };
+  }
+  if (!peer.evidence) fail(503, 'unavailable');
+  const applied = await apply({ action: 'accept_peer',
+    job_id: next.continuation.job_id, expected_generation: next.continuation.expected_generation, evidence: peer.evidence });
+  return applied.result ? applied : { ...applied, result: local.result };
 }
 type Row = Record<string, string | number | null>;
 const MAX_OBJECT = 1024 * 1024;
@@ -95,7 +136,14 @@ export default {
     }
     if (path === '/api/v1/forge/call') {
       return protectForge(async () => {
-        const { call, bytes } = await admitForge(request, env);
+        const { auth, call, bytes } = await admitForge(request, env);
+        if (call.operation >= 30 && call.operation <= 35) {
+          if (!auth) fail(401, 'unauthenticated');
+          const step = await transformQuantum(env, call.account_id,
+            { principal: auth.principal, credential_id: auth.credential_id }, { action: 'begin_transform', call });
+          if (!step.result) fail(503, 'unavailable');
+          return forgeReply(call, step.result.state, step.result.result);
+        }
         const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
         return env.REPOSITORIES.get(id).fetch(new Request(request, { body: bytes }));
       });
@@ -115,7 +163,7 @@ export default {
 };
 
 /** One SQLite authority per account. R2 is immutable payload storage, not a ref authority. */
-export class AccountRepository {
+class RepositoryEngine {
   private sql: SqlStorage;
   private tail: Promise<unknown> = Promise.resolve();
   private active = 0;
@@ -140,10 +188,48 @@ export class AccountRepository {
     if (this.active >= 16) return forge
       ? json({ version: 1, error: { code: 'resource_exhausted', message: 'account_admission_limit' } }, 429)
       : json({ error: 'account_admission_limit' }, 429);
+    return this.enqueue(() => checker ? protectChecker(() => this.handleChecker(request)) : forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request)));
+  }
+  private enqueue<T>(action: () => Promise<T>): Promise<T> {
     this.active++;
-    const work = this.tail.then(() => checker ? protectChecker(() => this.handleChecker(request)) : forge ? protectForge(() => this.handleForge(request)) : protect(() => this.handle(request))).finally(() => { this.active--; });
+    const work = this.tail.then(action).finally(() => { this.active--; });
     this.tail = work.then(() => undefined, () => undefined);
     return work;
+  }
+  transformRpc(frame: TransformRpcFrame, maintainAlarm = true): Promise<TransformRpcResult> {
+    if (this.active >= 16) fail(429, 'resource_exhausted');
+    return this.enqueue(async () => {
+      try {
+      if (frame.schema !== 1 || identifier(frame.account_id) !== frame.account_id || !hasForgeAccount(this.sql)) fail(403, 'permission_denied');
+      const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+      if (repository?.account !== frame.account_id) fail(403, 'permission_denied');
+      if (frame.auth !== null) requireDelegatedForgeCredential(this.env.PRINCIPALS_JSON, frame.auth, frame.account_id);
+      else if (!['recovery_next', 'transform_outcome', 'abort_transform', 'settle_export', 'accept_peer'].includes(frame.command.action)) fail(403, 'permission_denied');
+      return await this.forgeTransforms(frame.account_id, frame.auth?.principal ?? null, frame.auth).rpc(frame.command);
+      } finally {
+        // Maintenance is part of admitted work. A rejected RPC must not enqueue
+        // a second, unbounded stream of storage operations behind this queue.
+        if (maintainAlarm) await this.updateRecoveryAlarm(30_000);
+      }
+    });
+  }
+  recoveryAccount(): Promise<string | null> {
+    return this.enqueue(async () => {
+      const row = this.one('SELECT account FROM repository WHERE singleton=1');
+      return row ? String(row.account) : null;
+    });
+  }
+  refreshRecoveryAlarm(delay: number): Promise<void> {
+    return this.enqueue(() => this.updateRecoveryAlarm(delay));
+  }
+  private async updateRecoveryAlarm(delay: number): Promise<void> {
+      const exports = this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_exports'")
+        && this.one("SELECT 1 FROM transform_exports WHERE phase NOT IN ('settled_committed','settled_aborted') LIMIT 1");
+      const drafts = this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_drafts'")
+        && this.one("SELECT 1 FROM transform_drafts WHERE phase NOT IN ('committed','aborted','limit') LIMIT 1");
+      if (exports || drafts) {
+        if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + delay);
+      } else await this.ctx.storage.deleteAlarm();
   }
   private rows(query: string, ...bindings: (string | number | null)[]): Row[] {
     return [...this.sql.exec(query, ...bindings)] as Row[];
@@ -293,7 +379,7 @@ export class AccountRepository {
     if ([20, 21, 22, 23, 24].includes(call.operation)) {
       if (!auth) fail(401, 'unauthenticated');
       const { views, projections } = this.forgeServices(call.account_id, auth.principal, api, storage);
-      result = await this.forgeReviews(call.account_id, auth.principal, api, storage, views, projections).handle(call);
+      result = await this.forgeReviews(call.account_id, auth.principal, api, storage, views, projections, auth).handle(call);
     } else if (call.operation === 10) {
       const { views, projections } = this.forgeServices(call.account_id, auth?.principal ?? null, api, storage);
       result = await new ForgeUploads({
@@ -442,7 +528,15 @@ export class AccountRepository {
   private forgeServices(account: string, principal: string | null, api: ForgeAccounts, storage: ForgeStorage): { views: ForgeViews; projections: ForgeProjections } {
     const requireCanonicalRootInTx = (head: string): void => {
       if (!storage.describeInTx({ kind: 3, id: head })) fail(403, 'permission_denied');
-      if (!this.one('SELECT id FROM forge_validated_roots WHERE kind=3 AND id=?', head)) fail(400, 'failed_precondition');
+      if (this.one('SELECT id FROM forge_validated_roots WHERE kind=3 AND id=?', head)) return;
+      // A fully checked retained history proves each typed COMMIT member's
+      // complete closure, not just its tip. Availability alone is insufficient.
+      if (!this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='closure_jobs'")) fail(400, 'failed_precondition');
+      const parent = this.one("SELECT j.id,j.root_kind,j.root_id FROM closure_jobs j JOIN closure_nodes n ON n.job=j.id JOIN forge_retained_roots r ON r.kind=j.root_kind AND r.id=j.root_id AND r.active=1 AND r.owner_kind NOT LIKE 'transform-stage-%' WHERE j.account=? AND n.kind=3 AND n.id=? AND n.done=1 AND j.root_kind=3 AND j.phase IN ('ready','published') AND j.nodes=j.checked_nodes AND j.contexts=j.checked_contexts AND j.obligations=j.checked_obligations ORDER BY j.id LIMIT 1", account, head);
+      if (!parent) fail(400, 'failed_precondition');
+      this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head,
+        JSON.stringify({ validator: 'retained-closure-member-v1', root: head, job_id: parent.id,
+          container: { kind: parent.root_kind, id: parent.root_id } }));
     };
     const views = new ForgeViews({
       accountId: account, principal, sql: this.sql, core: forgeViewCore,
@@ -525,28 +619,89 @@ export class AccountRepository {
     if (!storage.describeInTx(root)
         || !this.one('SELECT 1 FROM forge_retained_roots WHERE kind=? AND id=? AND active=1 LIMIT 1', root.kind, root.id)) fail(400, 'failed_precondition');
     let job: string | undefined;
+    let container: ObjectKey | undefined;
     const saved = this.one('SELECT proof FROM forge_validated_roots WHERE kind=? AND id=?', root.kind, root.id);
     if (saved) {
-      let proof: { validator?: string; root?: string; job_id?: string };
+      let proof: { validator?: string; root?: string; job_id?: string; container?: ObjectKey };
       try { proof = JSON.parse(String(saved.proof)); } catch { fail(500, 'data_loss'); }
       if (proof.root !== root.id) fail(500, 'data_loss');
       // Provisioning independently verified these exact two native objects and
       // durably confirmed both puts. It predates generic closure-job state.
       if (root.kind === 3 && proof.validator === 'native-genesis-v1') return { proof_job: `native-genesis-v1:${root.id}` };
       if (typeof proof.job_id === 'string') job = proof.job_id;
+      if (proof.validator === 'retained-closure-member-v1') {
+        if (root.kind !== 3 || proof.container?.kind !== 3 || !/^[0-9a-f]{64}$/.test(proof.container.id)) fail(500, 'data_loss');
+        container = proof.container;
+      }
     }
     if (!job && this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='forge_upload_sessions'")) {
       const upload = this.one("SELECT integrity_job FROM forge_upload_sessions WHERE account=? AND kind=? AND object_id=? AND state='committed' AND integrity_job IS NOT NULL LIMIT 1", account, root.kind, root.id);
       if (upload) job = String(upload.integrity_job);
     }
+    if (!job) {
+      // Private preparation completeness is not canonical publication
+      // eligibility. Its exact local custody/proof may be reused internally.
+      const staged = this.one("SELECT j.id FROM closure_jobs j JOIN forge_retained_roots r ON r.kind=j.root_kind AND r.id=j.root_id AND r.active=1 AND r.owner_kind IN ('transform-stage-artifact','transform-stage-output') WHERE j.account=? AND j.root_kind=? AND j.root_id=? AND j.phase IN ('ready','published') AND j.nodes=j.checked_nodes AND j.contexts=j.checked_contexts AND j.obligations=j.checked_obligations ORDER BY j.id LIMIT 1", account, root.kind, root.id);
+      if (staged) job = String(staged.id);
+    }
     if (!job) fail(400, 'failed_precondition');
     const proof = this.one('SELECT account,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', job);
-    if (!proof || proof.account !== account || proof.root_kind !== root.kind || proof.root_id !== root.id
+    const expected = container ?? root;
+    if (!proof || proof.account !== account || proof.root_kind !== expected.kind || proof.root_id !== expected.id
         || !['ready', 'published'].includes(String(proof.phase))
         || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
+    if (container && !this.one('SELECT 1 FROM closure_nodes WHERE job=? AND kind=3 AND id=? AND done=1', job, root.id)) fail(400, 'failed_precondition');
     return { proof_job: job };
   }
-  private forgeReviews(account: string, principal: string, api: ForgeAccounts, storage: ForgeStorage, views: ForgeViews, projections: ForgeProjections): ForgeReviews {
+  private forgeTransforms(account: string, principal: string | null, auth: TrustedAuth | null): ForgeTransforms {
+    const storage = new ForgeStorage({ accountId: account, sql: this.sql,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
+    const api = this.forgeAccounts(account, principal, false, storage);
+    const { views, projections } = this.forgeServices(account, principal, api, storage);
+    return new ForgeTransforms({ accountId: account, principal, auth, sql: this.sql, views, projections,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback), nowSeconds: () => Math.floor(Date.now() / 1000),
+      requireCredentialInTx: () => {
+        if (!auth || auth.principal !== principal) fail(403, 'permission_denied');
+        requireDelegatedForgeCredential(this.env.PRINCIPALS_JSON, auth, account);
+      },
+      authorizeInTx: (action, epoch) => {
+        if (action !== 'admin') return api.authorityInTx(action, epoch);
+        const snapshot = api.requireAdminInTx();
+        if (epoch !== undefined && snapshot.epoch !== epoch) fail(409, 'aborted');
+        return { epoch: snapshot.epoch };
+      },
+      reviewConfiguration: () => this.reviewConfiguration(),
+      describeObjectInTx: key => storage.describeInTx(key), readVerifiedObject: key => storage.readVerifiedObject(key),
+      reserveGeneratedInTx: (owner, descriptor) => storage.reserveInTx('transform', owner, descriptor),
+      stageGenerated: (descriptor, bytes) => storage.stage(descriptor, bytes),
+      confirmGeneratedInTx: (owner, descriptor, confirmation) => storage.confirmInTx('transform', owner, descriptor, confirmation),
+      requireRetainedClosureInTx: root => this.retainedForgeClosureInTx(account, storage, root),
+      retainRootInTx: (ownerKind, owner, root, proofJob) => {
+        if (!ownerKind.startsWith('transform-') || !storage.describeInTx(root)) fail(503, 'failed_precondition');
+        const proof = this.one('SELECT account,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', proofJob);
+        if (!proof || proof.account !== account || proof.root_kind !== root.kind || proof.root_id !== root.id
+            || !['ready', 'published'].includes(String(proof.phase)) || proof.nodes !== proof.checked_nodes
+            || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
+        if (!ownerKind.startsWith('transform-stage-')) this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET proof=excluded.proof',
+          root.kind, root.id, JSON.stringify({ validator: 'closure-job-v1', root: root.id, job_id: proofJob }));
+        this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(?,?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', ownerKind, owner, root.kind, root.id);
+      },
+      releaseRootInTx: (ownerKind, owner, root) => {
+        if (!ownerKind.startsWith('transform-')) fail(503, 'failed_precondition');
+        this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=? AND owner_id=? AND kind=? AND id=?', ownerKind, owner, root.kind, root.id);
+      },
+      pushTransformReview: async (source, expectedPatchset) => {
+        if (principal === null) fail(403, 'permission_denied');
+        const call: ForgeCall = { version: 1, operation: 20, account_id: account, view: source.destination_view_name,
+          request_id: `transform-${source.run_id}`, payload_json: JSON.stringify({ source_base: source.destination_base,
+            source_head: source.output_head, view_version: source.destination_view, expected_patchset: expectedPatchset,
+            predecessor: null, provenance: source.run_id, lineage: [] }) };
+        return this.forgeReviews(account, principal, api, storage, views, projections, auth).handle(call);
+      },
+    });
+  }
+  private forgeReviews(account: string, principal: string, api: ForgeAccounts, storage: ForgeStorage, views: ForgeViews, projections: ForgeProjections, auth: TrustedAuth | null = null): ForgeReviews {
+    let transforms: ForgeTransforms | undefined;
     const ownedHost = { accountId: account, principal, sql: this.sql, views,
       requireWriterInTx: () => { api.requireWriterInTx(); }, describeObjectInTx: (key: ObjectKey) => storage.describeInTx(key) };
     return new ForgeReviews({ accountId: account, principal, sql: this.sql, views, projections,
@@ -557,6 +712,10 @@ export class AccountRepository {
         if (!main) fail(503, 'unavailable'); return { head: String(main.head), generation: Number(main.generation) };
       },
       reviewConfiguration: () => this.reviewConfiguration(),
+      requireTransformReviewInTx: (view, run, base, head) => {
+        transforms ??= this.forgeTransforms(account, principal, auth);
+        transforms.requireReviewInTx(view, run, base, head);
+      },
       requireAcceptedCheckPolicyInTx: candidate => this.requireAcceptedCheckPolicyInTx(account, candidate.scope.candidate_id, candidate.head, candidate.root_tree, candidate.profile),
       describeObjectInTx: key => storage.describeInTx(key), readVerifiedObject: key => storage.readVerifiedObject(key),
       requireOwnedCommitInTx: (view, descriptor, now) => {
@@ -772,5 +931,36 @@ export class AccountRepository {
       }
       return this.finish(id, { state: 'complete', name: pin, head, active: operation === 'create' });
     });
+  }
+}
+
+/** RPC capability boundary. Only these methods cross the namespace binding;
+ * the engine's TypeScript-private methods are not exposed as RPC methods. */
+export class AccountRepository extends DurableObject<Env> {
+  #engine: RepositoryEngine;
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.#engine = new RepositoryEngine(ctx, env);
+  }
+  async fetch(request: Request): Promise<Response> { return this.#engine.fetch(request); }
+  async transformRpc(frame: TransformRpcFrame): Promise<unknown> {
+    let result: TransformRpcEnvelope;
+    try { result = { ok: true, value: await this.#engine.transformRpc(frame) }; }
+    catch (error) {
+      result = error instanceof Failure ? { ok: false, status: error.status, code: error.code }
+        : { ok: false, status: 503, code: 'unavailable' };
+    }
+    return result;
+  }
+  async alarm(): Promise<void> {
+    const account = await this.#engine.recoveryAccount();
+    if (!account) return;
+    let delay = 60_000;
+    const local = (command: TransformRpcCommand) => this.#engine.transformRpc({ schema: 1, account_id: account, auth: null, command }, false);
+    try { await applyTransformPeer(this.env, null, await local({ action: 'recovery_next' }), local); }
+    catch { delay = 60 * 60_000; } // Preserve uncertain custody; bound unavailable-peer retries.
+    finally {
+      await this.#engine.refreshRecoveryAlarm(delay);
+    }
   }
 }

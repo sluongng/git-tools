@@ -12,6 +12,8 @@ pub(crate) mod forge;
 mod forge_resolve;
 #[path = "forge_review.rs"]
 mod forge_review;
+#[path = "forge_transform.rs"]
+mod forge_transform;
 #[path = "query.rs"]
 pub(crate) mod query;
 #[path = "search.rs"]

@@ -144,6 +144,7 @@ js_test(
         "$(rootpath @checker_bazel_linux_x86_64//file)",
         "cloudflare/worker.mjs",
         "cloudflare/core.wasm",
+        "$(rootpath //crates/jj-native-cli:tt)",
     ],
     data = [
         ":worker",
@@ -151,6 +152,7 @@ js_test(
         "//crates/tinytree-cloudflare:contract_fixture",
         "//crates/tinytree-check-runner:tinytree-check-runner-bin",
         "//crates/tinytree-check-runner:readonly_snapshot_helper",
+        "//crates/jj-native-cli:tt",
         "@checker_bazel_linux_x86_64//file",
     ],
     tags = ["local", "manual"],

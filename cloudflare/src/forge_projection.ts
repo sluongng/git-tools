@@ -53,6 +53,15 @@ export interface ProjectionStatus {
 export interface ReadyProjection {
   catalog_id: string; binding: ProjectionBinding; proof_job: string;
 }
+/** Private exact-baseline endpoint fact, not a public read/export capability.
+ * Canonical copy IDs must never be serialized into destination/public replies. */
+export interface CanonicalFileWitness {
+  readonly catalog_id: string; readonly account_id: string;
+  readonly view_version: string; readonly policy_epoch: number;
+  readonly canonical_revision: string; readonly relative_path: string;
+  readonly canonical_path: string; readonly file: Descriptor;
+  readonly executable: boolean; readonly canonical_copy: string | null;
+}
 export interface ProjectionPath {
   path: string; canonical_path: string; descriptor: Descriptor;
   executable: boolean; target_bytes: number | null;
@@ -618,6 +627,29 @@ export class ForgeProjections {
     const row=this.one<Catalog>("SELECT id,binding,proof_job,retired FROM projection_catalogs WHERE id=? AND purpose='review'",id);
     if(!row||row.retired!==0) return undefined;
     const result=this.catalog(view,row);if(hex(result.binding.canonical_revision)!==source.canonical_head) throw new Invalid();return result;
+  }
+  /** Select canonical lineage endpoints from this EXACT baseline snapshot.
+   * Historical closure membership, copy seeds and object availability alone
+   * cannot establish which canonical copy occupies a selected source path. */
+  canonicalFileWitnessInTx(view:ResolvedView,relativePath:string):CanonicalFileWitness|undefined {
+    const d=this.check(view);
+    if(typeof relativePath!=='string'||relativePath.length===0||encoder.encode(relativePath).length>4096) fail(400,'invalid_argument');
+    const canonical=d.root_prefix?`${d.root_prefix}/${relativePath}`:relativePath;
+    const decisions=this.allowedPathsInTx(view,[canonical]);
+    if(decisions.length!==1||decisions[0].path!==canonical||!decisions[0].allowed) fail(403,'permission_denied');
+    const ready=this.readyInTx(view);if(!ready) fail(400,'failed_precondition');
+    const row=this.one<Selected&{member_size:number|null;origin:string|null}>('SELECT p.canonical_path,p.relative_path,p.kind,p.id,p.size,p.executable,m.size AS member_size,o.value AS origin FROM projection_paths p LEFT JOIN projection_members m ON m.projection=p.projection AND m.kind=p.kind AND m.id=p.id LEFT JOIN projection_private_origins o ON o.projection=p.projection AND o.canonical_path=p.canonical_path WHERE p.projection=? AND p.canonical_path=? AND p.relative_path=?',ready.catalog_id,canonical,relativePath);
+    if(!row||row.kind!==1) return undefined;
+    if(row.canonical_path!==canonical||row.relative_path!==relative(d.root_prefix,canonical)||row.member_size!==row.size||![0,1].includes(row.executable)||typeof row.origin!=='string'||encoder.encode(row.origin).length>8192) throw new Invalid();
+    let origin:ProjectionCopyOrigin;try{origin=JSON.parse(row.origin);}catch{throw new Invalid();}
+    if(!origin||typeof origin!=='object'||origin.canonical_path!==canonical||hex(origin.canonical_revision)!==hex(ready.binding.canonical_revision)||hex(origin.file)!==row.id) throw new Invalid();
+    // Prove the private origin belongs to this exact generated catalog, rather
+    // than accepting an arbitrary origin row or a different snapshot's seed.
+    this.memberInTx(view,{kind:5,id:hex(origin.projected_copy)});
+    const copy=origin.canonical_copy===null?null:hex(origin.canonical_copy);
+    const file=descriptor({kind:1,id:row.id,size_bytes:row.size,format_version:1});
+    const actual=this.host.describeObjectInTx(file);if(!actual||!same(file,actual)) fail(503,'unavailable');
+    return Object.freeze({catalog_id:ready.catalog_id,account_id:this.host.accountId,view_version:hex(d.view_version),policy_epoch:d.policy_epoch,canonical_revision:hex(ready.binding.canonical_revision),relative_path:relativePath,canonical_path:canonical,file:Object.freeze(file),executable:row.executable===1,canonical_copy:copy});
   }
   canonicalForProjectedBaseInTx(view:ResolvedView,projectedCommit:string):{canonical_revision:string;projection_id:string}|undefined {
     const result=this.catalogForProjectedInTx(view,projectedCommit);

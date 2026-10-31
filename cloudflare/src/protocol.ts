@@ -66,8 +66,8 @@ export async function hash(value: string): Promise<string> {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 }
-export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge' }
-interface Principal extends Auth { token_sha256: string }
+export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge'; credential_id: string }
+interface Principal extends Omit<Auth, 'credential_id'> { token_sha256: string }
 function configuredPrincipals(secret: string | undefined): Principal[] {
   if (!secret || secret.length > 32 * 1024) fail(503, 'principal_configuration_invalid');
   let principals: unknown;
@@ -98,10 +98,21 @@ export async function authenticate(request: Request, secret: string | undefined)
   for (const p of principals) {
     let difference = 0;
     for (let i = 0; i < supplied.length; i++) difference |= supplied.charCodeAt(i) ^ p.token_sha256.charCodeAt(i);
-    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts: p.accounts, kind: p.kind };
+    if (difference === 0) matched = { principal: p.principal, operator: p.operator, accounts: p.accounts, kind: p.kind, credential_id: p.token_sha256 };
   }
   if (!matched) fail(401, 'authentication_required');
   return matched;
+}
+
+/** Internal binding-RPC delegation only. This lookup reference is not a bearer
+ * credential and never appears in public results. Do not aggregate ceilings
+ * from separate credentials that happen to name the same principal. */
+export function requireDelegatedForgeCredential(secret: string | undefined,
+  delegated: { principal: string; credential_id: string }, account: string): Auth {
+  const current = configuredPrincipals(secret).find(p => p.token_sha256 === delegated.credential_id);
+  if (!current || current.kind !== 'forge' || current.principal !== delegated.principal || !current.accounts.includes(account)) fail(403, 'permission_denied');
+  return { principal: current.principal, operator: current.operator, accounts: current.accounts,
+    kind: current.kind, credential_id: current.token_sha256 };
 }
 export async function protect(action: () => Promise<Response>): Promise<Response> {
   try { return await action(); }

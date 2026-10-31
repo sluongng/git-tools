@@ -1,5 +1,6 @@
 /** Account/member/replay authority. The embedding authenticates every call and
  * binds this host to exactly one account Durable Object. R2 contains bytes only. */
+import { requireNoArmedExportInTx } from './forge_transforms';
 import { normalizeForgeAccountCommand, type ForgeCall, type Descriptor } from './core';
 import { fail } from './protocol';
 import type { PolicySnapshot } from './forge_views';
@@ -160,6 +161,7 @@ export class ForgeAccounts {
     return this.wire(row);
   }
   bumpEpochInTx(expected: number): number {
+    requireNoArmedExportInTx(this.host.sql, this.host.accountId);
     if (!Number.isSafeInteger(expected) || expected < 1 || expected >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
     const updated = this.one<{ policy_epoch: number }>('UPDATE forge_account SET policy_epoch=policy_epoch+1 WHERE singleton=1 AND policy_epoch=? RETURNING policy_epoch', expected);
     if (!updated) fail(409, 'aborted');

@@ -69,18 +69,18 @@ function options(persist, { fault, config = principals(), forge = false, ui = fa
     const entry = fault === 'sql-receipt' ? `import worker, {AccountRepository as Base} from './${path.basename(bundle)}';
       export default worker;
       export class AccountRepository extends Base {
+        #fixtureStorage;
         constructor(ctx, env) {
-          const bind = (target, key) => { const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value; };
-          const sql = new Proxy(ctx.storage.sql, { get(target, key) {
-            if (key === 'exec') return (query, ...args) => {
-              if (query.startsWith('INSERT INTO forge_account_receipts')) throw new Error('deliberate receipt transaction failure');
-              return target.exec(query, ...args);
-            };
-            return bind(target, key);
-          }});
-          const storage = new Proxy(ctx.storage, { get(target, key) { return key === 'sql' ? sql : bind(target, key); }});
-          const state = new Proxy(ctx, { get(target, key) { return key === 'storage' ? storage : bind(target, key); }});
-          super(state, env);
+          super(ctx, env);
+          this.#fixtureStorage = ctx.storage;
+          // Keep the real platform state/SQL objects. Fail the actual receipt
+          // transaction, rather than proxying a branded DurableObjectState.
+          ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS forge_account_receipts (account_id TEXT NOT NULL, principal TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(account_id,principal,request_id))');
+          ctx.storage.sql.exec("CREATE TRIGGER fixture_receipt_failure BEFORE INSERT ON forge_account_receipts BEGIN SELECT RAISE(ABORT, 'deliberate receipt transaction failure'); END");
+        }
+        async fetch(request) {
+          try { return await super.fetch(request); }
+          finally { this.#fixtureStorage.sql.exec('DROP TRIGGER IF EXISTS fixture_receipt_failure'); }
         }
       }` : `import worker, {AccountRepository as Base} from './${path.basename(bundle)}';
       export default worker;
@@ -225,6 +225,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
   assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added);
   for (const [fault, selectedAccount] of [['after', 'r2-recovery'], ['sql-receipt', 'sql-recovery']]) {
+    t.diagnostic(`account staging fault=${fault}`);
     await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true, fault }));
     await forgeValue(await callForge(1, {}, 'recover-provision', { selectedAccount }), 503, 'unavailable');
     await forgeValue(await callForge(2, {}, '', { selectedAccount }), 403, 'permission_denied');
@@ -1521,4 +1522,288 @@ test('production reviews admit shipped bootstrap source, persist exact patchsets
   stage('votes-policy-verified');
   const after = (await success(2)).value;
   assert.deepEqual(after.main_revision, before.main_revision); assert.equal(after.main_generation, before.main_generation);
+});
+
+// Production account/bootstrap/export/review routes only. Native fixture facts
+// cover canonical bytes and lineage, not a fabricated passing check verdict.
+test('declared tt transforms two bootstrapped monorepos with exact pending replay and retained redacted pins', async t => {
+  const f = fixture.transform;
+  assert.ok(f?.native.review_admitted);
+  const token = 'transform-owner-runtime-fixture', readerToken = 'transform-destination-reader-fixture';
+  const accounts = [f.source.account_id, f.destination.account_id];
+  const config = [
+    { principal: f.owner, token_sha256: sha(token), accounts, operator: true, kind: 'forge' },
+    { principal: 'destination-reader', token_sha256: sha(readerToken), accounts: [f.destination.account_id], operator: false, kind: 'forge' },
+  ];
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-transform-runtime-'));
+  const configuration = { ...options(persist, { config, forge: true }), host: '127.0.0.1', port: 0 };
+  configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile: fixture.checker.profile,
+    committer: { name: 'Transform Runtime', email: 'fixture@example.invalid' } });
+  let mf = new Miniflare(configuration);
+  const address = await mf.ready; configuration.port = Number(address.port);
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const reload = async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; };
+  const call = async (account, operation, payload = {}, { id = '', auth = token } = {}) => {
+    const response = await mf.dispatchFetch(address.origin + '/api/v1/forge/call', { method: 'POST', signal: AbortSignal.timeout(30000),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${auth}` },
+      body: JSON.stringify({ version: 1, operation, account_id: account, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
+    });
+    const envelope = await response.json();
+    if (response.status === 200) {
+      assert.equal(envelope.operation, operation); assert.equal(envelope.account_id, account); assert.equal(envelope.request_id, id); assert.equal(envelope.view, 'public');
+    }
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const success = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, JSON.stringify(result)); return result; };
+  for (const source of [f.source, f.destination]) {
+    const provisioned = (await success(source.account_id, 1, {}, { id: 'transform-provision' })).value;
+    const begun = (await success(source.account_id, 40, { root: source.root,
+      source: { repository_id: `native-${source.account_id}`, reference: 'main', generation: 1, head: source.root.id },
+      destination: { generation: 1, head: Buffer.from(provisioned.main_revision).toString('hex') } }, { id: 'transform-bootstrap' })).value;
+    for (let offset = 0; offset < source.objects.length; offset += 8) {
+      await Promise.all(source.objects.slice(offset, offset + 8).map(object => success(source.account_id, 41, { import_id: begun.import_id,
+        descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version },
+        data_base64: Buffer.from(object.bytes).toString('base64') }, { id: `io-${begun.import_id}-${object.kind}-${object.id}` })));
+    }
+    let status = begun.status;
+    for (let step = 0; step < 128 && !status.complete; step++) {
+      status = (await success(source.account_id, 42, { import_id: begun.import_id, expected_generation: status.generation }, { id: `ia-${begun.import_id}-${status.generation}` })).value.status;
+      assert.equal(status.error, null);
+    }
+    assert.equal(status.phase, 'ready');
+    await success(source.account_id, 44, { import_id: begun.import_id, expected_generation: status.generation }, { id: 'transform-bootstrap-finish' });
+  }
+  await success(f.source.account_id, 4, { spec: f.source.before_spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'transform-before-view' });
+  await success(f.source.account_id, 4, { spec: f.source.after_spec, expected_epoch: 2, make_default: true, follow_main: false }, { id: 'transform-after-view' });
+  await success(f.destination.account_id, 4, { spec: f.destination.spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'transform-destination-view' });
+  const beforeMain = (await success(f.destination.account_id, 2)).value;
+  const tt = process.env.TINYTREE_TT_BINARY; assert.ok(tt);
+  const home = path.join(persist, 'cli-home'), cwd = path.join(persist, 'cli-workspace'), emptyPath = path.join(persist, 'no-programs');
+  await Promise.all([home, cwd, emptyPath].map(directory => mkdir(directory, { mode: 0o700 })));
+  const jjConfig = path.join(home, 'jj.toml');
+  await writeFile(jjConfig, '[user]\nname="Runtime Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
+  const env = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: jjConfig,
+    PATH: emptyPath, TERM: 'dumb', TT_TRANSFORM_TOKEN: token };
+  const cli = async (args, succeeds = true, deadline) => {
+    try {
+      const output = await promisify(execFile)(tt, ['--no-pager', '--color=never', ...args, '--json'],
+        { cwd, env, encoding: 'utf8', timeout: deadline ? Math.max(1, Math.min(70000, deadline - Date.now())) : 70000, maxBuffer: 2 * 1024 * 1024 });
+      assert.ok(succeeds, 'expected server refusal'); const result = JSON.parse(output.stdout); assert.equal(result.schema_version, 1); return result;
+    } catch (error) { if (succeeds || !Number.isInteger(error.code)) throw error; return { refused: true }; }
+  };
+  await cli(['context', 'set', '--transport', 'forge-https-v1', '--server', address.origin, '--account', f.destination.account_id, '--view', 'public', '--token-env', 'TT_TRANSFORM_TOKEN']);
+  const planPath = path.join(home, 'transform.json'); await writeFile(planPath, JSON.stringify(f.plan), { mode: 0o600 });
+  const key = 'runtime-cross-account-transform';
+  const initial = await success(f.destination.account_id, 30, f.plan, { id: key });
+  assert.equal(initial.envelope.state, 'transform_pending');
+  assert.equal(initial.value.change_id, f.plan.change_id);
+  await reload();
+  let proposed;
+  const deadline = Date.now() + 120000;
+  for (let attempt = 0; attempt < 3 && !proposed; attempt++) {
+    try {
+      assert.ok(Date.now() < deadline, 'transform resume exceeds absolute acceptance budget');
+      proposed = await cli(attempt === 0 ? ['transform', 'start', '--plan', planPath, '--request-id', key] : ['request', 'resume', key], true, deadline);
+    } catch (error) {
+      const stderr = String(error.stderr ?? '');
+      if (!/deadline/i.test(stderr) || !stderr.includes(`saved request ${key}`) || Date.now() >= deadline) throw error;
+      const journal = JSON.parse(await readFile(path.join(home, 'config/tinytree/requests', `request-${key}.json`), 'utf8'));
+      assert.equal(journal.operation, 30); assert.equal(journal.request_id, key); assert.equal(journal.context.transport, 'forge_https_v1');
+    }
+  }
+  assert.ok(proposed);
+  const product = proposed.result.value;
+  assert.equal(product.transform.id, f.native.run_id);
+  assert.equal(product.review.change_id, f.plan.change_id);
+  const journalPath = path.join(home, 'config/tinytree/requests', `request-${key}.json`);
+  const journalBytes = await readFile(journalPath);
+  const resumed = await cli(['request', 'resume', key]);
+  assert.deepEqual(resumed.result.value.transform, product.transform);
+  for (const field of ['patchset_id', 'source_head', 'source_base', 'provenance', 'change_id']) assert.deepEqual(resumed.result.value.review[field], product.review[field]);
+  assert.deepEqual(await readFile(journalPath), journalBytes);
+  let prepared = resumed.result.value;
+  for (let step = 0; step < 128 && !prepared.review.projected_head; step++) prepared = (await success(f.destination.account_id, 30, f.plan, { id: key })).value;
+  assert.ok(prepared.review.candidate && prepared.review.projected_head);
+  assert.equal(prepared.review.candidate.root_tree, f.native.output_root, 'actual canonical builder preserves the excluded destination parent subtree');
+  await cli(['request', 'reconcile', key], false);
+  const savedPlan = JSON.parse(journalBytes).payload;
+  assert.equal(savedPlan.destination_view, f.plan.destination_view);
+  const rebound = await call(f.destination.account_id, 30, { ...f.plan, change_id: 'ef'.repeat(16) }, { id: key });
+  assert.equal(rebound.status, 409); assert.equal(rebound.envelope.error.code, 'already_exists');
+  const run = product.transform.id;
+  await reload();
+  const shown = await cli(['transform', 'show', run]);
+  assert.equal(shown.result.value.id, run); assert.ok(shown.result.value.origin);
+  const lineage = await cli(['lineage', run]);
+  assert.equal(lineage.state, 'complete');
+  for (const operation of ['rename', 'copy']) assert.ok(lineage.result.value.origin.lineage.some(edge => edge.operation === operation));
+  const lineageFacts = edges => edges.map(edge => ({ operation: edge.operation, source_account: edge.source_account,
+    source_revision: Array.isArray(edge.source_revision) ? Buffer.from(edge.source_revision).toString('hex') : edge.source_revision,
+    source_path: edge.source_path, destination_path: edge.destination_path })).sort((a, b) => `${a.operation}\0${a.source_path}\0${a.destination_path}`.localeCompare(`${b.operation}\0${b.source_path}\0${b.destination_path}`));
+  assert.deepEqual(lineageFacts(lineage.result.value.origin.lineage), lineageFacts(f.native.lineage));
+  assert.ok(lineage.result.value.origin.lineage.every(edge => edge.destination_revision === product.transform.output_head));
+  const paths = [], fileMetadata = [];
+  let afterPath;
+  do {
+    const page = await cli(['pin', 'resolve', run, '--limit', '2', ...(afterPath ? ['--after-path', afterPath] : [])]);
+    fileMetadata.push(...page.result.value.files); paths.push(...page.result.value.files.map(file => file.path)); afterPath = page.result.value.next_path;
+  } while (afterPath && paths.length < 8);
+  assert.deepEqual(paths, f.pin_bytes.map(file => file.path));
+  assert.deepEqual(fileMetadata, f.native.pin_files.files);
+  for (const file of f.pin_bytes) {
+    const first = await cli(['pin', 'resolve', run, '--path', file.path, '--max-bytes', '5']);
+    const rest = await cli(['pin', 'resolve', run, '--path', file.path, '--offset', '5', '--max-bytes', '65536']);
+    assert.deepEqual([...first.result.value.bytes, ...rest.result.value.bytes], file.bytes); assert.equal(rest.result.value.eof, true);
+  }
+  const protectedPin = await call(f.destination.account_id, 34, { run_id: run }, { id: 'retire-protected-transform' });
+  assert.equal(protectedPin.status, 400); assert.equal(protectedPin.envelope.error.code, 'failed_precondition');
+  await cli(['pin', 'retire', run, '--request-id', 'tt-retire-protected-transform'], false);
+  await cli(['pin', 'resolve', 'ff'.repeat(32)], false);
+  assert.deepEqual((await success(f.destination.account_id, 2)).value, beforeMain, 'preparation, retained bytes and CLI replay never publish main');
+  await success(f.destination.account_id, 3, { expected_epoch: 2, member: { principal: 'destination-reader', can_write: false, can_review: false, is_admin: false, roles: [] } }, { id: 'transform-add-reader' });
+  await success(f.source.account_id, 4, { spec: { ...f.source.after_spec, export_allowed: false }, expected_epoch: 3,
+    make_default: true, follow_main: false }, { id: 'transform-disable-export' });
+  const redacted = await success(f.destination.account_id, 35, { run_id: run }, { auth: readerToken });
+  assert.equal(redacted.envelope.state, 'origin_unavailable'); assert.equal(redacted.value.origin, null);
+  const retained = await success(f.destination.account_id, 33, { run_id: run, path: f.pin_bytes[0].path, max_bytes: 65536 }, { auth: readerToken });
+  assert.deepEqual(retained.value.bytes, f.pin_bytes[0].bytes, 'destination retention survives origin export revocation, not a source-GC claim');
+  await success(f.destination.account_id, 4, { spec: { ...f.destination.spec, exclude_prefixes: ['private', 'vendor'] }, expected_epoch: 3,
+    make_default: true, follow_main: false }, { id: 'transform-narrow-destination' });
+  const denied = await call(f.destination.account_id, 33, { run_id: run }, { auth: readerToken });
+  assert.equal(denied.status, 403); assert.equal(denied.envelope.error.code, 'permission_denied');
+});
+
+// Fault-only TEST bundle: all source bytes, bootstrap authority and transform
+// preparation still use shipped APIs. No fake permit/root/check is installed.
+test('private proved transform roots cannot become public views before source arm or after export revocation', { timeout: 180000 }, async t => {
+  const f = fixture.transform;
+  const entry = process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE;
+  const core = process.env.TINYTREE_PROJECTION_HARNESS_WASM;
+  assert.ok(f && entry && core, 'declared transform fixture and test-only projection harness required');
+  const token = 'transform-private-stage-owner-fixture';
+  const accounts = [f.source.account_id, f.destination.account_id];
+  const config = [{ principal: f.owner, token_sha256: sha(token), accounts, operator: true, kind: 'forge' }];
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-private-transform-runtime-'));
+  const configuration = { ...options(persist, { config, forge: true }), host: '127.0.0.1', port: 0,
+    modules: [{ type: 'ESModule', path: entry }, { type: 'CompiledWasm', path: core }] };
+  configuration.bindings.EXPERIMENTAL_RAW_BACKEND = 'disabled';
+  configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile: fixture.checker.profile,
+    committer: { name: 'Transform Runtime', email: 'fixture@example.invalid' } });
+  const mf = new Miniflare(configuration);
+  const address = await mf.ready;
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const call = async (account, operation, payload = {}, { id = '', view = 'public' } = {}) => {
+    const response = await mf.dispatchFetch(address.origin + '/api/v1/forge/call', { method: 'POST', signal: AbortSignal.timeout(30000),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ version: 1, operation, account_id: account, view, request_id: id, payload_json: JSON.stringify(payload) }) });
+    const envelope = await response.json();
+    if (response.status === 200) {
+      assert.equal(envelope.operation, operation); assert.equal(envelope.account_id, account);
+      assert.equal(envelope.request_id, id); assert.equal(envelope.view, view);
+    }
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const success = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, JSON.stringify(result)); return result; };
+  const control = async (account, block) => {
+    const response = await mf.dispatchFetch(`${address.origin}/__fixture/transform-control?account=${account}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_arm_export: block }) });
+    assert.equal(response.status, 200); return response.json();
+  };
+  const peek = async account => {
+    const response = await mf.dispatchFetch(`${address.origin}/__fixture/transform-peek?account=${account}`);
+    assert.equal(response.status, 200); return response.json();
+  };
+  // Complete canonical histories enter both accounts solely through ordinary
+  // owner bootstrap. In particular the source's before commit is not raw-seeded.
+  for (const source of [f.source, f.destination]) {
+    const provisioned = (await success(source.account_id, 1, {}, { id: 'private-stage-provision' })).value;
+    const begun = (await success(source.account_id, 40, { root: source.root,
+      source: { repository_id: `native-${source.account_id}`, reference: 'main', generation: 1, head: source.root.id },
+      destination: { generation: 1, head: Buffer.from(provisioned.main_revision).toString('hex') } }, { id: 'private-stage-bootstrap' })).value;
+    for (let offset = 0; offset < source.objects.length; offset += 8) {
+      await Promise.all(source.objects.slice(offset, offset + 8).map(object => success(source.account_id, 41, { import_id: begun.import_id,
+        descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version },
+        data_base64: Buffer.from(object.bytes).toString('base64') }, { id: `io-${begun.import_id}-${object.kind}-${object.id}` })));
+    }
+    let status = begun.status;
+    for (let step = 0; step < 128 && !status.complete; step++) {
+      status = (await success(source.account_id, 42, { import_id: begun.import_id, expected_generation: status.generation }, { id: `ia-${begun.import_id}-${status.generation}` })).value.status;
+      assert.equal(status.error, null);
+    }
+    assert.equal(status.phase, 'ready');
+    await success(source.account_id, 44, { import_id: begun.import_id, expected_generation: status.generation }, { id: 'private-stage-bootstrap-finish' });
+  }
+  await success(f.source.account_id, 4, { spec: f.source.before_spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'private-stage-before-view' });
+  await success(f.source.account_id, 4, { spec: f.source.after_spec, expected_epoch: 2, make_default: true, follow_main: false }, { id: 'private-stage-after-view' });
+  await success(f.destination.account_id, 4, { spec: f.destination.spec, expected_epoch: 1, make_default: true, follow_main: false }, { id: 'private-stage-destination-view' });
+  const canonicalMain = (await success(f.destination.account_id, 2)).value;
+  // Positive routing/control: the identical public-view shape succeeds for an
+  // actually canonical root, not for either privately staged proposal root.
+  await success(f.destination.account_id, 4, { spec: { name: 'canonical-control', root_prefix: '', include_prefixes: [''], exclude_prefixes: [],
+    visibility: { kind: 'public' }, revision: canonicalMain.main_revision, export_allowed: true },
+    expected_epoch: canonicalMain.policy_epoch, make_default: false, follow_main: false }, { id: 'private-stage-canonical-control', view: 'canonical-control' });
+  const originalMain = (await success(f.destination.account_id, 2)).value;
+  assert.equal(originalMain.policy_epoch, canonicalMain.policy_epoch + 1);
+  assert.deepEqual(originalMain.main_revision, canonicalMain.main_revision);
+  assert.equal(originalMain.main_generation, canonicalMain.main_generation);
+  assert.equal((await control(f.source.account_id, true)).block_arm_export, 1);
+  const key = 'private-stage-block-before-arm';
+  const deadline = Date.now() + 120000;
+  let staged;
+  for (let step = 0; step < 512; step++) {
+    assert.ok(Date.now() < deadline, 'private-stage preparation exceeds absolute acceptance budget');
+    const result = await call(f.destination.account_id, 30, f.plan, { id: key });
+    if (result.status === 503) {
+      assert.equal(result.envelope.error.code, 'unavailable');
+      const source = await peek(f.source.account_id);
+      const destination = await peek(f.destination.account_id);
+      if (source.control.arm_export_calls > 0 && destination.stage_roots.length === 2) { staged = destination; break; }
+    } else {
+      assert.equal(result.status, 200, JSON.stringify(result));
+      assert.equal(result.envelope.state, 'transform_pending', 'run must not commit while source arm is blocked');
+    }
+  }
+  assert.ok(staged, 'must observe the exact two private proof roots before testing publication denial');
+  assert.equal(staged.committed_runs, 0); assert.equal(staged.active_pin_roots, 0);
+  assert.equal(staged.drafts.length, 1); assert.equal(staged.drafts[0].request_id, key);
+  assert.equal(staged.drafts[0].phase, 'prepared');
+  assert.match(staged.drafts[0].run_id, /^[0-9a-f]{64}$/);
+  const denyPublicRunAndPin = async () => {
+    for (const operation of [31, 33]) {
+      const result = await call(f.destination.account_id, operation, { run_id: staged.drafts[0].run_id });
+      assert.equal(result.status, 404, JSON.stringify(result)); assert.equal(result.envelope.error.code, 'not_found');
+    }
+  };
+  await denyPublicRunAndPin();
+  assert.deepEqual(staged.stage_roots.map(root => root.owner_kind).sort(), ['transform-stage-artifact', 'transform-stage-output']);
+  assert.equal(new Set(staged.stage_roots.map(root => root.id)).size, 2);
+  for (const root of staged.stage_roots) {
+    assert.equal(root.kind, 3); assert.equal(root.complete, 1); assert.equal(root.proof_phase, 'published');
+  }
+  const denyPublicViews = async phase => {
+    for (const root of staged.stage_roots) {
+      const name = root.owner_kind === 'transform-stage-artifact' ? 'private-artifact-probe' : 'private-output-probe';
+      const result = await call(f.destination.account_id, 4, { spec: { name, root_prefix: '', include_prefixes: [''], exclude_prefixes: [],
+        visibility: { kind: 'public' }, revision: Array.from(Buffer.from(root.id, 'hex')), export_allowed: true },
+        expected_epoch: originalMain.policy_epoch, make_default: false, follow_main: false }, { id: `${phase}-${name}`, view: name });
+      assert.equal(result.status, 400, JSON.stringify(result)); assert.equal(result.envelope.error.code, 'failed_precondition');
+    }
+    assert.deepEqual((await success(f.destination.account_id, 2)).value, originalMain, 'rejected root publication must not mutate account/main/epoch');
+  };
+  await denyPublicViews('before-revoke');
+  await success(f.source.account_id, 4, { spec: { ...f.source.after_spec, export_allowed: false }, expected_epoch: 3,
+    make_default: true, follow_main: false }, { id: 'private-stage-revoke-export' });
+  const revoked = await peek(f.source.account_id);
+  assert.equal(revoked.views.find(view => view.name === f.source.after_spec.name)?.export_allowed, 0, 'ordinary acknowledged view mutation disabled source export');
+  await denyPublicViews('after-revoke');
+  // Remove only the denial fault. The real source policy must now reject arm;
+  // the fixture never produces a permit, even for cleanup/reconciliation.
+  await control(f.source.account_id, false);
+  const rejected = await call(f.destination.account_id, 30, f.plan, { id: key });
+  assert.ok([403, 409].includes(rejected.status), JSON.stringify(rejected));
+  const final = await peek(f.destination.account_id);
+  assert.equal(final.committed_runs, 0); assert.equal(final.active_pin_roots, 0);
+  assert.ok(final.drafts.every(draft => draft.phase !== 'committed'));
+  await denyPublicRunAndPin();
+  assert.deepEqual((await success(f.destination.account_id, 2)).value, originalMain);
 });

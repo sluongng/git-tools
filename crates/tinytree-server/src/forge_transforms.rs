@@ -1,47 +1,13 @@
-//! Account-scoped transform and retained-dependency wire adapters.
-use serde::Deserialize;
-use serde_json::{Value, json};
+//! Account-scoped storage adapter for the shared strict transform protocol.
+use serde_json::Value;
+use tinytree_forge_core::transform_commands::{self as wire, Command};
 use tinytree_model::{ChangeId, Signature};
 use tinytree_proto::forge_v1::ForgeOperation;
-use tinytree_store::forge_transforms::{
-    ForgeLineageHint, ForgeTransformRequest, ForgeTransformSpec,
-};
+use tinytree_store::forge_transforms::ForgeTransformRequest;
 use tinytree_store::{
     AccountId, ForgeActor, ForgeReviewPushRequest, LandingCheckProfile, Store, ViewVersion,
 };
 use tonic::Status;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Start {
-    source_account: AccountId,
-    source_view: String,
-    source_before_view: String,
-    source_after_view: String,
-    destination_view: Option<String>,
-    spec: ForgeTransformSpec,
-    change_id: String,
-    #[serde(default)]
-    lineage: Vec<ForgeLineageHint>,
-    expected_patchset: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Run {
-    run_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolvePin {
-    run_id: String,
-    path: Option<String>,
-    offset: Option<u64>,
-    max_bytes: Option<usize>,
-    after_path: Option<String>,
-    limit: Option<usize>,
-}
 
 pub(crate) fn transform_call(
     store: &Store,
@@ -55,27 +21,33 @@ pub(crate) fn transform_call(
     profile: Option<&LandingCheckProfile>,
     now: i64,
 ) -> Result<Option<(String, Value)>, Status> {
-    use ForgeOperation as Op;
-    match operation {
-        Op::StartTransform | Op::SetPin => {
-            let payload: Start = parse(payload_json)?;
+    let Some(command) = wire::parse(operation as i32, payload_json).map_err(protocol)? else {
+        return Ok(None);
+    };
+    Ok(Some(match command {
+        Command::Start(payload) | Command::SetPin(payload) => {
             let profile = profile.ok_or_else(|| {
                 Status::failed_precondition("transform review requires a configured check profile")
             })?;
+            let source = AccountId(payload.source_account);
             let before = store
                 .forge_resolve_view(
-                    &payload.source_account,
+                    &source,
                     Some(actor),
                     &payload.source_view,
-                    Some(ViewVersion(id(&payload.source_before_view)?)),
+                    Some(ViewVersion(
+                        wire::id(&payload.source_before_view).map_err(protocol)?,
+                    )),
                 )
                 .map_err(status)?;
             let after = store
                 .forge_resolve_view(
-                    &payload.source_account,
+                    &source,
                     Some(actor),
                     &payload.source_view,
-                    Some(ViewVersion(id(&payload.source_after_view)?)),
+                    Some(ViewVersion(
+                        wire::id(&payload.source_after_view).map_err(protocol)?,
+                    )),
                 )
                 .map_err(status)?;
             let destination = store
@@ -86,8 +58,9 @@ pub(crate) fn transform_call(
                     payload
                         .destination_view
                         .as_deref()
-                        .map(id)
-                        .transpose()?
+                        .map(wire::id)
+                        .transpose()
+                        .map_err(protocol)?
                         .map(ViewVersion),
                 )
                 .map_err(status)?;
@@ -100,8 +73,12 @@ pub(crate) fn transform_call(
                         after,
                         destination,
                         spec: payload.spec,
-                        change_id: ChangeId(id(&payload.change_id)?),
-                        lineage: payload.lineage,
+                        change_id: ChangeId(wire::id(&payload.change_id).map_err(protocol)?),
+                        lineage: payload
+                            .lineage
+                            .into_iter()
+                            .map(|hint| hint.into_hint())
+                            .collect(),
                     },
                     committer,
                     now,
@@ -115,15 +92,16 @@ pub(crate) fn transform_call(
                     account,
                     actor,
                     &ForgeReviewPushRequest {
-                        request_id: format!("transform-{}", hex(&run.id)),
+                        request_id: format!("transform-{}", wire::hex(&run.id)),
                         source_base: tinytree_model::CommitId(run.destination_base),
                         source_head: tinytree_model::CommitId(run.output_head),
                         view_version: run.destination_view,
                         expected_patchset: payload
                             .expected_patchset
                             .as_deref()
-                            .map(id)
-                            .transpose()?,
+                            .map(wire::id)
+                            .transpose()
+                            .map_err(protocol)?,
                         predecessor: None,
                         provenance: Some(run.id),
                         lineage: vec![],
@@ -133,82 +111,58 @@ pub(crate) fn transform_call(
                     now,
                 )
                 .map_err(status)?;
-            // The prepared transform root protects bytes before and throughout
-            // proposal creation. Review retirement integration may later replace
-            // this conservative owner with its exact retained patchset roots.
             let transform = store
                 .forge_transform_run(account, actor, run.id)
                 .map_err(status)?;
-            let review = json_value(review)?;
-            let state = review
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("rebase_pending")
-                .to_owned();
-            Ok(Some((
-                state,
-                json!({"transform": transform, "review": review}),
-            )))
+            wire::format_started(&transform, &review)
+                .map_err(|_| Status::internal("transform response encoding"))?
         }
-        Op::GetTransform => {
-            let payload: Run = parse(payload_json)?;
+        Command::Get { run_id } => {
             let result = store
-                .forge_transform_run(account, actor, id(&payload.run_id)?)
+                .forge_transform_run(account, actor, wire::id(&run_id).map_err(protocol)?)
                 .map_err(status)?;
-            Ok(Some((
+            (
                 if result.pin.retired {
                     "retired"
                 } else {
                     "prepared"
                 }
                 .into(),
-                json_value(result)?,
-            )))
+                wire::format_view(&result),
+            )
         }
-        Op::ReadLineage => {
-            let payload: Run = parse(payload_json)?;
+        Command::ReadLineage { run_id } => {
             let result = store
-                .forge_transform_run(account, actor, id(&payload.run_id)?)
+                .forge_transform_run(account, actor, wire::id(&run_id).map_err(protocol)?)
                 .map_err(status)?;
-            Ok(Some((
+            (
                 if result.origin.is_some() {
                     "complete"
                 } else {
                     "origin_unavailable"
                 }
                 .into(),
-                json!({"run_id": result.id, "origin": result.origin}),
-            )))
+                wire::format_lineage(&result),
+            )
         }
-        Op::ResolvePin => {
-            let payload: ResolvePin = parse(payload_json)?;
-            let run = id(&payload.run_id)?;
+        Command::ResolvePin(payload) => {
+            let run = wire::id(&payload.run_id).map_err(protocol)?;
             let result = if let Some(path) = payload.path {
-                if payload.after_path.is_some() || payload.limit.is_some() {
-                    return Err(Status::invalid_argument(
-                        "pin chunk and page selectors cannot be combined",
-                    ));
-                }
-                json_value(
-                    store
+                wire::format_chunk(
+                    &store
                         .forge_read_pin_file(
                             account,
                             actor,
                             run,
                             &path,
                             payload.offset.unwrap_or(0),
-                            payload.max_bytes.unwrap_or(64 * 1024),
+                            payload.max_bytes.unwrap_or(65536),
                         )
                         .map_err(status)?,
-                )?
+                )
             } else {
-                if payload.offset.is_some() || payload.max_bytes.is_some() {
-                    return Err(Status::invalid_argument(
-                        "pin byte range requires a file path",
-                    ));
-                }
-                json_value(
-                    store
+                wire::format_page(
+                    &store
                         .forge_pin_files(
                             account,
                             actor,
@@ -217,50 +171,31 @@ pub(crate) fn transform_call(
                             payload.limit.unwrap_or(128),
                         )
                         .map_err(status)?,
-                )?
+                )
             };
-            Ok(Some(("retained".into(), result)))
+            ("retained".into(), result)
         }
-        Op::RetirePin => {
-            let payload: Run = parse(payload_json)?;
+        Command::RetirePin { run_id } => {
             let result = store
-                .forge_retire_pin(account, actor, id(&payload.run_id)?)
+                .forge_retire_pin(
+                    account,
+                    actor,
+                    view,
+                    wire::id(&run_id).map_err(protocol)?,
+                    request_id,
+                )
                 .map_err(status)?;
-            Ok(Some(("retired".into(), json_value(result)?)))
+            ("retired".into(), wire::format_pin(&result))
         }
-        _ => Ok(None),
-    }
+    }))
 }
-
-fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Status> {
-    if bytes.len() > 1024 * 1024 {
-        return Err(Status::resource_exhausted("transform payload limit"));
+fn protocol(error: tinytree_forge_core::Error) -> Status {
+    match error {
+        tinytree_forge_core::Error::Limit(_) => {
+            Status::resource_exhausted("transform resource limit")
+        }
+        _ => Status::invalid_argument("invalid transform operation payload"),
     }
-    serde_json::from_slice(bytes)
-        .map_err(|_| Status::invalid_argument("invalid transform operation payload"))
-}
-fn json_value(value: impl serde::Serialize) -> Result<Value, Status> {
-    serde_json::to_value(value).map_err(|_| Status::internal("transform response encoding"))
-}
-fn id<const N: usize>(text: &str) -> Result<[u8; N], Status> {
-    if text.len() != N * 2
-        || !text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(Status::invalid_argument(
-            "invalid transform object identity",
-        ));
-    }
-    let mut result = [0; N];
-    for (out, pair) in result.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-        let digit = |v: u8| if v <= b'9' { v - b'0' } else { v - b'a' + 10 };
-        *out = digit(pair[0]) * 16 + digit(pair[1]);
-    }
-    Ok(result)
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn status(error: tinytree_store::Error) -> Status {
     use tinytree_store::Error as E;

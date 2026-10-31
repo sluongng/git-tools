@@ -13,6 +13,9 @@ pub mod wire;
 pub mod search;
 pub mod upload;
 pub mod upload_scope;
+pub mod transforms;
+pub mod transform_commands;
+pub mod transform_lineage;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

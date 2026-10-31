@@ -47,6 +47,9 @@ pub(super) async fn request(
             json!({"request_id":saved.request_id,"account_id":context.account_id,"view":context.view,"operation":saved.operation,"source":saved.source}),
         ),
         RequestCommand::Reconcile { .. } => {
+            if matches!(saved.operation, 30 | 32 | 34) {
+                return Err(user_error("transform and pin requests support exact request resume; inspect their returned review identifiers for review reconciliation"));
+            }
             let mut reply = rpc::call(
                 &context,
                 Op::GetReviewOperation,

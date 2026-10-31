@@ -98,6 +98,8 @@ async fn call_inner(
         client.forge_resolve_view(input).await
     } else if operation == f::ForgeOperation::PushReview {
         client.forge_push_review(input).await
+    } else if matches!(operation, f::ForgeOperation::StartTransform | f::ForgeOperation::SetPin) {
+        client.forge_transform(input).await
     } else {
         client.forge_call(input).await
     };
