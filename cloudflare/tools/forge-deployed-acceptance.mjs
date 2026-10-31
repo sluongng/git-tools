@@ -81,7 +81,7 @@ export function validateManifest(m) {
   assert.ok(hex(m.public.readme_sha256) && bounded(m.public.query, 256) && typeof m.public.regex === 'boolean' && Number.isInteger(m.public.limit) && m.public.limit >= 1 && m.public.limit <= 100);
   assert.ok(Array.isArray(m.public.expected_paths) && m.public.expected_paths.length > 0 && m.public.expected_paths.length <= 100 && m.public.expected_paths.every(p => bounded(p, 1024)));
   assert.ok(Array.isArray(m.denials) && m.denials.length > 0 && m.denials.length <= 16);
-  for (const d of m.denials) { exact(d, ['actor', 'path', 'version']); assert.ok(['anonymous', 'invalid_token', 'agent_a', 'agent_b'].includes(d.actor) && bounded(d.path, 1024) && hex(d.version)); }
+  for (const d of m.denials) { exact(d, ['actor', 'view', 'path', 'version']); assert.ok(['anonymous', 'invalid_token', 'agent_a', 'agent_b'].includes(d.actor) && /^[A-Za-z0-9_-]{1,128}$/.test(d.view) && bounded(d.path, 1024) && hex(d.version)); }
   assert.ok(m.denials.some(d => d.actor === 'anonymous') && m.denials.some(d => d.actor === 'invalid_token'));
   assert.ok(Array.isArray(m.steps) && m.steps.length <= 64); m.steps.forEach(validateStep);
   assert.equal(new Set(m.steps.map(s => s.id)).size, m.steps.length);
@@ -130,6 +130,36 @@ function selection(m, value) {
   assert.equal(id(value.view_version), m.view_version); assert.equal(id(value.revision), m.revision);
   assert.ok(Number.isSafeInteger(value.policy_epoch) && value.policy_epoch > 0);
 }
+export async function verifyDenials(m, secrets, send = transport, onStage = () => {}) {
+  const receipts = [];
+  for (const [index, denial] of m.denials.entries()) {
+    const scoped = { ...m, view: denial.view };
+    const payload = { version: [...Buffer.from(denial.version, 'hex')], path: denial.path };
+    onStage(`denial_${index}_owner_account`);
+    const account = await requestForge(scoped, 2, {}, secrets[0], secrets, send);
+    assert.equal(account.status, 200); assert.equal(account.state, 'complete');
+    assert.equal(account.value.account_id, m.account_id);
+    assert.ok(Number.isSafeInteger(account.value.policy_epoch) && account.value.policy_epoch > 0);
+    onStage(`denial_${index}_owner_read`);
+    const owner = await requestForge(scoped, 7, payload, secrets[0], secrets, send);
+    assert.equal(owner.status, 200, 'owner control must read the exact locked resource'); assert.equal(owner.state, 'complete');
+    assert.equal(owner.value.account_id, m.account_id); assert.equal(owner.value.view, denial.view);
+    assert.equal(id(owner.value.view_version), denial.version); assert.ok(hex(id(owner.value.revision)) && id(owner.value.revision) !== '0'.repeat(64));
+    assert.equal(owner.value.policy_epoch, account.value.policy_epoch); assert.equal(owner.value.path, denial.path);
+    assert.ok(typeof owner.value.content === 'string' && Buffer.byteLength(owner.value.content, 'utf8') > 0, 'owner control requires nonempty file content');
+    onStage(`denial_${index}_access`);
+    const token = denial.actor === 'anonymous' ? undefined : denial.actor === 'invalid_token' ? randomBytes(32).toString('hex') : secrets[ACTORS.indexOf(denial.actor)];
+    const reply = await requestForge(scoped, 7, payload, token, [...secrets, token], send);
+    assert.ok([401, 403].includes(reply.status), 'locked read did not fail closed');
+    exact(reply.error, ['version', 'error']); assert.equal(reply.error.version, 1); exact(reply.error.error, ['code', 'message']);
+    assert.equal(reply.error.error.code, reply.status === 401 ? 'unauthenticated' : 'permission_denied');
+    assert.ok(typeof reply.error.error.message === 'string' && Buffer.byteLength(reply.error.error.message) <= 1024);
+    receipts.push({ id: `denial_${index}`, actor: denial.actor, view: denial.view, view_version: denial.version,
+      policy_epoch: owner.value.policy_epoch, owner_control_readable: true, state: 'verified', status: reply.status });
+  }
+  return receipts;
+}
+
 class SearchFailure extends Error { constructor(code) { super(code); this.code = code; } }
 export async function searchPublic(m, secrets, policyEpoch, send = transport, deadline = Date.now() + 60000) {
   const found = new Set(), cursors = new Set(); let cursor = null;
@@ -262,15 +292,7 @@ export async function run(m, { execute = false } = {}) {
       const view = await cli(binary, actor, ['view', 'show', '--version', m.view_version], secrets); selection(m, view.result.value); assert.equal(view.result.value.policy_epoch, selectedEpoch);
       receipt.stages.push({ id: `${name}_pinned_context`, state: 'verified' });
     }
-    for (const denial of m.denials) {
-      currentStage = `denial_${receipt.stages.length}`;
-      const token = denial.actor === 'anonymous' ? undefined : denial.actor === 'invalid_token' ? randomBytes(32).toString('hex') : secrets[ACTORS.indexOf(denial.actor)];
-      const reply = await requestForge(m, 7, { version: Buffer.from(denial.version, 'hex').toJSON().data, path: denial.path }, token, [...secrets, token]);
-      assert.ok([401, 403].includes(reply.status), 'locked read did not fail closed');
-      exact(reply.error, ['version', 'error']); assert.equal(reply.error.version, 1); exact(reply.error.error, ['code', 'message']);
-      assert.equal(reply.error.error.code, reply.status === 401 ? 'unauthenticated' : 'permission_denied'); assert.ok(typeof reply.error.error.message === 'string' && Buffer.byteLength(reply.error.error.message) <= 1024);
-      receipt.stages.push({ id: `denial_${receipt.stages.length}`, actor: denial.actor, state: 'verified', status: reply.status });
-    }
+    receipt.stages.push(...await verifyDenials(m, secrets, transport, stage => { currentStage = stage; }));
     receipt.deployment_preflight_complete = true;
     if (execute) for (const step of m.steps) {
       currentStage = `step:${step.id}`;

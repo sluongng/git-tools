@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateOrigin, validateManifest, validateStep, validateForgeReply, requestForge, assertNoSecrets, goalGates, searchPublic, validateStepReceipt } from './forge-deployed-acceptance.mjs';
+import { validateOrigin, validateManifest, validateStep, validateForgeReply, requestForge, assertNoSecrets, goalGates, searchPublic, validateStepReceipt, verifyDenials } from './forge-deployed-acceptance.mjs';
 const h = '12'.repeat(32);
 function manifest() {
   return { schema_version: 1, origin: 'https://forge.example.com', account_id: 'example', view: 'public', view_version: h, revision: h,
     tt: { path: '/declared/tt', sha256: h }, output_dir: '/private/results',
     actors: Object.fromEntries(['owner', 'agent_a', 'agent_b'].map(name => [name, { root: `/private/${name}`, token_env: `ACCEPT_${name.toUpperCase()}` }])),
     public: { readme_path: 'README.md', readme_sha256: h, query: 'example', regex: false, limit: 10, expected_paths: ['README.md'] },
-    denials: ['anonymous', 'invalid_token'].map(actor => ({ actor, path: 'private/file', version: h })), steps: [] };
+    denials: ['anonymous', 'invalid_token'].map(actor => ({ actor, view: 'locked', path: 'private/file', version: h })), steps: [] };
 }
 test('deployed manifest requires exact public HTTPS and rejects override execution', () => {
   assert.equal(validateManifest(manifest()).origin, 'https://forge.example.com');
@@ -82,4 +82,32 @@ test('public search continues exact pinned query and reports partial coverage ho
   const absent = { ...m, public: { ...m.public, expected_paths: ['missing.txt'] } };
   calls.length = 0;
   await assert.rejects(searchPublic(absent, [], 2, send), /search_expected_paths_missing_at_terminal/);
+});
+
+test('denial requires a positive owner read of the same locked view and resource', async () => {
+  const m = manifest(); m.denials = [m.denials[0]];
+  const secrets = ['synthetic-owner-token', 'synthetic-agent-a-token', 'synthetic-agent-b-token'];
+  const calls = [];
+  const send = async (_origin, bytes, token) => {
+    const call = JSON.parse(bytes); const payload = JSON.parse(call.payload_json); calls.push({ operation: call.operation, view: call.view, payload, token });
+    assert.equal(call.view, 'locked', 'public route cannot stand in for the locked view');
+    if (call.operation === 2 || token === secrets[0]) {
+      assert.equal(token, secrets[0]);
+      const value = call.operation === 2 ? { account_id: m.account_id, policy_epoch: 3 } : {
+        account_id: m.account_id, view: 'locked', view_version: h, revision: h, policy_epoch: 3, path: 'private/file', content: 'owner-visible fixture body',
+      };
+      return { status: 200, body: Buffer.from(JSON.stringify({ version: 1, operation: call.operation, account_id: call.account_id, view: call.view, request_id: '', state: 'complete', result_json: JSON.stringify(value) })) };
+    }
+    assert.equal(token, undefined); assert.deepEqual(payload, { version: [...Buffer.from(h, 'hex')], path: 'private/file' });
+    return { status: 403, body: Buffer.from(JSON.stringify({ version: 1, error: { code: 'permission_denied', message: 'locked' } })) };
+  };
+  const receipts = await verifyDenials(m, secrets, send);
+  assert.deepEqual(calls.map(call => call.operation), [2, 7, 7]); assert.equal(calls[1].token, secrets[0]);
+  assert.equal(receipts[0].view, 'locked'); assert.equal(receipts[0].view_version, h); assert.equal(receipts[0].owner_control_readable, true);
+  assert.ok(!JSON.stringify(receipts).includes('owner-visible fixture body'));
+  const wrongView = async (...args) => { const response = await send(...args); const call = JSON.parse(args[1]); if (call.operation === 7 && args[2] === secrets[0]) { const frame = JSON.parse(response.body); const value = JSON.parse(frame.result_json); value.view = 'public'; frame.result_json = JSON.stringify(value); response.body = Buffer.from(JSON.stringify(frame)); } return response; };
+  await assert.rejects(verifyDenials(m, secrets, wrongView));
+  const missing = async (...args) => { const call = JSON.parse(args[1]); if (call.operation === 7 && args[2] === secrets[0]) return { status: 403, body: Buffer.from(JSON.stringify({ version: 1, error: { code: 'permission_denied', message: 'unavailable' } })) }; return send(...args); };
+  await assert.rejects(verifyDenials(m, secrets, missing), /owner control must read/);
+  const incomplete = manifest(); delete incomplete.denials[0].view; assert.throws(() => validateManifest(incomplete));
 });
