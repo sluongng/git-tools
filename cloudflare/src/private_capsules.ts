@@ -1,0 +1,95 @@
+/** Private opaque custody. No native object/catalog/upload/check authority is minted here. */
+import { fail, Failure } from './protocol';
+import { canonicalArchive } from './archive_protocol';
+import { capsuleBytes, capsuleHex, capsuleChunkHash, capsuleChain, parsePrivateCapsuleCall, PRIVATE_CAPSULE_CHUNK, type CapsuleCall, type CapsuleDescriptor, type CapsuleReply, type CapsuleSelection } from './private_capsule_protocol';
+export interface PrivateCapsuleBase {projection_id:string;base_root:string}
+export interface PrivateCapsulesHost {
+ accountId:string;sql:SqlStorage;objects:R2Bucket;transactionSync<T>(f:()=>T):T;
+ /** Independently reauthenticate original request/account ceiling on EVERY invocation. */
+ authenticate():Promise<{principal:string}>;
+ /** Current member + exact epoch/version + selected/current export + ready sanitized baseline. */
+ authorizeInTx(principal:string,selection:CapsuleSelection):PrivateCapsuleBase;
+ /** Participate in the existing account GC/authoring barrier before SQL mutations. */
+ mutationInTx():void;
+ retainBaseInTx(capsuleId:string,baseRoot:string):void;
+ releaseBaseInTx(capsuleId:string,baseRoot:string):void;
+}
+export interface PrivateCapsuleRow {id:string;account:string;principal:string;workspace:string;view_name:string;view_version:string;epoch:number;projected_commit:string;projected_tree:string;projection_id:string;base_root:string;descriptor:string;expected_generation:number;generation:number;state:'uploading'|'sealed'|'retiring'|'deleted';next_sequence:number;next_offset:number;chain_root:string}
+export interface PrivateCapsuleChunk {capsule:string;sequence:number;attempt_id:string;size:number;sha256:string;locator:string;state:'pending'|'written'|'retiring'|'tombstoned';etag:string|null;version:string|null}
+/** Original tuple is retained even after opaque body replacement. */
+export function privateChunkMetadata(account:string,c:Pick<PrivateCapsuleChunk,'capsule'|'sequence'|'attempt_id'|'size'|'sha256'>,tombstone=false):Record<string,string>{return{account,capsule:c.capsule,sequence:String(c.sequence),attempt:c.attempt_id,sha256:c.sha256,size:String(c.size),format:'1',...(tombstone?{retired:'1'}:{})};}
+interface Usage {account:string;bytes:number;chunks:number;capsules:number}
+interface Head {generation:number;capsule:string|null}
+const MAX_BYTES=512*1024*1024,MAX_CHUNKS=32768,MAX_CAPSULES=4096,ZERO='0'.repeat(64);
+const equal=(a:unknown,b:unknown)=>canonicalArchive(a)===canonicalArchive(b);
+const valid=(n:number,max=Number.MAX_SAFE_INTEGER)=>Number.isSafeInteger(n)&&n>=0&&n<=max;
+export class PrivateCapsules {
+ constructor(private readonly host:PrivateCapsulesHost){
+  if(!/^[a-z0-9-]{1,64}$/.test(host.accountId))fail(400,'invalid_argument');
+  for(const sql of [
+   'CREATE TABLE IF NOT EXISTS private_capsules(id TEXT PRIMARY KEY,account TEXT NOT NULL,principal TEXT NOT NULL,workspace TEXT NOT NULL,view_name TEXT NOT NULL,view_version TEXT NOT NULL,epoch INTEGER NOT NULL,projected_commit TEXT NOT NULL,projected_tree TEXT NOT NULL,projection_id TEXT NOT NULL,base_root TEXT NOT NULL,descriptor TEXT NOT NULL,expected_generation INTEGER NOT NULL,generation INTEGER NOT NULL,state TEXT NOT NULL,next_sequence INTEGER NOT NULL,next_offset INTEGER NOT NULL,chain_root TEXT NOT NULL)',
+   'CREATE TABLE IF NOT EXISTS private_capsule_heads(principal TEXT NOT NULL,workspace TEXT NOT NULL,generation INTEGER NOT NULL,capsule TEXT,PRIMARY KEY(principal,workspace))',
+   'CREATE TABLE IF NOT EXISTS private_capsule_chunks(capsule TEXT NOT NULL,sequence INTEGER NOT NULL,attempt_id TEXT NOT NULL UNIQUE,size INTEGER NOT NULL,sha256 TEXT NOT NULL,locator TEXT NOT NULL UNIQUE,state TEXT NOT NULL,etag TEXT,version TEXT,PRIMARY KEY(capsule,sequence))',
+   'CREATE TABLE IF NOT EXISTS private_capsule_usage(singleton INTEGER PRIMARY KEY CHECK(singleton=1),account TEXT NOT NULL,bytes INTEGER NOT NULL,chunks INTEGER NOT NULL,capsules INTEGER NOT NULL)',
+  ])this.exec(sql);
+ }
+ private exec(sql:string,...args:(string|number|null)[]){try{return this.host.sql.exec(sql,...args);}catch(e){if(e instanceof Failure)throw e;fail(503,'unavailable');}}
+ private one<T>(sql:string,...args:(string|number|null)[]):T|undefined{return [...this.exec(sql,...args)][0] as T|undefined;}
+ private tx<T>(f:()=>T):T{try{return this.host.transactionSync(f);}catch(e){if(e instanceof Failure)throw e;fail(503,'unavailable');}}
+ private load(id:string):PrivateCapsuleRow{const r=this.one<PrivateCapsuleRow>('SELECT * FROM private_capsules WHERE id=?',id);if(!r)fail(404,'not_found');if(r.account!==this.host.accountId||!['uploading','sealed','retiring','deleted'].includes(r.state))fail(503,'unavailable');return r;}
+ private selection(r:PrivateCapsuleRow):CapsuleSelection{return{view:r.view_name,view_version:r.view_version,policy_epoch:r.epoch,projected_commit:r.projected_commit,projected_tree:r.projected_tree};}
+ private descriptor(r:PrivateCapsuleRow):CapsuleDescriptor{try{return JSON.parse(r.descriptor);}catch{fail(503,'unavailable');}}
+ private reply(r:PrivateCapsuleRow):CapsuleReply{return{schema:1,account_id:r.account,capsule_id:r.id,state:r.state,workspace_id:r.workspace,generation:r.generation,selection:this.selection(r),descriptor:this.descriptor(r),next_sequence:r.next_sequence,next_offset:r.next_offset,chain_root:r.chain_root};}
+ private usage():Usage{const u=this.one<Usage>('SELECT account,bytes,chunks,capsules FROM private_capsule_usage WHERE singleton=1');if(!u||u.account!==this.host.accountId||!valid(u.bytes,MAX_BYTES)||!valid(u.chunks,MAX_CHUNKS)||!valid(u.capsules,MAX_CAPSULES))fail(503,'unavailable');return u;}
+ private authorizeInTx(principal:string,r:PrivateCapsuleRow):void{if(r.principal!==principal)fail(403,'permission_denied');const p=this.host.authorizeInTx(principal,this.selection(r));if(p.projection_id!==r.projection_id||p.base_root!==r.base_root)fail(409,'aborted');}
+ private async auth(r:PrivateCapsuleRow):Promise<void>{const a=await this.host.authenticate();this.tx(()=>this.authorizeInTx(a.principal,r));}
+ private head(r:Pick<PrivateCapsuleRow,'principal'|'workspace'>):Head{return this.one<Head>('SELECT generation,capsule FROM private_capsule_heads WHERE principal=? AND workspace=?',r.principal,r.workspace)??{generation:0,capsule:null};}
+ private chunk(id:string,seq:number):PrivateCapsuleChunk|undefined{return this.one<PrivateCapsuleChunk>('SELECT * FROM private_capsule_chunks WHERE capsule=? AND sequence=?',id,seq);}
+ private checkChunk(r:PrivateCapsuleRow,c:PrivateCapsuleChunk):void{const d=this.descriptor(r),expected=Math.min(PRIVATE_CAPSULE_CHUNK,d.total_bytes-c.sequence*PRIVATE_CAPSULE_CHUNK);if(c.capsule!==r.id||!valid(c.sequence,d.chunk_count-1)||!valid(c.size,PRIVATE_CAPSULE_CHUNK)||c.size!==expected||!/^[0-9a-f]{64}$/.test(c.attempt_id)||!/^[0-9a-f]{64}$/.test(c.sha256)||c.locator!==`private/v1/${r.account}/${r.id}/${c.sequence}/${c.attempt_id}`||!['pending','written','retiring','tombstoned'].includes(c.state))fail(503,'unavailable');}
+ private metadata(r:PrivateCapsuleRow,c:PrivateCapsuleChunk,o:R2Object,pinned=true,tombstone=false):void{this.checkChunk(r,c);if(o.key!==c.locator||o.size!==(tombstone?0:c.size)||!equal(o.customMetadata??{},privateChunkMetadata(r.account,c,tombstone))||(pinned&&((c.etag!==null&&c.etag!==o.etag)||(c.version!==null&&c.version!==o.version))))fail(503,'unavailable');}
+ private isMarker(r:PrivateCapsuleRow,c:PrivateCapsuleChunk,o:R2Object):boolean{return o.size===0&&equal(o.customMetadata??{},privateChunkMetadata(r.account,c,true));}
+ private async verifiedMarker(r:PrivateCapsuleRow,c:PrivateCapsuleChunk,head:R2Object):Promise<void>{this.metadata(r,c,head,false,true);const object=await this.host.objects.get(c.locator,{onlyIf:{etagMatches:head.etag}});await this.auth(r);if(!object||!('body'in object))fail(503,'unavailable');this.metadata(r,c,object,false,true);if(object.etag!==head.etag||object.version!==head.version)fail(503,'unavailable');const bytes=await object.arrayBuffer();await this.auth(r);if(bytes.byteLength!==0)fail(503,'unavailable');}
+ private async verified(r:PrivateCapsuleRow,c:PrivateCapsuleChunk,head:R2Object):Promise<Uint8Array>{this.metadata(r,c,head);const object=await this.host.objects.get(c.locator,{onlyIf:{etagMatches:head.etag}});await this.auth(r);if(!object||!('body'in object))fail(503,'unavailable');this.metadata(r,c,object);if(object.etag!==head.etag||object.version!==head.version)fail(503,'unavailable');const bytes=new Uint8Array(await object.arrayBuffer());await this.auth(r);if(bytes.length!==c.size||await capsuleChunkHash(bytes)!==c.sha256)fail(503,'unavailable');await this.auth(r);return bytes;}
+ async handle(untrusted:CapsuleCall):Promise<CapsuleReply>{const call=parsePrivateCapsuleCall(untrusted);if(call.account_id!==this.host.accountId)fail(403,'permission_denied');const actor=await this.host.authenticate();
+  if(call.action==='begin')return this.begin(call,actor.principal);
+  const r=this.tx(()=>{const r=this.load(call.capsule_id);this.authorizeInTx(actor.principal,r);return r;});
+  if(call.action==='status')return this.reply(r);
+  if(call.action==='append')return this.append(r,call.sequence,capsuleBytes(call.bytes_hex));
+  if(call.action==='finish')return this.finish(r);
+  if(call.action==='read')return this.read(r,call.sequence);
+  return this.retire(r);
+ }
+ private begin(call:Extract<CapsuleCall,{action:'begin'}>,principal:string):CapsuleReply{return this.tx(()=>{
+  const proof=this.host.authorizeInTx(principal,call.selection);const old=this.one<PrivateCapsuleRow>('SELECT * FROM private_capsules WHERE id=?',call.capsule_id);
+  if(old){this.authorizeInTx(principal,old);if(old.workspace!==call.workspace_id||old.expected_generation!==call.expected_generation||!equal(this.selection(old),call.selection)||!equal(this.descriptor(old),call.descriptor))fail(409,'capsule_conflict');return this.reply(old);}
+  if(!/^[0-9a-f]{64}$/.test(proof.base_root)||proof.base_root!==call.selection.projected_commit||!proof.projection_id||proof.projection_id.length>256)fail(503,'unavailable');
+  this.host.mutationInTx();if(!this.one('SELECT singleton FROM private_capsule_usage WHERE singleton=1'))this.exec('INSERT INTO private_capsule_usage(singleton,account,bytes,chunks,capsules) VALUES(1,?,0,0,0)',call.account_id);
+  const u=this.usage(),counts=this.one<{live:number;uploading:number}>("SELECT COALESCE(SUM(state!='deleted'),0) AS live,COALESCE(SUM(state='uploading'),0) AS uploading FROM private_capsules")!;if(u.capsules>=MAX_CAPSULES||counts.live>=64||counts.uploading>=8)fail(429,'resource_exhausted');
+  const r:PrivateCapsuleRow={id:call.capsule_id,account:call.account_id,principal,workspace:call.workspace_id,view_name:call.selection.view,view_version:call.selection.view_version,epoch:call.selection.policy_epoch,projected_commit:call.selection.projected_commit,projected_tree:call.selection.projected_tree,projection_id:proof.projection_id,base_root:proof.base_root,descriptor:canonicalArchive(call.descriptor),expected_generation:call.expected_generation,generation:call.expected_generation+1,state:'uploading',next_sequence:0,next_offset:0,chain_root:ZERO};
+  this.exec('INSERT INTO private_capsules(id,account,principal,workspace,view_name,view_version,epoch,projected_commit,projected_tree,projection_id,base_root,descriptor,expected_generation,generation,state,next_sequence,next_offset,chain_root) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',r.id,r.account,r.principal,r.workspace,r.view_name,r.view_version,r.epoch,r.projected_commit,r.projected_tree,r.projection_id,r.base_root,r.descriptor,r.expected_generation,r.generation,r.state,0,0,ZERO);this.host.retainBaseInTx(r.id,r.base_root);this.exec('UPDATE private_capsule_usage SET capsules=capsules+1 WHERE singleton=1');return this.reply(r);
+ });}
+ private async append(r:PrivateCapsuleRow,sequence:number,bytes:Uint8Array):Promise<CapsuleReply>{const sha256=await capsuleChunkHash(bytes);await this.auth(r);const d=this.descriptor(r);if(sequence>=d.chunk_count||bytes.length!==Math.min(PRIVATE_CAPSULE_CHUNK,d.total_bytes-sequence*PRIVATE_CAPSULE_CHUNK))fail(409,'capsule_conflict');
+  if(sequence<r.next_sequence){const c=this.chunk(r.id,sequence);if(!c||c.state!=='written'||c.sha256!==sha256||c.size!==bytes.length)fail(409,'capsule_conflict');return this.reply(r);}
+  if(r.state!=='uploading'||sequence!==r.next_sequence)fail(409,'out_of_range');
+  let fresh=false;const c=this.tx(()=>{const old=this.chunk(r.id,sequence);if(old){this.checkChunk(r,old);if(old.sha256!==sha256||old.size!==bytes.length||old.state!=='pending')fail(409,'capsule_conflict');return old;}const u=this.usage();if(u.chunks>=MAX_CHUNKS||u.bytes+bytes.length>MAX_BYTES)fail(429,'resource_exhausted');this.host.mutationInTx();const attempt=capsuleHex(crypto.getRandomValues(new Uint8Array(32)));const c:PrivateCapsuleChunk={capsule:r.id,sequence,attempt_id:attempt,size:bytes.length,sha256,locator:`private/v1/${r.account}/${r.id}/${sequence}/${attempt}`,state:'pending',etag:null,version:null};this.exec('INSERT INTO private_capsule_chunks(capsule,sequence,attempt_id,size,sha256,locator,state,etag,version) VALUES(?,?,?,?,?,?,?,NULL,NULL)',r.id,sequence,attempt,c.size,sha256,c.locator,c.state);this.exec('UPDATE private_capsule_usage SET bytes=bytes+?,chunks=chunks+1 WHERE singleton=1',c.size);fresh=true;return c;});
+  let head:R2Object|null=null;if(!fresh){head=await this.host.objects.head(c.locator);await this.auth(r);}if(!head){try{head=await this.host.objects.put(c.locator,bytes,{onlyIf:{etagDoesNotMatch:'*'},customMetadata:privateChunkMetadata(r.account,c)});}catch{/* Pending custody is deliberately not refunded. */}await this.auth(r);}
+  if(!head){head=await this.host.objects.head(c.locator);await this.auth(r);}if(!head)fail(503,'unavailable');await this.verified(r,c,head);const chain=await capsuleChain(r.chain_root,sequence,c.size,sha256);await this.auth(r);
+  return this.tx(()=>{this.host.mutationInTx();const current=this.load(r.id),exact=this.chunk(r.id,sequence);if(current.state!=='uploading'||current.next_sequence!==sequence||!exact||exact.attempt_id!==c.attempt_id||exact.state!=='pending')fail(409,'capsule_conflict');this.exec("UPDATE private_capsule_chunks SET state='written',etag=?,version=? WHERE capsule=? AND sequence=?",head!.etag,head!.version,r.id,sequence);this.exec('UPDATE private_capsules SET next_sequence=next_sequence+1,next_offset=next_offset+?,chain_root=? WHERE id=?',c.size,chain,r.id);return this.reply(this.load(r.id));});
+ }
+ private finish(r:PrivateCapsuleRow):CapsuleReply{return this.tx(()=>{if(r.state==='sealed')return this.reply(r);if(r.state!=='uploading')fail(409,'capsule_conflict');const d=this.descriptor(r),h=this.head(r);if(r.next_sequence!==d.chunk_count||r.next_offset!==d.total_bytes||r.chain_root!==d.chain_root||h.generation!==r.expected_generation)fail(409,'capsule_conflict');const count=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_chunks WHERE capsule=? AND state='written'",r.id)!.n;if(count!==d.chunk_count)fail(409,'capsule_conflict');this.host.mutationInTx();this.exec("UPDATE private_capsules SET state='sealed' WHERE id=?",r.id);this.exec('INSERT INTO private_capsule_heads(principal,workspace,generation,capsule) VALUES(?,?,?,?) ON CONFLICT(principal,workspace) DO UPDATE SET generation=excluded.generation,capsule=excluded.capsule',r.principal,r.workspace,r.generation,r.id);return this.reply(this.load(r.id));});}
+ private async read(r:PrivateCapsuleRow,sequence:number):Promise<CapsuleReply>{if(r.state!=='sealed')fail(409,'capsule_conflict');if(sequence>=r.next_sequence)fail(409,'out_of_range');const c=this.chunk(r.id,sequence);if(!c||c.state!=='written')fail(503,'unavailable');const head=await this.host.objects.head(c.locator);await this.auth(r);if(!head)fail(503,'unavailable');const bytes=await this.verified(r,c,head);return{...this.reply(r),sequence,bytes_hex:capsuleHex(bytes),sha256:c.sha256};}
+ private async retire(r:PrivateCapsuleRow):Promise<CapsuleReply>{if(r.state==='deleted')return this.reply(r);this.tx(()=>{this.host.mutationInTx();this.exec("UPDATE private_capsules SET state='retiring' WHERE id=?",r.id);this.exec("UPDATE private_capsule_chunks SET state='retiring' WHERE capsule=? AND state IN('pending','written')",r.id);this.exec('UPDATE private_capsule_heads SET capsule=NULL WHERE principal=? AND workspace=? AND capsule=?',r.principal,r.workspace,r.id);});r=this.load(r.id);
+  const chunks=[...this.exec("SELECT * FROM private_capsule_chunks WHERE capsule=? AND state!='tombstoned' ORDER BY sequence LIMIT 16",r.id)] as unknown as PrivateCapsuleChunk[];
+  for(const c of chunks){this.checkChunk(r,c);let head=await this.host.objects.head(c.locator);await this.auth(r);
+   if(!head||!this.isMarker(r,c,head)){
+    if(head)await this.verified(r,c,head);
+    const onlyIf=head?{etagMatches:head.etag}:{etagDoesNotMatch:'*'};
+    try{head=await this.host.objects.put(c.locator,new Uint8Array(),{onlyIf,customMetadata:privateChunkMetadata(r.account,c,true)});}catch{head=null;}
+    await this.auth(r);if(!head){head=await this.host.objects.head(c.locator);await this.auth(r);}
+   }
+   if(!head)fail(503,'unavailable');await this.verifiedMarker(r,c,head);
+   this.tx(()=>{const exact=this.chunk(r.id,c.sequence);if(!exact||exact.attempt_id!==c.attempt_id)fail(409,'capsule_conflict');if(exact.state==='tombstoned')return;if(exact.state!=='retiring')fail(409,'capsule_conflict');this.host.mutationInTx();this.exec("UPDATE private_capsule_chunks SET state='tombstoned',etag=?,version=? WHERE capsule=? AND sequence=?",head!.etag,head!.version,r.id,c.sequence);this.exec('UPDATE private_capsule_usage SET bytes=bytes-? WHERE singleton=1',c.size);this.usage();});
+  }
+  return this.tx(()=>{if(!this.one("SELECT 1 FROM private_capsule_chunks WHERE capsule=? AND state!='tombstoned' LIMIT 1",r.id)){if(this.head(r).capsule===r.id)fail(409,'capsule_conflict');this.host.mutationInTx();this.host.releaseBaseInTx(r.id,r.base_root);this.exec("UPDATE private_capsules SET state='deleted' WHERE id=?",r.id);}return this.reply(this.load(r.id));});
+ }
+}

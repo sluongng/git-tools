@@ -433,6 +433,76 @@ async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_sha
     stop.send(()).unwrap();
     task.await.unwrap();
 }
+#[test]
+fn private_archive_payload_verifies_opaque_sha_and_locator_without_native_kind() {
+    use tinytree_client::archive::{ArchivePage, Content, ZERO_HASH};
+    let capsule="d".repeat(64); let attempt="c".repeat(64);
+    let mut page=ArchivePage { schema:1,account_id:"alpha".into(),archive_id:"a".repeat(64),build_id:"b".repeat(64),sequence:0,previous:ZERO_HASH.into(),hash:ZERO_HASH.into(),
+        content:Content::PrivatePayload {capsule_id:capsule.clone(),sequence:2,attempt_id:attempt.clone(),size:3,sha256:"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),locator:format!("private/v1/alpha/{capsule}/2/{attempt}"),state:"written".into(),source_etag:Some("source-etag".into()),source_version:Some("source-version".into()),presence:"present".into(),bytes_hex:Some("616263".into())} };
+    page.hash=page.computed_hash().unwrap(); page.validate().unwrap();
+    let original=page.clone();
+    if let Content::PrivatePayload {bytes_hex,..}=&mut page.content {*bytes_hex=Some("616264".into());}
+    page.hash=page.computed_hash().unwrap();
+    assert!(page.validate().is_err(),"recomputed outer chain cannot conceal changed opaque bytes with unchanged SHA256");
+    let mut page=original;
+    if let Content::PrivatePayload {locator,..}=&mut page.content {*locator="native/v2/alpha/1/not-an-opaque-capsule".into();}
+    page.hash=page.computed_hash().unwrap();assert!(page.validate().is_err(),"opaque custody cannot be laundered through native payload namespace");
+}
+
+#[tokio::test]
+async fn private_capsule_transport_pins_binding_replays_exact_chunks_and_checks_read_integrity() {
+    use tinytree_client::private_capsule::{self as c, CapsuleAction, CapsuleBinding, CapsuleCall, CapsuleDescriptor, CapsuleSelection, CapsuleState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Opaque transport protocol fixture, not native-capture or restore proof.
+    let first=vec![b'x';c::CHUNK_BYTES];let last=vec![b'y'];
+    let first_chain=c::chain_chunk(c::ZERO_CHAIN,0,&first).unwrap();let final_chain=c::chain_chunk(&first_chain,1,&last).unwrap();
+    let binding=CapsuleBinding {account_id:"alpha".into(),capsule_id:"a".repeat(64),workspace_id:"b".repeat(64),generation:5,
+        selection:CapsuleSelection {view:"Team_Public".into(),view_version:"1".repeat(64),policy_epoch:7,projected_commit:"2".repeat(64),projected_tree:"3".repeat(64)},
+        descriptor:CapsuleDescriptor {format:"tinytree-private-capture-v1".into(),total_bytes:c::CHUNK_BYTES as u64+1,chunk_count:2,chain_root:final_chain.clone()} };
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}",listener.local_addr().unwrap());
+    let inputs=Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));let seen=inputs.clone();
+    let (stop,mut stopped)=tokio::sync::oneshot::channel();
+    let bound=binding.clone();let raw_first=first.clone();let raw_last=last.clone();
+    let task=tokio::spawn(async move {
+        let mut append_zero=0usize;let mut read_one=0usize;let mut status_count=0usize;
+        loop {
+            let (mut socket,_)=tokio::select! {connection=listener.accept()=>connection.unwrap(),_=&mut stopped=>break};
+            let mut headers=Vec::new();while !headers.ends_with(b"\r\n\r\n"){let mut byte=[0];socket.read_exact(&mut byte).await.unwrap();headers.push(byte[0]);assert!(headers.len()<16384);}
+            let headers=String::from_utf8(headers).unwrap().to_ascii_lowercase();assert!(headers.starts_with("post /api/v1/private-capsule/call http/1.1\r\n"));assert!(headers.contains(&format!("authorization: bearer {TOKEN}\r\n")));assert!(headers.contains("accept-encoding: identity\r\n"));
+            let size:usize=headers.lines().find_map(|line|line.strip_prefix("content-length: ")).unwrap().parse().unwrap();assert!(size<=c::MAX_WIRE_BYTES);let mut bytes=vec![0;size];socket.read_exact(&mut bytes).await.unwrap();let input:serde_json::Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(input["schema"],1);assert_eq!(input["account_id"],bound.account_id);let long_view_begin=input["action"]=="begin"&&input["capsule_id"]=="f".repeat(64);assert_eq!(input["capsule_id"],if long_view_begin{"f".repeat(64)}else{bound.capsule_id.clone()});assert!(input.get("owner").is_none());seen.lock().unwrap().push(input.clone());
+            let action=input["action"].as_str().unwrap();let mut status=200;
+            let mut reply=serde_json::json!({"schema":1,"account_id":bound.account_id,"capsule_id":bound.capsule_id,"state":"uploading","workspace_id":bound.workspace_id,"generation":bound.generation,"selection":bound.selection,"descriptor":bound.descriptor,"next_sequence":0,"next_offset":0,"chain_root":c::ZERO_CHAIN});
+            match action {
+                "begin"=>{assert_eq!(input["expected_generation"],4);assert_eq!(input["descriptor"],serde_json::to_value(&bound.descriptor).unwrap());if long_view_begin{assert_eq!(input["selection"]["view"],"V".repeat(65));}else{assert_eq!(input["selection"]["view"],"Team_Public");}reply["capsule_id"]=input["capsule_id"].clone();reply["selection"]=input["selection"].clone();},
+                "append"=>{let sequence=input["sequence"].as_u64().unwrap();let expected=if sequence==0{&raw_first}else{&raw_last};let expected_hex=expected.iter().map(|b|format!("{b:02x}")).collect::<String>();assert_eq!(input["bytes_hex"],expected_hex);
+                    if sequence==0{append_zero+=1;if append_zero==1{status=503;reply=serde_json::json!({"schema":1,"error":{"code":"unavailable"}});}else{reply["next_sequence"]=serde_json::json!(1);reply["next_offset"]=serde_json::json!(c::CHUNK_BYTES);reply["chain_root"]=serde_json::json!(first_chain);}}
+                    else{reply["next_sequence"]=serde_json::json!(2);reply["next_offset"]=serde_json::json!(c::CHUNK_BYTES+1);reply["chain_root"]=serde_json::json!(final_chain);}},
+                "finish"|"status"|"read"=>{reply["state"]=serde_json::json!("sealed");reply["next_sequence"]=serde_json::json!(2);reply["next_offset"]=serde_json::json!(c::CHUNK_BYTES+1);reply["chain_root"]=serde_json::json!(final_chain);
+                    if action=="status"{status_count+=1;if status_count>1{reply["next_offset"]=serde_json::json!(c::CHUNK_BYTES+2);}}
+                    if action=="read"{let sequence=input["sequence"].as_u64().unwrap();let raw=if sequence==0{&raw_first}else{&raw_last};reply["sequence"]=serde_json::json!(sequence);reply["bytes_hex"]=serde_json::json!(raw.iter().map(|b|format!("{b:02x}")).collect::<String>());reply["sha256"]=serde_json::json!(c::chunk_sha256(raw).unwrap());if sequence==1{read_one+=1;if read_one==1{reply["sha256"]=serde_json::json!("0".repeat(64));}else{reply["workspace_id"]=serde_json::json!("e".repeat(64));}}}},
+                _=>panic!("unexpected capsule fixture action"),
+            }
+            let bytes=serde_json::to_vec(&reply).unwrap();assert!(bytes.len()<=c::MAX_WIRE_BYTES);socket.write_all(format!("HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await.unwrap();socket.write_all(&bytes).await.unwrap();
+        }
+    });
+    let config=Config {transport:tinytree_client::Transport::ForgeHttpsV1,endpoint,token_env:Some("TINYTREE_CLIENT_TEST_TOKEN".into()),..Default::default()};
+    let client=tinytree_client::PrivateCapsuleClient::connect(config.clone(),None).await.unwrap();
+    let mut long_view=binding.clone();long_view.capsule_id="f".repeat(64);long_view.selection.view="V".repeat(65);
+    let accepted=client.call(CapsuleCall::begin(&long_view).unwrap(),None).await.unwrap();assert_eq!(accepted.binding(),long_view,"existing 65-byte Forge view grammar is supported");
+    let begun=client.call(CapsuleCall::begin(&binding).unwrap(),None).await.unwrap();assert_eq!(begun.binding(),binding);assert_eq!(begun.state,CapsuleState::Uploading);
+    for (sequence,bytes) in [(0,&first[..]),(1,&last[..])] {let reply=client.call(CapsuleCall::append(&binding,sequence,bytes).unwrap(),Some(&binding)).await.unwrap();assert_eq!(reply.next_sequence,sequence+1);}
+    let sealed=client.call(CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Finish),Some(&binding)).await.unwrap();assert_eq!(sealed.state,CapsuleState::Sealed);
+    let discovered=client.call(CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Status),None).await.unwrap();assert_eq!(discovered.binding(),binding,"status discovers only a server assertion, not native verification");
+    let mut read=CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Read);read.sequence=Some(0);let reply=client.call(read.clone(),Some(&binding)).await.unwrap();assert_eq!(reply.read_bytes().unwrap(),first);
+    read.sequence=Some(1);let bad_hash=client.call(read.clone(),Some(&binding)).await.err().expect("corrupt read must fail");assert_eq!(bad_hash.code(),Code::DataLoss);let rebound=client.call(read,Some(&binding)).await.err().expect("foreign immutable receipt must fail");assert_eq!(rebound.code(),Code::DataLoss);
+    let malformed_progress=client.call(CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Status),Some(&binding)).await.err().expect("progress cannot exceed exact descriptor offset");assert_eq!(malformed_progress.code(),Code::DataLoss);
+    let seen=inputs.lock().unwrap().clone();let retries=seen.iter().filter(|v|v["action"]=="append"&&v["sequence"]==0).collect::<Vec<_>>();assert_eq!(retries.len(),2);assert_eq!(retries[0],retries[1],"unknown append outcome replays exactly the original chunk");assert_eq!(seen.iter().filter(|v|v["action"]=="read"&&v["sequence"]==1).count(),2,"DataLoss never retries");
+    let before=seen.len();let mut untrusted=serde_json::to_value(CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Status)).unwrap();untrusted["owner"]=serde_json::json!("override");assert!(serde_json::from_value::<CapsuleCall>(untrusted).is_err());
+    let mut oversized=CapsuleCall::new("alpha",&binding.capsule_id,CapsuleAction::Append);oversized.sequence=Some(0);oversized.bytes_hex=Some("ff".repeat(c::CHUNK_BYTES+1));let rejected=client.call(oversized,Some(&binding)).await.err().expect("oversized chunk refused locally");assert_eq!(rejected.code(),Code::InvalidArgument);assert_eq!(inputs.lock().unwrap().len(),before);
+    let mut anonymous=config;anonymous.token_env=None;assert_eq!(tinytree_client::PrivateCapsuleClient::connect(anonymous,None).await.err().expect("no anonymous capsule fallback").code(),Code::Unauthenticated);
+    stop.send(()).unwrap();task.await.unwrap();
+}
+
 #[tokio::test]
 async fn forge_archive_admission_limit_is_resource_exhausted_without_retry() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -482,6 +552,13 @@ async fn forge_archive_transport_refuses_changed_captured_trust_before_dispatch(
     let refused = tinytree_client::ArchiveClient::connect(config, "TINYTREE_CLIENT_TEST_TOKEN", Some([9;32])).await.err().expect("wrong expected trust digest must fail before network");
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert_eq!(refused.message(), "archive trust roots changed before dispatch");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); listener.set_nonblocking(true).unwrap();
+    let mut capsule = Config::default(); capsule.transport = tinytree_client::Transport::ForgeHttpsV1;
+    capsule.endpoint = format!("https://{}",listener.local_addr().unwrap()); capsule.token_env = Some("TINYTREE_CLIENT_TEST_TOKEN".into());
+    capsule.tls = Some(tinytree_client::Tls { ca_certificate: env!("TLS_CA_CERT").into(), domain_name: None });
+    let refused = tinytree_client::PrivateCapsuleClient::connect(capsule, Some([9;32])).await.err().expect("capsule must pin captured trust too");
+    assert_eq!(refused.code(), Code::FailedPrecondition); assert_eq!(refused.message(), "capsule trust roots changed before dispatch");
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "captured capsule trust mismatch performs no HTTP/TLS dispatch");
 }
 #[tokio::test]
 async fn forge_session_decodes_strict_server_identity_and_requires_exact_result_account() {

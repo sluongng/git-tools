@@ -875,8 +875,32 @@ mod forge_product {
         let mut second=ArchivePage { schema:1,account_id:"example".into(),archive_id:archive_id.clone(),build_id:build.clone(),sequence:1,previous:first.hash.clone(),hash:a::ZERO_HASH.into(),
             content:Content::Payload {attempt_id:attempt.clone(),object_kind:1,object_id:object_id.clone(),size:bytes.len() as u64,locator:format!("native/v2/example/1/{object_id}/{attempt}"),state:"written".into(),source_etag:Some("source-etag".into()),source_version:Some("source-version".into()),presence:"present".into(),bytes_hex:Some(a::hex(bytes))} };
         second.hash=second.computed_hash().unwrap();
-        let manifest=ArchiveManifest { schema:1,account_id:"example".into(),archive_id:archive_id.clone(),build_id:build.clone(),tables:vec![Table{name:"fixture_table".into(),columns:vec!["text".into(),"number".into(),"blob".into(),"real".into(),"empty".into()],rows:1}],page_count:2,chain_root:second.hash.clone(),rows:1,bytes:(first.content_bytes().unwrap()+second.content_bytes().unwrap()) as u64,payloads:1 };
-        let manifest_json=serde_json::to_value(&manifest).unwrap();let pages=[serde_json::to_value(first).unwrap(),serde_json::to_value(second).unwrap()];
+        // The same public CLI archive carries opaque bytes and permanent
+        // anti-resurrection markers without treating either as native objects.
+        use sha2::{Digest as _, Sha256};
+        let private_bytes = b"private working-copy capsule bytes";
+        let private_hash = a::hex(&Sha256::digest(private_bytes));
+        let mut pages = vec![first, second];
+        for (state, attempt, capsule, payload) in [
+            ("written", "e".repeat(64), "d".repeat(64), a::hex(private_bytes)),
+            ("tombstoned", "f".repeat(64), "9".repeat(64), String::new()),
+        ] {
+            let mut page = ArchivePage {
+                schema: 1, account_id: "example".into(), archive_id: archive_id.clone(),
+                build_id: build.clone(), sequence: pages.len() as u64,
+                previous: pages.last().unwrap().hash.clone(), hash: a::ZERO_HASH.into(),
+                content: Content::PrivatePayload {
+                    capsule_id: capsule.clone(), sequence: 0, attempt_id: attempt.clone(),
+                    size: private_bytes.len() as u64, sha256: private_hash.clone(),
+                    locator: format!("private/v1/example/{capsule}/0/{attempt}"), state: state.into(),
+                    source_etag: Some("private-source-etag".into()), source_version: Some("private-source-version".into()),
+                    presence: "present".into(), bytes_hex: Some(payload),
+                },
+            };
+            page.hash = page.computed_hash().unwrap(); page.validate().unwrap(); pages.push(page);
+        }
+        let manifest=ArchiveManifest { schema:1,account_id:"example".into(),archive_id:archive_id.clone(),build_id:build.clone(),tables:vec![Table{name:"fixture_table".into(),columns:vec!["text".into(),"number".into(),"blob".into(),"real".into(),"empty".into()],rows:1}],page_count:pages.len() as u64,chain_root:pages.last().unwrap().hash.clone(),rows:1,bytes:pages.iter().map(|p|p.content_bytes().unwrap() as u64).sum(),payloads:3 };
+        let manifest_json=serde_json::to_value(&manifest).unwrap();let pages=pages.into_iter().map(|p|serde_json::to_value(p).unwrap()).collect::<Vec<_>>();
         let archive_path=client.root.join("backup");let source_path=archive_path.clone();
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}",listener.local_addr().unwrap());
         let captured=std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));let seen=captured.clone();
@@ -894,13 +918,13 @@ mod forge_product {
                     let mut reply=serde_json::json!({"schema":1,"account_id":input["account_id"],"archive_id":input["archive_id"],"build_id":build,"state":"exporting","next_sequence":0});
                     match input["action"].as_str().unwrap(){
                         "export_begin"=>{if admitted.load(std::sync::atomic::Ordering::SeqCst){reply["next_sequence"]=serde_json::json!(1);}},
-                        "export_next"=>{let n=input["sequence"].as_u64().unwrap();if n==0&&!admitted.load(std::sync::atomic::Ordering::SeqCst){return;}if n<2{reply["state"]=serde_json::json!("page");reply["next_sequence"]=serde_json::json!(n+1);reply["page"]=pages[n as usize].clone();}else{reply["state"]=serde_json::json!("exported");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest.clone();}},
+                        "export_next"=>{let n=input["sequence"].as_u64().unwrap();if n==0&&!admitted.load(std::sync::atomic::Ordering::SeqCst){return;}if n<(pages.len() as u64){reply["state"]=serde_json::json!("page");reply["next_sequence"]=serde_json::json!(n+1);reply["page"]=pages[n as usize].clone();}else{reply["state"]=serde_json::json!("exported");reply["next_sequence"]=serde_json::json!(pages.len());reply["manifest"]=manifest.clone();}},
                         "export_abort"=>{reply["state"]=serde_json::json!("aborted");},
-                        "export_finish"=>{let durable:serde_json::Value=serde_json::from_slice(&fs::read(source_path.join("manifest.json")).unwrap()).unwrap();assert_eq!(durable,manifest,"complete local manifest precedes release of source barrier");assert_eq!(input["manifest"],manifest);reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest.clone();},
+                        "export_finish"=>{let durable:serde_json::Value=serde_json::from_slice(&fs::read(source_path.join("manifest.json")).unwrap()).unwrap();assert_eq!(durable,manifest,"complete local manifest precedes release of source barrier");assert_eq!(input["manifest"],manifest);reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(pages.len());reply["manifest"]=manifest.clone();},
                         "restore_begin"=>{assert_eq!(input["manifest"],manifest);reply["state"]=serde_json::json!("restoring");},
                         "restore_page"=>{let n=input["page"]["sequence"].as_u64().unwrap();assert_eq!(input["page"],pages[n as usize]);reply["state"]=serde_json::json!("restoring");reply["next_sequence"]=serde_json::json!(n+1);},
-                        "status"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest;},
-                        "restore_finish"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(2);reply["manifest"]=manifest;},
+                        "status"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(pages.len());reply["manifest"]=manifest;},
+                        "restore_finish"=>{reply["state"]=serde_json::json!("complete");reply["next_sequence"]=serde_json::json!(pages.len());reply["manifest"]=manifest;},
                         _=>panic!("unexpected archive action"),
                     }
                     let bytes=serde_json::to_vec(&reply).unwrap();socket.write_all(format!("HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",bytes.len()).as_bytes()).await.unwrap();let _=socket.write_all(&bytes).await;
@@ -915,6 +939,12 @@ mod forge_product {
         let intent=fs::read(archive_path.join("intent.json")).unwrap();assert!(!String::from_utf8_lossy(&intent).contains(ARCHIVE_TOKEN));assert!(!String::from_utf8_lossy(&intent).contains("public-forge-fixture-token-not-a-secret"));
         release_ack.store(true,std::sync::atomic::Ordering::SeqCst);
         let completed:serde_json::Value=serde_json::from_str(&client.success(&["account","backup","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--json"])).unwrap();assert_eq!(completed["state"],"complete");assert_eq!(completed["result"]["archive_id"],archive_id);
+        let saved_private: serde_json::Value = serde_json::from_slice(&fs::read(archive_path.join("page-00000002.json")).unwrap()).unwrap();
+        let saved_marker: serde_json::Value = serde_json::from_slice(&fs::read(archive_path.join("page-00000003.json")).unwrap()).unwrap();
+        assert_eq!(saved_private["content"]["kind"], "private_payload");
+        assert_eq!(saved_private["content"]["bytes_hex"], a::hex(private_bytes));
+        assert_eq!(saved_marker["content"]["state"], "tombstoned");
+        assert_eq!(saved_marker["content"]["bytes_hex"], "");
         let requests=captured.lock().unwrap().clone();let retries=requests.iter().filter(|r|r["action"]=="export_next"&&r["sequence"]==0).collect::<Vec<_>>();assert_eq!(retries.len(),4);assert!(retries.windows(2).all(|pair|pair[0]==pair[1]),"all lostACK retries/resume preserve exact archive request");
         let page_path=archive_path.join("page-00000000.json");let original_page=fs::read(&page_path).unwrap();let mut tampered:serde_json::Value=serde_json::from_slice(&original_page).unwrap();tampered["hash"]=serde_json::json!("0".repeat(64));fs::write(&page_path,serde_json::to_vec(&tampered).unwrap()).unwrap();
         let count=captured.lock().unwrap().len();let refused=client.run(&["account","restore","backup","--archive-token-env","ARCHIVE_TEST_TOKEN","--json"]);assert!(!refused.status.success());assert_eq!(captured.lock().unwrap().len(),count,"tampered archive refused before target HTTP");

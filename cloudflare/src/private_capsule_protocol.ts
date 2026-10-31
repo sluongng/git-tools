@@ -1,0 +1,29 @@
+/** Fixed-route private opaque transport. Integrity does not imply native capture validity. */
+import { authenticate, body, digest, fail, Failure, hash, identifier, integer, json, record, type Auth } from './protocol';
+import { strictArchiveJson } from './archive_protocol';
+export const PRIVATE_CAPSULE_ROUTE='/api/v1/private-capsule/call';
+export const PRIVATE_CAPSULE_WIRE_LIMIT=160*1024;
+export const PRIVATE_CAPSULE_CHUNK=65536;
+export interface CapsuleSelection {view:string;view_version:string;policy_epoch:number;projected_commit:string;projected_tree:string}
+export interface CapsuleDescriptor {format:'tinytree-private-capture-v1';total_bytes:number;chunk_count:number;chain_root:string}
+interface Base {schema:1;account_id:string;capsule_id:string}
+export type CapsuleCall=Base & ({action:'begin';workspace_id:string;expected_generation:number;selection:CapsuleSelection;descriptor:CapsuleDescriptor}|{action:'status'|'finish'|'retire'}|{action:'append';sequence:number;bytes_hex:string}|{action:'read';sequence:number});
+export interface CapsuleReply extends Base {state:'uploading'|'sealed'|'retiring'|'deleted';workspace_id:string;generation:number;selection:CapsuleSelection;descriptor:CapsuleDescriptor;next_sequence:number;next_offset:number;chain_root:string;sequence?:number;bytes_hex?:string;sha256?:string}
+export function capsuleBytes(hex:string):Uint8Array{const bytes=new Uint8Array(hex.length/2);for(let i=0;i<bytes.length;i++)bytes[i]=parseInt(hex.slice(i*2,i*2+2),16);return bytes;}
+export function capsuleHex(bytes:Uint8Array):string{return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');}
+export async function capsuleChunkHash(bytes:Uint8Array):Promise<string>{return capsuleHex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));}
+export async function capsuleChain(previous:string,sequence:number,size:number,sha256:string):Promise<string>{return hash('tinytree-private-capsule-chunk-v1\0'+previous+'\0'+sequence+'\0'+size+'\0'+sha256);}
+export function parseCapsuleSelection(raw:unknown):CapsuleSelection{const s=record(raw,['view','view_version','policy_epoch','projected_commit','projected_tree']);if(typeof s.view!=='string'||new TextEncoder().encode(s.view).length>128||/[\u0000-\u001f\u007f]/.test(s.view))fail(400,'invalid_argument');const epoch=integer(s.policy_epoch);if(epoch<1)fail(400,'invalid_argument');return{view:s.view,view_version:digest(s.view_version),policy_epoch:epoch,projected_commit:digest(s.projected_commit),projected_tree:digest(s.projected_tree)};}
+export function parseCapsuleDescriptor(raw:unknown):CapsuleDescriptor{const d=record(raw,['format','total_bytes','chunk_count','chain_root']);const total=integer(d.total_bytes,512*1024*1024),count=integer(d.chunk_count,8192);if(d.format!=='tinytree-private-capture-v1'||total<1||count!==Math.ceil(total/PRIVATE_CAPSULE_CHUNK))fail(400,'invalid_argument');return{format:d.format,total_bytes:total,chunk_count:count,chain_root:digest(d.chain_root)};}
+export function parsePrivateCapsuleCall(raw:unknown):CapsuleCall{
+ const c=record(raw,['schema','account_id','capsule_id','action','workspace_id','expected_generation','selection','descriptor','sequence','bytes_hex'],['schema','account_id','capsule_id','action']);if(c.schema!==1)fail(400,'invalid_argument');const base={schema:1 as const,account_id:identifier(c.account_id),capsule_id:digest(c.capsule_id)};
+ switch(c.action){case'begin':record(c,['schema','account_id','capsule_id','action','workspace_id','expected_generation','selection','descriptor']);return{...base,action:c.action,workspace_id:digest(c.workspace_id),expected_generation:integer(c.expected_generation,Number.MAX_SAFE_INTEGER-1),selection:parseCapsuleSelection(c.selection),descriptor:parseCapsuleDescriptor(c.descriptor)};
+ case'append':record(c,['schema','account_id','capsule_id','action','sequence','bytes_hex']);if(typeof c.bytes_hex!=='string'||c.bytes_hex.length<2||c.bytes_hex.length>2*PRIVATE_CAPSULE_CHUNK||!/^(?:[0-9a-f]{2})+$/.test(c.bytes_hex))fail(400,'invalid_argument');return{...base,action:c.action,sequence:integer(c.sequence,8191),bytes_hex:c.bytes_hex};
+ case'read':record(c,['schema','account_id','capsule_id','action','sequence']);return{...base,action:c.action,sequence:integer(c.sequence,8191)};
+ case'status':case'finish':case'retire':record(c,['schema','account_id','capsule_id','action']);return{...base,action:c.action};default:fail(400,'invalid_argument');}
+}
+export async function admitPrivateCapsule(request:Request,env:{PRINCIPALS_JSON?:string}):Promise<{auth:Auth;call:CapsuleCall;bytes:number}>{
+ const url=new URL(request.url);if(url.pathname!==PRIVATE_CAPSULE_ROUTE||url.search||url.hash)fail(400,'invalid_argument');if(request.method!=='POST')fail(405,'method_not_allowed');const auth=await authenticate(request,env.PRINCIPALS_JSON);if(auth.kind!=='forge')fail(403,'permission_denied');if(request.headers.get('content-type')?.split(';')[0]!=='application/json')fail(415,'json_required');const bytes=await body(request,PRIVATE_CAPSULE_WIRE_LIMIT);let raw:unknown;try{raw=strictArchiveJson(new TextDecoder('utf-8',{fatal:true,ignoreBOM:false}).decode(bytes));}catch(e){if(e instanceof Failure)throw e;fail(400,'invalid_argument');}const call=parsePrivateCapsuleCall(raw);if(!auth.accounts.includes(call.account_id))fail(403,'permission_denied');return{auth,call,bytes:bytes.length};
+}
+export function privateCapsuleResponse(reply:CapsuleReply):Response{if(new TextEncoder().encode(JSON.stringify(reply)).length>PRIVATE_CAPSULE_WIRE_LIMIT)fail(503,'unavailable');return json(reply);}
+export async function protectPrivateCapsule(action:()=>Promise<Response>):Promise<Response>{try{return await action();}catch(e){return json({schema:1,error:{code:e instanceof Failure?e.code:'unavailable'}},e instanceof Failure?e.status:503);}}

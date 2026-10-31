@@ -156,9 +156,36 @@ async function storageScenario(ctx: DurableObjectState, bucket: R2Bucket, accoun
   return { baseline, normal, confirmedReplay, original, replacement, read: Array.from(read.bytes), reread: Array.from(reread.bytes),
     reservedRetireError, staleError, deleteError, puts, deletes, heads, after };
 }
+interface CapsuleBackingFault { mode: 'none' | 'before-put' | 'after-put'; failHead: boolean; held?: { key: string; bytes: Uint8Array; options: R2PutOptions | undefined } }
 export class AccountRepository extends Base {
+  private capsuleFault: CapsuleBackingFault;
   constructor(private fixtureCtx: DurableObjectState, private fixtureEnv: Env) {
-    super(fixtureCtx, fixtureEnv);
+    // Test-only backing faults: after-PUT also loses its immediate HEAD
+    // reconciliation, leaving a genuine ambiguous attempt for restart. Authority remains
+    // production code; native object writes and other bucket keys are untouched.
+    const fault: CapsuleBackingFault = { mode: 'none', failHead: false };
+    const bucket = fixtureEnv.OBJECTS;
+    const wrapped = new Proxy(bucket, { get(target, property) {
+      if (property === 'put') return async (...args: Parameters<R2Bucket['put']>) => {
+        const privateKey = args[0].startsWith('private/v1/');
+        if (privateKey && fault.mode === 'before-put') {
+          fault.mode = 'none'; const data = args[1];
+          if (!(data instanceof Uint8Array) || data.byteLength > 65536) throw new Error('fixture private body shape');
+          fault.held = { key: args[0], bytes: Uint8Array.from(data), options: args[2] };
+          throw new Error('fixture private PUT unavailable');
+        }
+        const lose = privateKey && fault.mode === 'after-put'; if (lose) fault.mode = 'none';
+        const result = await target.put(...args);
+        if (lose) { fault.failHead = true; throw new Error('fixture private PUT acknowledgement lost'); }
+        return result;
+      };
+      if (property === 'head') return async (...args: Parameters<R2Bucket['head']>) => {
+        if (args[0].startsWith('private/v1/') && fault.failHead) { fault.failHead = false; throw new Error('fixture private reconciliation HEAD unavailable'); }
+        return target.head(...args);
+      };
+      const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    super(fixtureCtx, { ...fixtureEnv, OBJECTS: wrapped }); this.capsuleFault = fault;
     fixtureCtx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_transform_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),block_arm_export INTEGER NOT NULL DEFAULT 0,arm_export_calls INTEGER NOT NULL DEFAULT 0)');
     fixtureCtx.storage.sql.exec('INSERT OR IGNORE INTO fixture_transform_control(singleton) VALUES(1)');
   }
@@ -204,6 +231,30 @@ export class AccountRepository extends Base {
         const views = exists('forge_view_names') ? [...sql.exec("SELECT n.name,n.current_version AS version,json_extract(v.spec,'$.export_allowed') AS export_allowed FROM forge_view_names n JOIN forge_view_versions v ON v.version=n.current_version ORDER BY n.name LIMIT 65")] : [];
         const control = [...sql.exec('SELECT block_arm_export,arm_export_calls FROM fixture_transform_control WHERE singleton=1')][0];
         return Response.json({ drafts, stage_roots, committed_runs, active_pin_roots, views, control });
+      }
+      if (url.pathname === '/__fixture/private-capsules') {
+        const input = await request.json() as { action?: string; mode?: string };
+        if (input.action === 'fault') {
+          if (!['none', 'before-put', 'after-put'].includes(input.mode ?? '')) fail(400, 'fixture_fault_mode');
+          this.capsuleFault.mode = input.mode as typeof this.capsuleFault.mode;
+          return Response.json({ mode: this.capsuleFault.mode });
+        }
+        if (input.action === 'held-put' || input.action === 'late-put') {
+          const held = this.capsuleFault.held; if (!held) fail(400, 'fixture_no_held_put');
+          let wrote: boolean | null = null;
+          if (input.action === 'late-put') wrote = (await this.fixtureEnv.OBJECTS.put(held.key, held.bytes, held.options)) !== null;
+          const object = await this.fixtureEnv.OBJECTS.get(held.key);
+          return Response.json({ key: held.key, bytes_hex: Array.from(held.bytes, byte => byte.toString(16).padStart(2, '0')).join(''),
+            options: held.options, wrote, current: object ? { size: object.size, metadata: object.customMetadata, bytes_hex: Array.from(new Uint8Array(await object.arrayBuffer()), byte => byte.toString(16).padStart(2, '0')).join('') } : null });
+        }
+        const result: Record<string, unknown> = {};
+        for (const table of ['private_capsules', 'private_capsule_heads', 'private_capsule_chunks', 'private_capsule_usage', 'forge_retained_roots']) {
+          if (![...sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", table)].length) { result[table] = []; continue; }
+          const rows = [...sql.exec(`SELECT * FROM ${table} ORDER BY rowid LIMIT 129`)];
+          if (rows.length > 128) fail(413, 'fixture_row_limit'); result[table] = rows;
+        }
+        result.objects = [...sql.exec('SELECT COUNT(*) AS count FROM objects')];
+        return Response.json(result);
       }
       if (url.pathname === '/__fixture/storage') return Response.json(await storageScenario(this.fixtureCtx, this.fixtureEnv.OBJECTS, account!, request));
       if (url.pathname === '/__fixture/gc') {

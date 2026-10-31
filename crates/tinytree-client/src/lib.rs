@@ -3,6 +3,8 @@
 mod client;
 pub mod archive;
 pub use archive::ArchiveClient;
+pub mod private_capsule;
+pub use private_capsule::PrivateCapsuleClient;
 mod config;
 mod forge_http;
 mod transport;

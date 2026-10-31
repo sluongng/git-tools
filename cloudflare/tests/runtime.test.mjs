@@ -2230,3 +2230,323 @@ test('archive schema inventory matches every application DDL and identifies only
     actual_hash: '4eb6b2780dfba9eda11272ea4816ae3e343a9c1290ee04c32c0029b70fb152c0', expected_hash: null,
   }], 'every compiled application DDL must match; only the pinned workerd alarm/bookmark table is outside it');
 });
+
+// These cases verify opaque transport and custody only. The bytes deliberately
+// are not labelled a verified native capture or genuine private-WIP recovery.
+const capsuleHex = value => typeof value === 'string' ? value : Buffer.from(value).toString('hex');
+function capsuleDescriptor(bytes) {
+  const chunks = []; let chain = '0'.repeat(64);
+  for (let offset = 0; offset < bytes.length; offset += 65536) {
+    const chunk = bytes.subarray(offset, offset + 65536), sequence = chunks.length;
+    chain = sha(`tinytree-private-capsule-chunk-v1\0${chain}\0${sequence}\0${chunk.length}\0${sha(chunk)}`);
+    chunks.push(chunk);
+  }
+  return { chunks, descriptor: { format: 'tinytree-private-capture-v1', total_bytes: bytes.length, chunk_count: chunks.length, chain_root: chain } };
+}
+async function capsuleBackend(t) {
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-private-capsule-'));
+  const source = fixture.checker, account = source.account_id;
+  const owner = 'capsule-owner-fixture', rotated = 'capsule-owner-rotated-fixture', peer = 'capsule-peer-fixture', raw = 'capsule-raw-fixture', archiveToken = 'capsule-archive-fixture';
+  const config = [
+    ...[owner, rotated].map(token => ({ principal: source.owner, token_sha256: sha(token), accounts: [account], operator: true, kind: 'forge' })),
+    { principal: 'capsule-peer', token_sha256: sha(peer), accounts: [account], operator: true, kind: 'forge' },
+    { principal: 'capsule-raw', token_sha256: sha(raw), accounts: [account], operator: true, kind: 'raw' },
+  ];
+  const configuration = { ...options(persist, { config, forge: true }),
+    modules: [{ type: 'ESModule', path: process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE }, { type: 'CompiledWasm', path: process.env.TINYTREE_PROJECTION_HARNESS_WASM }] };
+  configuration.bindings.ARCHIVERS_JSON = JSON.stringify([{ principal: 'capsule-archiver', token_sha256: sha(archiveToken), accounts: [account], export: true, restore: true }]);
+  let mf = new Miniflare(configuration); await mf.ready;
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  const forge = async (operation, payload = {}, { id = '', view = 'public', auth = owner, expected = 200 } = {}) => {
+    const response = await mf.dispatchFetch('https://capsule.invalid/api/v1/forge/call', { method: 'POST',
+      headers: { authorization: `Bearer ${auth}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 1, operation, account_id: account, view, request_id: id, payload_json: JSON.stringify(payload) }) });
+    const result = await response.json(); assert.equal(response.status, expected, JSON.stringify(result));
+    return expected === 200 ? { state: result.state, value: JSON.parse(result.result_json) } : result;
+  };
+  const rawCapsule = (action, capsule, fields = {}, { auth = owner } = {}) => mf.dispatchFetch('https://capsule.invalid/api/v1/private-capsule/call', { method: 'POST',
+    headers: { 'content-type': 'application/json', ...(auth === null ? {} : { authorization: `Bearer ${auth}` }) },
+    body: JSON.stringify({ schema: 1, account_id: account, capsule_id: capsule, action, ...fields }) });
+  const capsule = async (action, id, fields = {}, { expected = 200, code, ...rest } = {}) => {
+    const response = await rawCapsule(action, id, fields, rest), result = await response.json();
+    assert.equal(response.status, expected, JSON.stringify(result)); assert.equal(result.schema, 1);
+    if (expected !== 200) {
+      assert.deepEqual(Object.keys(result).sort(), ['error', 'schema']); if (code) assert.equal(result.error.code, code);
+    } else {
+      assert.equal(result.account_id, account); assert.equal(result.capsule_id, id);
+      assert.ok(!JSON.stringify(result).includes('private/v1/'), 'public reply cannot reveal internal locators');
+    }
+    return result;
+  };
+  const control = async (payload = {}) => {
+    const response = await mf.dispatchFetch(`https://capsule.invalid/__fixture/private-capsules?account=${account}`, { method: 'POST', body: JSON.stringify(payload) });
+    return value(response);
+  };
+  const archive = async (action, archiveId, fields = {}, expected = 200) => {
+    const response = await mf.dispatchFetch('https://capsule.invalid/api/v1/archive/call', { method: 'POST',
+      headers: { authorization: `Bearer ${archiveToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ schema: 1, account_id: account, archive_id: archiveId, action, ...fields }) });
+    return value(response, expected);
+  };
+  return { account, source, owner, rotated, peer, raw, forge, rawCapsule, capsule, control, archive,
+    bucket: () => mf.getR2Bucket('OBJECTS'), reload: async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; } };
+}
+async function capsuleSource(t) {
+  const h = await capsuleBackend(t), { source } = h;
+  const provisioned = (await h.forge(1, {}, { id: 'capsule-provision' })).value;
+  const begun = (await h.forge(40, { root: source.root,
+    source: { repository_id: 'capsule-native-fixture', reference: 'main', generation: 1, head: source.root.id },
+    destination: { generation: 1, head: capsuleHex(provisioned.main_revision) } }, { id: 'capsule-bootstrap' })).value;
+  for (const object of source.objects) await h.forge(41, { import_id: begun.import_id,
+    descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version },
+    data_base64: Buffer.from(object.bytes).toString('base64') }, { id: `io-${begun.import_id}-${object.kind}-${object.id}` });
+  let status = begun.status;
+  for (let round = 0; round < 128 && !status.complete; round++) {
+    status = (await h.forge(42, { import_id: begun.import_id, expected_generation: status.generation }, { id: `ia-${begun.import_id}-${status.generation}` })).value.status;
+    assert.equal(status.error, null);
+  }
+  assert.equal(status.phase, 'ready');
+  await h.forge(44, { import_id: begun.import_id, expected_generation: status.generation }, { id: 'capsule-bootstrap-finish' });
+  await h.forge(3, { expected_epoch: 1, member: { principal: 'capsule-peer', can_write: true, can_review: false, is_admin: false, roles: ['authors'] } }, { id: 'capsule-add-peer' });
+  const spec = { ...source.spec, export_allowed: true };
+  await h.forge(4, { spec, expected_epoch: 2, make_default: true, follow_main: false }, { id: 'capsule-export-view' });
+  let view = await h.forge(6);
+  for (let round = 0; round < 128 && view.state === 'pending'; round++) view = await h.forge(6, { version: view.value.view_version, progress: view.value.progress });
+  assert.equal(view.state, 'complete');
+  h.selection = { view: view.value.view, view_version: capsuleHex(view.value.view_version), policy_epoch: view.value.policy_epoch,
+    projected_commit: capsuleHex(view.value.projected_commit), projected_tree: capsuleHex(view.value.projected_tree) };
+  h.spec = spec; return h;
+}
+async function uploadCapsule(h, id, workspace, bytes, generation = 0, options = {}) {
+  const body = capsuleDescriptor(bytes);
+  await h.capsule('begin', id, { workspace_id: workspace, expected_generation: generation, selection: h.selection, descriptor: body.descriptor }, options);
+  for (let sequence = 0; sequence < body.chunks.length; sequence++) await h.capsule('append', id, { sequence, bytes_hex: body.chunks[sequence].toString('hex') }, options);
+  return h.capsule('finish', id, {}, options);
+}
+
+test('private capsules enforce owner integrity, monotone generation CAS and current export policy across restart and physical retirement', async t => {
+  const h = await capsuleSource(t), workspace = sha('capsule-workspace');
+  const ids = Object.fromEntries(['first', 'stale', 'second', 'third', 'peer'].map(name => [name, sha(`private-capsule-${name}`)]));
+  const source = Buffer.alloc(131073); for (let i = 0; i < source.length; i++) source[i] = i % 251;
+  const body = capsuleDescriptor(source), begin = { workspace_id: workspace, expected_generation: 0, selection: h.selection, descriptor: body.descriptor };
+  const main = (await h.forge(2)).value, originalNative = (await h.control()).objects;
+  const initial = await h.capsule('begin', ids.first, begin);
+  assert.deepEqual(await h.capsule('begin', ids.first, begin), initial);
+  await h.capsule('begin', ids.first, { ...begin, expected_generation: 1 }, { expected: 409, code: 'capsule_conflict' });
+  await h.capsule('read', ids.first, { sequence: 0 }, { expected: 409, code: 'capsule_conflict' });
+  await h.capsule('begin', ids.first, { ...begin, owner: 'capsule-peer' }, { expected: 400 });
+  await h.capsule('status', ids.first, {}, { auth: null, expected: 401 });
+  await h.capsule('status', ids.first, {}, { auth: h.raw, expected: 403, code: 'permission_denied' });
+  await h.capsule('status', ids.first, {}, { auth: h.peer, expected: 403, code: 'permission_denied' });
+  assert.deepEqual(await h.capsule('status', ids.first, {}, { auth: h.rotated }), initial, 'same principal credential rotation is not an ownership transfer');
+  const staleBody = capsuleDescriptor(Buffer.from('stale'));
+  await h.capsule('begin', ids.stale, { ...begin, descriptor: staleBody.descriptor });
+  await h.capsule('append', ids.stale, { sequence: 0, bytes_hex: staleBody.chunks[0].toString('hex') });
+  await h.control({ action: 'fault', mode: 'after-put' });
+  await h.capsule('append', ids.first, { sequence: 0, bytes_hex: body.chunks[0].toString('hex') }, { expected: 503, code: 'unavailable' });
+  const uncertain = await h.control();
+  const attempt = uncertain.private_capsule_chunks.find(chunk => chunk.capsule === ids.first);
+  assert.equal(attempt.state, 'pending'); assert.ok(await (await h.bucket()).get(attempt.locator));
+  const charged = uncertain.private_capsule_usage[0].bytes;
+  await h.reload();
+  const recovered = await h.capsule('append', ids.first, { sequence: 0, bytes_hex: body.chunks[0].toString('hex') });
+  assert.equal(recovered.next_sequence, 1);
+  assert.deepEqual(await h.capsule('append', ids.first, { sequence: 0, bytes_hex: body.chunks[0].toString('hex') }), recovered);
+  const afterRecovery = await h.control();
+  assert.equal(afterRecovery.private_capsule_usage[0].bytes, charged);
+  assert.equal(afterRecovery.private_capsule_chunks.find(chunk => chunk.capsule === ids.first).attempt_id, attempt.attempt_id);
+  const changed = Buffer.from(body.chunks[0]); changed[0] ^= 1;
+  await h.capsule('append', ids.first, { sequence: 0, bytes_hex: changed.toString('hex') }, { expected: 409, code: 'capsule_conflict' });
+  await h.capsule('append', ids.first, { sequence: 2, bytes_hex: '00' }, { expected: 409, code: 'out_of_range' });
+  const lost = await h.rawCapsule('append', ids.first, { sequence: 1, bytes_hex: body.chunks[1].toString('hex') });
+  assert.equal(lost.status, 200); await lost.body.cancel(); // Accepted response is deliberately not durably acknowledged.
+  await h.reload();
+  assert.equal((await h.capsule('append', ids.first, { sequence: 1, bytes_hex: body.chunks[1].toString('hex') })).next_sequence, 2);
+  await h.capsule('append', ids.first, { sequence: 2, bytes_hex: body.chunks[2].toString('hex') });
+  const sealed = await h.capsule('finish', ids.first); assert.equal(sealed.generation, 1); assert.equal(sealed.chain_root, body.descriptor.chain_root);
+  await h.reload(); assert.deepEqual(await h.capsule('finish', ids.first), sealed);
+  for (let sequence = 0; sequence < body.chunks.length; sequence++) {
+    const read = await h.capsule('read', ids.first, { sequence });
+    assert.equal(read.bytes_hex, body.chunks[sequence].toString('hex')); assert.equal(read.sha256, sha(body.chunks[sequence]));
+  }
+  await h.capsule('read', ids.first, { sequence: 0 }, { auth: h.peer, expected: 403 });
+  await h.capsule('retire', ids.first, {}, { auth: h.peer, expected: 403 });
+  const beforeRetire = await h.control();
+  await h.control({ action: 'fault', mode: 'after-put' });
+  await h.capsule('retire', ids.first, {}, { expected: 503 });
+  const deleting = await h.control();
+  assert.equal(deleting.private_capsule_usage[0].bytes, beforeRetire.private_capsule_usage[0].bytes, 'lost physical marker ACK cannot settle quota');
+  await h.reload(); assert.equal((await h.capsule('retire', ids.first)).state, 'deleted');
+  const retired = await h.control();
+  assert.equal(retired.private_capsule_usage[0].bytes, beforeRetire.private_capsule_usage[0].bytes - source.length);
+  for (const chunk of retired.private_capsule_chunks.filter(chunk => chunk.capsule === ids.first)) {
+    assert.equal(chunk.state, 'tombstoned'); const marker = await (await h.bucket()).get(chunk.locator);
+    assert.ok(marker); assert.equal(marker.size, 0); assert.equal(marker.customMetadata.retired, '1');
+    assert.equal((await marker.arrayBuffer()).byteLength, 0);
+  }
+  const head = retired.private_capsule_heads.find(head => head.principal === h.source.owner && head.workspace === workspace);
+  assert.equal(head.generation, 1); assert.equal(head.capsule, null, 'retirement preserves the generation tombstone');
+  await h.capsule('finish', ids.stale, {}, { expected: 409, code: 'capsule_conflict' });
+  assert.equal((await h.capsule('status', ids.stale)).state, 'uploading');
+  assert.equal((await h.capsule('retire', ids.stale)).state, 'deleted');
+  const second = await uploadCapsule(h, ids.second, workspace, Buffer.from('second'), 1); assert.equal(second.generation, 2);
+  const third = await uploadCapsule(h, ids.third, workspace, Buffer.from('third'), 2); assert.equal(third.generation, 3);
+  assert.deepEqual(await h.capsule('finish', ids.second), second, 'historical sealed receipt does not rewrite the newer head');
+  await h.capsule('finish', ids.first, {}, { expected: 409 });
+  assert.equal((await h.capsule('status', ids.first)).generation, 1);
+  const peer = await uploadCapsule(h, ids.peer, workspace, Buffer.from('peer'), 0, { auth: h.peer }); assert.equal(peer.generation, 1);
+  const heads = (await h.control()).private_capsule_heads;
+  const ownerHead = heads.find(head => head.principal === h.source.owner && head.workspace === workspace);
+  assert.equal(ownerHead.generation, 3); assert.equal(ownerHead.capsule, ids.third, 'historical replay and another principal cannot replace the current owner head');
+  assert.equal(heads.find(head => head.principal === 'capsule-peer' && head.workspace === workspace).generation, 1);
+  assert.equal((await h.capsule('read', ids.third, { sequence: 0 })).bytes_hex, Buffer.from('third').toString('hex'));
+  assert.ok((await h.control()).objects[0].count <= originalNative[0].count, 'opaque storage never installs native object authority; ordinary GC may remove old objects');
+  assert.deepEqual((await h.forge(2)).value, main, 'capsules never publish main or review/check state');
+  const heldId = sha('capsule-held-original'), heldBytes = Buffer.from('held original conditional create');
+  const heldBody = capsuleDescriptor(heldBytes);
+  await h.capsule('begin', heldId, { workspace_id: sha('capsule-held-workspace'), expected_generation: 0, selection: h.selection, descriptor: heldBody.descriptor });
+  await h.control({ action: 'fault', mode: 'before-put' });
+  await h.capsule('append', heldId, { sequence: 0, bytes_hex: heldBytes.toString('hex') }, { expected: 503 });
+  const pending = await h.control(), pendingRow = pending.private_capsule_chunks.find(chunk => chunk.capsule === heldId);
+  assert.equal(pendingRow.state, 'pending'); assert.equal(await (await h.bucket()).get(pendingRow.locator), null);
+  await h.capsule('append', heldId, { sequence: 0, bytes_hex: heldBytes.toString('hex') });
+  const retried = await h.control();
+  assert.equal(retried.private_capsule_usage[0].bytes, pending.private_capsule_usage[0].bytes);
+  assert.equal(retried.private_capsule_chunks.find(chunk => chunk.capsule === heldId).attempt_id, pendingRow.attempt_id);
+  assert.equal((await h.capsule('retire', heldId)).state, 'deleted');
+  const late = await h.control({ action: 'late-put' });
+  assert.equal(late.wrote, false, 'late original create-only PUT cannot resurrect retired bytes');
+  assert.equal(late.current.size, 0); assert.equal(late.current.bytes_hex, ''); assert.equal(late.current.metadata.retired, '1');
+  const protectedState = await h.control();
+  await h.forge(4, { spec: { ...h.spec, export_allowed: false }, expected_epoch: h.selection.policy_epoch, make_default: true, follow_main: false }, { id: 'capsule-revoke-export' });
+  await h.capsule('read', ids.third, { sequence: 0 }, { expected: 409, code: 'aborted' });
+  await h.capsule('retire', ids.third, {}, { expected: 409, code: 'aborted' });
+  assert.deepEqual((await h.control()).private_capsule_usage, protectedState.private_capsule_usage, 'stale policy retains private custody and charges');
+});
+
+test('private capsule archive restores sealed bytes, pending custody and permanent anti-resurrection markers in fresh SQLite and R2', async t => {
+  const h = await capsuleSource(t), sealedId = sha('capsule-archive-sealed'), pendingId = sha('capsule-archive-pending'), markerId = sha('capsule-archive-marker'), settledId = sha('capsule-archive-settled-marker');
+  const bytes = Buffer.alloc(65553); for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 17) % 256;
+  const sealed = await uploadCapsule(h, sealedId, sha('archive-sealed-workspace'), bytes);
+  const absentBytes = Buffer.from('unobserved private bytes'), absent = capsuleDescriptor(absentBytes);
+  await h.capsule('begin', pendingId, { workspace_id: sha('archive-pending-workspace'), expected_generation: 0, selection: h.selection, descriptor: absent.descriptor });
+  await h.control({ action: 'fault', mode: 'before-put' });
+  await h.capsule('append', pendingId, { sequence: 0, bytes_hex: absentBytes.toString('hex') }, { expected: 503 });
+  const markerBytes = Buffer.from('late original private payload'), markerBody = capsuleDescriptor(markerBytes);
+  await h.capsule('begin', markerId, { workspace_id: sha('archive-marker-workspace'), expected_generation: 0, selection: h.selection, descriptor: markerBody.descriptor });
+  await h.control({ action: 'fault', mode: 'before-put' });
+  await h.capsule('append', markerId, { sequence: 0, bytes_hex: markerBytes.toString('hex') }, { expected: 503 });
+  await h.capsule('append', markerId, { sequence: 0, bytes_hex: markerBytes.toString('hex') });
+  const chargedBeforeMarker = (await h.control()).private_capsule_usage[0].bytes;
+  await h.control({ action: 'fault', mode: 'after-put' });
+  await h.capsule('retire', markerId, {}, { expected: 503 });
+  const uncertainMarker = await h.control();
+  const originalMarkerRow = uncertainMarker.private_capsule_chunks.find(chunk => chunk.capsule === markerId);
+  assert.equal(originalMarkerRow.state, 'retiring');
+  assert.equal(uncertainMarker.private_capsules.find(capsule => capsule.id === markerId).state, 'retiring');
+  assert.equal(uncertainMarker.private_capsule_usage[0].bytes, chargedBeforeMarker, 'physical marker without its SQL ACK remains charged');
+  const sourceMarker = await (await h.bucket()).head(originalMarkerRow.locator);
+  assert.ok(sourceMarker); assert.equal(sourceMarker.size, 0); assert.equal(sourceMarker.customMetadata.retired, '1');
+  assert.notEqual(originalMarkerRow.etag, sourceMarker.etag);
+  assert.notEqual(originalMarkerRow.version, sourceMarker.version, 'export must handle the actual marker with stale original payload SQL identity');
+  await uploadCapsule(h, settledId, sha('archive-settled-marker-workspace'), Buffer.from('settled'));
+  assert.equal((await h.capsule('retire', settledId)).state, 'deleted');
+  const held = await h.control({ action: 'held-put' });
+  assert.equal(held.current.size, 0); assert.equal(held.current.metadata.retired, '1');
+  const before = await h.control(), account = (await h.forge(2)).value;
+  const pending = before.private_capsule_chunks.find(chunk => chunk.capsule === pendingId);
+  assert.equal(pending.state, 'pending'); assert.equal(await (await h.bucket()).get(pending.locator), null);
+  const archiveId = sha('opaque-private-full-account-archive');
+  let progress = await h.archive('export_begin', archiveId), pages = [], manifest;
+  let restarted = false;
+  for (let round = 0; round < 2048; round++) {
+    const sequence = progress.next_sequence;
+    const next = await h.archive('export_next', archiveId, { sequence });
+    if (next.page) {
+      assert.equal(next.page.sequence, pages.length); pages.push(next.page);
+      if (!restarted) {
+        await h.reload();
+        assert.deepEqual(await h.archive('export_next', archiveId, { sequence }), next, 'accepted export page replay survives SQLite restart');
+        restarted = true;
+      }
+    }
+    progress = next;
+    if (next.state === 'exported') { manifest = next.manifest; break; }
+  }
+  assert.ok(manifest && restarted); assert.equal(pages.length, manifest.page_count);
+  const privatePages = pages.filter(page => page.content.kind === 'private_payload');
+  assert.equal(privatePages.length, before.private_capsule_chunks.length);
+  for (const { content } of privatePages) {
+    assert.equal(Object.hasOwn(content, 'object_kind'), false); assert.equal(Object.hasOwn(content, 'object_id'), false);
+    assert.ok(content.locator.startsWith(`private/v1/${h.account}/`));
+  }
+  const markerPage = privatePages.find(page => page.content.capsule_id === markerId).content;
+  assert.equal(markerPage.state, 'retiring'); assert.equal(markerPage.presence, 'present'); assert.equal(markerPage.bytes_hex, '');
+  assert.equal(markerPage.size, markerBytes.length); assert.equal(markerPage.sha256, sha(markerBytes));
+  assert.equal(markerPage.source_etag, originalMarkerRow.etag); assert.equal(markerPage.source_version, originalMarkerRow.version);
+  const settledPage = privatePages.find(page => page.content.capsule_id === settledId).content;
+  assert.equal(settledPage.state, 'tombstoned'); assert.equal(settledPage.bytes_hex, '');
+  const absentPage = privatePages.find(page => page.content.capsule_id === pendingId).content;
+  assert.equal(absentPage.state, 'pending'); assert.equal(absentPage.presence, 'absent'); assert.equal(absentPage.bytes_hex, null);
+  await h.capsule('status', sealedId, {}, { expected: 503 });
+  await h.archive('export_finish', archiveId, { manifest });
+  assert.deepEqual(await h.capsule('status', sealedId), sealed);
+  const exportedState = await h.control();
+  assert.deepEqual(exportedState.private_capsule_chunks, before.private_capsule_chunks, 'archive operator cannot settle or rewrite source private custody');
+  assert.deepEqual(exportedState.private_capsule_usage, before.private_capsule_usage);
+  const target = await capsuleBackend(t);
+  await target.archive('restore_begin', archiveId, { manifest });
+  await target.capsule('status', sealedId, {}, { expected: 503 });
+  let restoredPage = false;
+  for (const page of pages) {
+    const receipt = await target.archive('restore_page', archiveId, { page });
+    if (!restoredPage && page.content.kind === 'private_payload') {
+      await target.reload();
+      assert.deepEqual(await target.archive('restore_page', archiveId, { page }), receipt, 'private payload checkpoint replays without duplicate quota or PUT adoption');
+      restoredPage = true;
+    }
+  }
+  assert.ok(restoredPage);
+  assert.equal((await target.archive('restore_finish', archiveId)).state, 'complete');
+  assert.deepEqual((await target.forge(2)).value, account);
+  const restored = await target.control();
+  assert.deepEqual(restored.private_capsule_usage, before.private_capsule_usage);
+  assert.deepEqual(restored.private_capsule_heads, before.private_capsule_heads);
+  assert.deepEqual(restored.private_capsules, before.private_capsules);
+  assert.deepEqual(await target.capsule('status', sealedId), sealed);
+  await target.capsule('read', sealedId, { sequence: 0 }, { auth: target.peer, expected: 403 });
+  const restoredBytes = [];
+  for (let sequence = 0; sequence < sealed.descriptor.chunk_count; sequence++) {
+    const chunk = await target.capsule('read', sealedId, { sequence });
+    const body = Buffer.from(chunk.bytes_hex, 'hex'); assert.equal(chunk.sha256, sha(body)); restoredBytes.push(body);
+  }
+  assert.deepEqual(Buffer.concat(restoredBytes), bytes, 'fresh target reads exact opaque bytes through production authority and target R2 identities');
+  const marker = await (await target.bucket()).get(held.key);
+  assert.ok(marker); assert.equal(marker.size, 0); assert.equal(marker.customMetadata.retired, '1');
+  const rebound = restored.private_capsule_chunks.find(chunk => chunk.capsule === markerId);
+  assert.equal(rebound.state, 'retiring'); assert.equal(rebound.etag, marker.etag); assert.equal(rebound.version, marker.version);
+  assert.notEqual(rebound.version, originalMarkerRow.version, 'restore rebinds provider identity without settling logical retirement');
+  const late = await (await target.bucket()).put(held.key, Buffer.from(held.bytes_hex, 'hex'), held.options);
+  assert.equal(late, null, 'restored permanent marker rejects the exact held original create-only PUT');
+  assert.equal((await (await target.bucket()).head(held.key)).size, 0);
+  assert.equal((await target.capsule('retire', markerId)).state, 'deleted');
+  const settledMarker = await target.control();
+  assert.equal(settledMarker.private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes - markerBytes.length);
+  assert.equal((await target.capsule('retire', markerId)).state, 'deleted');
+  assert.deepEqual((await target.control()).private_capsule_usage, settledMarker.private_capsule_usage, 'owner retirement refunds the archived unsettled marker exactly once');
+  const beforeRetry = await target.control();
+  await target.capsule('append', pendingId, { sequence: 0, bytes_hex: absentBytes.toString('hex') });
+  const afterRetry = await target.control();
+  assert.equal(afterRetry.private_capsule_usage[0].bytes, beforeRetry.private_capsule_usage[0].bytes, 'retry of archived uncertain attempt cannot charge twice');
+  assert.equal(afterRetry.private_capsule_chunks.find(chunk => chunk.capsule === pendingId).attempt_id, pending.attempt_id);
+  assert.equal((await target.capsule('finish', pendingId)).state, 'sealed');
+  assert.equal((await target.capsule('read', pendingId, { sequence: 0 })).bytes_hex, absentBytes.toString('hex'));
+  assert.equal((await target.capsule('retire', sealedId)).state, 'deleted');
+  const afterRetire = await target.control();
+  assert.equal(afterRetire.private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes - markerBytes.length - bytes.length);
+  for (const chunk of afterRetire.private_capsule_chunks.filter(chunk => chunk.capsule === sealedId)) {
+    const object = await (await target.bucket()).get(chunk.locator); assert.ok(object); assert.equal(object.size, 0); assert.equal(object.customMetadata.retired, '1');
+  }
+  assert.deepEqual(await h.capsule('status', sealedId), sealed, 'target byte retirement cannot mutate the separate source bucket or account');
+  assert.equal((await h.control()).private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes);
+});

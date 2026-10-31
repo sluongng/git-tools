@@ -22,6 +22,8 @@ import { AccountArchive, archiveBarrierInTx } from './account_archive';
 import { admitArchive, archiveResponse, protectArchive } from './archive_protocol';
 import { ARCHIVE_BUILD_ID, ARCHIVE_SCHEMA } from './archive_schema.generated';
 const ARCHIVE_ROUTE = '/api/v1/archive/call';
+import { PrivateCapsules } from './private_capsules';
+import { PRIVATE_CAPSULE_ROUTE, admitPrivateCapsule, privateCapsuleResponse, protectPrivateCapsule } from './private_capsule_protocol';
 
 interface Env {
   ASSETS?: Fetcher;
@@ -133,6 +135,14 @@ export default {
     const presentation = await staticUi(request, env.ASSETS);
     if (presentation) return presentation;
     const path = new URL(request.url).pathname;
+    if (path === PRIVATE_CAPSULE_ROUTE) {
+      return protectPrivateCapsule(async () => {
+        if (env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
+        const { call } = await admitPrivateCapsule(request.clone(), env);
+        const id = env.REPOSITORIES.idFromName(`native-account-v1:${call.account_id}`);
+        return env.REPOSITORIES.get(id).fetch(request);
+      });
+    }
     if (path === ARCHIVE_ROUTE) {
       return protectArchive(async () => {
         // Admit a bounded clone for routing; the DO independently authenticates
@@ -212,9 +222,11 @@ class RepositoryEngine {
     const forge = path.startsWith('/api/v1/forge/');
     const checker = path === CHECKER_ROUTE;
     const archive = path === ARCHIVE_ROUTE;
+    const capsule = path === PRIVATE_CAPSULE_ROUTE;
     // Archive pages are much larger than ordinary product calls. Keep at
     // most one physical archive page queued/running per account instance.
     if (archive && (this.active >= 16 || this.archiveActive >= 1)) return protectArchive(async () => fail(429, 'resource_exhausted'));
+    if (this.active >= 16 && capsule) return protectPrivateCapsule(async () => fail(429, 'resource_exhausted'));
     if (this.active >= 16 && checker) return json({ schema: 1, error: { code: 'resource_exhausted' } }, 429);
     if (this.active >= 16) return forge
       ? json({ version: 1, error: { code: 'resource_exhausted', message: 'account_admission_limit' } }, 429)
@@ -222,9 +234,9 @@ class RepositoryEngine {
     const dispatch = async (): Promise<Response> => {
       if (archive) return this.handleArchive(request);
       if (archiveBarrierInTx(this.sql)) fail(503, 'unavailable');
-      return checker ? this.handleChecker(request) : forge ? this.handleForge(request) : this.handle(request);
+      return capsule ? this.handlePrivateCapsule(request) : checker ? this.handleChecker(request) : forge ? this.handleForge(request) : this.handle(request);
     };
-    return this.enqueue(() => archive ? protectArchive(dispatch) : checker ? protectChecker(dispatch) : forge ? protectForge(dispatch) : protect(dispatch), archive);
+    return this.enqueue(() => archive ? protectArchive(dispatch) : capsule ? protectPrivateCapsule(dispatch) : checker ? protectChecker(dispatch) : forge ? protectForge(dispatch) : protect(dispatch), archive);
   }
   private enqueue<T>(action: () => Promise<T>, archive = false): Promise<T> {
     this.active++; if (archive) this.archiveActive++;
@@ -278,6 +290,56 @@ class RepositoryEngine {
       && this.one("SELECT 1 FROM transform_exports WHERE phase NOT IN ('settled_committed','settled_aborted') LIMIT 1"))
       || !!(this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_drafts'")
       && this.one("SELECT 1 FROM transform_drafts WHERE phase NOT IN ('committed','aborted','limit') LIMIT 1"));
+  }
+  private async handlePrivateCapsule(request: Request): Promise<Response> {
+    if (this.env.FORGE_BACKEND !== 'enabled') fail(503, 'unavailable');
+    const { call } = await admitPrivateCapsule(request, this.env);
+    const account = call.account_id, storage = this.forgeStorage(account);
+    let validatedBase: { root: string; projection: string } | undefined;
+    const capsules = new PrivateCapsules({
+      accountId: account, sql: this.sql, objects: this.env.OBJECTS,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      authenticate: async () => {
+        // Re-match the original current credential on every call, including
+        // after physical awaits. Only principal owns a capsule; rotation is
+        // allowed if the new exact credential still admits this account.
+        const current = await authenticate(request, this.env.PRINCIPALS_JSON);
+        if (current.kind !== 'forge' || !current.accounts.includes(account)) fail(403, 'permission_denied');
+        return { principal: current.principal };
+      },
+      authorizeInTx: (principal, selection) => {
+        const api = this.forgeAccounts(account, principal, false, storage);
+        api.authorityInTx(['begin', 'append', 'finish'].includes(call.action) ? 'write' : 'read', selection.policy_epoch);
+        const { views, projections } = this.forgeServices(account, principal, api, storage);
+        const version = Array.from(selection.view_version.match(/../g)!, byte => parseInt(byte, 16));
+        const view = views.resolveInTx(selection.view, version), d = view.description;
+        if (d.policy_epoch !== selection.policy_epoch || nativeId(d.view_version) !== selection.view_version) fail(409, 'aborted');
+        const selected = this.one('SELECT spec FROM forge_view_versions WHERE version=?', selection.view_version);
+        const current = this.one('SELECT v.spec FROM forge_view_names n JOIN forge_view_versions v ON v.version=n.current_version WHERE n.name=?', d.view);
+        let selectedSpec, currentSpec;
+        try { selectedSpec = JSON.parse(String(selected?.spec)); currentSpec = JSON.parse(String(current?.spec)); } catch { fail(503, 'unavailable'); }
+        if (selectedSpec.export_allowed !== true || currentSpec.export_allowed !== true) fail(403, 'permission_denied');
+        const ready = projections.readyInTx(view);
+        if (!ready) fail(409, 'aborted');
+        const root = nativeId(ready.binding.projected_commit);
+        if (root !== selection.projected_commit || nativeId(ready.binding.projected_tree) !== selection.projected_tree) fail(409, 'aborted');
+        this.retainedForgeClosureInTx(account, storage, { kind: 3, id: root });
+        validatedBase = { root, projection: ready.catalog_id };
+        return { projection_id: ready.catalog_id, base_root: root };
+      },
+      mutationInTx: () => this.rootAddedInTx(storage),
+      retainBaseInTx: (capsuleId, baseRoot) => {
+        if (!validatedBase || validatedBase.root !== baseRoot) fail(403, 'permission_denied');
+        this.rootAddedInTx(storage);
+        this.retainedForgeClosureInTx(account, storage, { kind: 3, id: baseRoot });
+        this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('private-capsule',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", capsuleId, baseRoot);
+      },
+      releaseBaseInTx: (capsuleId, baseRoot) => {
+        this.rootAddedInTx(storage);
+        this.sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='private-capsule' AND owner_id=? AND kind=3 AND id=?", capsuleId, baseRoot);
+      },
+    });
+    return privateCapsuleResponse(await capsules.handle(call));
   }
   private archive(accountId: string): AccountArchive {
     const tables = ARCHIVE_SCHEMA.filter(entry => entry.kind === 'table');

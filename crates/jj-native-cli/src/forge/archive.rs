@@ -229,6 +229,7 @@ struct Counts {
     tables: BTreeMap<String, (Vec<String>, u64, Option<i64>)>,
     last_table: Option<String>,
     last_attempt: Option<String>,
+    last_private_attempt: Option<String>,
 }
 impl Counts {
     fn accept(&mut self, page: &ArchivePage) -> Result<(), CommandError> {
@@ -243,6 +244,7 @@ impl Counts {
                 rows,
             } => {
                 if self.last_attempt.is_some()
+                    || self.last_private_attempt.is_some()
                     || self.last_table.as_ref().is_some_and(|last| last > table)
                 {
                     return Err(invalid());
@@ -265,14 +267,26 @@ impl Counts {
                 self.rows += rows.len() as u64;
             }
             Content::Payload { attempt_id, .. } => {
+                if self.last_private_attempt.is_some()
+                    || self
+                        .last_attempt
+                        .as_ref()
+                        .is_some_and(|last| last >= attempt_id)
+                {
+                    return Err(invalid());
+                }
+                self.last_attempt = Some(attempt_id.clone());
+                self.payloads += 1;
+            }
+            Content::PrivatePayload { attempt_id, .. } => {
                 if self
-                    .last_attempt
+                    .last_private_attempt
                     .as_ref()
                     .is_some_and(|last| last >= attempt_id)
                 {
                     return Err(invalid());
                 }
-                self.last_attempt = Some(attempt_id.clone());
+                self.last_private_attempt = Some(attempt_id.clone());
                 self.payloads += 1;
             }
         }

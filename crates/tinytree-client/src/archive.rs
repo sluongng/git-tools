@@ -198,6 +198,19 @@ pub enum Content {
         presence: String,
         bytes_hex: Option<String>,
     },
+    PrivatePayload {
+        capsule_id: String,
+        sequence: u64,
+        attempt_id: String,
+        size: u64,
+        sha256: String,
+        locator: String,
+        state: String,
+        source_etag: Option<String>,
+        source_version: Option<String>,
+        presence: String,
+        bytes_hex: Option<String>,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -404,6 +417,56 @@ impl ArchivePage {
                             .map_err(|_| invalid())?;
                     }
                     ("absent", None) if state != "written" => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            Content::PrivatePayload {
+                capsule_id,
+                sequence,
+                attempt_id,
+                size,
+                sha256,
+                locator,
+                state,
+                source_etag,
+                source_version,
+                presence,
+                bytes_hex,
+            } => {
+                if !valid_hash(capsule_id)
+                    || !valid_hash(attempt_id)
+                    || !valid_hash(sha256)
+                    || *sequence >= 8192
+                    || *size == 0
+                    || *size > 65536
+                    || locator
+                        != &format!(
+                            "private/v1/{}/{}/{}/{}",
+                            self.account_id, capsule_id, sequence, attempt_id
+                        )
+                    || !["pending", "written", "retiring", "tombstoned"].contains(&state.as_str())
+                    || source_etag.as_ref().is_some_and(|s| s.len() > 1024)
+                    || source_version.as_ref().is_some_and(|s| s.len() > 1024)
+                {
+                    return Err(invalid());
+                }
+                match (presence.as_str(), bytes_hex) {
+                    ("present", Some(bytes))
+                        if matches!(state.as_str(), "retiring" | "tombstoned")
+                            && bytes.is_empty() => {}
+                    ("present", Some(bytes))
+                        if state != "tombstoned"
+                            && bytes.len() == *size as usize * 2
+                            && bytes
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+                    {
+                        let actual = Sha256::digest(unhex(bytes)?);
+                        if hex(&actual) != *sha256 {
+                            return Err(invalid());
+                        }
+                    }
+                    ("absent", None) if state != "written" && state != "tombstoned" => {}
                     _ => return Err(invalid()),
                 }
             }
