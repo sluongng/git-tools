@@ -35,7 +35,7 @@ export interface ProjectionHost {
    * attachInTx is invoked inside ClosureJobs.publish's existing SQL transaction. */
   closureForProjection(view: ResolvedView, binding: ClosureBinding,
     attachInTx: (proofJobId: string) => unknown, authorizeCurrentInTx?: () => void): ClosureJobs;
-  retainProjectionRootInTx(projectionId: string, head: string, proofJobId: string): void;
+  retainProjectionRootInTx(projectionId: string, head: string, proofJobId: string, producerJobId: string): void;
 }
 export interface ProjectionProgress { job_id: string; expected_generation: number }
 type Phase = 'select' | 'build' | 'stage' | 'closure' | 'ready' | 'limit' | 'obsolete';
@@ -553,7 +553,7 @@ export class ForgeProjections {
         this.host.sql.exec('INSERT INTO projection_private_origins(projection,canonical_path,projected_copy,value) VALUES(?,?,?,?)',plan.record_key,origin.canonical_path,hex(origin.projected_copy),encoded);
       }
     }
-    this.host.retainProjectionRootInTx(plan.record_key,hex(plan.binding.projected_commit),proofId);
+    this.host.retainProjectionRootInTx(plan.record_key,hex(plan.binding.projected_commit),proofId,job.id);
     job.phase='ready';job.error=null;job.result=JSON.stringify(plan.binding);job.plan_bytes=0;this.save(job);
     const frontier=this.one<{n:number;bytes:number}>('SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(prefix AS BLOB))),0) AS bytes FROM projection_frontier WHERE job=?',job.id)!;
     const usage=this.usage();if(usage.frontier_rows<frontier.n||usage.selected_rows<selected.length||usage.path_bytes<frontier.bytes+job.path_bytes) throw new Invalid();

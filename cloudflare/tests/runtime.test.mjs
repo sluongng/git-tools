@@ -231,7 +231,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
     await forgeValue(await callForge(2, {}, '', { selectedAccount }), 403, 'permission_denied');
     assert.equal((await call(mf, selectedAccount, 'repository', {}, { token: raw, method: 'GET' })).status, 404, 'no partial SQL claim');
     const bucket = await mf.getR2Bucket('OBJECTS');
-    assert.ok((await bucket.list({ prefix: `native/v1/${selectedAccount}/` })).objects.length > 0, 'real staged R2 orphan');
+    assert.ok((await bucket.list({ prefix: `native/v2/${selectedAccount}/` })).objects.length > 0, 'real staged R2 orphan');
     await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true }));
     const recovered = await forgeValue(await callForge(1, {}, 'recover-provision', { selectedAccount }));
     assert.equal(recovered.main_generation, 1); assert.equal(recovered.policy_epoch, 1);
@@ -461,9 +461,18 @@ test('declared tt CLI uses actual workerd account authority and resumes exact in
   await command(first, ['account', 'provision', '--request-id', 'tt-cannot-steal-peer'], false);
   assert.deepEqual((await command(peer, ['account', 'show'])).result.value, peerProvisioned);
   await select(first, firstAccount);
-  const keys = async () => (await (await mf.getR2Bucket('OBJECTS')).list({ prefix: `native/v1/${firstAccount}/` })).objects.map(object => object.key).sort();
+  const keys = async () => (await (await mf.getR2Bucket('OBJECTS')).list({ prefix: `native/v2/${firstAccount}/` })).objects.map(object => object.key).sort();
   const originalKeys = await keys();
-  assert.ok(originalKeys.includes(`native/v1/${firstAccount}/3/${provisioned.main_revision}`));
+  const mainLocators = originalKeys.filter(key => key.startsWith(`native/v2/${firstAccount}/3/${provisioned.main_revision}/`));
+  assert.equal(mainLocators.length, 1, 'provision replay retains one physical canonical main incarnation');
+  const mainLocator = mainLocators[0];
+  const attempt = mainLocator.split('/').at(-1);
+  assert.match(attempt, /^[0-9a-f]{64}$/);
+  const physicalMain = await (await mf.getR2Bucket('OBJECTS')).head(mainLocator);
+  assert.ok(physicalMain);
+  assert.deepEqual(physicalMain.customMetadata, { account: firstAccount, kind: '3', id: provisioned.main_revision, attempt, format: '1' });
+  assert.ok(!mainLocator.includes(firstToken) && !mainLocator.includes(peerToken));
+  assert.ok(originalKeys.every(key => !key.startsWith(`native/v2/${peerAccount}/`)), 'owner payload inventory stays account-scoped');
   await mf.dispose();
   mf = new Miniflare({ ...options(persist, { config, forge: true }), host: '127.0.0.1', port: Number(address.port) });
   assert.equal((await mf.ready).origin, endpoint, 'restart retains the exact context origin, not a rebound request');
@@ -648,9 +657,9 @@ async function projectionRuntime(t, source = fixture.projection) {
     const result = await call(operation, payload, options);
     assert.equal(result.status, 200, JSON.stringify(result)); return result;
   };
-  const control = async (action, payload) => {
+  const control = async (action, payload, expected = 200) => {
     const response = await state.mf.dispatchFetch(`https://projection.invalid/__fixture/${action}?account=${source.account_id}`, { method: 'POST', body: JSON.stringify(payload ?? {}) });
-    const value = await response.json(); assert.equal(response.status, 200, JSON.stringify(value)); return value;
+    const value = await response.json(); assert.equal(response.status, expected, JSON.stringify(value)); return value;
   };
   await success(1, {}, { id: 'wide-provision' });
   const before = (await success(2)).value;
@@ -699,6 +708,7 @@ async function projectionRuntime(t, source = fixture.projection) {
     assert.equal(shown.state, 'complete'); return shown.result.value;
   };
   return { source, call, success, control, showWithCli, cliCommand,
+    bucket: () => state.mf.getR2Bucket('OBJECTS'),
     reload: async () => { await state.mf.dispose(); state.mf = new Miniflare({ ...configuration, port: Number(address.port) }); await state.mf.ready; },
     keys: async () => (await (await state.mf.getR2Bucket('OBJECTS')).list()).objects.map(object => object.key).sort(),
   };
@@ -777,6 +787,37 @@ test('ordinary scoped uploads match native byte receipts and copy/path authority
     }
   }
   assert.ok(widePending > 0, '701-path metadata scope is resumable work, not one synchronous publication');
+  // The vendor TREE is a retained standalone upload root whose CopyHistory is
+  // valid only at its canonical nonempty prefix. Production GC must preserve
+  // that context and its dependencies, while deleting an unrelated orphan.
+  const orphan = await h.control('storage', { action: 'orphan', object: { ...objects.get('original_file'), format_version: 1 } });
+  const gcControl = (payload, expected) => h.control('gc', payload, expected);
+  const retainedUploads = source.cases.filter(object => ['new-file', 'new-copy', 'nested-tree'].includes(object.name));
+  for (const uploaded of retainedUploads) {
+    const denied = await h.call(9, { version: source.view_version, kind: uploaded.kind,
+      id: Array.from(Buffer.from(uploaded.id, 'hex')), max_bytes: 65536 });
+    assert.equal(denied.status, 403, 'supplied-byte ownership is not a baseline view read grant even before GC');
+    assert.equal(denied.envelope.error.code, 'permission_denied');
+  }
+  await gcControl({ action: 'request' });
+  const collected = await finishProductionGc(gcControl);
+  assert.equal(activeGcJob(collected).phase, 'complete', JSON.stringify(activeGcJob(collected)));
+  assert.ok(activeGcJob(collected).deleted >= 1);
+  assert.equal(collected.attempts.find(attempt => attempt.attempt_id === orphan.incarnation.attempt_id).state, 'deleted');
+  for (const uploaded of retainedUploads) {
+    const denied = await h.call(9, { version: source.view_version, kind: uploaded.kind,
+      id: Array.from(Buffer.from(uploaded.id, 'hex')), max_bytes: 65536 });
+    assert.equal(denied.status, 403, 'GC preserves, rather than broadens, unchanged baseline read authority');
+    assert.equal(denied.envelope.error.code, 'permission_denied');
+    const incarnation = collected.attempts.find(attempt => attempt.kind === uploaded.kind && attempt.id === uploaded.id && attempt.current === 1);
+    assert.ok(incarnation, `${uploaded.name}: retained current catalog incarnation`);
+    assert.equal(incarnation.state, 'written');
+    const payload = await (await h.bucket()).get(incarnation.locator);
+    assert.ok(payload, `${uploaded.name}: genuine retained R2 payload`);
+    assert.deepEqual(Array.from(new Uint8Array(await payload.arrayBuffer())), uploaded.bytes);
+    assert.deepEqual(payload.customMetadata, physicalMetadata(h.source.account_id, uploaded, incarnation.attempt_id));
+  }
+
   assert.deepEqual((await h.success(2)).value, before.account, 'neither scoped receipts nor canonical closure readiness publishes main');
   assert.deepEqual((await h.success(5)).value, before.views, 'ordinary byte uploads cannot change named/default views');
   const first = source.cases[0];
@@ -1292,12 +1333,14 @@ test('production reviews admit shipped bootstrap source, persist exact patchsets
       signal, method: 'POST', headers: { 'content-type': 'application/json', ...(auth === null ? {} : { authorization: `Bearer ${auth}` }) },
       body: JSON.stringify({ version: 1, operation, account_id: source.account_id, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
     });
+    const errorBody = response.status === 200 ? undefined : (await response.clone().text()).replaceAll(token, '<redacted>').slice(0, 4096);
     const envelope = await response.json();
     if (response.status === 200) {
       assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id);
       assert.equal(envelope.account_id, source.account_id); assert.equal(envelope.view, 'public');
     }
-    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined,
+      ...(errorBody === undefined ? {} : { error_body: errorBody }) };
   };
   const success = async (...args) => { const reply = await callReview(...args); assert.equal(reply.status, 200, JSON.stringify(reply)); return reply; };
   const provisioned = (await success(1, {}, { id: 'review-provision' })).value;
@@ -1349,7 +1392,7 @@ test('production reviews admit shipped bootstrap source, persist exact patchsets
     source_base: oracle.push.source_base, source_head: oracle.push.source_head, view_version: oracle.push.view_version };
   const push = async (round = -1, previous = 'new', signal) => {
     const reply = await callReview(20, pushPayload, { id: oracle.request_id, signal });
-    assert.equal(reply.status, 200, JSON.stringify({ request_id: oracle.request_id, round, previous_state: previous }));
+    assert.equal(reply.status, 200, JSON.stringify({ request_id: oracle.request_id, round, previous_state: previous, ...(reply.status === 200 ? {} : { response_body: reply.error_body }) }));
     return reply;
   };
   let review = await push();
@@ -1807,3 +1850,341 @@ test('private proved transform roots cannot become public views before source ar
   await denyPublicRunAndPin();
   assert.deepEqual((await success(f.destination.account_id, 2)).value, originalMain);
 });
+
+
+
+// Test-only trusted maintenance actions; product provisioning still uses the
+// shipped ingress. The harness uses genuine SQLite/R2 and production lifecycle
+// methods, not public deletion authority or a synthetic successful receipt.
+async function storageLifecycleRuntime(t, accounts) {
+  const entry = process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE;
+  const core = process.env.TINYTREE_PROJECTION_HARNESS_WASM;
+  assert.ok(entry && core, 'declared storage harness and RustWasm required');
+  const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-storage-lifecycle-'));
+  const token = 'storage-lifecycle-owner-fixture';
+  const configuration = {
+    modules: [{ type: 'ESModule', path: entry }, { type: 'CompiledWasm', path: core }],
+    compatibilityDate: '2026-07-08',
+    durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
+    r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(persist, 'do'), r2Persist: path.join(persist, 'r2'),
+    bindings: { PRINCIPALS_JSON: JSON.stringify([{ principal: 'storage-owner', token_sha256: sha(token), accounts, operator: true, kind: 'forge' }]),
+      FORGE_BACKEND: 'enabled', EXPERIMENTAL_RAW_BACKEND: 'disabled' },
+  };
+  let mf = new Miniflare(configuration);
+  await mf.ready;
+  t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
+  for (const account of accounts) {
+    const response = await mf.dispatchFetch('https://storage.invalid/api/v1/forge/call', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ version: 1, operation: 1, account_id: account, view: '', request_id: 'storage-provision', payload_json: '{}' }),
+    });
+    assert.equal(response.status, 200, await response.text());
+  }
+  const rawControl = async (account, action, payload) => {
+    const response = await mf.dispatchFetch(`https://storage.invalid/__fixture/${action}?account=${account}`, { method: 'POST', body: JSON.stringify(payload) });
+    return { status: response.status, value: await response.json() };
+  };
+  const control = async (account, action, payload, expected = 200) => {
+    const result = await rawControl(account, action, payload);
+    assert.equal(result.status, expected, JSON.stringify(result.value)); return result.value;
+  };
+  const call = async (account, operation, payload = {}, { id = '', view = 'public', auth = token } = {}) => {
+    const response = await mf.dispatchFetch('https://storage.invalid/api/v1/forge/call', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(auth === null ? {} : { authorization: `Bearer ${auth}` }) },
+      body: JSON.stringify({ version: 1, operation, account_id: account, view, request_id: id, payload_json: JSON.stringify(payload) }),
+    });
+    const envelope = await response.json();
+    return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
+  };
+  const success = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, JSON.stringify(result)); return result; };
+  return {
+    control, rawControl, call, success,
+    invoke: (account, payload) => control(account, 'storage', payload),
+    bucket: () => mf.getR2Bucket('OBJECTS'),
+    reload: async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; },
+  };
+}
+function accountingDelta(after, before) {
+  return Object.fromEntries(Object.keys(before).map(key => [key, after[key] - before[key]]));
+}
+function physicalMetadata(account, object, attempt) {
+  return { attempt, account, kind: String(object.kind), id: object.id, format: '1' };
+}
+
+test('production storage isolates delayed old DELETE and stale confirmation from a same-ID replacement with exact restart settlement', async t => {
+  const account = 'storage-replacement';
+  const h = await storageLifecycleRuntime(t, [account]);
+  const object = { ...objects.get('original_file'), format_version: 1 };
+  const result = await h.invoke(account, { action: 'replace-delayed-delete', object });
+  assert.deepEqual(accountingDelta(result.normal.accounting, result.baseline.accounting), {
+    logical_objects: 1, logical_bytes: object.size_bytes, reservations: 1,
+    physical_payloads: 1, physical_bytes: object.size_bytes, attempt_rows: 1,
+  });
+  assert.deepEqual(result.confirmedReplay, result.normal, 'exact confirmation replay does not double-charge');
+  assert.deepEqual(result.read, object.bytes);
+  assert.deepEqual(result.reread, object.bytes, 'replacement remains readable after actual old DELETE');
+  assert.deepEqual(result.reservedRetireError, { status: 409, code: 'aborted' }, 'live reservation fences current victim retirement');
+  assert.deepEqual(result.staleError, { status: 409, code: 'aborted' }, 'old process-local token cannot resurrect retired incarnation');
+  assert.deepEqual(result.deleteError, { status: 503, code: 'unavailable' });
+  assert.notEqual(result.original.attempt_id, result.replacement.attempt_id);
+  assert.ok(result.replacement.generation > result.original.generation);
+  assert.equal(result.puts.length, 2);
+  for (const [index, incarnation] of [result.original, result.replacement].entries()) {
+    const expected = physicalMetadata(account, object, incarnation.attempt_id);
+    assert.equal(result.puts[index].key, `native/v2/${account}/${object.kind}/${object.id}/${incarnation.attempt_id}`);
+    assert.deepEqual(result.puts[index].metadata, expected);
+  }
+  assert.deepEqual(result.deletes, [result.puts[0].key]);
+  assert.equal(result.heads[0], null, 'fault occurs after the real old payload was deleted');
+  assert.deepEqual(result.heads[1], { size: object.size_bytes, metadata: result.puts[1].metadata });
+  assert.deepEqual(accountingDelta(result.after.accounting, result.baseline.accounting), {
+    logical_objects: 1, logical_bytes: object.size_bytes, reservations: 1,
+    physical_payloads: 2, physical_bytes: 2 * object.size_bytes, attempt_rows: 2,
+  }, 'unknown DELETE acknowledgement must retain charge until exact replay');
+  assert.equal(result.after.attempts.find(a => a.attempt_id === result.original.attempt_id).state, 'retiring');
+  await h.reload();
+  const settled = await h.invoke(account, { action: 'delete', attempt_id: result.original.attempt_id });
+  assert.deepEqual(accountingDelta(settled.accounting, result.baseline.accounting), {
+    logical_objects: 1, logical_bytes: object.size_bytes, reservations: 1,
+    physical_payloads: 1, physical_bytes: object.size_bytes, attempt_rows: 2,
+  });
+  assert.equal(settled.attempts.find(a => a.attempt_id === result.original.attempt_id).state, 'deleted');
+  assert.deepEqual(settled.read, object.bytes, 'fresh storage instance reads the replacement after old delete recovery');
+  const live = settled.attempts.find(a => a.attempt_id === result.replacement.attempt_id);
+  assert.equal(live.current, true); assert.equal(live.state, 'written');
+  assert.deepEqual(await h.invoke(account, { action: 'delete', attempt_id: result.original.attempt_id }), settled,
+    'replayed settlement cannot release the replacement charge or decrement twice');
+});
+
+test('production storage retains uncertain PUT custody across restart and trusted bounded reservation release is exact-once', async t => {
+  const accounts = ['storage-lost-put', 'storage-absent-put', 'storage-terminal-owner'];
+  const h = await storageLifecycleRuntime(t, accounts);
+  const object = { ...objects.get('original_file'), format_version: 1 };
+  const written = await h.invoke(accounts[0], { action: 'put-ack-lost', object });
+  assert.deepEqual(written.error, { status: 503, code: 'unavailable' });
+  assert.equal(written.visible, null);
+  const writtenAttempt = written.attempts.find(a => a.descriptor.id === object.id);
+  assert.equal(writtenAttempt.state, 'pending'); assert.equal(writtenAttempt.current, false);
+  assert.deepEqual(written.head, { size: object.size_bytes, metadata: physicalMetadata(accounts[0], object, writtenAttempt.attempt_id) });
+  const absent = await h.invoke(accounts[1], { action: 'put-unobserved', object });
+  assert.deepEqual(absent.error, { status: 503, code: 'unavailable' });
+  assert.equal(absent.head, null); assert.equal(absent.visible, null);
+  const absentAttempt = absent.attempts.find(a => a.descriptor.id === object.id);
+  assert.equal(absentAttempt.state, 'pending');
+  for (const result of [written, absent]) {
+    assert.deepEqual(accountingDelta(result.accounting, result.baseline.accounting), {
+      logical_objects: 1, logical_bytes: object.size_bytes, reservations: 1,
+      physical_payloads: 1, physical_bytes: object.size_bytes, attempt_rows: 1,
+    });
+  }
+  await h.reload();
+  const recovered = await h.invoke(accounts[0], { action: 'recover', attempt_id: writtenAttempt.attempt_id });
+  assert.deepEqual(recovered.recovered, { ...writtenAttempt, state: 'written' }, 'exact HEAD may establish terminal write, never logical publication');
+  assert.deepEqual(recovered.accounting, written.accounting);
+  assert.equal(recovered.visible, null); assert.equal(recovered.read, null);
+  const unresolved = await h.invoke(accounts[1], { action: 'recover', attempt_id: absentAttempt.attempt_id });
+  assert.deepEqual(unresolved.recovered, absentAttempt, 'HEAD absence cannot prove an outstanding PUT will never arrive');
+  assert.deepEqual(unresolved.accounting, absent.accounting);
+  assert.deepEqual(await h.invoke(accounts[1], { action: 'recover', attempt_id: absentAttempt.attempt_id }), unresolved);
+  const descriptors = [...new Map([...fixture.objects, ...fixture.projection.objects].filter(o => o.kind === 1).map(o => [o.id, { kind: o.kind, id: o.id, size_bytes: o.size_bytes, format_version: 1 }])).values()].slice(0, 3);
+  assert.equal(descriptors.length, 3, 'native fixture supplies three distinct FILE reservations');
+  const released = await h.invoke(accounts[2], { action: 'release', objects: descriptors });
+  assert.equal(released.reserved.accounting.reservations - released.baseline.accounting.reservations, 4);
+  assert.deepEqual(released.releases, [{ released: 1, complete: false }, { released: 1, complete: false }, { released: 1, complete: true }, { released: 0, complete: true }]);
+  assert.equal(released.after.accounting.reservations - released.baseline.accounting.reservations, 1, 'unrelated live owner reservation is not released');
+  assert.equal(released.after.accounting.physical_payloads, released.baseline.accounting.physical_payloads, 'owner release is not physical payload settlement');
+  assert.ok(released.retained.objects.some(d => d.id === descriptors[0].id));
+  assert.ok(!released.retained.objects.some(d => descriptors.slice(1).some(o => o.id === d.id)));
+});
+
+function activeGcJob(snapshot) {
+  const active = snapshot.gc_maintenance[0].active;
+  return active ? snapshot.gc_jobs.find(job => job.id === active) : snapshot.gc_jobs.at(-1);
+}
+async function finishProductionGc(control, initial) {
+  let snapshot = initial;
+  const deadline = Date.now() + 60000;
+  for (let quantum = 0; quantum < 512 && Date.now() < deadline; quantum++) {
+    if (snapshot && snapshot.gc_maintenance[0].active === null && ['complete', 'failed'].includes(activeGcJob(snapshot)?.phase)) return snapshot;
+    snapshot = await control({ action: 'tick' });
+  }
+  assert.fail(`production GC did not terminate within bounded alarm delivery: ${JSON.stringify(activeGcJob(snapshot))}`);
+}
+async function readyStorageView(h, account, view = 'public') {
+  let reply = await h.success(account, 6, {}, { view });
+  for (let round = 0; round < 512 && reply.envelope.state === 'pending'; round++) {
+    reply = await h.success(account, 6, continuation(reply), { view });
+  }
+  assert.equal(reply.envelope.state, 'complete'); return reply.value;
+}
+async function gcViewFixture(h, account, historical = false) {
+  const keep = fixture.checker;
+  const seed = async (objects, root) => h.control(account, 'seed', {
+    objects: objects.map(object => ({ ...object, format_version: 1 })), root,
+  });
+  const handoff = root => h.control(account, 'gc', { action: 'handoff-seed', root });
+  let epoch = 1, old;
+  if (historical) {
+    const root = closureKey(objects.get('first_commit'));
+    const names = ['original_file', 'updated_file', 'copy_seed', 'nested_copy', 'symlink', 'subtree', 'first_tree', 'first_commit'];
+    await seed(names.map(name => objects.get(name)), root);
+    const spec = { ...keep.spec, revision: Array.from(Buffer.from(root.id, 'hex')) };
+    old = (await h.success(account, 4, { spec, expected_epoch: epoch++, make_default: true, follow_main: false }, { id: 'gc-historical-view' })).value;
+    await readyStorageView(h, account);
+    await handoff(root);
+  }
+  await seed(keep.objects, keep.root);
+  const current = (await h.success(account, 4, { spec: keep.spec, expected_epoch: epoch++, make_default: true, follow_main: false }, { id: 'gc-public-view' })).value;
+  await handoff(keep.root);
+  const lockedSpec = { ...keep.spec, name: 'locked', visibility: { kind: 'members' } };
+  const locked = (await h.success(account, 4, { spec: lockedSpec, expected_epoch: epoch++, make_default: false, follow_main: false }, { id: 'gc-locked-view', view: 'locked' })).value;
+  if (old) await h.success(account, 11, { version: old.view_version, expected_epoch: epoch++ }, { id: 'gc-retire-history' });
+  const publicSnapshot = await readyStorageView(h, account);
+  const lockedSnapshot = await readyStorageView(h, account, 'locked');
+  assert.deepEqual(publicSnapshot.view_version, current.view_version);
+  assert.deepEqual(lockedSnapshot.view_version, locked.view_version);
+  return { keep, publicSnapshot, lockedSnapshot, epoch };
+}
+
+test('production alarm GC restarts strict marking, preserves main/public/locked custody and pending PUTs, and physically deletes retired-view payloads', async t => {
+  const account = 'gc-retired-source';
+  const h = await storageLifecycleRuntime(t, [account]);
+  const views = await gcViewFixture(h, account, true);
+  const pending = await h.invoke(account, { action: 'put-unobserved', object: { ...objects.get('updated_file'), format_version: 1 } });
+  const pendingAttempt = pending.attempts.find(attempt => attempt.state === 'pending');
+  assert.ok(pendingAttempt);
+  const control = (payload, expected) => h.control(account, 'gc', payload, expected);
+  const before = await control({ action: 'inspect' });
+  const victim = before.attempts.find(attempt => attempt.id === objects.get('original_file').id && attempt.state === 'written');
+  assert.ok(victim, 'historical canonical/projection closure actually held original FILE bytes');
+  const liveIds = new Set(views.keep.objects.map(object => object.id));
+  for (const snapshot of [views.publicSnapshot, views.lockedSnapshot]) {
+    liveIds.add(Buffer.from(snapshot.projected_commit).toString('hex'));
+    liveIds.add(Buffer.from(snapshot.projected_tree).toString('hex'));
+  }
+  const main = (await h.success(account, 2)).value;
+  liveIds.add(Buffer.from(main.main_revision).toString('hex'));
+  const livePayloads = [];
+  for (const attempt of before.attempts.filter(attempt => liveIds.has(attempt.id) && attempt.state === 'written' && attempt.current === 1)) {
+    const object = await (await h.bucket()).get(attempt.locator);
+    assert.ok(object); livePayloads.push({ key: attempt.locator, bytes: new Uint8Array(await object.arrayBuffer()) });
+  }
+  assert.ok(livePayloads.length > 8);
+  assert.ok(await (await h.bucket()).get(victim.locator));
+  await control({ action: 'request' });
+  let progress;
+  for (let count = 0; count < 128; count++) {
+    progress = await control({ action: 'tick' });
+    if (activeGcJob(progress).phase === 'mark' && progress.scratch.length) break;
+  }
+  assert.equal(activeGcJob(progress).phase, 'mark'); assert.ok(progress.scratch.length > 0);
+  const frozen = activeGcJob(progress);
+  const refused = await h.call(account, 4, { spec: views.keep.spec, expected_epoch: views.epoch,
+    make_default: true, follow_main: false }, { id: 'cannot-author-through-maintenance' });
+  assert.equal(refused.status, 503); assert.equal(refused.envelope.error.code, 'unavailable');
+  assert.equal(refused.envelope.error.message, 'account_maintenance');
+  const oldGeneration = frozen.generation - 1;
+  assert.ok(oldGeneration >= 0);
+  const stale = await control({ action: 'stale-generation', gc_id: frozen.id, generation: oldGeneration }, 409);
+  assert.equal(stale.error, 'aborted');
+  await h.reload();
+  const reopened = await control({ action: 'inspect' });
+  assert.equal(activeGcJob(reopened).id, frozen.id);
+  assert.equal(activeGcJob(reopened).generation, activeGcJob(progress).generation);
+  await control({ action: 'fail-delete-checkpoint' });
+  let interrupted;
+  const interruptionDeadline = Date.now() + 60000;
+  for (let quantum = 0; quantum < 512 && Date.now() < interruptionDeadline; quantum++) {
+    const tick = await h.rawControl(account, 'gc', { action: 'tick' });
+    if (tick.status !== 200) {
+      assert.equal(tick.status, 500, JSON.stringify(tick));
+      assert.equal(tick.value.error, 'fixture_error');
+      interrupted = await control({ action: 'inspect' }); break;
+    }
+  }
+  assert.ok(interrupted, 'actual post-DELETE counter checkpoint must hit the injected SQLite interruption');
+  const interruptedJob = activeGcJob(interrupted);
+  assert.equal(interruptedJob.id, frozen.id); assert.equal(interruptedJob.phase, 'sweep');
+  assert.ok(interruptedJob.pending_delete, 'exact deleted-attempt attribution must precede physical DELETE');
+  const settledAttempt = interrupted.attempts.find(attempt => attempt.attempt_id === interruptedJob.pending_delete);
+  assert.ok(settledAttempt, 'pending deletion names a genuine durable physical attempt');
+  assert.equal(settledAttempt.state, 'deleted');
+  assert.equal(await (await h.bucket()).get(settledAttempt.locator), null, 'actual R2 delete completed before counter ACK loss');
+  assert.equal(interruptedJob.deleted, 0, 'fault rolls back only the first GC deletion checkpoint');
+  assert.equal(interrupted.accounting.physical_payloads, before.accounting.physical_payloads - 1);
+  assert.equal(interrupted.accounting.physical_bytes, before.accounting.physical_bytes - settledAttempt.size);
+  await control({ action: 'clear-delete-checkpoint' });
+  await h.reload();
+  const recoveredCheckpoint = await control({ action: 'inspect' });
+  assert.equal(activeGcJob(recoveredCheckpoint).pending_delete, interruptedJob.pending_delete);
+  assert.deepEqual(recoveredCheckpoint.accounting, interrupted.accounting);
+  const complete = await finishProductionGc(control, recoveredCheckpoint);
+  const job = activeGcJob(complete);
+  assert.equal(job.phase, 'complete', JSON.stringify(job)); assert.equal(job.error, null);
+  const newlyDeleted = complete.attempts.filter(attempt => attempt.state === 'deleted' && before.attempts.some(previous => previous.attempt_id === attempt.attempt_id && previous.state !== 'deleted'));
+  assert.ok(newlyDeleted.length > 0); assert.equal(job.deleted, newlyDeleted.length, 'recovery attributes each physical deletion exactly once including lost counter ACK');
+  assert.equal(job.pending_delete, null); assert.ok(job.skipped_pending >= 1);
+  assert.equal(complete.accounting.physical_payloads, before.accounting.physical_payloads - newlyDeleted.length);
+  assert.equal(complete.accounting.physical_bytes, before.accounting.physical_bytes - newlyDeleted.reduce((sum, attempt) => sum + attempt.size, 0));
+  const terminalReplay = await control({ action: 'tick' });
+  assert.deepEqual(activeGcJob(terminalReplay), job); assert.deepEqual(terminalReplay.accounting, complete.accounting);
+  assert.equal(complete.gc_maintenance[0].active, null);
+  assert.equal(complete.scratch.length, 0); assert.equal(complete.scratch_rows, 0);
+  assert.equal(complete.gc_roots.length, 0); assert.equal(complete.gc_marks.length, 0);
+  assert.equal(await (await h.bucket()).get(victim.locator), null, 'actual R2 old source payload is physically absent');
+  for (const live of livePayloads) {
+    const object = await (await h.bucket()).get(live.key); assert.ok(object, `retained payload ${live.key}`);
+    assert.deepEqual(new Uint8Array(await object.arrayBuffer()), live.bytes);
+  }
+  assert.equal(complete.attempts.find(attempt => attempt.attempt_id === pendingAttempt.attempt_id).state, 'pending');
+  assert.ok(complete.accounting.physical_payloads >= livePayloads.length + 1, 'unobserved PUT still owns a physical charge');
+  const staleBinding = await control({ action: 'stale-binding', binding: { account_id: account, gc_id: frozen.id, epoch: frozen.epoch } }, 409);
+  assert.equal(staleBinding.error, 'aborted');
+  assert.deepEqual((await h.success(account, 2)).value, main, 'GC does not publish a repository revision');
+  const publicReadme = await h.success(account, 7, { version: views.publicSnapshot.view_version, path: 'README.md' }, { auth: null });
+  assert.match(publicReadme.value.content, /Disposable checked source/);
+  const lockedAnonymous = await h.call(account, 7, { version: views.lockedSnapshot.view_version, path: 'README.md' }, { view: 'locked', auth: null });
+  assert.equal(lockedAnonymous.status, 403);
+});
+
+test('production alarm aborts missing strict roots before deletion, releases its barrier and permits genuine fresh-locator byte repair', async t => {
+  const account = 'gc-missing-source';
+  const h = await storageLifecycleRuntime(t, [account]);
+  const views = await gcViewFixture(h, account);
+  await h.invoke(account, { action: 'orphan', object: { ...objects.get('original_file'), format_version: 1 } });
+  const control = (payload, expected) => h.control(account, 'gc', payload, expected);
+  const before = await control({ action: 'inspect' });
+  const readme = views.keep.objects.find(object => object.kind === 1 && Buffer.from(object.bytes).toString('utf8').startsWith('# Disposable checked source'));
+  assert.ok(readme);
+  const missing = before.attempts.find(attempt => attempt.kind === 1 && attempt.id === readme.id && attempt.state === 'written');
+  assert.ok(missing);
+  await (await h.bucket()).delete(missing.locator); // Exact test-only backing fault, not a caller-supplied GC victim.
+  await control({ action: 'request' });
+  const failed = await finishProductionGc(control);
+  const job = activeGcJob(failed);
+  assert.equal(job.phase, 'failed'); assert.ok(job.error);
+  assert.equal(job.retired, 0); assert.equal(job.deleted, 0);
+  assert.equal(failed.gc_maintenance[0].active, null);
+  assert.equal(failed.scratch.length, 0); assert.equal(failed.scratch_rows, 0);
+  assert.deepEqual(failed.accounting, before.accounting);
+  assert.deepEqual(failed.attempts, before.attempts, 'failed marking changes no physical victim state');
+  for (const attempt of before.attempts.filter(attempt => attempt.state === 'written' && attempt.attempt_id !== missing.attempt_id)) {
+    assert.ok(await (await h.bucket()).get(attempt.locator), 'strict failure permits zero other physical deletions');
+  }
+  // Repair is the supported scoped upload protocol: real bytes, real validation,
+  // fresh physical locator. Never PUT over the deleted etag/version-bound key.
+  const repaired = await uploadObject((payload, id) => h.call(account, 10, payload, { id }), views.publicSnapshot.view_version,
+    { ...readme, path: 'README.md', request_id: 'gc-supported-repair' });
+  assert.equal(repaired.status, 200, JSON.stringify(repaired)); assert.equal(repaired.value.state, 'committed');
+  const afterRepair = await control({ action: 'inspect' });
+  const replacement = afterRepair.attempts.find(attempt => attempt.id === readme.id && attempt.attempt_id !== missing.attempt_id && attempt.state === 'written');
+  assert.ok(replacement); assert.notEqual(replacement.locator, missing.locator);
+  assert.equal(await (await h.bucket()).get(missing.locator), null);
+  const read = await h.success(account, 7, { version: views.publicSnapshot.view_version, path: 'README.md' });
+  assert.equal(read.value.content, Buffer.from(readme.bytes).toString('utf8'));
+  await control({ action: 'request' });
+  const retried = await finishProductionGc(control);
+  assert.equal(activeGcJob(retried).phase, 'complete', JSON.stringify(activeGcJob(retried)));
+  assert.ok(activeGcJob(retried).deleted >= 1);
+});
+

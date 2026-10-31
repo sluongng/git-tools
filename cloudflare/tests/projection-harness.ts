@@ -3,11 +3,116 @@
 import worker, { AccountRepository as Base } from '../src/index';
 import { ForgeStorage } from '../src/forge_storage';
 import { ClosureJobs } from '../src/closure_jobs';
+import { ForgeGc, type GcBinding } from '../src/forge_gc';
 import { Failure, fail } from '../src/protocol';
 import type { Descriptor, ObjectKey } from '../src/core';
 interface Env {
   REPOSITORIES: DurableObjectNamespace<Base>; OBJECTS: R2Bucket;
   PRINCIPALS_JSON: string; EXPERIMENTAL_RAW_BACKEND: string; FORGE_BACKEND?: string;
+}
+// Fixture-only trusted maintenance driver. No public endpoint accepts owner or
+// victim strings in the product; these test-only actions exercise its storage API.
+async function storageScenario(ctx: DurableObjectState, bucket: R2Bucket, account: string, request: Request): Promise<unknown> {
+  const input = await request.json() as { action: string; object?: Descriptor & { bytes: number[] }; objects?: Descriptor[]; attempt_id?: string };
+  const tx = <T>(f: () => T): T => ctx.storage.transactionSync(f);
+  const open = (objects = bucket) => new ForgeStorage({ accountId: account, sql: ctx.storage.sql, objects, transactionSync: tx });
+  let storage = open();
+  const snapshot = () => tx(() => ({ accounting: storage.accountingInTx(), attempts: storage.attemptsInTx().attempts }));
+  const failure = async (f: () => unknown | Promise<unknown>) => {
+    try { await f(); return null; } catch (error) { if (error instanceof Failure) return { status: error.status, code: error.code }; throw error; }
+  };
+  if (input.action === 'recover' || input.action === 'delete') {
+    if (!input.attempt_id) fail(400, 'fixture_missing_attempt');
+    const recovered = input.action === 'recover' ? await storage.recoverAttempt(input.attempt_id) : undefined;
+    if (input.action === 'delete') await storage.deleteRetired(input.attempt_id);
+    const state = snapshot();
+    const d = state.attempts.find(a => a.attempt_id === input.attempt_id)!.descriptor;
+    const visible = tx(() => storage.describeInTx(d)) ?? null;
+    const read = visible ? Array.from((await storage.readVerifiedObject(d)).bytes) : null;
+    return { recovered, ...state, visible, read };
+  }
+  if (input.action === 'release') {
+    if (!input.objects || input.objects.length !== 3) fail(400, 'fixture_input_limit');
+    const baseline = snapshot();
+    tx(() => { for (const d of input.objects!) storage.reserveInTx('fixture-terminal', 'completed-owner', d); storage.reserveInTx('fixture-live', 'retained-owner', input.objects![0]); });
+    const reserved = snapshot();
+    const marks = tx(() => storage.reservedKeysInTx(null, 128));
+    const releases = [];
+    for (let i = 0; i < 4; i++) releases.push(tx(() => storage.releaseReservationsInTx('fixture-terminal', 'completed-owner', 1)));
+    const after = snapshot();
+    const retained = tx(() => storage.reservedKeysInTx(null, 128));
+    return { baseline, reserved, marks, releases, after, retained };
+  }
+  const d = input.object;
+  if (!d || !Array.isArray(d.bytes) || d.bytes.length > 1024 * 1024) fail(400, 'fixture_input_limit');
+  const bytes = Uint8Array.from(d.bytes), baseline = snapshot();
+  const gate = [...ctx.storage.sql.exec('SELECT active FROM gc_maintenance WHERE singleton=1')][0];
+  if (gate?.active) fail(503, 'account_maintenance');
+  tx(() => storage.reserveInTx('fixture-terminal', 'completed-owner', d));
+  const puts: { key: string; metadata: Record<string, string> | undefined }[] = [];
+  const tracked = (put: (key: string, data: Uint8Array, options?: R2PutOptions) => Promise<R2Object | null>, del?: (key: string | string[]) => Promise<void>) => new Proxy(bucket, {
+    get(target, property) {
+      if (property === 'put') return put;
+      if (property === 'delete' && del) return del;
+      const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  if (input.action === 'put-ack-lost' || input.action === 'put-unobserved') {
+    storage = open(tracked(async (key, data, options) => {
+      puts.push({ key, metadata: options?.customMetadata });
+      if (input.action === 'put-ack-lost') await bucket.put(key, data, options);
+      throw new Error('test-only uncertain PUT outcome');
+    }));
+    const error = await failure(() => storage.stage(d, bytes));
+    const head = await bucket.head(puts[0].key);
+    return { baseline, error, puts, head: head ? { size: head.size, metadata: head.customMetadata } : null,
+      visible: tx(() => storage.describeInTx(d)) ?? null, ...snapshot() };
+  }
+  if (input.action === 'orphan') {
+    const token = await storage.stage(d, bytes);
+    tx(() => storage.confirmInTx('fixture-terminal', 'completed-owner', d, token));
+    tx(() => storage.releaseReservationsInTx('fixture-terminal', 'completed-owner'));
+    const incarnation = tx(() => storage.incarnationInTx(d));
+    return { baseline, incarnation, ...snapshot() };
+  }
+  if (input.action !== 'replace-delayed-delete') fail(400, 'fixture_unknown_storage_action');
+  let releaseDelete!: () => void, enteredDelete!: () => void;
+  const deleteGate = new Promise<void>(resolve => { releaseDelete = resolve; });
+  const deleteEntered = new Promise<void>(resolve => { enteredDelete = resolve; });
+  const deletes: string[] = [];
+  storage = open(tracked(async (key, data, options) => {
+    puts.push({ key, metadata: options?.customMetadata }); return bucket.put(key, data, options);
+  }, async key => {
+    if (typeof key !== 'string') fail(400, 'fixture_expected_single_delete');
+    deletes.push(key); enteredDelete(); await deleteGate; await bucket.delete(key);
+    throw new Error('test-only lost DELETE acknowledgement after actual deletion');
+  }));
+  const oldToken = await storage.stage(d, bytes);
+  tx(() => storage.confirmInTx('fixture-terminal', 'completed-owner', d, oldToken));
+  const normal = snapshot();
+  tx(() => storage.confirmInTx('fixture-terminal', 'completed-owner', d, oldToken));
+  const confirmedReplay = snapshot(), original = tx(() => storage.incarnationInTx(d))!;
+  const read = await storage.readVerifiedObject(d);
+  const reservedRetireError = await failure(() => tx(() => storage.retireInTx(original.attempt_id, original)));
+  tx(() => storage.releaseReservationsInTx('fixture-terminal', 'completed-owner'));
+  tx(() => storage.retireInTx(original.attempt_id, original));
+  // The DELETE has already captured its durable old victim, but has not yet
+  // reached R2. Reinstall the identical logical descriptor while it is paused.
+  const deleting = failure(() => storage.deleteRetired(original.attempt_id));
+  if (!await Promise.race([deleteEntered.then(() => true), deleting.then(() => false)])) fail(400, 'fixture_delete_not_started');
+  let replacement: NonNullable<ReturnType<ForgeStorage['incarnationInTx']>>, staleError;
+  try {
+    tx(() => storage.reserveInTx('fixture-live', 'replacement-owner', d));
+    const newToken = await storage.stage(d, bytes);
+    tx(() => storage.confirmInTx('fixture-live', 'replacement-owner', d, newToken));
+    replacement = tx(() => storage.incarnationInTx(d))!;
+    staleError = await failure(() => tx(() => storage.confirmInTx('fixture-live', 'replacement-owner', d, oldToken)));
+  } catch (error) { releaseDelete(); await deleting; throw error; }
+  releaseDelete(); const deleteError = await deleting;
+  const after = snapshot(), reread = await storage.readVerifiedObject(d);
+  const heads = await Promise.all(puts.map(async p => { const h = await bucket.head(p.key); return h ? { size: h.size, metadata: h.customMetadata } : null; }));
+  return { baseline, normal, confirmedReplay, original, replacement, read: Array.from(read.bytes), reread: Array.from(reread.bytes),
+    reservedRetireError, staleError, deleteError, puts, deletes, heads, after };
 }
 export class AccountRepository extends Base {
   constructor(private fixtureCtx: DurableObjectState, private fixtureEnv: Env) {
@@ -57,6 +162,61 @@ export class AccountRepository extends Base {
         const control = [...sql.exec('SELECT block_arm_export,arm_export_calls FROM fixture_transform_control WHERE singleton=1')][0];
         return Response.json({ drafts, stage_roots, committed_runs, active_pin_roots, views, control });
       }
+      if (url.pathname === '/__fixture/storage') return Response.json(await storageScenario(this.fixtureCtx, this.fixtureEnv.OBJECTS, account!, request));
+      if (url.pathname === '/__fixture/gc') {
+        const input = await request.json() as { action: string; root?: ObjectKey; gc_id?: string; generation?: number; binding?: GcBinding };
+        const tx = <T>(f: () => T): T => this.fixtureCtx.storage.transactionSync(f);
+        // Guard-only instance uses actual SQL but has no root/custody/provider
+        // capabilities. The facade's private engine remains inaccessible. All
+        // real collection progress below goes through the production alarm.
+        const guardOnly = () => fail(400, 'fixture_guard_only');
+        const collector = () => new ForgeGc({ accountId: account!, sql, transactionSync: tx,
+          rootPageInTx: guardOnly, custodyPageInTx: guardOnly,
+          closureForRoot: guardOnly, storageForMaintenance: guardOnly });
+        if (input.action === 'handoff-seed') {
+          const root = input.root;
+          if (!root || root.kind !== 3) fail(400, 'fixture_requires_seed_root');
+          tx(() => {
+            if ([...sql.exec('SELECT active FROM gc_maintenance WHERE singleton=1')][0]?.active) fail(503, 'account_maintenance');
+            if (![...sql.exec("SELECT 1 FROM forge_retained_roots WHERE owner_kind='fixture-source' AND owner_id=? AND kind=3 AND id=? AND active=1", root.id, root.id)].length
+              || ![...sql.exec("SELECT 1 FROM forge_retained_roots WHERE owner_kind='view' AND kind=3 AND id=? AND active=1", root.id)].length) fail(400, 'fixture_requires_real_view_handoff');
+            sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='fixture-source' AND owner_id=? AND kind=3 AND id=?", root.id, root.id);
+          });
+          const storage = new ForgeStorage({ accountId: account!, sql, objects: this.fixtureEnv.OBJECTS, transactionSync: tx });
+          let complete = false;
+          for (let page = 0; page < 8 && !complete; page++) complete = tx(() => storage.releaseReservationsInTx('fixture-source', root.id, 128)).complete;
+          if (!complete) fail(400, 'fixture_handoff_limit');
+        } else if (input.action === 'request') {
+          tx(() => sql.exec('UPDATE forge_gc_schedule SET requested=1,last_started=0,last_mutation=0 WHERE singleton=1'));
+        } else if (input.action === 'tick') {
+          // Test clock only: do not wait for platform coalescing/cooldown.
+          tx(() => sql.exec('UPDATE forge_gc_schedule SET last_started=0,last_mutation=0 WHERE singleton=1'));
+          try { await super.alarm(); } finally { await this.fixtureCtx.storage.deleteAlarm(); }
+        } else if (input.action === 'fail-delete-checkpoint') {
+          sql.exec("CREATE TRIGGER fixture_gc_delete_checkpoint BEFORE UPDATE ON gc_jobs WHEN NEW.deleted>OLD.deleted BEGIN SELECT RAISE(ABORT,'fixture_gc_delete_checkpoint'); END");
+        } else if (input.action === 'clear-delete-checkpoint') {
+          sql.exec('DROP TRIGGER fixture_gc_delete_checkpoint');
+        } else if (input.action === 'stale-generation') {
+          if (!input.gc_id || input.generation === undefined) fail(400, 'fixture_missing_generation');
+          const current = [...sql.exec('SELECT generation FROM gc_jobs WHERE id=?', input.gc_id)][0];
+          if (!current || current.generation === input.generation) fail(400, 'fixture_requires_stale_generation');
+          await collector().advance(input.gc_id, input.generation);
+        } else if (input.action === 'stale-binding') {
+          if (!input.binding) fail(400, 'fixture_missing_binding');
+          tx(() => collector().requireBindingInTx(input.binding!));
+        } else if (input.action !== 'inspect') fail(400, 'fixture_unknown_gc_action');
+        // Test driver owns alarm delivery timing, but every tick above runs the
+        // actual production queue, controller, strict walker and R2 deletion.
+        await this.fixtureCtx.storage.deleteAlarm();
+        const result: Record<string, unknown> = {};
+        for (const table of ['gc_maintenance', 'gc_jobs', 'gc_roots', 'gc_marks', 'forge_gc_schedule']) result[table] = [...sql.exec(`SELECT * FROM ${table}`)];
+        result.scratch = [...sql.exec("SELECT id,phase,generation FROM closure_jobs WHERE json_extract(binding,'$[3]')='account-gc'")];
+        result.scratch_rows = [...sql.exec("SELECT (SELECT COUNT(*) FROM closure_nodes WHERE job IN(SELECT id FROM closure_jobs WHERE json_extract(binding,'$[3]')='account-gc'))+(SELECT COUNT(*) FROM closure_contexts WHERE job IN(SELECT id FROM closure_jobs WHERE json_extract(binding,'$[3]')='account-gc'))+(SELECT COUNT(*) FROM closure_obligations WHERE job IN(SELECT id FROM closure_jobs WHERE json_extract(binding,'$[3]')='account-gc')) AS count")][0].count;
+        result.attempts = [...sql.exec('SELECT a.attempt_id,a.kind,a.id,a.size,a.locator,a.state,CASE WHEN EXISTS(SELECT 1 FROM forge_storage_bindings b WHERE b.kind=a.kind AND b.id=a.id AND b.attempt_id=a.attempt_id) THEN 1 ELSE 0 END AS current FROM forge_storage_attempts a ORDER BY a.attempt_id')];
+        result.accounting = new ForgeStorage({ accountId: account!, sql, objects: this.fixtureEnv.OBJECTS, transactionSync: tx }).accountingInTx();
+        return Response.json(result);
+      }
+
       if (url.pathname === '/__fixture/inspect') {
         const tables = ['projection_usage', 'projection_jobs', 'projection_frontier', 'projection_selected', 'projection_outputs', 'projection_plan_chunks', 'projection_catalogs', 'closure_job_usage', 'forge_storage_usage', 'forge_upload_usage', 'forge_upload_buffers', 'objects', 'refs'];
         const result: Record<string, unknown> = {};
@@ -72,6 +232,7 @@ export class AccountRepository extends Base {
       const input = await request.json() as { objects: (Descriptor & { bytes: number[] })[]; root: ObjectKey };
       if (!Array.isArray(input.objects) || input.objects.length > 1024 || input.root.kind !== 3) fail(400, 'fixture_input_limit');
       const storage = new ForgeStorage({ accountId: account!, sql, objects: this.fixtureEnv.OBJECTS, transactionSync: f => this.fixtureCtx.storage.transactionSync(f) });
+      if ([...sql.exec('SELECT active FROM gc_maintenance WHERE singleton=1')][0]?.active) fail(503, 'account_maintenance');
       for (const object of input.objects) {
         this.fixtureCtx.storage.transactionSync(() => storage.reserveInTx('fixture-source', input.root.id, object));
         const token = await storage.stage(object, Uint8Array.from(object.bytes));
@@ -95,7 +256,7 @@ export class AccountRepository extends Base {
           return { root, job_id: jobId };
         },
       });
-      let status = await jobs.begin('fixture-source-import', input.root);
+      let status = await jobs.begin(`fixture-source-${input.root.id}`, input.root);
       for (let count = 0; count < 64 && !status.complete && !status.error; count++) status = await jobs.advance(status.job_id, status.generation);
       if (!status.complete) fail(400, 'fixture_source_not_ready');
       return Response.json(jobs.publish(status.job_id, status.generation));

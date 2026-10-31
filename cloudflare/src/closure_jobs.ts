@@ -390,6 +390,36 @@ export class ClosureJobs {
     }
     return this.host.transactionSync(() => this.report(this.load(id, job.generation)));
   }
+  /** Internal GC scratch only. The host must already have copied all checked
+   * typed marks durably before marked disposal, or durably aborted GC before
+   * abandoning its scratch. Each page participates in the outer SQL tx. Product published
+   * proofs and certificate evidence are never disposable through this seam. */
+  disposeGcScratchInTx(id: string, expectedGeneration: number, limit = 128, mode: 'marked' | 'aborted' = 'marked'): boolean {
+    if (this.binding.purpose !== 'account-gc') fail(403, 'permission_denied');
+    if (!safe(limit, 128) || limit < 1) fail(400, 'invalid_argument');
+    const job = this.load(id, expectedGeneration);
+    if (job.phase === 'published' || job.result !== null) fail(403, 'permission_denied');
+    if (mode !== 'marked' && mode !== 'aborted') fail(400, 'invalid_argument');
+    if (mode === 'marked' && (job.phase !== 'ready' || this.next(job)
+        || job.checked_nodes !== job.nodes || job.checked_contexts !== job.contexts
+        || job.checked_obligations !== job.obligations)) fail(400, 'failed_precondition');
+    let remaining = limit, removed = 0;
+    for (const table of ['closure_nodes', 'closure_contexts', 'closure_obligations']) {
+      const rows = [...this.host.sql.exec(`SELECT rowid AS row FROM ${table} WHERE job=? LIMIT ?`, id, remaining)] as unknown as { row: number }[];
+      for (const row of rows) this.host.sql.exec(`DELETE FROM ${table} WHERE rowid=? AND job=?`, row.row, id);
+      remaining -= rows.length; removed += rows.length;
+      if (!remaining) break;
+    }
+    const usage = this.usage();
+    if (usage.jobs < 1 || usage.frontier_rows < removed) fail(500, 'data_loss');
+    this.host.sql.exec('UPDATE closure_job_usage SET frontier_rows=frontier_rows-? WHERE singleton=1', removed);
+    const pending = ['closure_nodes', 'closure_contexts', 'closure_obligations']
+      .some(table => this.one(`SELECT 1 FROM ${table} WHERE job=? LIMIT 1`, id));
+    if (pending) return false;
+    this.host.sql.exec('DELETE FROM closure_jobs WHERE id=?', id);
+    this.host.sql.exec('UPDATE closure_job_usage SET jobs=jobs-1 WHERE singleton=1');
+    return true;
+  }
   publish(id: string, expectedGeneration: number): { status: ClosureJobStatus; result: unknown } {
     if (!safe(expectedGeneration)) fail(400, 'invalid_argument');
     return this.host.transactionSync(() => {

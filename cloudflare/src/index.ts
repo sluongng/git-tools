@@ -6,6 +6,7 @@ import { ForgeViews } from './forge_views';
 import { ForgeProjections } from './forge_projection';
 import { ForgeReads } from './forge_reads';
 import { ForgeStorage } from './forge_storage';
+import { ForgeGc, type GcBinding } from './forge_gc';
 import { ClosureJobs } from './closure_jobs';
 import { BootstrapImports } from './bootstrap_import';
 import { ForgeSearch } from './forge_search';
@@ -167,10 +168,16 @@ class RepositoryEngine {
   private sql: SqlStorage;
   private tail: Promise<unknown> = Promise.resolve();
   private active = 0;
+  private readonly storageCollectors = new WeakMap<ForgeStorage, ForgeGc>();
   constructor(private ctx: DurableObjectState, private env: Env) {
     this.sql = ctx.storage.sql;
     for (const statement of [
       'CREATE TABLE IF NOT EXISTS repository (singleton INTEGER PRIMARY KEY CHECK(singleton=1), account TEXT NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS forge_gc_schedule(singleton INTEGER PRIMARY KEY CHECK(singleton=1),requested INTEGER NOT NULL,last_started INTEGER NOT NULL,last_mutation INTEGER NOT NULL)',
+      'INSERT OR IGNORE INTO forge_gc_schedule(singleton,requested,last_started,last_mutation) VALUES(1,0,0,0)',
+      'CREATE TABLE IF NOT EXISTS transform_recovery_schedule(singleton INTEGER PRIMARY KEY CHECK(singleton=1),due INTEGER NOT NULL)',
+      'INSERT OR IGNORE INTO transform_recovery_schedule(singleton,due) VALUES(1,0)',
+      'CREATE TABLE IF NOT EXISTS forge_storage_terminal_owners(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,PRIMARY KEY(owner_kind,owner_id))',
       'CREATE TABLE IF NOT EXISTS objects (kind INTEGER NOT NULL, id TEXT NOT NULL, size INTEGER NOT NULL, inspection TEXT NOT NULL, visible INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(kind,id))',
       'CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, principal TEXT NOT NULL, fingerprint TEXT NOT NULL, status INTEGER, result TEXT)',
       'CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, generation INTEGER NOT NULL, head TEXT NOT NULL)',
@@ -192,7 +199,10 @@ class RepositoryEngine {
   }
   private enqueue<T>(action: () => Promise<T>): Promise<T> {
     this.active++;
-    const work = this.tail.then(action).finally(() => { this.active--; });
+    const work = this.tail.then(async () => {
+      try { return await action(); }
+      finally { await this.maintainCollectionAlarm().catch(() => undefined); }
+    }).finally(() => { this.active--; });
     this.tail = work.then(() => undefined, () => undefined);
     return work;
   }
@@ -215,22 +225,190 @@ class RepositoryEngine {
   }
   recoveryAccount(): Promise<string | null> {
     return this.enqueue(async () => {
+      const due = Number(this.one('SELECT due FROM transform_recovery_schedule WHERE singleton=1')!.due);
+      if (!due || Date.now() < due || !this.recoveryPendingInTx()) return null;
       const row = this.one('SELECT account FROM repository WHERE singleton=1');
       return row ? String(row.account) : null;
     });
   }
   refreshRecoveryAlarm(delay: number): Promise<void> {
-    return this.enqueue(() => this.updateRecoveryAlarm(delay));
+    return this.enqueue(() => this.updateRecoveryAlarm(delay, true));
   }
-  private async updateRecoveryAlarm(delay: number): Promise<void> {
-      const exports = this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_exports'")
-        && this.one("SELECT 1 FROM transform_exports WHERE phase NOT IN ('settled_committed','settled_aborted') LIMIT 1");
-      const drafts = this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_drafts'")
-        && this.one("SELECT 1 FROM transform_drafts WHERE phase NOT IN ('committed','aborted','limit') LIMIT 1");
-      if (exports || drafts) {
-        if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + delay);
-      } else await this.ctx.storage.deleteAlarm();
+  private async updateRecoveryAlarm(delay: number, reset = false): Promise<void> {
+    const pending = this.recoveryPendingInTx();
+    this.sql.exec('UPDATE transform_recovery_schedule SET due=CASE WHEN ?=0 THEN 0 WHEN ?=1 OR due=0 THEN ? ELSE due END WHERE singleton=1',
+      pending ? 1 : 0, reset ? 1 : 0, Date.now() + delay);
+    await this.maintainCollectionAlarm(true);
   }
+  private recoveryPendingInTx(): boolean {
+    return !!(this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_exports'")
+      && this.one("SELECT 1 FROM transform_exports WHERE phase NOT IN ('settled_committed','settled_aborted') LIMIT 1"))
+      || !!(this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transform_drafts'")
+      && this.one("SELECT 1 FROM transform_drafts WHERE phase NOT IN ('committed','aborted','limit') LIMIT 1"));
+  }
+  /** Platform-only maintenance; there is no HTTP deletion or root-list route. */
+  async alarm(): Promise<void> {
+    if (this.active >= 16) throw new Error('account maintenance admission limit');
+    this.active++;
+    const work = this.tail.then(async () => {
+      try {
+        const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+        if (!repository || !hasForgeAccount(this.sql)) return;
+        const account = String(repository.account), collector = this.forgeCollector(account);
+        let current = collector.active();
+        if (!current) {
+          // Transfer large terminal owners incrementally before freezing roots.
+          const storage = this.forgeStorage(account);
+          for (let page = 0; page < 4; page++) {
+            const owner = this.one('SELECT owner_kind,owner_id FROM forge_storage_terminal_owners ORDER BY owner_kind,owner_id LIMIT 1');
+            if (!owner) break;
+            this.ctx.storage.transactionSync(() => {
+              const result = storage.releaseReservationsInTx(String(owner.owner_kind), String(owner.owner_id), 128);
+              if (result.complete) this.sql.exec('DELETE FROM forge_storage_terminal_owners WHERE owner_kind=? AND owner_id=?', owner.owner_kind, owner.owner_id);
+            });
+          }
+          if (this.one('SELECT 1 FROM forge_storage_terminal_owners LIMIT 1')) return;
+          const schedule = this.one('SELECT requested,last_started,last_mutation FROM forge_gc_schedule WHERE singleton=1')!;
+          if (!Number(schedule.requested) || Date.now() < Math.max(Number(schedule.last_mutation) + 30000, Number(schedule.last_started) + 300000)) return;
+          current = collector.begin();
+          this.ctx.storage.transactionSync(() => {
+            this.sql.exec('UPDATE forge_gc_schedule SET requested=0,last_started=? WHERE singleton=1', Date.now());
+          });
+        }
+        // Bound one platform delivery while avoiding a second-long pause for
+        // every metadata-only page. A quantum owns at most one physical await.
+        const deadline = Date.now() + 200;
+        for (let quantum = 0; quantum < 8; quantum++) {
+          current = await collector.advance(current.gc_id, current.generation);
+          if (current.phase === 'complete' || current.phase === 'failed' || Date.now() >= deadline) break;
+        }
+      } finally { await this.maintainCollectionAlarm(true); }
+    }).finally(() => { this.active--; });
+    this.tail = work.then(() => undefined, () => undefined); await work;
+  }
+  private async maintainCollectionAlarm(force = false): Promise<void> {
+    const repository = this.one('SELECT account FROM repository WHERE singleton=1');
+    if (!repository || !hasForgeAccount(this.sql)) return;
+    const collector = this.forgeCollector(String(repository.account));
+    const active = collector.active();
+    const release = !!this.one('SELECT 1 FROM forge_storage_terminal_owners LIMIT 1');
+    const schedule = this.one('SELECT requested,last_started,last_mutation FROM forge_gc_schedule WHERE singleton=1')!;
+    const now = Date.now();
+    const busy = !!active || release;
+    const due = Math.max(Number(schedule.last_mutation) + 30000, Number(schedule.last_started) + 300000);
+    const collectionWhen = busy ? now + 1000 : Number(schedule.requested) ? Math.max(now + 1000, due) : null;
+    const recoveryDue = this.recoveryPendingInTx()
+      ? Number(this.one('SELECT due FROM transform_recovery_schedule WHERE singleton=1')!.due) : 0;
+    const recoveryWhen = recoveryDue ? Math.max(now + 1000, recoveryDue) : null;
+    const when = collectionWhen === null ? recoveryWhen : recoveryWhen === null ? collectionWhen : Math.min(collectionWhen, recoveryWhen);
+    if (when === null) {
+      if (force) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const existing = force ? null : await this.ctx.storage.getAlarm();
+    // Coalesce GC authoring without postponing an independently due peer
+    // recovery. GC wake-ups do not reset unavailable-peer recovery backoff.
+    if (existing === null || existing > when || (!busy && existing < when)) await this.ctx.storage.setAlarm(when);
+  }
+  /** Internal account collector, never a public root/victim authority. */
+  private forgeCollector(account: string): ForgeGc {
+    let collector: ForgeGc;
+    let reader: ForgeStorage;
+    const storage = (binding?: GcBinding): ForgeStorage => new ForgeStorage({
+      accountId: account, sql: this.sql, objects: this.env.OBJECTS,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      mutationInTx: mode => {
+        collector.mutationInTx(mode, binding);
+        if (mode === 'authoring') this.requestCollectionInTx();
+      },
+    });
+    collector = new ForgeGc({
+      accountId: account, sql: this.sql,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      rootPageInTx: (after, limit) => {
+        const uploads = !!this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='forge_upload_sessions'");
+        const activeUpload = this.one("SELECT 1 FROM forge_retained_roots WHERE active=1 AND owner_kind='upload' LIMIT 1");
+        if (activeUpload && (!uploads || this.one(`SELECT 1 FROM forge_retained_roots r
+          LEFT JOIN forge_upload_sessions u ON u.id=r.owner_id AND u.account=? AND u.kind=r.kind AND u.object_id=r.id
+            AND u.state='committed' AND u.integrity_job IS NOT NULL
+          WHERE r.active=1 AND r.owner_kind='upload' AND u.id IS NULL LIMIT 1`, account))) fail(500, 'data_loss');
+        // A scoped TREE is not a generic root. Preserve its exact trusted upload
+        // path, including distinct contexts for the same immutable TREE ID.
+        const uploadRoots = uploads
+          ? "SELECT r.kind,r.id,CASE WHEN r.kind=2 THEN u.path ELSE '' END AS tree_prefix FROM forge_retained_roots r JOIN forge_upload_sessions u ON u.id=r.owner_id AND u.account=? AND u.kind=r.kind AND u.object_id=r.id AND u.state='committed' AND u.integrity_job IS NOT NULL WHERE r.active=1 AND r.owner_kind='upload'"
+          : "SELECT kind,id,'' AS tree_prefix FROM forge_retained_roots WHERE 0";
+        const rows = this.rows(`SELECT kind,id,tree_prefix FROM (
+          SELECT 3 AS kind,head AS id,'' AS tree_prefix FROM refs
+          UNION SELECT 3 AS kind,head AS id,'' AS tree_prefix FROM pins WHERE active=1
+          UNION SELECT kind,id,'' AS tree_prefix FROM forge_retained_roots WHERE active=1 AND owner_kind<>'upload'
+          UNION ${uploadRoots}
+        ) WHERE kind>? OR (kind=? AND (id>? OR (id=? AND tree_prefix>?)))
+          ORDER BY kind,id,tree_prefix COLLATE BINARY LIMIT ?`,
+          ...(uploads ? [account] : []), after?.kind ?? 0, after?.kind ?? 0,
+          after?.id ?? '', after?.id ?? '', after?.tree_prefix ?? '', limit + 1);
+        const more = rows.length > limit;
+        const roots = rows.slice(0, limit).map(row => ({ kind: Number(row.kind), id: String(row.id), tree_prefix: String(row.tree_prefix) }));
+        return { roots, next: more ? roots.at(-1)! : null };
+      },
+      custodyPageInTx: (after, limit) => {
+        const page = reader.reservedKeysInTx(after, limit);
+        return { objects: page.objects.map(value => ({ kind: value.kind, id: value.id })), next: page.next };
+      },
+      storageForMaintenance: binding => storage(binding),
+      closureForRoot: (binding, root) => new ClosureJobs({
+        binding: { account_id: account, identity: { kind: 'principal', principal: 'account-gc-controller' },
+          policy_epoch: binding.epoch, purpose: 'account-gc',
+          publication: JSON.stringify([binding.gc_id, binding.epoch, root.kind, root.id]),
+          ...(root.kind === 2 ? { tree_prefix: root.tree_prefix } : {}) },
+        sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
+        authorizeCurrentInTx: selected => {
+          collector.requireBindingInTx(binding);
+          if (selected.account_id !== account || selected.identity.kind !== 'principal'
+              || selected.identity.principal !== 'account-gc-controller' || selected.policy_epoch !== binding.epoch
+              || selected.purpose !== 'account-gc'
+              || selected.publication !== JSON.stringify([binding.gc_id, binding.epoch, root.kind, root.id])
+              || (selected.tree_prefix ?? '') !== root.tree_prefix) fail(403, 'permission_denied');
+        },
+        describeObjectInTx: key => reader.describeInTx(key),
+        readVerifiedObject: key => reader.readVerifiedObject(key),
+        attachRootInTx: () => fail(400, 'failed_precondition'),
+      }),
+    });
+    reader = storage();
+    this.storageCollectors.set(reader, collector);
+    return collector;
+  }
+  private forgeStorage(account: string): ForgeStorage {
+    const collector = this.forgeCollector(account);
+    const storage = new ForgeStorage({ accountId: account, sql: this.sql, objects: this.env.OBJECTS,
+      transactionSync: callback => this.ctx.storage.transactionSync(callback),
+      mutationInTx: mode => {
+        collector.mutationInTx(mode);
+        if (mode === 'authoring') this.requestCollectionInTx();
+      },
+    });
+    this.storageCollectors.set(storage, collector); return storage;
+  }
+  private rootAddedInTx(storage: ForgeStorage): void {
+    const collector = this.storageCollectors.get(storage);
+    if (!collector) fail(500, 'data_loss');
+    collector.mutationInTx('authoring'); this.requestCollectionInTx();
+  }
+  private requestCollectionInTx(): void {
+    this.sql.exec('UPDATE forge_gc_schedule SET requested=1,last_mutation=MAX(last_mutation,?) WHERE singleton=1', Date.now());
+  }
+  private releaseStorageOwnerInTx(storage: ForgeStorage, kind: string, owner: string): void {
+    // Terminal ownership transfers are bounded by the account reservation quota.
+    // This runs only after a durable root was attached in the same transaction.
+    const result = storage.releaseReservationsInTx(kind, owner, 128);
+    if (!result.complete) {
+      const pending = Number(this.one('SELECT COUNT(*) AS n FROM forge_storage_terminal_owners')!.n);
+      if (!this.one('SELECT 1 FROM forge_storage_terminal_owners WHERE owner_kind=? AND owner_id=?', kind, owner) && pending >= 4096) fail(429, 'resource_exhausted');
+      this.sql.exec('INSERT OR IGNORE INTO forge_storage_terminal_owners(owner_kind,owner_id) VALUES(?,?)', kind, owner);
+    }
+    this.requestCollectionInTx();
+  }
+
   private rows(query: string, ...bindings: (string | number | null)[]): Row[] {
     return [...this.sql.exec(query, ...bindings)] as Row[];
   }
@@ -319,7 +497,7 @@ class RepositoryEngine {
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (!repository || repository.account !== call.account_id || !hasForgeAccount(this.sql)) fail(403, 'permission_denied');
     const account = call.account_id;
-    const storage = new ForgeStorage({ accountId: account, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
+    const storage = this.forgeStorage(account);
     // Only SQL-derived preparers reach this factory. A checker grant is never
     // substituted for membership; each current-authority check remains in SQL.
     const subjects = new Map<string, ForgeReviews>();
@@ -359,10 +537,12 @@ class RepositoryEngine {
       },
       describeObjectInTx: key => storage.describeInTx(key), readVerifiedObject: key => storage.readVerifiedObject(key),
       retainCheckInTx: (lease, root) => {
+        this.rootAddedInTx(storage);
         if (root.kind !== 3) fail(400, 'failed_precondition'); this.retainedForgeClosureInTx(account, storage, root);
         this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('checker',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", lease, root.kind, root.id);
       },
       releaseCheckInTx: (lease, root) => {
+        this.requestCollectionInTx();
         this.sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='checker' AND owner_id=? AND kind=? AND id=?", lease, root.kind, root.id);
       },
     });
@@ -373,7 +553,7 @@ class RepositoryEngine {
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (repository && repository.account !== call.account_id) fail(403, 'permission_denied');
     // This host is per request. Never cache an actor/grant on the DO instance.
-    const storage = new ForgeStorage({ accountId: call.account_id, sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
+    const storage = this.forgeStorage(call.account_id);
     const api = this.forgeAccounts(call.account_id, auth?.principal ?? null, auth?.operator ?? false, storage);
     let result;
     if ([20, 21, 22, 23, 24].includes(call.operation)) {
@@ -400,9 +580,11 @@ class RepositoryEngine {
         stageUpload: (descriptor, bytes) => storage.stage(descriptor, bytes),
         confirmUploadInTx: (session, descriptor, confirmation) => storage.confirmInTx('upload', session, descriptor, confirmation),
         retainUploadInTx: (session, descriptor, expiresAt) => {
+          this.rootAddedInTx(storage);
           const available = storage.describeInTx(descriptor);
           if (!available || available.size_bytes !== descriptor.size_bytes || available.format_version !== descriptor.format_version) fail(503, 'unavailable');
           this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'upload\',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', session, descriptor.kind, descriptor.id);
+          this.releaseStorageOwnerInTx(storage, 'upload', session);
           return { staging_lease: `upload-${session}`, expires_at: expiresAt };
         },
       }).handle(call);
@@ -426,6 +608,14 @@ class RepositoryEngine {
       if (!auth) fail(401, 'unauthenticated');
       result = await this.bootstrapImports(call.account_id, auth.principal, api, storage).handle(call);
     } else result = await api.handle(call);
+    if (auth && [1, 3, 4, 10, 11, 20, 23, 24, 40, 41, 42, 44].includes(call.operation)) {
+      // Successful authorized mutation progress is active authoring even while
+      // immutable bytes have not reached their eventual staging phase. Pure
+      // public reads cannot keep extending this idle deadline.
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec('UPDATE forge_gc_schedule SET last_mutation=MAX(last_mutation,?) WHERE singleton=1', Date.now());
+      });
+    }
     return forgeReply(call, result.state, result.result);
   }
   private forgeAccounts(accountId: string, principal: string | null, canProvision: boolean, storage: ForgeStorage): ForgeAccounts {
@@ -436,6 +626,7 @@ class RepositoryEngine {
       sql: this.sql, transactionSync: callback => this.ctx.storage.transactionSync(callback),
       stageGenesis: objects => this.stageGenesis(accountId, objects, staged, storage, confirmations),
       claimRepositoryInTx: (account, objects, head) => {
+        this.rootAddedInTx(storage);
         if (account !== accountId || this.one('SELECT account FROM repository WHERE singleton=1')
             || this.one('SELECT name FROM refs LIMIT 1')) fail(400, 'failed_precondition');
         if (objects.length !== 2 || !objects.some(o => o.kind === 3 && o.id === head)) fail(503, 'unavailable');
@@ -451,6 +642,7 @@ class RepositoryEngine {
         // both durable puts. Installing proof/root is atomic with the account.
         this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-genesis-v1', root: head }));
         this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1)', head);
+        this.releaseStorageOwnerInTx(storage, 'genesis', 'genesis');
       },
       currentMainInTx: () => {
         const main = this.one('SELECT generation,head FROM refs WHERE name=\'main\'');
@@ -502,6 +694,7 @@ class RepositoryEngine {
         });
       },
       attachBootstrapInTx: (record, root, jobId) => {
+        this.rootAddedInTx(storage);
         const owner = api.requireOwnerInTx();
         if (record.account !== account || record.principal !== principal || record.epoch !== owner.policy_epoch
             || record.job_id !== jobId || root.kind !== 3 || root.id !== record.payload.root.id
@@ -520,6 +713,7 @@ class RepositoryEngine {
         this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'main\',\'main\',3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', root.id);
         views.advanceFollowingViewsInTx(root.id);
         api.sealBootstrapInTx(root.id, record.id, jobId);
+        this.releaseStorageOwnerInTx(storage, 'bootstrap', 'bootstrap');
         return { import_id: record.id, closure_job_id: jobId, root, declared_source: record.payload.source,
           policy_epoch: record.epoch, main: { head: root.id, generation: 2 }, bootstrap_sealed: true };
       },
@@ -554,10 +748,12 @@ class RepositoryEngine {
       },
       requireCanonicalRootInTx,
       retainViewRootInTx: (version, head) => {
+        this.rootAddedInTx(storage);
         requireCanonicalRootInTx(head);
         this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'view\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', version, head);
       },
       releaseViewRootsInTx: version => {
+        this.requestCollectionInTx();
         this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'view\' AND owner_id=?', version);
         this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=\'projection\' AND owner_id IN(SELECT id FROM projection_catalogs WHERE version=?)', version);
         this.sql.exec('UPDATE projection_catalogs SET retired=1 WHERE version=?', version);
@@ -603,12 +799,14 @@ class RepositoryEngine {
           attachRootInTx: (_binding, root, job) => { if (root.kind !== 3) fail(400, 'failed_precondition'); return attach(job); },
         });
       },
-      retainProjectionRootInTx: (projection, head, proofJob) => {
+      retainProjectionRootInTx: (projection, head, proofJob, producerJob) => {
+        this.rootAddedInTx(storage);
         const proof = this.one('SELECT root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', proofJob);
         if (!proof || proof.root_kind !== 3 || proof.root_id !== head || proof.phase !== 'ready'
             || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
         this.sql.exec('INSERT OR IGNORE INTO forge_validated_roots(kind,id,proof) VALUES(3,?,?)', head, JSON.stringify({ validator: 'native-closure-v1', job_id: proofJob, root: head }));
         this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(\'projection\',?,3,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', projection, head);
+        this.releaseStorageOwnerInTx(storage, 'projection', producerJob);
       },
     });
     return { views, projections };
@@ -654,8 +852,7 @@ class RepositoryEngine {
     return { proof_job: job };
   }
   private forgeTransforms(account: string, principal: string | null, auth: TrustedAuth | null): ForgeTransforms {
-    const storage = new ForgeStorage({ accountId: account, sql: this.sql,
-      transactionSync: callback => this.ctx.storage.transactionSync(callback), objects: this.env.OBJECTS });
+    const storage = this.forgeStorage(account);
     const api = this.forgeAccounts(account, principal, false, storage);
     const { views, projections } = this.forgeServices(account, principal, api, storage);
     return new ForgeTransforms({ accountId: account, principal, auth, sql: this.sql, views, projections,
@@ -677,6 +874,7 @@ class RepositoryEngine {
       confirmGeneratedInTx: (owner, descriptor, confirmation) => storage.confirmInTx('transform', owner, descriptor, confirmation),
       requireRetainedClosureInTx: root => this.retainedForgeClosureInTx(account, storage, root),
       retainRootInTx: (ownerKind, owner, root, proofJob) => {
+        this.rootAddedInTx(storage);
         if (!ownerKind.startsWith('transform-') || !storage.describeInTx(root)) fail(503, 'failed_precondition');
         const proof = this.one('SELECT account,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', proofJob);
         if (!proof || proof.account !== account || proof.root_kind !== root.kind || proof.root_id !== root.id
@@ -687,6 +885,7 @@ class RepositoryEngine {
         this.sql.exec('INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES(?,?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1', ownerKind, owner, root.kind, root.id);
       },
       releaseRootInTx: (ownerKind, owner, root) => {
+        this.rootAddedInTx(storage);
         if (!ownerKind.startsWith('transform-')) fail(503, 'failed_precondition');
         this.sql.exec('UPDATE forge_retained_roots SET active=0 WHERE owner_kind=? AND owner_id=? AND kind=? AND id=?', ownerKind, owner, root.kind, root.id);
       },
@@ -737,6 +936,7 @@ class RepositoryEngine {
       },
       requireRetainedClosureInTx: root => this.retainedForgeClosureInTx(account, storage, root),
       retainReviewInputInTx: (owner, root, proofJob) => {
+        this.rootAddedInTx(storage);
         if (this.retainedForgeClosureInTx(account, storage, root).proof_job !== proofJob) fail(400, 'failed_precondition');
         this.sql.exec("INSERT OR IGNORE INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('review-input',?,?,?,1)", owner, root.kind, root.id);
       },
@@ -744,14 +944,17 @@ class RepositoryEngine {
       stageGenerated: (descriptor, bytes) => storage.stage(descriptor, bytes),
       confirmGeneratedInTx: (attempt, descriptor, confirmation) => storage.confirmInTx('review-candidate', attempt, descriptor, confirmation),
       retainCandidateInTx: (attempt, root, proofJob) => {
+        this.rootAddedInTx(storage);
         const proof = this.one('SELECT account,root_kind,root_id,phase,nodes,checked_nodes,contexts,checked_contexts,obligations,checked_obligations FROM closure_jobs WHERE id=?', proofJob);
         if (!proof || proof.account !== account || proof.root_kind !== root.kind || proof.root_id !== root.id || proof.phase !== 'ready'
             || proof.nodes !== proof.checked_nodes || proof.contexts !== proof.checked_contexts || proof.obligations !== proof.checked_obligations) fail(400, 'failed_precondition');
         this.sql.exec('INSERT INTO forge_validated_roots(kind,id,proof) VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET proof=excluded.proof', root.kind, root.id,
           JSON.stringify({ validator: 'native-closure-v1', root: root.id, job_id: proofJob }));
         this.sql.exec("INSERT INTO forge_retained_roots(owner_kind,owner_id,kind,id,active) VALUES('review-candidate',?,?,?,1) ON CONFLICT(owner_kind,owner_id,kind,id) DO UPDATE SET active=1", attempt, root.kind, root.id);
+        this.releaseStorageOwnerInTx(storage, 'review-candidate', attempt);
       },
       publishMainInTx: input => {
+        this.rootAddedInTx(storage);
         api.authorityInTx('write');
         if (!Number.isSafeInteger(input.target_generation) || input.target_generation < 1 || input.target_generation >= Number.MAX_SAFE_INTEGER) fail(429, 'resource_exhausted');
         this.requireAcceptedCheckPolicyInTx(account, input.candidate_id, input.head, input.root_tree, this.reviewConfiguration()?.profile);
@@ -953,6 +1156,7 @@ export class AccountRepository extends DurableObject<Env> {
     return result;
   }
   async alarm(): Promise<void> {
+    await this.#engine.alarm();
     const account = await this.#engine.recoveryAccount();
     if (!account) return;
     let delay = 60_000;
