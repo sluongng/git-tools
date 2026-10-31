@@ -31,3 +31,12 @@ rust_test(
     edition = "2024",
     deps = all_crate_deps(normal = True, normal_dev = True),
 )
+
+rust_binary(
+    name = "checker_status",
+    srcs = ["src/checker_status.rs"],
+    aliases = aliases(),
+    crate_root = "src/checker_status.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
