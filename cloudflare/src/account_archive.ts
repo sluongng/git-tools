@@ -1,10 +1,11 @@
 /** Same-build, same-account archive. The enclosing account queue must serialize
  * every call through its physical awaits and fence all non-archive entry points. */
 import { inspect } from './core';
+import { PrivateMarkerCatalog, type PreparedMarkerMutation } from './private_marker_catalog';
 import { fail, Failure } from './protocol';
 import { capsuleChunkHash, capsuleChain, parseCapsuleDescriptor } from './private_capsule_protocol';
 import { privateChunkMetadata, type PrivateCapsuleRow, type PrivateCapsuleChunk } from './private_capsules';
-import { archivePageHash, canonicalArchive, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_PAGE, MAX_ARCHIVE_PAGES, MAX_ARCHIVE_ROW, MAX_ARCHIVE_ROWS, parseArchiveCall, requireArchiveAuth, type ArchiveAuth, type ArchiveCall, type ArchiveCell, type ArchiveContent, type ArchiveManifest, type ArchivePage, type ArchiveReply, type ArchiveTable } from './archive_protocol';
+import { archivePageHash, canonicalArchive, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_PAYLOADS, MAX_ARCHIVE_PAGE, MAX_ARCHIVE_PAGES, MAX_ARCHIVE_ROW, MAX_ARCHIVE_ROWS, parseArchiveCall, requireArchiveAuth, type ArchiveAuth, type ArchiveCall, type ArchiveCell, type ArchiveContent, type ArchiveManifest, type ArchivePage, type ArchiveReply, type ArchiveTable } from './archive_protocol';
 export interface ArchiveSchemaEntry {kind:'table'|'index';name:string;table:string;sql:string}
 export interface AccountArchiveHost {
  accountId:string;sql:SqlStorage;objects:R2Bucket;buildId:string;schema:readonly ArchiveSchemaEntry[];
@@ -24,10 +25,10 @@ interface Job {
  manifest:ArchiveManifest|null;last_hash:string|null;
 }
 interface Attempt {attempt_id:string;kind:number;id:string;size:number;inspection:string;locator:string;state:'pending'|'written'|'retiring'|'deleted';etag:string|null;version:string|null}
-interface Proof {attempt_id:string;presence:string;etag:string|null;version:string|null}
+interface Proof {attempt_id:string;presence:string;etag:string|null;version:string|null;rebind?:PreparedMarkerMutation}
 const encoder=new TextEncoder();
 const proofKey=(domain:'native'|'private',attempt:string)=>`${domain}:${attempt}`;
-const ZERO='0'.repeat(64), MAX_TABLES=512, MAX_COLUMNS=256, MAX_PAYLOADS=131072;
+const ZERO='0'.repeat(64), MAX_TABLES=512, MAX_COLUMNS=256;
 function quoted(name:string):string {return '"'+name.replace(/"/g,'""')+'"';}
 function size(value:unknown):number{return encoder.encode(canonicalArchive(value)).byteLength;}
 function same(a:unknown,b:unknown):boolean{return canonicalArchive(a)===canonicalArchive(b);}
@@ -56,8 +57,10 @@ export function archiveBarrierInTx(sql:SqlStorage):boolean {
  return !['export_complete','aborted','complete'].includes(j.phase);
 }
 export class AccountArchive {
+ private readonly markers:PrivateMarkerCatalog;
  constructor(private readonly host:AccountArchiveHost,private readonly secret:()=>string|undefined){
   if(!/^[a-z0-9-]{1,64}$/.test(host.accountId)||!/^[0-9a-f]{64}$/.test(host.buildId))fail(503,'archive_configuration_invalid');
+  this.markers=new PrivateMarkerCatalog({accountId:host.accountId,sql:host.sql});
   for(const sql of [
    'CREATE TABLE IF NOT EXISTS archive_job(singleton INTEGER PRIMARY KEY CHECK(singleton=1),body TEXT NOT NULL)',
    'CREATE TABLE IF NOT EXISTS archive_checkpoint(part INTEGER PRIMARY KEY,body TEXT NOT NULL)',
@@ -156,38 +159,46 @@ export class AccountArchive {
   }
  }
  private validatePrivateCoverage():void {
+  // Catalog payload bytes are already retired; original sizes remain lifetime
+  // identity/accounting, never a second charged-payload byte balance.
+  const cold=this.markers.totalsInTx();
   const totals=this.one<{capsules:number;chunks:number;bytes:number}>("SELECT (SELECT COUNT(*) FROM private_capsules) AS capsules,COUNT(*) AS chunks,COALESCE(SUM(CASE WHEN state<>'tombstoned' THEN size ELSE 0 END),0) AS bytes FROM private_capsule_chunks")!;
-  if(![totals.capsules,totals.chunks,totals.bytes].every(n=>safe(n)&&n>=0)||totals.capsules>4096||totals.chunks>32768||totals.bytes>512*1024*1024)fail(503,'archive_private_invalid');
-  // Reservation is the unattempted suffix of each whole uploading intent.
-  // Pending physical custody already consumed admission even without its ACK;
-  // next_offset/next_sequence therefore cannot reconstruct this accounting.
-  const uploading=this.rows<{id:string;descriptor:string;attempted_bytes:number;attempted_chunks:number}>("SELECT r.id,r.descriptor,COALESCE(SUM(c.size),0) AS attempted_bytes,COUNT(c.attempt_id) AS attempted_chunks FROM private_capsules r LEFT JOIN private_capsule_chunks c ON c.capsule=r.id WHERE r.state='uploading' GROUP BY r.id ORDER BY r.id LIMIT 4097");
+  if(![totals.capsules,totals.chunks,totals.bytes,cold.tuples,cold.bytes,cold.pages,cold.encoded_bytes].every(n=>safe(n)&&n>=0)||totals.capsules>4096||totals.chunks>32768||totals.bytes>512*1024*1024)fail(503,'archive_private_invalid');
+  const uploading=this.rows<{id:string;descriptor:string;attempted_bytes:number;attempted_chunks:number}>("SELECT r.id,r.descriptor,COALESCE(SUM(c.size),0)+COALESCE(m.source_bytes,0) AS attempted_bytes,COUNT(c.attempt_id)+COALESCE(m.tuples,0) AS attempted_chunks FROM private_capsules r LEFT JOIN private_capsule_chunks c ON c.capsule=r.id LEFT JOIN private_marker_roots m ON m.capsule=r.id WHERE r.state='uploading' GROUP BY r.id ORDER BY r.id LIMIT 4097");
   if(uploading.length>4096)fail(503,'archive_private_invalid');
   let reserved_bytes=0,reserved_chunks=0;
   for(const r of uploading){
    let descriptor;try{descriptor=parseCapsuleDescriptor(JSON.parse(r.descriptor));}catch{fail(503,'archive_private_invalid');}
    if(![r.attempted_bytes,r.attempted_chunks].every(n=>safe(n)&&n>=0)||r.attempted_bytes>descriptor.total_bytes||r.attempted_chunks>descriptor.chunk_count)fail(503,'archive_private_invalid');
-   reserved_bytes+=descriptor.total_bytes-r.attempted_bytes;
-   reserved_chunks+=descriptor.chunk_count-r.attempted_chunks;
+   reserved_bytes+=descriptor.total_bytes-r.attempted_bytes;reserved_chunks+=descriptor.chunk_count-r.attempted_chunks;
    if(!safe(reserved_bytes)||!safe(reserved_chunks)||totals.bytes+reserved_bytes>512*1024*1024||totals.chunks+reserved_chunks>32768)fail(503,'archive_private_invalid');
   }
-  const usage=this.one<{account:string;bytes:number;chunks:number;capsules:number;reserved_bytes:number;reserved_chunks:number}>('SELECT account,bytes,chunks,capsules,reserved_bytes,reserved_chunks FROM private_capsule_usage WHERE singleton=1');
-  if(usage?usage.account!==this.host.accountId||![usage.bytes,usage.chunks,usage.capsules,usage.reserved_bytes,usage.reserved_chunks].every(n=>safe(n)&&n>=0)||usage.bytes!==totals.bytes||usage.chunks!==totals.chunks||usage.capsules!==totals.capsules||usage.reserved_bytes!==reserved_bytes||usage.reserved_chunks!==reserved_chunks||usage.bytes+usage.reserved_bytes>512*1024*1024||usage.chunks+usage.reserved_chunks>32768:totals.capsules!==0||totals.chunks!==0||reserved_bytes!==0||reserved_chunks!==0)fail(503,'archive_private_invalid');
+  const lifetime_chunks=totals.chunks+cold.tuples,reserved_lifetime_chunks=reserved_chunks;
+  if(!safe(lifetime_chunks)||lifetime_chunks+reserved_lifetime_chunks>131072||(lifetime_chunks+reserved_lifetime_chunks)*4096+totals.capsules*4096>528*1024*1024)fail(503,'archive_private_invalid');
+  const usage=this.one<{account:string;bytes:number;chunks:number;capsules:number;reserved_bytes:number;reserved_chunks:number;lifetime_chunks:number;reserved_lifetime_chunks:number}>('SELECT account,bytes,chunks,capsules,reserved_bytes,reserved_chunks,lifetime_chunks,reserved_lifetime_chunks FROM private_capsule_usage WHERE singleton=1');
+  if(usage?usage.account!==this.host.accountId||![usage.bytes,usage.chunks,usage.capsules,usage.reserved_bytes,usage.reserved_chunks,usage.lifetime_chunks,usage.reserved_lifetime_chunks].every(n=>safe(n)&&n>=0)||usage.bytes!==totals.bytes||usage.chunks!==totals.chunks||usage.capsules!==totals.capsules||usage.reserved_bytes!==reserved_bytes||usage.reserved_chunks!==reserved_chunks||usage.lifetime_chunks!==lifetime_chunks||usage.reserved_lifetime_chunks!==reserved_lifetime_chunks||usage.bytes+usage.reserved_bytes>512*1024*1024||usage.chunks+usage.reserved_chunks>32768:totals.capsules!==0||lifetime_chunks!==0||reserved_bytes!==0||reserved_chunks!==0)fail(503,'archive_private_invalid');
   const capsules=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsules WHERE account<>? OR state NOT IN ('uploading','sealed','retiring','deleted')",this.host.accountId)!;
   if(capsules.n)fail(503,'archive_private_invalid');
-  const bad=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_chunks c LEFT JOIN private_capsules r ON r.id=c.capsule LEFT JOIN archive_payload_proofs p ON p.attempt_id='private:'||c.attempt_id WHERE r.id IS NULL OR r.account<>? OR c.state NOT IN ('pending','written','retiring','tombstoned') OR p.attempt_id IS NULL OR (c.state IN ('written','tombstoned') AND p.presence<>'present') OR (r.state='deleted' AND c.state<>'tombstoned')",this.host.accountId);
-  const heads=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_heads h LEFT JOIN private_capsules r ON r.id=h.capsule WHERE h.capsule IS NOT NULL AND (r.id IS NULL OR r.state='deleted' OR h.principal<>r.principal OR h.workspace<>r.workspace OR h.generation<>r.generation)");
-  if(!bad||bad.n!==0||!heads||heads.n!==0)fail(503,'archive_private_incomplete');
+  const hot=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_chunks c LEFT JOIN private_capsules r ON r.id=c.capsule LEFT JOIN archive_payload_proofs p ON p.attempt_id='private:'||c.attempt_id WHERE r.id IS NULL OR r.account<>? OR c.state NOT IN ('pending','written','retiring','tombstoned') OR p.attempt_id IS NULL OR (c.state IN ('written','tombstoned') AND p.presence<>'present') OR (r.state='deleted' AND c.state<>'tombstoned')",this.host.accountId)!;
+  const missingCold=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_marker_attempts i LEFT JOIN archive_payload_proofs p ON p.attempt_id='private:'||i.attempt_id WHERE p.attempt_id IS NULL OR p.presence<>'present'")!.n;
+  const proofs=this.one<{n:number}>("SELECT COUNT(*) AS n FROM archive_payload_proofs WHERE substr(attempt_id,1,8)='private:'")!.n;
+  const heads=this.one<{n:number}>("SELECT COUNT(*) AS n FROM private_capsule_heads h LEFT JOIN private_capsules r ON r.id=h.capsule WHERE h.capsule IS NOT NULL AND (r.id IS NULL OR r.state='deleted' OR h.principal<>r.principal OR h.workspace<>r.workspace OR h.generation<>r.generation)")!;
+  // Every cold index member has one verified per-marker proof. Lookup/rebind
+  // validates its entire bounded canonical page (hashes, range/index bijection
+  // and root links), so no unvisited page may hide behind aggregate counts.
+  if(hot.n!==0||missingCold!==0||proofs!==lifetime_chunks||heads.n!==0)fail(503,'archive_private_incomplete');
  }
  private async audit(j:Job,auth:ArchiveAuth):Promise<ArchiveReply>{
   if(j.audit_domain==='native'){const legacy=await this.host.objects.list({prefix:`native/v1/${j.account}/`,limit:1});await this.auth(auth,'export');if(legacy.objects.length||legacy.truncated)fail(412,'archive_legacy_payload');}
   const prefix=j.audit_domain==='native'?`native/v2/${j.account}/`:`private/v1/${j.account}/`;
   const list=await this.host.objects.list({prefix,limit:256,...(j.audit_cursor?{cursor:j.audit_cursor}:{}),include:['customMetadata']});await this.auth(auth,'export');
+  const privateRows=new Map<string,PrivateCapsuleChunk>();
+  if(j.audit_domain==='private')for(const o of list.objects){const c=await this.markers.lookupLocator(o.key);await this.auth(auth,'export');if(!c)fail(503,'archive_unknown_payload');privateRows.set(o.key,c);}
   this.tx(()=>{
    for(const o of list.objects){
     let attempt:string;
     if(j.audit_domain==='native'){const a=this.one<Attempt>('SELECT * FROM forge_storage_attempts WHERE locator=?',o.key);if(!a)fail(503,'archive_unknown_payload');this.assertAttempt(a);if(a.state==='deleted')fail(503,'archive_unknown_payload');this.matchR2(a,o);attempt=a.attempt_id;}
-    else{const c=this.one<PrivateCapsuleChunk>('SELECT * FROM private_capsule_chunks WHERE locator=?',o.key);if(!c)fail(503,'archive_unknown_payload');this.matchPrivate(c,o);attempt=c.attempt_id;}
+    else{const c=privateRows.get(o.key);if(!c)fail(503,'archive_unknown_payload');this.markers.assertCurrentInTx(c);this.matchPrivate(c,o);attempt=c.attempt_id;}
     if(j.phase==='audit_final'){const key=proofKey(j.audit_domain,attempt),p=this.one<Proof>('SELECT * FROM archive_payload_proofs WHERE attempt_id=?',key);if(!p||p.presence!=='present'||p.etag!==o.etag||p.version!==o.version)fail(503,'archive_payload_changed');this.exec('INSERT OR REPLACE INTO archive_audit_seen(attempt_id) VALUES(?)',key);}
    }
    if(list.truncated)j.audit_cursor=list.cursor;
@@ -203,8 +214,8 @@ export class AccountArchive {
    if(rows.length)return{kind:'rows',table:t.name,columns:t.columns,rows};j.table_index++;j.last_rowid=null;
   }j.phase='payloads';return;
  }
- private async page(j:Job,content:ArchiveContent,auth:ArchiveAuth,proof?:Proof):Promise<ArchiveReply>{const unhashed={schema:1 as const,account_id:j.account,archive_id:j.id,build_id:j.build,sequence:j.sequence,previous:j.chain,content};const page:ArchivePage={...unhashed,hash:await archivePageHash(unhashed)};await this.auth(auth,'export');if(size(page)>MAX_ARCHIVE_PAGE)fail(413,'resource_exhausted');this.tx(()=>{if(proof)this.exec('INSERT INTO archive_payload_proofs(attempt_id,presence,etag,version) VALUES(?,?,?,?)',proof.attempt_id,proof.presence,proof.etag,proof.version);this.acceptCounts(j,page);this.checkpoint(page);this.save(j);});return{...this.reply(j,'page'),page};}
- private acceptCounts(j:Job,p:ArchivePage):void{j.sequence++;j.chain=p.hash;j.last_hash=p.hash;j.bytes+=size(p.content);if(p.content.kind==='rows')j.rows+=p.content.rows.length;else j.payloads++;if(j.sequence>MAX_ARCHIVE_PAGES||j.rows>MAX_ARCHIVE_ROWS||j.bytes>MAX_ARCHIVE_BYTES||j.payloads>MAX_PAYLOADS)fail(413,'resource_exhausted');}
+ private async page(j:Job,content:ArchiveContent,auth:ArchiveAuth,proof?:Proof,current?:()=>void):Promise<ArchiveReply>{const unhashed={schema:1 as const,account_id:j.account,archive_id:j.id,build_id:j.build,sequence:j.sequence,previous:j.chain,content};const page:ArchivePage={...unhashed,hash:await archivePageHash(unhashed)};await this.auth(auth,'export');if(size(page)>MAX_ARCHIVE_PAGE)fail(413,'resource_exhausted');this.tx(()=>{current?.();if(proof)this.exec('INSERT INTO archive_payload_proofs(attempt_id,presence,etag,version) VALUES(?,?,?,?)',proof.attempt_id,proof.presence,proof.etag,proof.version);this.acceptCounts(j,page);this.checkpoint(page);this.save(j);});return{...this.reply(j,'page'),page};}
+ private acceptCounts(j:Job,p:ArchivePage):void{j.sequence++;j.chain=p.hash;j.last_hash=p.hash;j.bytes+=size(p.content);if(p.content.kind==='rows')j.rows+=p.content.rows.length;else j.payloads++;if(j.sequence>MAX_ARCHIVE_PAGES||j.rows>MAX_ARCHIVE_ROWS||j.bytes>MAX_ARCHIVE_BYTES||j.payloads>MAX_ARCHIVE_PAYLOADS)fail(413,'resource_exhausted');}
  private async exportNext(j:Job,sequence:number,auth:ArchiveAuth):Promise<ArchiveReply>{
   if(sequence===j.sequence-1){const page=this.lastPage();if(!page||page.sequence!==sequence)fail(409,'archive_sequence');return{...this.reply(j,'page'),page};}if(sequence!==j.sequence)fail(409,'archive_sequence');if(j.phase==='exported'||j.phase==='export_complete')return{...this.reply(j,j.phase==='exported'?'exported':'complete'),manifest:j.manifest!};if(j.phase==='aborted')fail(409,'archive_aborted');
   if(j.phase==='audit'||j.phase==='audit_final')return this.audit(j,auth);
@@ -215,9 +226,9 @@ export class AccountArchive {
     return this.page(j,content,auth,{attempt_id:proofKey('native',a.attempt_id),presence:bytes?'present':'absent',etag:o?.etag??null,version:o?.version??null});}
    j.payload_domain='private';j.payload_after='';
   }
-  const c=this.one<PrivateCapsuleChunk>("SELECT * FROM private_capsule_chunks WHERE attempt_id>? ORDER BY attempt_id LIMIT 1",j.payload_after);
+  const c=await this.markers.nextAttempt(j.payload_after||null);await this.auth(auth,'export');
   if(c){this.privateAttempt(c);const o=await this.host.objects.get(c.locator);await this.auth(auth,'export');let bytes:Uint8Array|null=null;if(o){const marker=this.matchPrivate(c,o);bytes=new Uint8Array(await o.arrayBuffer());await this.auth(auth,'export');await this.privateBytes(c,bytes,auth,'export',marker);}else if(c.state==='written'||c.state==='tombstoned')fail(503,'archive_payload_missing');j.payload_after=c.attempt_id;
-   return this.page(j,{kind:'private_payload',capsule_id:c.capsule,sequence:c.sequence,attempt_id:c.attempt_id,size:c.size,sha256:c.sha256,locator:c.locator,state:c.state,source_etag:c.etag,source_version:c.version,presence:bytes?'present':'absent',bytes_hex:bytes?hex(bytes):null},auth,{attempt_id:proofKey('private',c.attempt_id),presence:bytes?'present':'absent',etag:o?.etag??null,version:o?.version??null});
+   return this.page(j,{kind:'private_payload',capsule_id:c.capsule,sequence:c.sequence,attempt_id:c.attempt_id,size:c.size,sha256:c.sha256,locator:c.locator,state:c.state,source_etag:c.etag,source_version:c.version,presence:bytes?'present':'absent',bytes_hex:bytes?hex(bytes):null},auth,{attempt_id:proofKey('private',c.attempt_id),presence:bytes?'present':'absent',etag:o?.etag??null,version:o?.version??null},()=>this.markers.assertCurrentInTx(c));
   }
   await this.checkPrivateSealed(j,auth,'export');
   j.private_checked=true;j.phase='audit_final';j.audit_cursor=null;j.audit_domain='native';this.tx(()=>{this.exec('DELETE FROM archive_audit_seen');this.save(j);});return this.reply(j);
@@ -246,9 +257,9 @@ export class AccountArchive {
    if(missing)fail(400,'archive_payload_order');j.payload_domain='private';j.payload_after='';
   }
   if(c.attempt_id<=j.payload_after)fail(400,'archive_payload_order');
-  const a=this.one<PrivateCapsuleChunk>('SELECT * FROM private_capsule_chunks WHERE attempt_id=?',c.attempt_id);if(!a)fail(400,'archive_payload_unknown');this.privateAttempt(a);
+  const a=await this.markers.lookupAttempt(c.attempt_id);await this.auth(auth,'restore');if(!a)fail(400,'archive_payload_unknown');this.privateAttempt(a);
   if(a.capsule!==c.capsule_id||a.sequence!==c.sequence||a.size!==c.size||a.sha256!==c.sha256||a.locator!==c.locator||a.state!==c.state||a.etag!==c.source_etag||a.version!==c.source_version)fail(400,'archive_payload_mismatch');
-  if(c.presence==='absent'){const exists=await this.host.objects.head(a.locator);await this.auth(auth,'restore');if(exists)fail(409,'target_payload_exists');return{attempt_id:proofKey('private',a.attempt_id),presence:'absent',etag:null,version:null};}
+  if(c.presence==='absent'){const exists=await this.host.objects.head(a.locator);await this.auth(auth,'restore');if(exists)fail(409,'target_payload_exists');return{attempt_id:proofKey('private',a.attempt_id),presence:'absent',etag:null,version:null,rebind:{applyInTx:()=>{this.markers.assertCurrentInTx(a);this.exec('UPDATE private_capsule_chunks SET etag=NULL,version=NULL WHERE attempt_id=?',a.attempt_id);}}};}
   const bytes=unhex(c.bytes_hex!),marker=bytes.length===0;
   await this.privateBytes(a,bytes,auth,'restore',marker);
   let existing=await this.host.objects.head(a.locator);await this.auth(auth,'restore');
@@ -258,12 +269,13 @@ export class AccountArchive {
   if(!got||!('body'in got)||this.matchPrivate(a,got,false)!==marker||got.etag!==existing.etag||got.version!==existing.version)fail(503,'archive_payload_mismatch');
   const actual=new Uint8Array(await got.arrayBuffer());await this.auth(auth,'restore');await this.privateBytes(a,actual,auth,'restore',marker);
   if(hex(actual)!==c.bytes_hex)fail(503,'archive_payload_mismatch');
-  return{attempt_id:proofKey('private',a.attempt_id),presence:'present',etag:got.etag,version:got.version};
+  const rebind=await this.markers.prepareRebind(a,got.etag,got.version);await this.auth(auth,'restore');
+  return{attempt_id:proofKey('private',a.attempt_id),presence:'present',etag:got.etag,version:got.version,rebind};
  }
  private async restorePage(j:Job,p:ArchivePage,auth:ArchiveAuth):Promise<ArchiveReply>{
   if(p.account_id!==j.account||p.archive_id!==j.id||p.build_id!==j.build)fail(400,'archive_binding_mismatch');const {hash:claimed,...unhashed}=p;if(await archivePageHash(unhashed)!==claimed)fail(400,'archive_chain_mismatch');await this.auth(auth,'restore');if(p.sequence===j.sequence-1){if(j.last_hash!==p.hash)fail(409,'archive_replay_conflict');return this.reply(j);}if(p.sequence!==j.sequence||p.previous!==j.chain||p.sequence>=j.manifest!.page_count)fail(409,'archive_sequence');
   let proof:Proof|undefined;if(p.content.kind==='payload')proof=await this.targetPayload(j,p.content,auth);else if(p.content.kind==='private_payload')proof=await this.targetPrivatePayload(j,p.content,auth);
-  return this.tx(()=>{if(p.content.kind==='rows'){if(j.payload_domain!=='native'||j.payload_after!=='')fail(400,'archive_table_order');this.restoreRows(j,p.content);}else{if(!proof)fail(503,'unavailable');this.exec('INSERT INTO archive_payload_proofs(attempt_id,presence,etag,version) VALUES(?,?,?,?)',proof.attempt_id,proof.presence,proof.etag,proof.version);if(p.content.kind==='payload')this.exec('UPDATE forge_storage_attempts SET etag=?,version=? WHERE attempt_id=?',proof.etag,proof.version,p.content.attempt_id);else this.exec('UPDATE private_capsule_chunks SET etag=?,version=? WHERE attempt_id=?',proof.etag,proof.version,p.content.attempt_id);j.payload_after=p.content.attempt_id;}this.acceptCounts(j,p);this.checkpoint(p);this.save(j);return this.reply(j);});
+  return this.tx(()=>{if(p.content.kind==='rows'){if(j.payload_domain!=='native'||j.payload_after!=='')fail(400,'archive_table_order');this.restoreRows(j,p.content);}else{if(!proof)fail(503,'unavailable');this.exec('INSERT INTO archive_payload_proofs(attempt_id,presence,etag,version) VALUES(?,?,?,?)',proof.attempt_id,proof.presence,proof.etag,proof.version);if(p.content.kind==='payload')this.exec('UPDATE forge_storage_attempts SET etag=?,version=? WHERE attempt_id=?',proof.etag,proof.version,p.content.attempt_id);else{if(!proof.rebind)fail(503,'unavailable');proof.rebind.applyInTx();}j.payload_after=p.content.attempt_id;}this.acceptCounts(j,p);this.checkpoint(p);this.save(j);return this.reply(j);});
  }
  private async finishRestore(j:Job,auth:ArchiveAuth):Promise<ArchiveReply>{await this.auth(auth,'restore');await this.checkPrivateSealed(j,auth,'restore');return this.tx(()=>{if(j.phase!=='restoring'||!same(this.manifest(j),j.manifest))fail(409,'archive_incomplete');this.schemaMatches(j.tables);for(const t of j.tables)if(this.one<{n:number}>(`SELECT COUNT(*) AS n FROM ${quoted(t.name)}`)!.n!==t.rows)fail(400,'archive_count_mismatch');const missing=this.one<{n:number}>("SELECT COUNT(*) AS n FROM forge_storage_attempts a LEFT JOIN archive_payload_proofs p ON 'native:'||a.attempt_id=p.attempt_id WHERE a.state!='deleted' AND p.attempt_id IS NULL")!.n;if(missing!==0)fail(409,'archive_incomplete');this.validatePrivateCoverage();this.validateBindings();this.host.requireSingleAccountInTx();j.phase='complete';this.save(j);this.host.onActivatedInTx();return{...this.reply(j,'complete'),manifest:j.manifest!};});}
 }

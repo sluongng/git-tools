@@ -292,7 +292,7 @@ impl Counts {
         }
         if self.rows > a::MAX_ROWS
             || self.bytes > a::MAX_BYTES
-            || self.payloads > 131072
+            || self.payloads > a::MAX_ARCHIVE_PAYLOADS
             || self.tables.len() > 512
         {
             return Err(invalid());

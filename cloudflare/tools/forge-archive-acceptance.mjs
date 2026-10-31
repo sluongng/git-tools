@@ -18,10 +18,11 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
 let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay, privateRelay;
-let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, resumedWip, fifthWip, resumeEvidence, pruneEvidence, complete = false, cleaned = false;
+let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, resumedWip, fifthWip, resumeEvidence, pruneEvidence, markerRecovery, complete = false, cleaned = false;
 const fault = { export: true, restore: true, retire: false };
 const events = [], physicalEvidence = [];
-const grants = token => JSON.stringify([{ principal: 'archive-target', token_sha256: sha(token), accounts: ['forge-check'], export: false, restore: true }]);
+// This disposable recovery operator both restores and exports the recovered account.
+const grants = token => JSON.stringify([{ principal: 'archive-target', token_sha256: sha(token), accounts: ['forge-check'], export: true, restore: true }]);
 const redact = value => [exportToken, otherExportToken, restoreToken, context?.token].filter(Boolean)
   .reduce((text, secret) => text.replaceAll(secret, '<redacted>'), String(value ?? '')).slice(0, 8192);
 
@@ -63,6 +64,9 @@ async function privateTransport(upstream) {
       const result = await fetch(upstream() + request.url, { method: 'POST', signal: AbortSignal.timeout(60000),
         headers: { authorization: request.headers.authorization, 'content-type': 'application/json' }, body });
       const returned = await bytes(result), value = JSON.parse(returned);
+      if (result.status >= 400 || value.error) events.push({ action: 'observed_forge_failure', route: request.url,
+        operation: call.operation ?? call.action, request_id: call.request_id ?? null, status: result.status,
+        error: value.error ?? null });
       const lost = fault.retire && request.url === '/api/v1/private-capsule/call' && call.action === 'retire'
         && call.capsule_id === secondWip?.capsule_id && result.status === 200 && value.state === 'deleted';
       if (lost) {
@@ -177,7 +181,7 @@ async function verifyPhysical(claim, expectedCandidate) {
   assert.ok(bep.some(event => event.id?.testSummary?.label === '//:smoke' && event.testSummary?.overallStatus === (receipt.outcome === 'passed' ? 'PASSED' : 'FAILED')));
   assert.ok((await stat(path.join(attempt, 'execution.compact'))).size > 0);
   if (context.artifacts) {
-    assert.match(claim, /^archive-restored-[01]$/);
+    assert.match(claim, /^archive-(?:cold-)?restored-[01]$/);
     for (const name of ['bep.jsonl', 'execution.compact', 'snapshot-proof.json']) {
       await copyFile(path.join(attempt, name), path.join(context.artifacts, `${claim}-${name}`));
     }
@@ -442,7 +446,41 @@ const workflow = {
     const sourceScope = (await command(targetClient, ['status'], { cwd: workspace })).result.workspace;
     await raw(targetClient, ['tinytree', 'unmount', workspace]);
     await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined;
-    const finalClient = await client('post-land-target', targetOrigin, restoreToken);
+    // Re-export the recovered account AFTER real marker compaction. Restore
+    // into a second independent SQL/R2 service before recovering capsule5.
+    const markerDirectory = path.join(localRoot, 'settled-marker-account');
+    const markerArchiveId = randomBytes(32).toString('hex');
+    await select(targetClient, targetOrigin);
+    const markerBackup = await command(targetClient, ['account', 'backup', markerDirectory,
+      '--archive-token-env', 'TT_ARCHIVE_TOKEN', '--archive-id', markerArchiveId]);
+    assert.equal(markerBackup.state, 'complete');
+    const markerManifest = await privateJson(path.join(markerDirectory, 'manifest.json'));
+    for (const table of ['private_marker_pages', 'private_marker_roots', 'private_marker_attempts'])
+      assert.ok(markerManifest.tables.find(entry => entry.name === table)?.rows > 0, `archive includes actual ${table}`);
+    let coldMarkers = 0;
+    for (let sequence = 0; sequence < markerManifest.page_count; sequence++) {
+      const page = await privateJson(pageFile(markerDirectory, sequence));
+      if (page.content.kind === 'private_payload' && page.content.state === 'tombstoned') {
+        assert.equal(page.content.presence, 'present'); assert.equal(page.content.bytes_hex, ''); coldMarkers++;
+      }
+    }
+    assert.ok(coldMarkers > 0, 'second account archive contains permanent compacted marker proofs');
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'marker-account-manifest.json'), JSON.stringify(markerManifest, null, 2), { mode: 0o600 });
+    await target.dispose();
+    targetConfiguration = { ...targetConfiguration, port: 0, durableObjectsPersist: path.join(localRoot, 'marker-target-do'),
+      r2Persist: path.join(localRoot, 'marker-target-r2') };
+    target = new Miniflare(targetConfiguration); targetOrigin = (await target.ready).origin;
+    targetConfiguration.port = Number(new URL(targetOrigin).port);
+    await select(targetClient, targetOrigin);
+    const markerRestored = await command(targetClient, ['account', 'restore', markerDirectory, '--archive-token-env', 'TT_ARCHIVE_TOKEN']);
+    assert.equal(markerRestored.state, 'complete'); assert.equal(markerRestored.result.chain_root, markerManifest.chain_root);
+    for (const old of [firstWip, secondWip, thirdWip, resumedWip]) assert.equal((await capsuleStatus(old.capsule_id)).state, 'deleted');
+    assert.equal((await capsuleStatus(fifthWip.capsule_id)).state, 'sealed');
+    markerRecovery = { compacted_pages_archived: true, permanent_marker_proofs: coldMarkers,
+      fresh_second_sqlite_r2_service: true, exact_archive_chain_restored: true,
+      old_terminal_receipts_preserved: true, newest_native_capsule_preserved: true,
+      archive_id: markerArchiveId, page_count: markerManifest.page_count, payloads: markerManifest.payloads };
+    const finalClient = await client('post-land-target', privateRelay.origin, restoreToken);
     const finalWorkspace = path.join(finalClient.cwd, 'work');
     const final = await command(finalClient, ['work', finalWorkspace, '--capsule', fifthWip.capsule_id]);
     targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor;
@@ -454,6 +492,33 @@ const workflow = {
     assert.equal(await readFile(path.join(workspace, 'before-local-prune.txt'), 'utf8'), 'third acknowledged capture for real local retention cleanup\n');
     assert.equal(await readFile(path.join(workspace, 'dirty-prune-do-not-snapshot.txt'), 'utf8'), 'prune must leave unsnapshotted dirty bytes untouched\n');
     assert.equal(await readFile(path.join(workspace, 'pending-prune-input.txt'), 'utf8'), 'quota-denied native source must remain pending and untouched\n');
+    // A fresh marker-catalog restore must remain writable through a genuine
+    // exact-candidate check and checked landing, not just readable metadata.
+    await writeFile(path.join(workspace, 'after-marker-restore-checked.txt'), 'checked work after compacted marker recovery\n');
+    await raw(targetClient, ['describe', '-m', 'Checked work after marker catalog restore'], { cwd: workspace });
+    let coldPush = await command(targetClient, ['push', '--request-id', 'marker-restored-source'], { cwd: workspace });
+    for (let round = 0; round < 128 && (coldPush.state !== 'checks_pending' || !coldPush.result.value.projected_head); round++)
+      coldPush = await command(targetClient, ['request', 'resume', 'marker-restored-source'], { cwd: workspace });
+    assert.equal(coldPush.state, 'checks_pending'); const coldReview = coldPush.result.value;
+    context.retargetChecker(targetOrigin);
+    let coldReceipt;
+    for (let round = 0; round < 2 && !coldReceipt; round++) {
+      const claim = `archive-cold-restored-${round}`;
+      const report = JSON.parse((await context.run(['run-remote', '--account', context.source.account_id, '--profile', 'checks', '--claim-id', claim])).stdout);
+      assert.equal(report.result.state, 'completed');
+      const intended = report.result.completion.lease.request.job_id === coldReview.candidate.id;
+      const receipt = await verifyPhysical(claim, intended ? coldReview.candidate : context.cancellationCandidate);
+      assert.equal(receipt.outcome, intended ? 'passed' : 'failed');
+      if (intended) coldReceipt = receipt;
+    }
+    assert.ok(coldReceipt);
+    const coldExact = { change_id: coldReview.change_id, patchset_id: coldReview.patchset_id, candidate_id: coldReview.candidate.id };
+    await forgeCall(targetOrigin, 23, { ...coldExact, decision: 'approve' }, 'marker-restored-approve');
+    const coldLand = await forgeCall(targetOrigin, 24, coldExact, 'marker-restored-land'); assert.equal(coldLand.state, 'landed');
+    assert.deepEqual(await forgeCall(targetOrigin, 24, coldExact, 'marker-restored-land'), coldLand);
+    const coldReconcile = await command(targetClient, ['request', 'reconcile', 'marker-restored-source'], { cwd: workspace });
+    assert.equal(coldReconcile.result.value.local_reconciliation, 'applied');
+    markerRecovery.subsequent_real_check_and_landing = true; markerRecovery.exact_candidate = coldReview.candidate.id;
     await writeFile(path.join(workspace, 'after-restore-private.txt'), 'new work must survive normal restored resume\n');
     await raw(targetClient, ['status'], { cwd: workspace });
     const currentOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
@@ -463,12 +528,12 @@ const workflow = {
     assert.ok(await mounted(workspace));
     assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), currentOp, 'normal restored resume does not replay original backup over subsequent WIP');
     assert.equal(await readFile(path.join(workspace, 'after-restore-private.txt'), 'utf8'), 'new work must survive normal restored resume\n');
-    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, resumed: resumedWip, fifth: fifthWip, resume: resumeEvidence, prune: pruneEvidence, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, third: thirdWip, resumed: resumedWip, fifth: fifthWip, resume: resumeEvidence, prune: pruneEvidence, marker_recovery: markerRecovery, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
     await this.cleanup({ success: true }); complete = true;
     return { production_worker: true, actual_sqlite_r2: true, source_archive_id: archiveId, build_id: manifest.build_id,
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
-      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, resumed_capsule: resumedWip, fifth_capsule: fifthWip, explicit_prune: pruneEvidence, exact_saved_resume: resumeEvidence },
+      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, resumed_capsule: resumedWip, fifth_capsule: fifthWip, explicit_prune: pruneEvidence, exact_saved_resume: resumeEvidence, settled_marker_recovery: markerRecovery },
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
       tamper_and_missing_page_rejected: true, existing_target_preserved: true, legacy_orphan_target_rejected: true, incomplete_restore_fenced: true,
       owned_cleanup: true, deployed_recovery_proof: false };
@@ -484,7 +549,10 @@ const workflow = {
     if (target) await target.dispose(); cleaned = true;
     // On failure retain the original archive and restore state for explicit
     // recovery; never infer that an incomplete import can be rolled back.
-    if (!success && localRoot) console.error(JSON.stringify({ retained_private_archive_fixture: localRoot }));
+    if (!success && localRoot) {
+      console.error(JSON.stringify({ retained_private_archive_fixture: localRoot }));
+      console.error(redact(JSON.stringify({ observed_forge_failures: events.filter(event => event.action === 'observed_forge_failure') })));
+    }
   },
 };
 await runCheckerAcceptance({ inputs: [...inputs, tt], archiveWorkflow: workflow });

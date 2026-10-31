@@ -1,5 +1,6 @@
 /** Dedicated account archive transport. No Forge/checker credential is authority here. */
 import { body, digest, fail, Failure, hash, identifier, integer, json, record } from './protocol';
+export const MAX_ARCHIVE_PAYLOADS = 131072 + 131072;
 export const MAX_ARCHIVE_PAGE = 16 * 1024 * 1024;
 export const MAX_ARCHIVE_ROW = 8 * 1024 * 1024;
 export const MAX_ARCHIVE_PAGES = 1_000_000;
@@ -40,7 +41,7 @@ function text(value:unknown,max=4096):string {if(typeof value!=='string'||new Te
 export function parseArchiveManifest(raw:unknown):ArchiveManifest {
  const m=record(raw,['schema','account_id','archive_id','build_id','tables','page_count','chain_root','rows','bytes','payloads']);if(m.schema!==1||!Array.isArray(m.tables)||m.tables.length>512)fail(400,'invalid_argument');
  const seen=new Set<string>();const tables=m.tables.map(v=>{const t=record(v,['name','columns','rows']);const n=text(t.name,256);if(seen.has(n)||!Array.isArray(t.columns)||t.columns.length>256)fail(400,'invalid_argument');seen.add(n);const columns=t.columns.map(c=>text(c,256));if(new Set(columns).size!==columns.length)fail(400,'invalid_argument');return{name:n,columns,rows:integer(t.rows,MAX_ARCHIVE_ROWS)};});
- return{schema:1,account_id:identifier(m.account_id),archive_id:digest(m.archive_id),build_id:digest(m.build_id),tables,page_count:integer(m.page_count,MAX_ARCHIVE_PAGES),chain_root:digest(m.chain_root),rows:integer(m.rows,MAX_ARCHIVE_ROWS),bytes:integer(m.bytes,MAX_ARCHIVE_BYTES),payloads:integer(m.payloads,131072)};
+ return{schema:1,account_id:identifier(m.account_id),archive_id:digest(m.archive_id),build_id:digest(m.build_id),tables,page_count:integer(m.page_count,MAX_ARCHIVE_PAGES),chain_root:digest(m.chain_root),rows:integer(m.rows,MAX_ARCHIVE_ROWS),bytes:integer(m.bytes,MAX_ARCHIVE_BYTES),payloads:integer(m.payloads,MAX_ARCHIVE_PAYLOADS)};
 }
 function cell(raw:unknown):ArchiveCell {const c=record(raw,['kind','value','hex'],['kind']);switch(c.kind){case'null':record(c,['kind']);return{kind:'null'};case'text':record(c,['kind','value']);return{kind:'text',value:text(c.value,MAX_ARCHIVE_ROW)};case'integer':record(c,['kind','value']);if(typeof c.value!=='number'||!Number.isSafeInteger(c.value))fail(400,'invalid_argument');return{kind:'integer',value:c.value};case'real':record(c,['kind','value']);if(typeof c.value!=='string'||!Number.isFinite(Number(c.value))||Math.abs(Number(c.value))>Number.MAX_SAFE_INTEGER||String(Number(c.value))!==c.value)fail(400,'invalid_argument');return{kind:'real',value:c.value};case'blob':record(c,['kind','hex']);if(typeof c.hex!=='string'||c.hex.length>MAX_ARCHIVE_ROW*2||!/^(?:[0-9a-f]{2})*$/.test(c.hex))fail(400,'invalid_argument');return{kind:'blob',hex:c.hex};default:fail(400,'invalid_argument');}}
 export function parseArchivePage(raw:unknown):ArchivePage {

@@ -2,6 +2,7 @@
 // Real product requests use the unchanged production ingress and account host.
 import worker, { AccountRepository as Base } from '../src/index';
 import { ForgeStorage } from '../src/forge_storage';
+import { PrivateMarkerCatalog } from '../src/private_marker_catalog';
 import { ClosureJobs } from '../src/closure_jobs';
 import { ForgeGc, type GcBinding } from '../src/forge_gc';
 import { Failure, fail } from '../src/protocol';
@@ -233,11 +234,27 @@ export class AccountRepository extends Base {
         return Response.json({ drafts, stage_roots, committed_runs, active_pin_roots, views, control });
       }
       if (url.pathname === '/__fixture/private-capsules') {
-        const input = await request.json() as { action?: string; mode?: string };
+        const input = await request.json() as { action?: string; mode?: string; capsule?: string; first_sequence?: number; body_hex?: string };
         if (input.action === 'fault') {
           if (!['none', 'before-put', 'after-put'].includes(input.mode ?? '')) fail(400, 'fixture_fault_mode');
           this.capsuleFault.mode = input.mode as typeof this.capsuleFault.mode;
           return Response.json({ mode: this.capsuleFault.mode });
+        }
+        if (input.action === 'corrupt-marker-page') {
+          const page = [...sql.exec('SELECT capsule,first_sequence,body FROM private_marker_pages ORDER BY capsule,first_sequence LIMIT 1')][0];
+          if (!page || !(page.body instanceof ArrayBuffer)) fail(400, 'fixture_no_marker_page');
+          const original = new Uint8Array(page.body), changed = original.slice(); changed[0] ^= 1;
+          sql.exec('UPDATE private_marker_pages SET body=? WHERE capsule=? AND first_sequence=?', changed.buffer, page.capsule, page.first_sequence);
+          return Response.json({ capsule: page.capsule, first_sequence: page.first_sequence,
+            body_hex: Array.from(original, byte => byte.toString(16).padStart(2, '0')).join('') });
+        }
+        if (input.action === 'restore-marker-page') {
+          if (typeof input.capsule !== 'string' || !/^[0-9a-f]{64}$/.test(input.capsule)
+            || !Number.isInteger(input.first_sequence) || input.first_sequence! < 0 || input.first_sequence! > 8191
+            || typeof input.body_hex !== 'string' || input.body_hex.length > 256 * 1024 || !/^(?:[0-9a-f]{2})+$/.test(input.body_hex)) fail(400, 'fixture_marker_page');
+          const body = Uint8Array.from(input.body_hex.match(/../g)!, byte => parseInt(byte, 16));
+          sql.exec('UPDATE private_marker_pages SET body=? WHERE capsule=? AND first_sequence=?', body.buffer, input.capsule, input.first_sequence!);
+          return Response.json({ restored: true });
         }
         if (input.action === 'held-put' || input.action === 'late-put') {
           const held = this.capsuleFault.held; if (!held) fail(400, 'fixture_no_held_put');
@@ -248,10 +265,24 @@ export class AccountRepository extends Base {
             options: held.options, wrote, current: object ? { size: object.size, metadata: object.customMetadata, bytes_hex: Array.from(new Uint8Array(await object.arrayBuffer()), byte => byte.toString(16).padStart(2, '0')).join('') } : null });
         }
         const result: Record<string, unknown> = {};
-        for (const table of ['private_capsules', 'private_capsule_heads', 'private_capsule_chunks', 'private_capsule_usage', 'forge_retained_roots']) {
+        for (const table of ['private_capsules', 'private_capsule_heads', 'private_capsule_chunks', 'private_capsule_usage', 'private_marker_pages', 'private_marker_roots', 'private_marker_attempts', 'forge_retained_roots']) {
           if (![...sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", table)].length) { result[table] = []; continue; }
           const rows = [...sql.exec(`SELECT * FROM ${table} ORDER BY rowid LIMIT 129`)];
           if (rows.length > 128) fail(413, 'fixture_row_limit'); result[table] = rows;
+        }
+        // Bounded verified fixture inventory. Product routes do not expose
+        // either internal marker keys or the cold SQL catalogue.
+        result.private_capsule_cold_chunks = [];
+        if ([...sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='private_capsule_chunks'")].length) {
+          const catalog = new PrivateMarkerCatalog({ accountId: account!, sql });
+          const all = []; let after: string | null = null;
+          for (let count = 0; count < 129; count++) {
+            const next = await catalog.nextAttempt(after); if (!next) break;
+            all.push(next); after = next.attempt_id;
+          }
+          if (all.length > 128) fail(413, 'fixture_row_limit');
+          const hot = new Set((result.private_capsule_chunks as { attempt_id: string }[]).map(chunk => chunk.attempt_id));
+          result.private_capsule_cold_chunks = all.filter(chunk => !hot.has(chunk.attempt_id));
         }
         result.objects = [...sql.exec('SELECT COUNT(*) AS count FROM objects')];
         return Response.json(result);

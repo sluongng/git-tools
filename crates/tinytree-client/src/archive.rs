@@ -10,6 +10,8 @@ pub const MAX_PAGES: u64 = 1_000_000;
 pub const MAX_ROWS: u64 = 8_000_000;
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+// Complete archives enumerate both native attempts and all private issued tuples.
+pub const MAX_ARCHIVE_PAYLOADS: u64 = 131_072 + 131_072;
 const SAFE: u64 = (1u64 << 53) - 1;
 fn invalid() -> Status {
     Status::data_loss("invalid bounded account archive")
@@ -282,7 +284,7 @@ impl ArchiveManifest {
             || self.page_count > MAX_PAGES
             || self.rows > MAX_ROWS
             || self.bytes > MAX_BYTES
-            || self.payloads > 131072
+            || self.payloads > MAX_ARCHIVE_PAYLOADS
             || self.tables.len() > 512
         {
             return Err(invalid());

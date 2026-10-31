@@ -435,7 +435,7 @@ async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_sha
 }
 #[test]
 fn private_archive_payload_verifies_opaque_sha_and_locator_without_native_kind() {
-    use tinytree_client::archive::{ArchivePage, Content, ZERO_HASH};
+    use tinytree_client::archive::{ArchiveManifest, ArchivePage, Content, ZERO_HASH};
     let capsule="d".repeat(64); let attempt="c".repeat(64);
     let mut page=ArchivePage { schema:1,account_id:"alpha".into(),archive_id:"a".repeat(64),build_id:"b".repeat(64),sequence:0,previous:ZERO_HASH.into(),hash:ZERO_HASH.into(),
         content:Content::PrivatePayload {capsule_id:capsule.clone(),sequence:2,attempt_id:attempt.clone(),size:3,sha256:"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),locator:format!("private/v1/alpha/{capsule}/2/{attempt}"),state:"written".into(),source_etag:Some("source-etag".into()),source_version:Some("source-version".into()),presence:"present".into(),bytes_hex:Some("616263".into())} };
@@ -447,6 +447,17 @@ fn private_archive_payload_verifies_opaque_sha_and_locator_without_native_kind()
     let mut page=original;
     if let Content::PrivatePayload {locator,..}=&mut page.content {*locator="native/v2/alpha/1/not-an-opaque-capsule".into();}
     page.hash=page.computed_hash().unwrap();assert!(page.validate().is_err(),"opaque custody cannot be laundered through native payload namespace");
+    // Public manifest-boundary validation, not a claim that these synthetic
+    // counts establish complete storage coverage or restore authority.
+    let mut manifest = ArchiveManifest {
+        schema: 1, account_id: "alpha".into(), archive_id: "a".repeat(64), build_id: "b".repeat(64),
+        tables: vec![], page_count: 262_144, chain_root: ZERO_HASH.into(), rows: 0, bytes: 0, payloads: 131_072,
+    };
+    manifest.validate().unwrap();
+    manifest.payloads = 262_144;
+    manifest.validate().expect("native attempts plus private issued tuples fit the combined archive bound");
+    manifest.payloads += 1;
+    assert_eq!(manifest.validate().unwrap_err().code(), Code::DataLoss, "one payload above the combined bound is refused");
 }
 
 #[tokio::test]

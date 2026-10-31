@@ -2233,6 +2233,7 @@ test('archive schema inventory matches every application DDL and identifies only
 
 // These cases verify opaque transport and custody only. The bytes deliberately
 // are not labelled a verified native capture or genuine private-WIP recovery.
+const capsuleTuples = state => [...state.private_capsule_chunks, ...(state.private_capsule_cold_chunks ?? [])];
 const capsuleHex = value => typeof value === 'string' ? value : Buffer.from(value).toString('hex');
 function capsuleDescriptor(bytes) {
   const chunks = []; let chain = '0'.repeat(64);
@@ -2283,13 +2284,11 @@ async function capsuleBackend(t) {
     const response = await mf.dispatchFetch(`https://capsule.invalid/__fixture/private-capsules?account=${account}`, { method: 'POST', body: JSON.stringify(payload) });
     return value(response);
   };
-  const archive = async (action, archiveId, fields = {}, expected = 200) => {
-    const response = await mf.dispatchFetch('https://capsule.invalid/api/v1/archive/call', { method: 'POST',
-      headers: { authorization: `Bearer ${archiveToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ schema: 1, account_id: account, archive_id: archiveId, action, ...fields }) });
-    return value(response, expected);
-  };
-  return { account, source, owner, rotated, peer, reader, raw, forge, rawCapsule, capsule, control, archive,
+  const rawArchive = (action, archiveId, fields = {}) => mf.dispatchFetch('https://capsule.invalid/api/v1/archive/call', { method: 'POST',
+    headers: { authorization: `Bearer ${archiveToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ schema: 1, account_id: account, archive_id: archiveId, action, ...fields }) });
+  const archive = async (action, archiveId, fields = {}, expected = 200) => value(await rawArchive(action, archiveId, fields), expected);
+  return { account, source, owner, rotated, peer, reader, raw, forge, rawCapsule, capsule, control, archive, rawArchive,
     bucket: () => mf.getR2Bucket('OBJECTS'), reload: async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; } };
 }
 async function capsuleSource(t, { readonlyMember = false } = {}) {
@@ -2371,11 +2370,14 @@ test('private capsules enforce owner integrity, monotone generation CAS and curr
   await h.capsule('append', admitted.intent.id, { sequence: 0, bytes_hex: firstChunk.toString('hex') });
   assert.deepEqual((await h.control()).private_capsule_usage, converted.private_capsule_usage, 'append replay cannot convert reservation twice');
   assert.equal((await h.capsule('retire', admitted.intent.id)).state, 'deleted');
-  const released = await h.control(), marker = released.private_capsule_chunks.find(row => row.capsule === admitted.intent.id);
+  const released = await h.control(), marker = capsuleTuples(released).find(row => row.capsule === admitted.intent.id);
   assert.equal(released.private_capsule_usage[0].bytes, quotaBefore.bytes);
   assert.equal(released.private_capsule_usage[0].reserved_bytes, quotaBefore.reserved_bytes);
   assert.equal(released.private_capsule_usage[0].reserved_chunks, quotaBefore.reserved_chunks);
-  assert.equal(released.private_capsule_usage[0].chunks, quotaBefore.chunks + 1, 'permanent marker remains charged as historical chunk capacity');
+  assert.equal(released.private_capsule_usage[0].chunks, quotaBefore.chunks, 'settled marker no longer consumes a hot chunk slot');
+  assert.equal(released.private_capsule_usage[0].lifetime_chunks, (quotaBefore.lifetime_chunks ?? 0) + 1, 'issued marker remains permanently charged in the lifetime budget');
+  assert.equal(released.private_capsule_usage[0].reserved_lifetime_chunks, quotaBefore.reserved_lifetime_chunks ?? 0, 'only the never-issued suffix liability is released');
+  assert.equal(released.private_capsule_cold_chunks.length, 1); assert.ok(released.private_marker_pages.length > 0);
   assert.equal(marker.state, 'tombstoned');
   assert.equal((await (await h.bucket()).get(marker.locator)).size, 0);
   await h.reload();
@@ -2401,9 +2403,11 @@ test('private capsules enforce owner integrity, monotone generation CAS and curr
   const bucketBeforeReader = await privateCustody();
   await h.capsule('begin', sha('private-capsule-readonly'), { ...begin, workspace_id: sha('readonly-private-workspace') }, { auth: h.reader, expected: 403, code: 'permission_denied' });
   const afterReader = await h.control();
-  for (const field of ['bytes', 'chunks', 'capsules', 'reserved_bytes', 'reserved_chunks']) assert.equal(afterReader.private_capsule_usage[0]?.[field] ?? 0, beforeReader.private_capsule_usage[0]?.[field] ?? 0, `read-only denial cannot allocate ${field}`);
+  for (const field of ['bytes', 'chunks', 'capsules', 'reserved_bytes', 'reserved_chunks', 'lifetime_chunks', 'reserved_lifetime_chunks']) assert.equal(afterReader.private_capsule_usage[0]?.[field] ?? 0, beforeReader.private_capsule_usage[0]?.[field] ?? 0, `read-only denial cannot allocate ${field}`);
   assert.deepEqual(afterReader.private_capsules, beforeReader.private_capsules);
   assert.deepEqual(afterReader.private_capsule_chunks, beforeReader.private_capsule_chunks);
+  for (const table of ['private_marker_pages', 'private_marker_roots', 'private_marker_attempts', 'private_capsule_cold_chunks'])
+    assert.deepEqual(afterReader[table], beforeReader[table], `read-only denial preserves ${table}`);
   assert.deepEqual(afterReader.private_capsule_heads, beforeReader.private_capsule_heads);
   assert.deepEqual(afterReader.forge_retained_roots, beforeReader.forge_retained_roots, 'read-only denial cannot allocate retention authority');
   assert.deepEqual(await privateCustody(), bucketBeforeReader, 'read-only begin cannot add or alter physical custody, including the legitimate permanent marker');
@@ -2456,7 +2460,10 @@ test('private capsules enforce owner integrity, monotone generation CAS and curr
   await h.reload(); assert.equal((await h.capsule('retire', ids.first)).state, 'deleted');
   const retired = await h.control();
   assert.equal(retired.private_capsule_usage[0].bytes, beforeRetire.private_capsule_usage[0].bytes - source.length);
-  for (const chunk of retired.private_capsule_chunks.filter(chunk => chunk.capsule === ids.first)) {
+  const retiredChunks = capsuleTuples(retired).filter(chunk => chunk.capsule === ids.first);
+  assert.equal(retiredChunks.length, body.chunks.length, 'every retired tuple remains known after hot-row reclamation');
+  assert.equal(retired.private_capsule_chunks.filter(chunk => chunk.capsule === ids.first).length, 0);
+  for (const chunk of retiredChunks) {
     assert.equal(chunk.state, 'tombstoned'); const marker = await (await h.bucket()).get(chunk.locator);
     assert.ok(marker); assert.equal(marker.size, 0); assert.equal(marker.customMetadata.retired, '1');
     assert.equal((await marker.arrayBuffer()).byteLength, 0);
@@ -2530,6 +2537,20 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   assert.equal((await h.capsule('retire', settledId)).state, 'deleted');
   const held = await h.control({ action: 'held-put' });
   assert.equal(held.current.size, 0); assert.equal(held.current.metadata.retired, '1');
+  // Real 17-chunk custody crosses the fixed full-page/final-partial boundary.
+  // Drop the first accepted retirement reply, then restart before continuing.
+  const bulkId = sha('archive-multi-page-settled-markers');
+  const bulkBytes = Buffer.alloc(16 * 65536 + 7, 23);
+  await uploadCapsule(h, bulkId, sha('archive-multi-page-workspace'), bulkBytes);
+  const firstRetire = await h.rawCapsule('retire', bulkId); assert.equal(firstRetire.status, 200); await firstRetire.body.cancel();
+  await h.reload();
+  let bulkState = await h.capsule('status', bulkId);
+  for (let round = 0; bulkState.state !== 'deleted' && round < 8; round++) bulkState = await h.capsule('retire', bulkId);
+  assert.equal(bulkState.state, 'deleted');
+  const bulkCatalog = await h.control();
+  assert.equal(bulkCatalog.private_capsule_chunks.filter(chunk => chunk.capsule === bulkId).length, 0);
+  assert.equal(bulkCatalog.private_capsule_cold_chunks.filter(chunk => chunk.capsule === bulkId).length, 17);
+  assert.ok(bulkCatalog.private_marker_pages.filter(page => page.capsule === bulkId).length >= 2);
   const partialId = sha('archive-partially-uploaded-reservation'), partialBytes = Buffer.alloc(65553, 61), partialBody = capsuleDescriptor(partialBytes);
   await h.capsule('begin', partialId, { workspace_id: sha('archive-partial-workspace'), expected_generation: 0, selection: h.selection, descriptor: partialBody.descriptor });
   await h.capsule('append', partialId, { sequence: 0, bytes_hex: partialBody.chunks[0].toString('hex') });
@@ -2557,7 +2578,9 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   }
   assert.ok(manifest && restarted); assert.equal(pages.length, manifest.page_count);
   const privatePages = pages.filter(page => page.content.kind === 'private_payload');
-  assert.equal(privatePages.length, before.private_capsule_chunks.length);
+  assert.equal(privatePages.length, capsuleTuples(before).length, 'archive enumerates hot custody and compacted permanent markers');
+  assert.ok(before.private_capsule_cold_chunks.some(chunk => chunk.capsule === settledId));
+  assert.ok(!before.private_capsule_chunks.some(chunk => chunk.capsule === settledId));
   for (const { content } of privatePages) {
     assert.equal(Object.hasOwn(content, 'object_kind'), false); assert.equal(Object.hasOwn(content, 'object_id'), false);
     assert.ok(content.locator.startsWith(`private/v1/${h.account}/`));
@@ -2576,10 +2599,12 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   const exportedState = await h.control();
   assert.deepEqual(exportedState.private_capsule_chunks, before.private_capsule_chunks, 'archive operator cannot settle or rewrite source private custody');
   assert.deepEqual(exportedState.private_capsule_usage, before.private_capsule_usage);
+  for (const table of ['private_marker_pages', 'private_marker_roots', 'private_marker_attempts', 'private_capsule_cold_chunks'])
+    assert.deepEqual(exportedState[table], before[table], `export does not mutate source ${table}`);
   const target = await capsuleBackend(t);
   await target.archive('restore_begin', archiveId, { manifest });
   await target.capsule('status', sealedId, {}, { expected: 503 });
-  let restoredPage = false;
+  let restoredPage = false, restoredColdPage = false;
   for (const page of pages) {
     const receipt = await target.archive('restore_page', archiveId, { page });
     if (!restoredPage && page.content.kind === 'private_payload') {
@@ -2587,12 +2612,19 @@ test('private capsule archive restores sealed bytes, pending custody and permane
       assert.deepEqual(await target.archive('restore_page', archiveId, { page }), receipt, 'private payload checkpoint replays without duplicate quota or PUT adoption');
       restoredPage = true;
     }
+    if (!restoredColdPage && page.content.kind === 'private_payload' && page.content.capsule_id === bulkId) {
+      await target.reload();
+      assert.deepEqual(await target.archive('restore_page', archiveId, { page }), receipt, 'partial cold-page target receipt rebinding survives restart and exact ACK replay');
+      restoredColdPage = true;
+    }
   }
-  assert.ok(restoredPage);
+  assert.ok(restoredPage && restoredColdPage);
   assert.equal((await target.archive('restore_finish', archiveId)).state, 'complete');
   assert.deepEqual((await target.forge(2)).value, account);
   const restored = await target.control();
   assert.deepEqual(restored.private_capsule_usage, before.private_capsule_usage);
+  assert.equal(restored.private_capsule_cold_chunks.filter(chunk => chunk.capsule === bulkId).length, 17);
+  assert.equal((await target.capsule('status', bulkId)).state, 'deleted');
   assert.deepEqual(restored.private_capsule_heads, before.private_capsule_heads);
   assert.deepEqual(restored.private_capsules, before.private_capsules);
   assert.deepEqual(await target.capsule('status', sealedId), sealed);
@@ -2603,6 +2635,13 @@ test('private capsule archive restores sealed bytes, pending custody and permane
     const body = Buffer.from(chunk.bytes_hex, 'hex'); assert.equal(chunk.sha256, sha(body)); restoredBytes.push(body);
   }
   assert.deepEqual(Buffer.concat(restoredBytes), bytes, 'fresh target reads exact opaque bytes through production authority and target R2 identities');
+  const sourceCold = before.private_capsule_cold_chunks.find(chunk => chunk.capsule === settledId);
+  const targetCold = restored.private_capsule_cold_chunks.find(chunk => chunk.capsule === settledId);
+  assert.ok(sourceCold && targetCold); assert.equal(targetCold.attempt_id, sourceCold.attempt_id);
+  assert.notEqual(targetCold.version, sourceCold.version, 'cold page stores actual independently recreated target marker receipts');
+  const targetSettled = await (await target.bucket()).head(targetCold.locator);
+  assert.equal(targetSettled.version, targetCold.version); assert.equal(targetSettled.etag, targetCold.etag);
+  assert.equal(targetSettled.size, 0);
   const marker = await (await target.bucket()).get(held.key);
   assert.ok(marker); assert.equal(marker.size, 0); assert.equal(marker.customMetadata.retired, '1');
   const rebound = restored.private_capsule_chunks.find(chunk => chunk.capsule === markerId);
@@ -2626,7 +2665,9 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   assert.equal((await target.capsule('retire', sealedId)).state, 'deleted');
   const afterRetire = await target.control();
   assert.equal(afterRetire.private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes - markerBytes.length - bytes.length);
-  for (const chunk of afterRetire.private_capsule_chunks.filter(chunk => chunk.capsule === sealedId)) {
+  const reclaimedSealed = capsuleTuples(afterRetire).filter(chunk => chunk.capsule === sealedId);
+  assert.equal(reclaimedSealed.length, 2); assert.equal(afterRetire.private_capsule_chunks.filter(chunk => chunk.capsule === sealedId).length, 0);
+  for (const chunk of reclaimedSealed) {
     const object = await (await target.bucket()).get(chunk.locator); assert.ok(object); assert.equal(object.size, 0); assert.equal(object.customMetadata.retired, '1');
   }
   const beforePartial = (await target.control()).private_capsule_usage[0];
@@ -2645,4 +2686,26 @@ test('private capsule archive restores sealed bytes, pending custody and permane
   assert.equal((await target.capsule('read', partialId, { sequence: 1 })).bytes_hex, partialBody.chunks[1].toString('hex'));
   assert.deepEqual(await h.capsule('status', sealedId), sealed, 'target byte retirement cannot mutate the separate source bucket or account');
   assert.equal((await h.control()).private_capsule_usage[0].bytes, before.private_capsule_usage[0].bytes);
+  const rejectedExport = async (label, code) => {
+    const id = sha(`marker-catalog-negative-${label}`);
+    let state = await h.archive('export_begin', id), denied = false;
+    for (let round = 0; round < 2048; round++) {
+      const response = await h.rawArchive('export_next', id, { sequence: state.next_sequence });
+      const next = await response.json();
+      if (response.status === 503) { assert.equal(next.error.code, code); denied = true; break; }
+      assert.equal(response.status, 200, JSON.stringify(next)); assert.notEqual(next.state, 'exported', `${label} must prevent a complete archive`); state = next;
+    }
+    assert.equal(denied, true, `${label} must fail closed`);
+    await h.archive('export_abort', id);
+  };
+  const savedPage = await h.control({ action: 'corrupt-marker-page' });
+  await rejectedExport('corrupt-cold-page', 'unavailable');
+  await h.control({ action: 'restore-marker-page', ...savedPage });
+  assert.deepEqual(await h.capsule('status', sealedId), sealed);
+  const unknownKey = `private/v1/${h.account}/${sha('unknown-marker-capsule')}/0/${sha('unknown-marker-attempt')}`;
+  await (await h.bucket()).put(unknownKey, new Uint8Array());
+  await rejectedExport('unknown-private-custody', 'archive_unknown_payload');
+  await (await h.bucket()).delete(unknownKey); // Only this exact fixture-owned object.
+  await (await h.bucket()).delete(sourceCold.locator); // Deliberate loss in the disposable source fixture.
+  await rejectedExport('missing-permanent-marker', 'archive_payload_missing');
 });
