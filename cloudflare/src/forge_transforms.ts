@@ -72,6 +72,8 @@ export interface ForgeTransformsHost {
  requireRetainedClosureInTx(root: ObjectKey): { proof_job: string };
  retainRootInTx(ownerKind: string, ownerId: string, root: ObjectKey, proofJob: string): void;
  releaseRootInTx(ownerKind: string, ownerId: string, root: ObjectKey): void;
+ /** Terminal logical custody transfer only; physical attempts remain charged. */
+ releaseGeneratedOwnerInTx(draftId: string): void;
  pushTransformReview(source: Readonly<TransformReviewSource>, expectedPatchset: string | null): Promise<{ state: string; result: unknown }>;
 }
 interface Person { name: string; email: string; millis: number; offset: number }
@@ -454,6 +456,7 @@ export class ForgeTransforms {
    this.host.sql.exec('INSERT INTO transform_runs(id,account,principal,draft,binding,value,artifact_proof,output_proof,generation,retired) VALUES(?,?,?,?,?,?,?,?,1,0)', d.run_id!, this.host.accountId, d.principal, d.id, d.source!, value, d.artifact_job!, d.output_job!);
    for (const owner of plan.run.pin.protected_roots) this.host.sql.exec("INSERT INTO transform_pin_owners(run_id,kind,owner) VALUES(?,'transform',?)", d.run_id!, owner); }
    d.phase = 'committed'; d.permit = encoded(permit); d.publication_digest = publication; this.saveDraft(d);
+   this.host.releaseGeneratedOwnerInTx(d.id);
   });
  }
  private outcome(job: string, exportId: string, abort = false): DestinationOutcome {
@@ -463,18 +466,21 @@ export class ForgeTransforms {
    // Cleanup transport is trusted and bound to an exact source SQL custody.
    // It cannot select arbitrary payloads or create a permit/publication.
    if (d.export_id === null && abort) { d.export_id = exportId; this.saveDraft(d); }
-   if (d.phase === 'committed') { const permit = JSON.parse(d.permit!) as SourcePermit; return { draft_id: d.id, export_id: exportId, state: 'committed', run_id: d.run_id!, permit_id: permit.permit_id, publication_digest: d.publication_digest! }; }
-   if (abort && d.phase !== 'aborted') this.abortLocal(d);
+   if (d.phase === 'committed') { this.host.releaseGeneratedOwnerInTx(d.id); const permit = JSON.parse(d.permit!) as SourcePermit; return { draft_id: d.id, export_id: exportId, state: 'committed', run_id: d.run_id!, permit_id: permit.permit_id, publication_digest: d.publication_digest! }; }
+   if (abort) this.abortLocal(d);
+   else if (d.phase === 'aborted') this.host.releaseGeneratedOwnerInTx(d.id);
    return { draft_id: d.id, export_id: exportId, state: d.phase === 'aborted' ? 'aborted' : 'pending' };
   });
  }
  private abortLocal(d: Draft): void {
-  if (d.phase === 'committed' || d.phase === 'aborted') return;
+  if (d.phase === 'committed') return;
+  if (d.phase === 'aborted') { this.host.releaseGeneratedOwnerInTx(d.id); return; }
   d.phase = 'aborted'; this.saveDraft(d);
   for (const [side, job] of [['artifact', d.artifact_job], ['output', d.output_job]]) if (job) {
    const proof = this.one<{ account: string; root_kind: number; root_id: string }>('SELECT account,root_kind,root_id FROM closure_jobs WHERE id=?', job);
    if (proof && proof.account === this.host.accountId && proof.root_kind === 3) this.host.releaseRootInTx(`transform-stage-${side}`, d.id, { kind: 3, id: proof.root_id });
   }
+  this.host.releaseGeneratedOwnerInTx(d.id);
  }
  private settle(e: Export, outcome: DestinationOutcome): PeerEvidence {
   return this.host.transactionSync(() => {
@@ -614,6 +620,7 @@ export class ForgeTransforms {
   if (d.phase === 'proof_artifact' || d.phase === 'proof_output') { await this.prove(d); return this.pending(d); }
   if (d.phase === 'prepared') return this.next(d, p.source_account, { action: 'arm_export', export_id: d.export_id!, prepared: await this.prepared(d) });
   if (d.phase === 'committed') {
+   this.host.transactionSync(() => { this.destination(d); this.host.releaseGeneratedOwnerInTx(d.id); });
    if (!d.settled) return this.next(d, p.source_account, { action: 'settle_export', export_id: d.export_id!, outcome: this.outcome(d.id, d.export_id!) });
    const row = this.host.transactionSync(() => this.run(d.run_id!)), b = this.saved(d);
    const review = await this.host.pushTransformReview({ run_id: row.id, account_id: this.host.accountId, destination_view: b.destination_view, destination_view_name: b.destination_view_name, destination_base: b.destination_base, output_head: hex((JSON.parse(row.value) as NativeRun).output_head) }, p.expected_patchset);

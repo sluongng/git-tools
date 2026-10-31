@@ -1605,7 +1605,10 @@ test('declared tt transforms two bootstrapped monorepos with exact pending repla
     { principal: 'destination-reader', token_sha256: sha(readerToken), accounts: [f.destination.account_id], operator: false, kind: 'forge' },
   ];
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-transform-runtime-'));
-  const configuration = { ...options(persist, { config, forge: true }), host: '127.0.0.1', port: 0 };
+  const configuration = { ...options(persist, { config, forge: true }), host: '127.0.0.1', port: 0,
+    modules: [{ type: 'ESModule', path: process.env.TINYTREE_PROJECTION_HARNESS_BUNDLE }, { type: 'CompiledWasm', path: process.env.TINYTREE_PROJECTION_HARNESS_WASM }] };
+  const archiveToken = 'transform-local-archive-runtime-fixture';
+  configuration.bindings.ARCHIVERS_JSON = JSON.stringify([{ principal: 'transform-archiver', token_sha256: sha(archiveToken), accounts: [f.destination.account_id], export: true, restore: true }]);
   configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile: fixture.checker.profile,
     committer: { name: 'Transform Runtime', email: 'fixture@example.invalid' } });
   let mf = new Miniflare(configuration);
@@ -1624,6 +1627,17 @@ test('declared tt transforms two bootstrapped monorepos with exact pending repla
     return { status: response.status, envelope, value: typeof envelope.result_json === 'string' ? JSON.parse(envelope.result_json) : undefined };
   };
   const success = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, JSON.stringify(result)); return result; };
+  const archive = async (action, fields = {}, expected = 200) => {
+    const response = await mf.dispatchFetch(address.origin + '/api/v1/archive/call', { method: 'POST', signal: AbortSignal.timeout(60000),
+      headers: { authorization: `Bearer ${archiveToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ schema: 1, account_id: f.destination.account_id, archive_id: sha('runtime-local-transform-archive'), action, ...fields }) });
+    const result = await response.json(); assert.equal(response.status, expected, JSON.stringify(result)); return result;
+  };
+  const fixtureControl = async (account, route, body) => {
+    const response = await mf.dispatchFetch(`${address.origin}/__fixture/${route}?account=${account}`, body === undefined ? { signal: AbortSignal.timeout(30000) } : { method: 'POST', signal: AbortSignal.timeout(30000), body: JSON.stringify(body) });
+    return value(response);
+  };
+
   for (const source of [f.source, f.destination]) {
     const provisioned = (await success(source.account_id, 1, {}, { id: 'transform-provision' })).value;
     const begun = (await success(source.account_id, 40, { root: source.root,
@@ -1666,6 +1680,7 @@ test('declared tt transforms two bootstrapped monorepos with exact pending repla
   const initial = await success(f.destination.account_id, 30, f.plan, { id: key });
   assert.equal(initial.envelope.state, 'transform_pending');
   assert.equal(initial.value.change_id, f.plan.change_id);
+  assert.equal((await archive('export_begin', {}, 400)).error.code, 'failed_precondition', 'nonterminal cross-account custody cannot be archived');
   await reload();
   let proposed;
   const deadline = Date.now() + 120000;
@@ -1729,9 +1744,88 @@ test('declared tt transforms two bootstrapped monorepos with exact pending repla
   await cli(['pin', 'retire', run, '--request-id', 'tt-retire-protected-transform'], false);
   await cli(['pin', 'resolve', 'ff'.repeat(32)], false);
   assert.deepEqual((await success(f.destination.account_id, 2)).value, beforeMain, 'preparation, retained bytes and CLI replay never publish main');
+  let local;
+  for (let round = 0; round < 32; round++) {
+    local = await fixtureControl(f.destination.account_id, 'transform-peek');
+    if (local.drafts.every(draft => draft.phase === 'committed' && draft.settled === 1) && local.terminal_reservations === 0) break;
+    await success(f.destination.account_id, 30, f.plan, { id: key });
+  }
+  assert.ok(local.drafts.every(draft => draft.phase === 'committed' && draft.settled === 1));
+  assert.equal(local.terminal_reservations, 0, 'terminal transform reservations drain without releasing physical payload custody');
   await success(f.destination.account_id, 3, { expected_epoch: 2, member: { principal: 'destination-reader', can_write: false, can_review: false, is_admin: false, roles: [] } }, { id: 'transform-add-reader' });
   await success(f.source.account_id, 4, { spec: { ...f.source.after_spec, export_allowed: false }, expected_epoch: 3,
     make_default: true, follow_main: false }, { id: 'transform-disable-export' });
+  // Retire the two no-longer-named source versions through product APIs, then
+  // drive genuine source collection. Canonical source main still retains its
+  // after snapshot: this is NOT a claim that every source FILE is collectible.
+  await success(f.source.account_id, 11, { version: f.source.before_view, expected_epoch: 4 }, { id: 'transform-retire-before' });
+  await success(f.source.account_id, 11, { version: f.source.after_view, expected_epoch: 5 }, { id: 'transform-retire-after' });
+  let sourceGc = await fixtureControl(f.source.account_id, 'gc', { action: 'inspect' });
+  const gcDeadline = Date.now() + 120000; let gcSteps = 0;
+  const tickSourceGc = async () => {
+    assert.ok(gcSteps++ < 512 && Date.now() < gcDeadline, 'scoped source GC exceeded its absolute acceptance budget');
+    return fixtureControl(f.source.account_id, 'gc', { action: 'tick' });
+  };
+  // An automatic collection may already exist. Finish that exact active job
+  // before requesting a fresh pass over the post-retirement root inventory.
+  while (sourceGc.gc_maintenance[0]?.active) {
+    const activeId = sourceGc.gc_maintenance[0].active;
+    const active = sourceGc.gc_jobs.find(job => job.id === activeId); assert.ok(active);
+    assert.notEqual(active.phase, 'failed', JSON.stringify(active));
+    sourceGc = await tickSourceGc();
+    const advanced = sourceGc.gc_jobs.find(job => job.id === activeId); assert.ok(advanced);
+    assert.notEqual(advanced.phase, 'failed', JSON.stringify(advanced));
+  }
+  const previousGcIds = new Set(sourceGc.gc_jobs.map(job => job.id));
+  await fixtureControl(f.source.account_id, 'gc', { action: 'request' });
+  let requestedGcId, requestedGc;
+  do {
+    sourceGc = await tickSourceGc();
+    if (!requestedGcId) {
+      const fresh = sourceGc.gc_jobs.filter(job => !previousGcIds.has(job.id));
+      assert.ok(fresh.length <= 1, 'one explicit post-retirement request must select one new collection');
+      requestedGcId = fresh[0]?.id;
+    }
+    requestedGc = sourceGc.gc_jobs.find(job => job.id === requestedGcId);
+    if (requestedGc) assert.notEqual(requestedGc.phase, 'failed', JSON.stringify(requestedGc));
+  } while (requestedGc?.phase !== 'complete');
+  assert.ok(requestedGcId && !previousGcIds.has(requestedGcId));
+  assert.equal(requestedGc.phase, 'complete', 'the exact newly requested scoped source GC must finish');
+  t.diagnostic('Source views retired and actual scoped GC completed; canonical main retains the after snapshot, so pin FILE deletion is not claimed.');
+  for (const [action, status, code] of [['unsettled', 400, 'failed_precondition'], ['missing-pin', 503, 'archive_transform_invalid'], ['rebound-proof', 503, 'archive_transform_invalid'], ['missing-review-owner', 503, 'archive_transform_invalid']]) {
+    await fixtureControl(f.destination.account_id, 'transform-archive-fault', { action, run_id: run });
+    try { assert.equal((await archive('export_begin', {}, status)).error.code, code); }
+    finally { await fixtureControl(f.destination.account_id, 'transform-archive-fault', { action: 'restore' }); }
+  }
+  const pages = []; let manifest, progress = await archive('export_begin'); const exportDeadline = Date.now() + 120000;
+  for (let round = 0; round < 2048 && !manifest; round++) {
+    assert.ok(Date.now() < exportDeadline, 'destination-only archive exceeded its absolute acceptance budget');
+    progress = await archive('export_next', { sequence: pages.length });
+    if (progress.page) { assert.equal(progress.page.sequence, pages.length); pages.push(progress.page); }
+    if (progress.state === 'exported') manifest = progress.manifest;
+  }
+  assert.ok(manifest); await archive('export_finish', { manifest });
+  const restoredPersist = await mkdtemp(path.join(tmpdir(), 'tinytree-transform-local-restore-'));
+  t.after(() => rm(restoredPersist, { recursive: true, force: true }));
+  await mf.dispose();
+  mf = new Miniflare({ ...configuration, durableObjectsPersist: path.join(restoredPersist, 'do'), r2Persist: path.join(restoredPersist, 'r2') }); await mf.ready;
+  await archive('restore_begin', { manifest });
+  for (const page of pages) await archive('restore_page', { page });
+  assert.equal((await archive('restore_finish')).state, 'complete');
+  assert.notEqual((await call(f.source.account_id, 2)).status, 200, 'fresh target has only the destination account, not a hidden source authority');
+  assert.equal((await success(f.destination.account_id, 35, { run_id: run })).value.origin, null);
+  const restoredViewDeadline = Date.now() + 60000;
+  let restoredView = await success(f.destination.account_id, 6);
+  for (let round = 0; round < 512 && restoredView.envelope.state === 'pending'; round++) {
+    assert.ok(Date.now() < restoredViewDeadline, 'restored public view preparation exceeded its absolute budget');
+    restoredView = await success(f.destination.account_id, 6, { version: restoredView.value.view_version, progress: restoredView.value.progress });
+  }
+  assert.equal(restoredView.envelope.state, 'complete');
+  for (const file of f.pin_bytes) assert.deepEqual((await success(f.destination.account_id, 33, { run_id: run, path: file.path, max_bytes: 65536 })).value.bytes, file.bytes);
+  for (const object of [f.source.root, f.source.private_file]) {
+    const deniedSourceHash = await call(f.destination.account_id, 9, { version: restoredView.value.view_version, kind: object.kind, id: Array.from(Buffer.from(object.id, 'hex')), max_bytes: 0 });
+    assert.equal(deniedSourceHash.status, 403, 'known source-only native hashes do not become destination raw read grants');
+  }
   const redacted = await success(f.destination.account_id, 35, { run_id: run }, { auth: readerToken });
   assert.equal(redacted.envelope.state, 'origin_unavailable'); assert.equal(redacted.value.origin, null);
   const retained = await success(f.destination.account_id, 33, { run_id: run, path: f.pin_bytes[0].path, max_bytes: 65536 }, { auth: readerToken });
@@ -1758,8 +1852,8 @@ test('private proved transform roots cannot become public views before source ar
   configuration.bindings.EXPERIMENTAL_RAW_BACKEND = 'disabled';
   configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile: fixture.checker.profile,
     committer: { name: 'Transform Runtime', email: 'fixture@example.invalid' } });
-  const mf = new Miniflare(configuration);
-  const address = await mf.ready;
+  let mf = new Miniflare(configuration);
+  const address = await mf.ready; configuration.port = Number(address.port);
   t.after(async () => { await mf.dispose(); await rm(persist, { recursive: true, force: true }); });
   const call = async (account, operation, payload = {}, { id = '', view = 'public' } = {}) => {
     const response = await mf.dispatchFetch(address.origin + '/api/v1/forge/call', { method: 'POST', signal: AbortSignal.timeout(30000),
@@ -1816,6 +1910,12 @@ test('private proved transform roots cannot become public views before source ar
   assert.deepEqual(originalMain.main_revision, canonicalMain.main_revision);
   assert.equal(originalMain.main_generation, canonicalMain.main_generation);
   assert.equal((await control(f.source.account_id, true)).block_arm_export, 1);
+  await mf.dispose(); mf = new Miniflare(configuration);
+  assert.equal((await mf.ready).origin, address.origin);
+  const restoredControl = await peek(f.source.account_id);
+  assert.equal(restoredControl.control.block_arm_export, 1, 'explicit denial control remains durable across isolate restart');
+  assert.equal(restoredControl.control.arm_export_calls, 0);
+
   const key = 'private-stage-block-before-arm';
   const deadline = Date.now() + 120000;
   let staged;

@@ -19,6 +19,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { requireDelegatedForgeCredential } from './protocol';
 import { ForgeTransforms, type TrustedAuth, type TransformRpcCommand, type TransformRpcResult } from './forge_transforms';
 import { AccountArchive, archiveBarrierInTx } from './account_archive';
+import { requireClosedTransformArchiveInTx } from './transform_archive';
 import { admitArchive, archiveResponse, protectArchive } from './archive_protocol';
 import { ARCHIVE_BUILD_ID, ARCHIVE_SCHEMA } from './archive_schema.generated';
 const ARCHIVE_ROUTE = '/api/v1/archive/call';
@@ -349,11 +350,9 @@ class RepositoryEngine {
     const single = (): void => {
       const repository = this.one('SELECT account FROM repository WHERE singleton=1');
       if (repository && repository.account !== accountId) fail(400, 'failed_precondition');
+      requireClosedTransformArchiveInTx(this.sql, accountId);
       for (const table of tables) {
         if (!exists(table.name)) continue;
-        // Cross-account transform/export custody needs a coherent related-
-        // account archive protocol. Do not silently serialize it independently.
-        if (table.name !== 'transform_recovery_schedule' && /^(?:transform_|export_)/.test(table.name) && this.one(`SELECT 1 AS present FROM ${quoted(table.name)} LIMIT 1`)) fail(400, 'failed_precondition');
         const columns = this.rows(`PRAGMA table_info(${quoted(table.name)})`);
         for (const column of columns) if (column.name === 'account' || column.name === 'account_id') {
           if (this.one(`SELECT 1 AS foreign_account FROM ${quoted(table.name)} WHERE ${quoted(String(column.name))} IS NOT NULL AND ${quoted(String(column.name))}<>? LIMIT 1`, accountId)) fail(400, 'failed_precondition');
@@ -546,7 +545,8 @@ class RepositoryEngine {
   }
   private releaseStorageOwnerInTx(storage: ForgeStorage, kind: string, owner: string): void {
     // Terminal ownership transfers are bounded by the account reservation quota.
-    // This runs only after a durable root was attached in the same transaction.
+    // The owning state machine must have transferred durable roots or aborted
+    // and released its stage roots in this same transaction.
     const result = storage.releaseReservationsInTx(kind, owner, 128);
     if (!result.complete) {
       const pending = Number(this.one('SELECT COUNT(*) AS n FROM forge_storage_terminal_owners')!.n);
@@ -1037,6 +1037,12 @@ class RepositoryEngine {
       reserveGeneratedInTx: (owner, descriptor) => storage.reserveInTx('transform', owner, descriptor),
       stageGenerated: (descriptor, bytes) => storage.stage(descriptor, bytes),
       confirmGeneratedInTx: (owner, descriptor, confirmation) => storage.confirmInTx('transform', owner, descriptor, confirmation),
+      releaseGeneratedOwnerInTx: draftId => {
+        if (!/^[0-9a-f]{64}$/.test(draftId)) fail(503, 'failed_precondition');
+        const draft = this.one('SELECT account,phase FROM transform_drafts WHERE id=?', draftId);
+        if (!draft || draft.account !== account || !['committed', 'aborted'].includes(String(draft.phase))) fail(503, 'failed_precondition');
+        this.releaseStorageOwnerInTx(storage, 'transform', draftId);
+      },
       requireRetainedClosureInTx: root => this.retainedForgeClosureInTx(account, storage, root),
       retainRootInTx: (ownerKind, owner, root, proofJob) => {
         this.rootAddedInTx(storage);

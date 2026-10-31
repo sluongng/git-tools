@@ -1,6 +1,7 @@
 /** Same-build, same-account archive. The enclosing account queue must serialize
  * every call through its physical awaits and fence all non-archive entry points. */
 import { inspect } from './core';
+import { prepareClosedTransformArchive } from './transform_archive';
 import { PrivateMarkerCatalog, type PreparedMarkerMutation } from './private_marker_catalog';
 import { fail, Failure } from './protocol';
 import { capsuleChunkHash, capsuleChain, parseCapsuleDescriptor } from './private_capsule_protocol';
@@ -203,9 +204,9 @@ export class AccountArchive {
    }
    if(list.truncated)j.audit_cursor=list.cursor;
    else if(j.audit_domain==='native'){j.audit_domain='private';j.audit_cursor=null;}
-   else{j.audit_cursor=null;if(j.phase==='audit_final'){const missing=this.one<{n:number}>("SELECT COUNT(*) AS n FROM archive_payload_proofs p LEFT JOIN archive_audit_seen s ON p.attempt_id=s.attempt_id WHERE p.presence='present' AND s.attempt_id IS NULL")!.n;if(missing)fail(503,'archive_payload_changed');j.phase='seal';this.sealExport(j);}else j.phase='rows';}
+   else{j.audit_cursor=null;if(j.phase==='audit_final'){const missing=this.one<{n:number}>("SELECT COUNT(*) AS n FROM archive_payload_proofs p LEFT JOIN archive_audit_seen s ON p.attempt_id=s.attempt_id WHERE p.presence='present' AND s.attempt_id IS NULL")!.n;if(missing)fail(503,'archive_payload_changed');j.phase='seal';}else j.phase='rows';}
    this.save(j);
-  });return j.phase==='exported'?{...this.reply(j,'exported'),manifest:j.manifest!}:this.reply(j);
+  });return j.phase==='seal'?this.finishExportSeal(j,auth):this.reply(j);
  }
  private encodeCell(value:unknown,type:string):ArchiveCell{if(type==='null'&&value===null)return{kind:'null'};if(type==='text'&&typeof value==='string')return{kind:'text',value};if(type==='integer'&&typeof value==='number'&&safe(value))return{kind:'integer',value};if(type==='real'&&typeof value==='number'&&Number.isFinite(value)&&Math.abs(value)<=Number.MAX_SAFE_INTEGER)return{kind:'real',value:String(value)};if(type==='blob'&&(value instanceof ArrayBuffer||ArrayBuffer.isView(value))){const b=value instanceof ArrayBuffer?new Uint8Array(value):new Uint8Array(value.buffer,value.byteOffset,value.byteLength);return{kind:'blob',hex:hex(b)};}fail(413,'archive_value_unsupported');}
  private rowContent(j:Job):ArchiveContent|undefined{
@@ -219,6 +220,7 @@ export class AccountArchive {
  private async exportNext(j:Job,sequence:number,auth:ArchiveAuth):Promise<ArchiveReply>{
   if(sequence===j.sequence-1){const page=this.lastPage();if(!page||page.sequence!==sequence)fail(409,'archive_sequence');return{...this.reply(j,'page'),page};}if(sequence!==j.sequence)fail(409,'archive_sequence');if(j.phase==='exported'||j.phase==='export_complete')return{...this.reply(j,j.phase==='exported'?'exported':'complete'),manifest:j.manifest!};if(j.phase==='aborted')fail(409,'archive_aborted');
   if(j.phase==='audit'||j.phase==='audit_final')return this.audit(j,auth);
+  if(j.phase==='seal')return this.finishExportSeal(j,auth);
   if(j.phase==='rows'){const content=this.tx(()=>this.rowContent(j));if(content){await this.auth(auth,'export');return this.page(j,content,auth);}}
   if(j.payload_domain==='native'){
    const a=this.one<Attempt>("SELECT * FROM forge_storage_attempts WHERE state!='deleted' AND attempt_id>? ORDER BY attempt_id LIMIT 1",j.payload_after);
@@ -232,6 +234,11 @@ export class AccountArchive {
   }
   await this.checkPrivateSealed(j,auth,'export');
   j.private_checked=true;j.phase='audit_final';j.audit_cursor=null;j.audit_domain='native';this.tx(()=>{this.exec('DELETE FROM archive_audit_seen');this.save(j);});return this.reply(j);
+ }
+ private async finishExportSeal(j:Job,auth:ArchiveAuth):Promise<ArchiveReply>{
+  const proof=await prepareClosedTransformArchive({sql:this.host.sql,accountId:this.host.accountId,assertAuthorized:()=>this.auth(auth,'export')});
+  await this.auth(auth,'export');
+  return this.tx(()=>{const current=this.load();if(!current||current.id!==j.id||current.phase!=='seal'||current.sequence!==j.sequence||current.chain!==j.chain)fail(409,'archive_conflict');proof.assertCurrentInTx();this.sealExport(j);this.save(j);return{...this.reply(j,'exported'),manifest:j.manifest!};});
  }
  private sealExport(j:Job):void{if(!j.private_checked)fail(503,'archive_private_incomplete');this.validatePrivateCoverage();this.validateBindings();if(j.rows!==j.tables.reduce((n,t)=>n+t.rows,0))fail(503,'archive_count_mismatch');this.host.requireSingleAccountInTx();j.phase='exported';j.manifest=this.manifest(j);}
  private validateBindings():void{const bad=this.one<{n:number}>("SELECT COUNT(*) AS n FROM objects o LEFT JOIN forge_storage_bindings b ON o.kind=b.kind AND o.id=b.id LEFT JOIN forge_storage_attempts a ON b.attempt_id=a.attempt_id LEFT JOIN archive_payload_proofs p ON 'native:'||a.attempt_id=p.attempt_id WHERE o.visible=1 AND (a.attempt_id IS NULL OR a.state!='written' OR a.kind!=o.kind OR a.id!=o.id OR a.size!=o.size OR p.presence IS NULL OR p.presence!='present')");if(!bad||bad.n!==0)fail(503,'archive_payload_missing');}
@@ -277,5 +284,5 @@ export class AccountArchive {
   let proof:Proof|undefined;if(p.content.kind==='payload')proof=await this.targetPayload(j,p.content,auth);else if(p.content.kind==='private_payload')proof=await this.targetPrivatePayload(j,p.content,auth);
   return this.tx(()=>{if(p.content.kind==='rows'){if(j.payload_domain!=='native'||j.payload_after!=='')fail(400,'archive_table_order');this.restoreRows(j,p.content);}else{if(!proof)fail(503,'unavailable');this.exec('INSERT INTO archive_payload_proofs(attempt_id,presence,etag,version) VALUES(?,?,?,?)',proof.attempt_id,proof.presence,proof.etag,proof.version);if(p.content.kind==='payload')this.exec('UPDATE forge_storage_attempts SET etag=?,version=? WHERE attempt_id=?',proof.etag,proof.version,p.content.attempt_id);else{if(!proof.rebind)fail(503,'unavailable');proof.rebind.applyInTx();}j.payload_after=p.content.attempt_id;}this.acceptCounts(j,p);this.checkpoint(p);this.save(j);return this.reply(j);});
  }
- private async finishRestore(j:Job,auth:ArchiveAuth):Promise<ArchiveReply>{await this.auth(auth,'restore');await this.checkPrivateSealed(j,auth,'restore');return this.tx(()=>{if(j.phase!=='restoring'||!same(this.manifest(j),j.manifest))fail(409,'archive_incomplete');this.schemaMatches(j.tables);for(const t of j.tables)if(this.one<{n:number}>(`SELECT COUNT(*) AS n FROM ${quoted(t.name)}`)!.n!==t.rows)fail(400,'archive_count_mismatch');const missing=this.one<{n:number}>("SELECT COUNT(*) AS n FROM forge_storage_attempts a LEFT JOIN archive_payload_proofs p ON 'native:'||a.attempt_id=p.attempt_id WHERE a.state!='deleted' AND p.attempt_id IS NULL")!.n;if(missing!==0)fail(409,'archive_incomplete');this.validatePrivateCoverage();this.validateBindings();this.host.requireSingleAccountInTx();j.phase='complete';this.save(j);this.host.onActivatedInTx();return{...this.reply(j,'complete'),manifest:j.manifest!};});}
+ private async finishRestore(j:Job,auth:ArchiveAuth):Promise<ArchiveReply>{await this.auth(auth,'restore');if(j.phase!=='restoring'||!same(this.manifest(j),j.manifest))fail(409,'archive_incomplete');await this.checkPrivateSealed(j,auth,'restore');const proof=await prepareClosedTransformArchive({sql:this.host.sql,accountId:this.host.accountId,assertAuthorized:()=>this.auth(auth,'restore')});await this.auth(auth,'restore');return this.tx(()=>{proof.assertCurrentInTx();if(j.phase!=='restoring'||!same(this.manifest(j),j.manifest))fail(409,'archive_incomplete');this.schemaMatches(j.tables);for(const t of j.tables)if(this.one<{n:number}>(`SELECT COUNT(*) AS n FROM ${quoted(t.name)}`)!.n!==t.rows)fail(400,'archive_count_mismatch');const missing=this.one<{n:number}>("SELECT COUNT(*) AS n FROM forge_storage_attempts a LEFT JOIN archive_payload_proofs p ON 'native:'||a.attempt_id=p.attempt_id WHERE a.state!='deleted' AND p.attempt_id IS NULL")!.n;if(missing!==0)fail(409,'archive_incomplete');this.validatePrivateCoverage();this.validateBindings();this.host.requireSingleAccountInTx();j.phase='complete';this.save(j);this.host.onActivatedInTx();return{...this.reply(j,'complete'),manifest:j.manifest!};});}
 }

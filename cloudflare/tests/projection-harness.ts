@@ -160,6 +160,9 @@ async function storageScenario(ctx: DurableObjectState, bucket: R2Bucket, accoun
 interface CapsuleBackingFault { mode: 'none' | 'before-put' | 'after-put'; failHead: boolean; held?: { key: string; bytes: Uint8Array; options: R2PutOptions | undefined } }
 export class AccountRepository extends Base {
   private capsuleFault: CapsuleBackingFault;
+  private transformArchiveFault?: { id: string; draft: string; artifact_proof: string; settled: number;
+    roots: { owner_kind: string; owner_id: string; kind: number; id: string; active: number }[];
+    owners: { run_id: string; kind: string; owner: string }[] };
   constructor(private fixtureCtx: DurableObjectState, private fixtureEnv: Env) {
     // Test-only backing faults: after-PUT also loses its immediate HEAD
     // reconciliation, leaving a genuine ambiguous attempt for restart. Authority remains
@@ -187,8 +190,13 @@ export class AccountRepository extends Base {
       const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
     } });
     super(fixtureCtx, { ...fixtureEnv, OBJECTS: wrapped }); this.capsuleFault = fault;
-    fixtureCtx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_transform_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),block_arm_export INTEGER NOT NULL DEFAULT 0,arm_export_calls INTEGER NOT NULL DEFAULT 0)');
-    fixtureCtx.storage.sql.exec('INSERT OR IGNORE INTO fixture_transform_control(singleton) VALUES(1)');
+  }
+  // Dedicated denial tests create this durable control lazily. Ordinary
+  // production-shaped accounts have no test DDL to hide from archive audits.
+  private transformControlSnapshot(): { block_arm_export: number; arm_export_calls: number } {
+    const sql = this.fixtureCtx.storage.sql;
+    if (![...sql.exec("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='fixture_transform_control'")].length) return { block_arm_export: 0, arm_export_calls: 0 };
+    return [...sql.exec('SELECT block_arm_export,arm_export_calls FROM fixture_transform_control WHERE singleton=1')][0] as { block_arm_export: number; arm_export_calls: number };
   }
   /** Fault-only override: deny the final source arm. Never manufacture peer
    * evidence, permits, validated roots, acknowledgements, or check verdicts. */
@@ -196,7 +204,7 @@ export class AccountRepository extends Base {
     if (frame.command.action === 'arm_export') {
       const blocked = this.fixtureCtx.storage.transactionSync(() => {
         const sql = this.fixtureCtx.storage.sql;
-        const row = [...sql.exec('SELECT block_arm_export FROM fixture_transform_control WHERE singleton=1')][0];
+        const row = this.transformControlSnapshot();
         if (row?.block_arm_export !== 1) return false;
         sql.exec('UPDATE fixture_transform_control SET arm_export_calls=arm_export_calls+1 WHERE singleton=1');
         return true;
@@ -219,19 +227,58 @@ export class AccountRepository extends Base {
         const text = await request.text(); if (text.length > 256) fail(400, 'fixture_input_limit');
         const input = JSON.parse(text) as Record<string, unknown>;
         if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1 || typeof input.block_arm_export !== 'boolean') fail(400, 'fixture_input_limit');
-        this.fixtureCtx.storage.transactionSync(() => sql.exec('UPDATE fixture_transform_control SET block_arm_export=? WHERE singleton=1', input.block_arm_export ? 1 : 0));
-        return Response.json([...sql.exec('SELECT block_arm_export,arm_export_calls FROM fixture_transform_control WHERE singleton=1')][0]);
+        this.fixtureCtx.storage.transactionSync(() => {
+          sql.exec('CREATE TABLE IF NOT EXISTS fixture_transform_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),block_arm_export INTEGER NOT NULL DEFAULT 0,arm_export_calls INTEGER NOT NULL DEFAULT 0)');
+          sql.exec('INSERT OR IGNORE INTO fixture_transform_control(singleton) VALUES(1)');
+          sql.exec('UPDATE fixture_transform_control SET block_arm_export=? WHERE singleton=1', input.block_arm_export ? 1 : 0);
+        });
+        return Response.json(this.transformControlSnapshot());
+      }
+      if (url.pathname === '/__fixture/transform-archive-fault') {
+        const text = await request.text(); if (text.length > 256) fail(400, 'fixture_input_limit');
+        const input = JSON.parse(text) as { action: string; run_id?: string };
+        if (request.method !== 'POST') fail(405, 'fixture_method');
+        this.fixtureCtx.storage.transactionSync(() => {
+          const archive = [...sql.exec("SELECT name FROM sqlite_schema WHERE type='table' AND name='archive_job'")];
+          if (archive.length) {
+            const row = [...sql.exec('SELECT body FROM archive_job WHERE singleton=1')][0];
+            if (row && !['export_complete', 'complete', 'aborted'].includes(JSON.parse(String(row.body)).phase)) fail(503, 'fixture_archive_active');
+          }
+          if (input.action === 'restore') {
+            const saved = this.transformArchiveFault; if (!saved) fail(400, 'fixture_missing_saved_fault');
+            sql.exec('UPDATE transform_runs SET artifact_proof=? WHERE id=?', saved.artifact_proof, saved.id);
+            sql.exec('UPDATE transform_drafts SET settled=? WHERE id=?', saved.settled, saved.draft);
+            for (const owner of saved.owners) sql.exec('INSERT OR IGNORE INTO transform_pin_owners(run_id,kind,owner) VALUES(?,?,?)', owner.run_id, owner.kind, owner.owner);
+            for (const root of saved.roots) sql.exec('UPDATE forge_retained_roots SET active=? WHERE owner_kind=? AND owner_id=? AND kind=? AND id=?', root.active, root.owner_kind, root.owner_id, root.kind, root.id);
+            this.transformArchiveFault = undefined; return;
+          }
+          if (this.transformArchiveFault || !['unsettled', 'missing-pin', 'rebound-proof', 'missing-review-owner'].includes(input.action) || !input.run_id) fail(400, 'fixture_input_limit');
+          const run = [...sql.exec('SELECT id,draft,artifact_proof FROM transform_runs WHERE id=?', input.run_id)][0];
+          if (!run) fail(400, 'fixture_missing_run');
+          const draft = [...sql.exec('SELECT settled FROM transform_drafts WHERE id=?', run.draft)][0];
+          if (!draft || draft.settled !== 1) fail(400, 'fixture_requires_settled_run');
+          const roots = [...sql.exec("SELECT owner_kind,owner_id,kind,id,active FROM forge_retained_roots WHERE owner_id=? AND owner_kind IN ('transform-pin','transform-output')", input.run_id)] as { owner_kind: string; owner_id: string; kind: number; id: string; active: number }[];
+          const owners = [...sql.exec("SELECT run_id,kind,owner FROM transform_pin_owners WHERE run_id=? AND kind='review' ORDER BY owner LIMIT 17", run.id)] as { run_id: string; kind: string; owner: string }[];
+          if (owners.length > 16 || (input.action === 'missing-review-owner' && !owners.length)) fail(400, 'fixture_requires_review_owner');
+          this.transformArchiveFault = { id: String(run.id), draft: String(run.draft), artifact_proof: String(run.artifact_proof), settled: Number(draft.settled), roots, owners };
+          if (input.action === 'unsettled') sql.exec('UPDATE transform_drafts SET settled=0 WHERE id=?', run.draft);
+          else if (input.action === 'missing-review-owner') sql.exec('DELETE FROM transform_pin_owners WHERE run_id=? AND kind=? AND owner=?', owners[0].run_id, owners[0].kind, owners[0].owner);
+          else if (input.action === 'rebound-proof') sql.exec("UPDATE transform_runs SET artifact_proof='fixture-unrelated-proof' WHERE id=?", run.id);
+          else sql.exec("UPDATE forge_retained_roots SET active=0 WHERE owner_kind='transform-pin' AND owner_id=?", run.id);
+        });
+        return Response.json({ restored: input.action === 'restore' });
       }
       if (url.pathname === '/__fixture/transform-peek') {
         if (request.method !== 'GET') fail(405, 'fixture_method');
         const exists = (table: string): boolean => [...sql.exec('SELECT name FROM sqlite_master WHERE type=\'table\' AND name=?', table)].length === 1;
-        const drafts = exists('transform_drafts') ? [...sql.exec('SELECT id,request_id,phase,run_id,artifact_job,output_job FROM transform_drafts ORDER BY id LIMIT 8')] : [];
+        const drafts = exists('transform_drafts') ? [...sql.exec('SELECT id,request_id,phase,settled,run_id,artifact_job,output_job FROM transform_drafts ORDER BY id LIMIT 8')] : [];
         const stage_roots = exists('transform_drafts') && exists('closure_jobs') ? [...sql.exec("SELECT r.owner_kind,r.owner_id,r.kind,r.id,j.phase AS proof_phase,(j.nodes=j.checked_nodes AND j.contexts=j.checked_contexts AND j.obligations=j.checked_obligations) AS complete FROM forge_retained_roots r JOIN transform_drafts d ON d.id=r.owner_id JOIN closure_jobs j ON j.id=CASE r.owner_kind WHEN 'transform-stage-artifact' THEN d.artifact_job ELSE d.output_job END WHERE r.active=1 AND r.owner_kind IN ('transform-stage-artifact','transform-stage-output') AND j.account=? AND j.root_kind=r.kind AND j.root_id=r.id ORDER BY r.owner_kind,r.owner_id LIMIT 16", account)] : [];
         const committed_runs = exists('transform_runs') ? [...sql.exec('SELECT COUNT(*) AS count FROM transform_runs')][0].count : 0;
         const active_pin_roots = [...sql.exec("SELECT COUNT(*) AS count FROM forge_retained_roots WHERE active=1 AND owner_kind IN ('transform-pin','transform-output')")][0].count;
         const views = exists('forge_view_names') ? [...sql.exec("SELECT n.name,n.current_version AS version,json_extract(v.spec,'$.export_allowed') AS export_allowed FROM forge_view_names n JOIN forge_view_versions v ON v.version=n.current_version ORDER BY n.name LIMIT 65")] : [];
-        const control = [...sql.exec('SELECT block_arm_export,arm_export_calls FROM fixture_transform_control WHERE singleton=1')][0];
-        return Response.json({ drafts, stage_roots, committed_runs, active_pin_roots, views, control });
+        const control = this.transformControlSnapshot();
+        const terminal_reservations = exists('forge_storage_reservations') && exists('transform_drafts') ? [...sql.exec("SELECT COUNT(*) AS count FROM forge_storage_reservations r JOIN transform_drafts d ON r.owner_id=d.id WHERE r.owner_kind='transform' AND d.phase IN ('committed','aborted')")][0].count : 0;
+        return Response.json({ drafts, stage_roots, committed_runs, active_pin_roots, views, control, terminal_reservations });
       }
       if (url.pathname === '/__fixture/private-capsules') {
         const input = await request.json() as { action?: string; mode?: string; capsule?: string; first_sequence?: number; body_hex?: string };

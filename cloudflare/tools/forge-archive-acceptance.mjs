@@ -18,6 +18,7 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
 let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay, privateRelay;
+let destinationTransformRecovery;
 let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, thirdWip, resumedWip, fifthWip, resumeEvidence, pruneEvidence, markerRecovery, complete = false, cleaned = false;
 const fault = { export: true, restore: true, retire: false };
 const events = [], physicalEvidence = [];
@@ -203,6 +204,15 @@ const workflow = {
     context = value; localRoot = await mkdtemp('/tmp/tfa.');
     if (process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR) assert.equal(typeof context.artifacts, 'string', 'configured evidence directory must reach archive workflow');
     const directory = path.join(localRoot, 'archive');
+    // Source authority is deliberately unavailable to the eventual fresh target.
+    // Retire historical source views normally; canonical main still protects
+    // its after FILEs, so this acceptance does not claim those bytes were GC'd.
+    const dependency = context.source.transform, upstream = dependency.source;
+    await context.invoke(4, { spec: { ...upstream.after_spec, export_allowed: false }, expected_epoch: 3,
+      make_default: true, follow_main: false }, 'archive-disable-transform-origin', 200, 'public', upstream.account_id);
+    await context.invoke(11, { version: upstream.before_view, expected_epoch: 4 }, 'archive-retire-transform-before', 200, 'public', upstream.account_id);
+    await context.invoke(11, { version: upstream.after_view, expected_epoch: 5 }, 'archive-retire-transform-after', 200, 'public', upstream.account_id);
+
     // Exercise the actual supported Legacy client, not an opaque byte fixture.
     const prior = (await context.invoke(2)).value;
     await context.invoke(4, { spec: { ...context.source.spec, revision: prior.main_revision, export_allowed: true },
@@ -312,6 +322,33 @@ const workflow = {
     assert.equal(restored.result.chain_root, manifest.chain_root);
     assert.deepEqual((await forgeCall(targetOrigin, 2)).value, acknowledged);
     assert.deepEqual(await forgeCall(targetOrigin, 24, selector, 'accept-positive-land'), replay);
+    const dependencyRun = context.evidence.find(entry => entry.label === 'transform')?.run_id;
+    assert.match(dependencyRun, /^[0-9a-f]{64}$/);
+    const absentSourceResponse = await fetch(targetOrigin + '/api/v1/forge/call', { method: 'POST', signal: AbortSignal.timeout(30000),
+      headers: { authorization: `Bearer ${context.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 1, operation: 2, account_id: context.source.transform.source.account_id, view: 'public', request_id: '', payload_json: '{}' }) });
+    assert.notEqual(absentSourceResponse.status, 200, 'only the destination account was restored; no source origin exists in this namespace');
+    const lineageAfterRestore = await forgeCall(targetOrigin, 35, { run_id: dependencyRun });
+    assert.equal(lineageAfterRestore.state, 'origin_unavailable'); assert.equal(lineageAfterRestore.value.origin, null);
+    const restoredViewDeadline = Date.now() + 60000;
+    let restoredView = await forgeCall(targetOrigin, 6);
+    for (let round = 0; round < 512 && restoredView.state === 'pending'; round++) {
+      assert.ok(Date.now() < restoredViewDeadline, 'restored public view preparation exceeded its absolute budget');
+      restoredView = await forgeCall(targetOrigin, 6, { version: restoredView.value.view_version, progress: restoredView.value.progress });
+    }
+    assert.equal(restoredView.state, 'complete');
+    for (const file of context.source.transform.pin_bytes) {
+      const retained = await forgeCall(targetOrigin, 33, { run_id: dependencyRun, path: file.path, max_bytes: 65536 });
+      assert.deepEqual(retained.value.bytes, file.bytes, 'destination-only restore reproduces exact retained dependency bytes');
+    }
+    for (const object of [context.source.transform.source.root, context.source.transform.source.private_file]) {
+      const denied = await forgeCall(targetOrigin, 9, { version: restoredView.value.view_version, kind: object.kind, id: Array.from(Buffer.from(object.id, 'hex')), max_bytes: 0 }, '', 403);
+      assert.equal(denied.error.code, 'permission_denied');
+    }
+    assert.equal((await forgeCall(targetOrigin, 34, { run_id: dependencyRun }, 'protect-restored-transform-pin', 400)).error.code, 'failed_precondition');
+    destinationTransformRecovery = { run_id: dependencyRun, source_account_absent: true, historical_source_views_retired: true,
+      source_file_gc_claimed: false, pin_bytes_exact: true, origin_redacted: true, source_hash_read_denied: true };
+
     // A fresh, independently provisioned account must never be overwritten.
     const occupied = new Miniflare({ ...targetConfiguration, port: 0, durableObjectsPersist: path.join(localRoot, 'occupied-do'), r2Persist: path.join(localRoot, 'occupied-r2') });
     try {
@@ -360,6 +397,10 @@ const workflow = {
     const landed = await forgeCall(targetOrigin, 24, exact, 'restored-land'); assert.equal(landed.state, 'landed');
     assert.deepEqual(await forgeCall(targetOrigin, 24, exact, 'restored-land'), landed);
     assert.equal((await forgeCall(targetOrigin, 2)).value.main_generation, acknowledged.main_generation + 1);
+    for (const file of context.source.transform.pin_bytes) assert.deepEqual((await forgeCall(targetOrigin, 33,
+      { run_id: dependencyRun, path: file.path, max_bytes: 65536 })).value.bytes, file.bytes);
+    destinationTransformRecovery.subsequent_real_check_land = true;
+
     const reconciled = await command(targetClient, ['request', 'reconcile', 'restored-source'], { cwd: workspace });
     assert.equal(reconciled.result.value.local_reconciliation, 'applied');
     // Capture again after a real Land/reconcile: the mapped review base differs
@@ -534,6 +575,7 @@ const workflow = {
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
       native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip, third_capsule: thirdWip, resumed_capsule: resumedWip, fifth_capsule: fifthWip, explicit_prune: pruneEvidence, exact_saved_resume: resumeEvidence, settled_marker_recovery: markerRecovery },
+      destination_local_transform: destinationTransformRecovery,
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
       tamper_and_missing_page_rejected: true, existing_target_preserved: true, legacy_orphan_target_rejected: true, incomplete_restore_fenced: true,
       owned_cleanup: true, deployed_recovery_proof: false };
