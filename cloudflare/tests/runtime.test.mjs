@@ -2246,10 +2246,11 @@ function capsuleDescriptor(bytes) {
 async function capsuleBackend(t) {
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-private-capsule-'));
   const source = fixture.checker, account = source.account_id;
-  const owner = 'capsule-owner-fixture', rotated = 'capsule-owner-rotated-fixture', peer = 'capsule-peer-fixture', raw = 'capsule-raw-fixture', archiveToken = 'capsule-archive-fixture';
+  const owner = 'capsule-owner-fixture', rotated = 'capsule-owner-rotated-fixture', peer = 'capsule-peer-fixture', reader = 'capsule-reader-fixture', raw = 'capsule-raw-fixture', archiveToken = 'capsule-archive-fixture';
   const config = [
     ...[owner, rotated].map(token => ({ principal: source.owner, token_sha256: sha(token), accounts: [account], operator: true, kind: 'forge' })),
     { principal: 'capsule-peer', token_sha256: sha(peer), accounts: [account], operator: true, kind: 'forge' },
+    { principal: 'capsule-reader', token_sha256: sha(reader), accounts: [account], operator: false, kind: 'forge' },
     { principal: 'capsule-raw', token_sha256: sha(raw), accounts: [account], operator: true, kind: 'raw' },
   ];
   const configuration = { ...options(persist, { config, forge: true }),
@@ -2288,10 +2289,10 @@ async function capsuleBackend(t) {
       body: JSON.stringify({ schema: 1, account_id: account, archive_id: archiveId, action, ...fields }) });
     return value(response, expected);
   };
-  return { account, source, owner, rotated, peer, raw, forge, rawCapsule, capsule, control, archive,
+  return { account, source, owner, rotated, peer, reader, raw, forge, rawCapsule, capsule, control, archive,
     bucket: () => mf.getR2Bucket('OBJECTS'), reload: async () => { await mf.dispose(); mf = new Miniflare(configuration); await mf.ready; } };
 }
-async function capsuleSource(t) {
+async function capsuleSource(t, { readonlyMember = false } = {}) {
   const h = await capsuleBackend(t), { source } = h;
   const provisioned = (await h.forge(1, {}, { id: 'capsule-provision' })).value;
   const begun = (await h.forge(40, { root: source.root,
@@ -2308,8 +2309,13 @@ async function capsuleSource(t) {
   assert.equal(status.phase, 'ready');
   await h.forge(44, { import_id: begun.import_id, expected_generation: status.generation }, { id: 'capsule-bootstrap-finish' });
   await h.forge(3, { expected_epoch: 1, member: { principal: 'capsule-peer', can_write: true, can_review: false, is_admin: false, roles: ['authors'] } }, { id: 'capsule-add-peer' });
-  const spec = { ...source.spec, export_allowed: true };
-  await h.forge(4, { spec, expected_epoch: 2, make_default: true, follow_main: false }, { id: 'capsule-export-view' });
+  let policyEpoch = 2;
+  if (readonlyMember) {
+    await h.forge(3, { expected_epoch: policyEpoch, member: { principal: 'capsule-reader', can_write: false, can_review: false, is_admin: false, roles: ['authors'] } }, { id: 'capsule-add-reader' });
+    policyEpoch++;
+  }
+  const spec = { ...source.spec, export_allowed: true, ...(readonlyMember ? { visibility: { kind: 'roles', roles: ['authors'] } } : {}) };
+  await h.forge(4, { spec, expected_epoch: policyEpoch, make_default: !readonlyMember, follow_main: false }, { id: 'capsule-export-view' });
   let view = await h.forge(6);
   for (let round = 0; round < 128 && view.state === 'pending'; round++) view = await h.forge(6, { version: view.value.view_version, progress: view.value.progress });
   assert.equal(view.state, 'complete');
@@ -2325,11 +2331,23 @@ async function uploadCapsule(h, id, workspace, bytes, generation = 0, options = 
 }
 
 test('private capsules enforce owner integrity, monotone generation CAS and current export policy across restart and physical retirement', async t => {
-  const h = await capsuleSource(t), workspace = sha('capsule-workspace');
+  const h = await capsuleSource(t, { readonlyMember: true }), workspace = sha('capsule-workspace');
   const ids = Object.fromEntries(['first', 'stale', 'second', 'third', 'peer'].map(name => [name, sha(`private-capsule-${name}`)]));
   const source = Buffer.alloc(131073); for (let i = 0; i < source.length; i++) source[i] = i % 251;
   const body = capsuleDescriptor(source), begin = { workspace_id: workspace, expected_generation: 0, selection: h.selection, descriptor: body.descriptor };
   const main = (await h.forge(2)).value, originalNative = (await h.control()).objects;
+  const readable = await h.forge(6, { version: Array.from(Buffer.from(h.selection.view_version, 'hex')) }, { auth: h.reader });
+  assert.equal(readable.state, 'complete');
+  assert.equal(capsuleHex(readable.value.projected_commit), h.selection.projected_commit, 'real read-only member can resolve the role-allowed exported view');
+  const beforeReader = await h.control();
+  const bucketBeforeReader = await (await h.bucket()).list({ prefix: `private/v1/${h.account}/` });
+  await h.capsule('begin', sha('private-capsule-readonly'), { ...begin, workspace_id: sha('readonly-private-workspace') }, { auth: h.reader, expected: 403, code: 'permission_denied' });
+  const afterReader = await h.control();
+  for (const field of ['bytes', 'chunks', 'capsules']) assert.equal(afterReader.private_capsule_usage[0]?.[field] ?? 0, beforeReader.private_capsule_usage[0]?.[field] ?? 0, `read-only denial cannot allocate ${field}`);
+  assert.deepEqual(afterReader.private_capsules, beforeReader.private_capsules);
+  assert.deepEqual(afterReader.private_capsule_chunks, beforeReader.private_capsule_chunks);
+  assert.deepEqual(afterReader.private_capsule_heads, beforeReader.private_capsule_heads);
+  assert.deepEqual((await (await h.bucket()).list({ prefix: `private/v1/${h.account}/` })).objects, bucketBeforeReader.objects, 'read-only begin cannot stage a physical payload');
   const initial = await h.capsule('begin', ids.first, begin);
   assert.deepEqual(await h.capsule('begin', ids.first, begin), initial);
   await h.capsule('begin', ids.first, { ...begin, expected_generation: 1 }, { expected: 409, code: 'capsule_conflict' });
@@ -2418,7 +2436,7 @@ test('private capsules enforce owner integrity, monotone generation CAS and curr
   assert.equal(late.wrote, false, 'late original create-only PUT cannot resurrect retired bytes');
   assert.equal(late.current.size, 0); assert.equal(late.current.bytes_hex, ''); assert.equal(late.current.metadata.retired, '1');
   const protectedState = await h.control();
-  await h.forge(4, { spec: { ...h.spec, export_allowed: false }, expected_epoch: h.selection.policy_epoch, make_default: true, follow_main: false }, { id: 'capsule-revoke-export' });
+  await h.forge(4, { spec: { ...h.spec, export_allowed: false }, expected_epoch: h.selection.policy_epoch, make_default: h.spec.visibility.kind === 'public', follow_main: false }, { id: 'capsule-revoke-export' });
   await h.capsule('read', ids.third, { sequence: 0 }, { expected: 409, code: 'aborted' });
   await h.capsule('retire', ids.third, {}, { expected: 409, code: 'aborted' });
   assert.deepEqual((await h.control()).private_capsule_usage, protectedState.private_capsule_usage, 'stale policy retains private custody and charges');
