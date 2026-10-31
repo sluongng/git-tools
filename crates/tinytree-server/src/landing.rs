@@ -1089,4 +1089,51 @@ impl p::landing_server::Landing for LandingService {
         .await?;
         response(&host, job, work, &repo, &key)
     }
+    async fn recover_landing(
+        &self,
+        request: Request<p::RecoverLandingRequest>,
+    ) -> Result<Response<p::LandingResponse>, Status> {
+        let work = work(&request)?;
+        let identity = self.repository.query_identity(request.metadata())?;
+        let host = self.repository.landing_host();
+        let input = request.into_inner();
+        token(&input.idempotency_key)?;
+        let expected: [u8; 32] = input
+            .expected_job_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("invalid landing job ID"))?;
+        let owner = host.repository(&work, &identity, &input.repository_id, None)?;
+        let store = host.store.clone();
+        let repo = input.repository_id.clone();
+        let key = input.idempotency_key.clone();
+        let attempts = input.expected_attempts;
+        let recoveries = input.expected_recoveries;
+        let job = execute(work.clone(), move || {
+            store
+                .landing_job(&input.repository_id, owner, &input.idempotency_key)
+                .map_err(crate::service::store_status)?
+                .ok_or_else(|| Status::not_found("landing job unavailable"))
+        })
+        .await?;
+        if job.id != expected {
+            return Err(Status::failed_precondition("landing job differs"));
+        }
+        identity.authorize_landing(&repo, &job.profile.name, &host.config.local_owner_profiles)?;
+        if !host.config.enabled
+            || !host
+                .config
+                .configured(&repo, &job.profile.name, &job.profile.version)
+        {
+            return Err(Status::failed_precondition(
+                "current landing profile unavailable",
+            ));
+        }
+        let checker = host
+            .checker
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("checker unavailable"))?;
+        checker.recover_once(&repo, expected, attempts, recoveries)?;
+        response(&host, job, work, &repo, &key)
+    }
 }

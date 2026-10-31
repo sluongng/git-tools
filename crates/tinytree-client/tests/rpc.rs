@@ -12895,6 +12895,9 @@ struct LandingProtocolBoundary {
 }
 #[tonic::async_trait]
 impl tinytree_proto::landing_v1::landing_server::Landing for LandingProtocolBoundary {
+    async fn recover_landing(&self, _request: Request<tinytree_proto::landing_v1::RecoverLandingRequest>) -> Result<Response<tinytree_proto::landing_v1::LandingResponse>, Status> {
+        Err(Status::unimplemented("fixture does not admit recovery"))
+    }
     async fn start_landing(
         &self,
         request: Request<tinytree_proto::landing_v1::StartLandingRequest>,

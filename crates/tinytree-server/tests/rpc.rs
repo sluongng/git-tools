@@ -10668,7 +10668,8 @@ async fn wait_landing_phase(
 #[tokio::test]
 async fn checker_status_explains_prelaunch_authority_failure_and_recovers() {
     use tinytree_proto::landing_v1 as l;
-    let (_temporary, store, config, input, _scratch) = checked_landing_setup("pass");
+    let (_temporary, store, mut config, input, _scratch) = checked_landing_setup("pass");
+    config.service.landing.checker.as_mut().unwrap().max_attempts = 1;
     let policy = config.service.landing.checker.as_ref().unwrap().config.clone();
     let original = std::fs::read(&policy).unwrap();
     let running = Running::start_landing(store.clone(), config.service, landing_principals(true), true).await;
@@ -10700,6 +10701,11 @@ async fn checker_status_explains_prelaunch_authority_failure_and_recovers() {
     assert_eq!(progress.error_code, 0);
     assert!(progress.attempts >= 1);
     assert_eq!(complete.id, failed.id);
+    let refusal = client.recover_landing(request(l::RecoverLandingRequest {
+        repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+        expected_job_id: complete.id.clone(), expected_attempts: 1, expected_recoveries: 8,
+    }, ALPHA)).await.unwrap_err();
+    assert_eq!(refusal.code(), Code::FailedPrecondition);
     running.stop().await;
 }
 
@@ -11067,11 +11073,71 @@ async fn target_movement_while_checking_rejects_exact_old_candidate() {
 }
 
 #[tokio::test]
+async fn recovery_setup_failure_spends_automatic_and_one_shot_admissions() {
+    use tinytree_proto::landing_v1 as l;
+    let (_temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");
+    let checker = config.service.landing.checker.as_mut().unwrap();
+    checker.max_attempts = 1;
+    checker.max_recovery_attempts = 1;
+    checker.retry_delay_seconds = 2;
+    let running = Running::start_landing(store.clone(), config.service, landing_principals(true), true).await;
+    let mut client = running.landing_client().await;
+    client.start_landing(request(input.clone(), ALPHA)).await.unwrap();
+    // Only this disposable fixture's owned attempt is made temporarily absent.
+    // No new production fault hook or caller-supplied recovery path exists.
+    let record = wait_checker_record(&store, &["Uncertain"]).await;
+    let jobs = store.external_checks_directory().unwrap().unwrap().join("jobs");
+    let job_directory = std::fs::read_dir(&jobs).unwrap().map(|e|e.unwrap().path())
+        .find(|p|p.join("state.json").is_file()).unwrap();
+    let attempt = job_directory.join(record["request"]["attempt_id"].as_str().unwrap());
+    let held = job_directory.join("held-fixture-attempt");
+    std::fs::rename(&attempt, &held).unwrap();
+    let blocked = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = client.get_landing(request(l::GetLandingRequest {
+                repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            if status.checker_progress.as_ref().is_some_and(|p| p.automatic_recovery_blocked && p.recoveries == 1) { break status; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(blocked.phase, l::Phase::PreparedPendingChecks as i32);
+    let recover = l::RecoverLandingRequest { repository_id: input.repository_id.clone(),
+        idempotency_key: input.idempotency_key.clone(), expected_job_id: blocked.id.clone(),
+        expected_attempts: 1, expected_recoveries: 1 };
+    client.recover_landing(request(recover.clone(), ALPHA)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client.get_landing(request(l::GetLandingRequest {
+                repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            if status.checker_progress.as_ref().is_some_and(|p| !p.active_task && p.recoveries == 2) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    // Existing durable-record fixture observation verifies the fence survived
+    // setup failure, rather than merely observing an in-memory counter.
+    let saved = wait_checker_record(&store, &["Uncertain", "DispatchIntent"]).await;
+    assert_eq!(saved["recoveries"], 2);
+    assert!(saved["retry_at"].as_i64().unwrap() > 0);
+    std::fs::rename(&held, &attempt).unwrap();
+    for _ in 0..2 { client.recover_landing(request(recover.clone(), ALPHA)).await.unwrap(); }
+    let mut advanced = recover; advanced.expected_recoveries = 2;
+    assert_eq!(client.recover_landing(request(advanced, ALPHA)).await.unwrap_err().code(), Code::FailedPrecondition);
+    let executions = std::fs::read_to_string(scratch.join("executions")).unwrap();
+    assert_eq!(executions.lines().filter(|line| *line == "run").count(), 1);
+    assert_eq!(executions.lines().filter(|line| *line == "recover").count(), 0);
+    assert_eq!(store.references("alpha", &["main".into()]).unwrap()[0].generation, 1);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
     use tinytree_proto::landing_v1 as l;
     let (temporary, store, mut config, input, scratch) = checked_landing_setup("uncertain");
     config.service.landing.job_ttl_seconds = 2;
     config.service.landing.checker.as_mut().unwrap().max_recovery_attempts = 1;
+    config.service.landing.checker.as_mut().unwrap().max_attempts = 1;
     let running = Running::start_landing(
         store.clone(),
         config.service.clone(),
@@ -11111,6 +11177,37 @@ async fn uncertain_cleanup_vetoes_ttl_and_gc_across_checker_disabled_restart() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.unwrap();
+    let recover = l::RecoverLandingRequest {
+        repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+        expected_job_id: job.id.clone(), expected_attempts: 1, expected_recoveries: 1,
+    };
+    assert_eq!(client.recover_landing(request(recover.clone(), READER)).await.unwrap_err().code(), Code::PermissionDenied);
+    assert_eq!(client.recover_landing(request(recover.clone(), PEER)).await.unwrap_err().code(), Code::NotFound);
+    let executions_before = std::fs::read_to_string(scratch.join("executions")).unwrap();
+    let admitted = client.recover_landing(request(recover.clone(), ALPHA)).await.unwrap().into_inner().job.unwrap();
+    assert_eq!(admitted.id, job.id);
+    // Inflight duplicates acknowledge this same job, not a second task.
+    assert_eq!(client.recover_landing(request(recover.clone(), ALPHA)).await.unwrap().into_inner().job.unwrap().id, job.id);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client.get_landing(request(l::GetLandingRequest {
+                repository_id: input.repository_id.clone(), idempotency_key: input.idempotency_key.clone(),
+            }, ALPHA)).await.unwrap().into_inner().job.unwrap();
+            let p = status.checker_progress.unwrap();
+            if !p.active_task && p.recoveries == 2 {
+                assert_eq!(p.attempts, 1);
+                assert!(p.automatic_recovery_blocked);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    client.recover_landing(request(recover.clone(), ALPHA)).await.unwrap();
+    let mut second = recover; second.expected_recoveries = 2;
+    assert_eq!(client.recover_landing(request(second, ALPHA)).await.unwrap_err().code(), Code::FailedPrecondition);
+    let executions_after = std::fs::read_to_string(scratch.join("executions")).unwrap();
+    assert_eq!(executions_after.lines().filter(|v| *v == "run").count(), 1);
+    assert_eq!(executions_after.lines().filter(|v| *v == "recover").count(), executions_before.lines().filter(|v| *v == "recover").count() + 1);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let retained = wait_landing_phase(&mut client, &input, l::Phase::PreparedPendingChecks).await;
     assert!(retained.roots_retained);

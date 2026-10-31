@@ -7,6 +7,7 @@ import "tinytree/v1/repository.proto";
 service Landing {
   rpc StartLanding(StartLandingRequest) returns (LandingResponse);
   rpc GetLanding(GetLandingRequest) returns (LandingResponse);
+  rpc RecoverLanding(RecoverLandingRequest) returns (LandingResponse);
 }
 message StartLandingRequest {
   string repository_id = 1;
@@ -22,6 +23,14 @@ message StartLandingRequest {
 message GetLandingRequest {
   string repository_id = 1;
   string idempotency_key = 2;
+}
+// One recover-only quantum of the server's exact first saved attempt.
+message RecoverLandingRequest {
+  string repository_id = 1;
+  string idempotency_key = 2;
+  bytes expected_job_id = 3;
+  uint32 expected_attempts = 4;
+  uint32 expected_recoveries = 5;
 }
 message LandingResponse {
   LandingJob job = 1;

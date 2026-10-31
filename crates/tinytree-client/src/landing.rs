@@ -603,6 +603,46 @@ impl NativeClient {
         })
         .await
     }
+    /// Explicit single-attempt recover-only admission, never a verdict or an
+    /// assertion that recovery ran. Exact expected counters make replay inert.
+    pub async fn recover_landing_once(
+        &self,
+        start: &LandingStart,
+        expected_id: [u8; 32],
+        attempts: u32,
+        recoveries: u32,
+    ) -> Result<CheckedLandingJob, Status> {
+        start.validate()?;
+        if expected_id == [0; 32] || attempts != 1 || recoveries >= 256 {
+            return Err(Status::invalid_argument("invalid recover-once binding"));
+        }
+        let deadline = self.deadline();
+        let memory = self.landing_retained()?;
+        let binding = Arc::new(IntentBinding {
+            start: start.clone(),
+            repository: self.inner.config.repository_id.clone(),
+            client: Arc::downgrade(&self.inner),
+            _memory: memory.clone(),
+        });
+        let (wire, budget) = self
+            .landing_call(
+                deadline,
+                "/tinytree.landing.v1.Landing/RecoverLanding",
+                || l::RecoverLandingRequest {
+                    repository_id: self.inner.config.repository_id.clone(),
+                    idempotency_key: start.idempotency_key.clone(),
+                    expected_job_id: expected_id.to_vec(),
+                    expected_attempts: attempts,
+                    expected_recoveries: recoveries,
+                },
+            )
+            .await?;
+        let limits = self.inner.config.landing.clone();
+        blocking_owned(deadline, budget, None, move || {
+            checked(wire, None, binding, memory, limits, Some(expected_id))
+        })
+        .await
+    }
     pub async fn get_landing(&self, handle: &LandingHandle) -> Result<CheckedLandingJob, Status> {
         if !handle.binding.client.ptr_eq(&Arc::downgrade(&self.inner))
             || handle.binding.repository != self.inner.config.repository_id

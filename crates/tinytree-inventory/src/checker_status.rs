@@ -1,4 +1,5 @@
-//! Explicit operator read-only landing diagnostics. Never starts or advances work.
+//! Operator diagnostics are read-only by default. Explicit recover-once admits
+//! one server-owned recovery quantum; it never supplies a verdict.
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tinytree_client::{Config, LandingPhase, LandingStart, NativeClient, Transport};
@@ -9,6 +10,9 @@ struct Args {
     job: [u8; 32],
     intent: LandingStart,
     timeout: u64,
+    recover_once: bool,
+    expected_attempts: Option<u32>,
+    expected_recoveries: Option<u32>,
 }
 fn id(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64
@@ -30,7 +34,15 @@ fn hex(value: &[u8]) -> String {
 fn args() -> Result<Args, String> {
     let mut fields = BTreeMap::new();
     let mut input = std::env::args().skip(1);
+    let mut recover_once = false;
     while let Some(key) = input.next() {
+        if key == "--recover-once" {
+            if recover_once {
+                return Err("invalid_or_duplicate_argument".into());
+            }
+            recover_once = true;
+            continue;
+        }
         if !matches!(
             key.as_str(),
             "--config"
@@ -44,6 +56,8 @@ fn args() -> Result<Args, String> {
                 | "--profile"
                 | "--profile-version"
                 | "--timeout-seconds"
+                | "--expected-attempts"
+                | "--expected-recoveries"
         ) {
             return Err("unknown_argument".into());
         }
@@ -80,11 +94,29 @@ fn args() -> Result<Args, String> {
     if !(1..=60).contains(&timeout) || job == [0; 32] {
         return Err("invalid_argument".into());
     }
+    let expected_attempts = fields
+        .remove("--expected-attempts")
+        .map(|v| v.parse::<u32>())
+        .transpose()
+        .map_err(|_| "invalid_attempts")?;
+    let expected_recoveries = fields
+        .remove("--expected-recoveries")
+        .map(|v| v.parse::<u32>())
+        .transpose()
+        .map_err(|_| "invalid_recoveries")?;
+    if recover_once != (expected_attempts.is_some() && expected_recoveries.is_some())
+        || (!recover_once && (expected_attempts.is_some() || expected_recoveries.is_some()))
+    {
+        return Err("invalid_recover_once_arguments".into());
+    }
     Ok(Args {
         config,
         job,
         intent,
         timeout,
+        recover_once,
+        expected_attempts,
+        expected_recoveries,
     })
 }
 fn stage(value: i32) -> Result<&'static str, String> {
@@ -138,12 +170,19 @@ async fn run(args: Args) -> Result<Value, String> {
     let client = NativeClient::connect(config)
         .await
         .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
-    // Opaque handles cannot be synthesized from an ID. This existing method
-    // performs GetLanding only and binds the observed job to the exact intent.
-    let job = client
-        .lookup_landing(&args.intent, Some(args.job))
-        .await
-        .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
+    let job = if args.recover_once {
+        client
+            .recover_landing_once(
+                &args.intent,
+                args.job,
+                args.expected_attempts.unwrap(),
+                args.expected_recoveries.unwrap(),
+            )
+            .await
+    } else {
+        client.lookup_landing(&args.intent, Some(args.job)).await
+    }
+    .map_err(|s| format!("rpc_{:?}", s.code()).to_ascii_lowercase())?;
     let progress = job.checker_progress().map(|p| -> Result<Value,String> {
         if p.retry_at_seconds < 0 { return Err("invalid_checker_progress".into()); }
         Ok(json!({"stage":stage(p.stage)?,"active_task":p.active_task,"attempts":p.attempts,
@@ -155,7 +194,7 @@ async fn run(args: Args) -> Result<Value, String> {
         .candidate()
         .map(|c| json!({"head":hex(&c.head.0),"root_tree":hex(&c.root_tree.0)}));
     Ok(
-        json!({"schema_version":1,"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress}),
+        json!({"schema_version":1,"mode":if args.recover_once {"recover_once_admission"} else {"read_only"},"job_id":hex(&job.handle().id()),"phase":phase(job.phase()),"candidate":candidate,"checker_progress":progress}),
     )
 }
 #[tokio::main]

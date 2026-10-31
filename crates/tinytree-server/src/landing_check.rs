@@ -794,6 +794,7 @@ impl CheckerHost {
         repo: &str,
         pending: Option<&s::PendingLanding>,
         existing: Option<Key>,
+        recover_only: Option<(u32, u32)>,
     ) -> bool {
         if self.closing.load(Ordering::Acquire) {
             return true;
@@ -864,15 +865,26 @@ impl CheckerHost {
         }
         if slot.active
             || matches!(slot.record.phase, Phase::Terminal | Phase::UnavailableReady)
-            || slot.record.retry_at > now().unwrap_or(i64::MAX)
+            || (recover_only.is_none() && slot.record.retry_at > now().unwrap_or(i64::MAX))
         {
             return true;
         }
-        if slot.record.uncertain() && slot.record.recoveries >= self.policy.max_recovery_attempts {
+        if recover_only.is_none()
+            && slot.record.uncertain()
+            && slot.record.recoveries >= self.policy.max_recovery_attempts
+        {
             return true;
         }
         if !slot.record.uncertain() && slot.handle.is_none() {
             return true;
+        }
+        if let Some((attempts, recoveries)) = recover_only {
+            if !slot.record.uncertain()
+                || slot.record.attempts != attempts as usize
+                || slot.record.recoveries != recoveries as usize
+            {
+                return true;
+            }
         }
         slot.active = true;
         slot.diagnostic = CheckerProgress {
@@ -890,11 +902,76 @@ impl CheckerHost {
         let host = self.clone();
         drop(tokio::spawn(async move {
             let _work = work;
-            if host.process(key.clone()).await.is_err() {
+            if host.process(key.clone(), recover_only).await.is_err() {
                 host.process_error(&key, CheckerErrorCode::ProcessFailed);
             }
         }));
         true
+    }
+    pub(crate) fn recover_once(
+        self: &Arc<Self>,
+        repo: &str,
+        job: [u8; 32],
+        attempts: u32,
+        recoveries: u32,
+    ) -> Result<(), tonic::Status> {
+        use tonic::Status;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Status::unavailable("checker service is draining"));
+        }
+        let key = (repo.to_owned(), job);
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Status::unavailable("checker admission unavailable"))?;
+            let slot = state
+                .slots
+                .get(&key)
+                .ok_or_else(|| Status::failed_precondition("saved checker attempt unavailable"))?;
+            if self.policy.max_attempts != 1
+                || attempts != 1
+                || recoveries as usize != self.policy.max_recovery_attempts
+                || recoveries >= 256
+                || slot.record.attempts != attempts as usize
+            {
+                return Err(Status::failed_precondition(
+                    "recover-once binding unavailable",
+                ));
+            }
+            // A durable normal increment is the ACK/replay marker. It may
+            // precede a crash or failed spawn; replay never dispatches again.
+            if slot.record.recoveries == recoveries as usize + 1 {
+                return Ok(());
+            }
+            if !slot.record.uncertain() || slot.record.recoveries != recoveries as usize {
+                return Err(Status::failed_precondition(
+                    "checker is not recovery-blocked",
+                ));
+            }
+            if slot.active {
+                return Ok(());
+            }
+        }
+        if !self.schedule(repo, None, Some(key.clone()), Some((attempts, recoveries))) {
+            if self
+                .state
+                .lock()
+                .ok()
+                .and_then(|s| {
+                    s.slots
+                        .get(&key)
+                        .map(|v| v.active || v.record.recoveries == recoveries as usize + 1)
+                })
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            return Err(Status::resource_exhausted(
+                "checker execution admission exhausted",
+            ));
+        }
+        Ok(())
     }
     pub(crate) fn start(self: &Arc<Self>) -> Result<(), tonic::Status> {
         let mut worker = self
@@ -977,7 +1054,7 @@ impl CheckerHost {
                 });
                 let mut blocked = false;
                 if let Some(key) = recovery {
-                    if host.schedule(&key.0, None, Some(key.clone())) {
+                    if host.schedule(&key.0, None, Some(key.clone()), None) {
                         recovery_after = Some(key);
                     } else {
                         blocked = true
@@ -986,7 +1063,7 @@ impl CheckerHost {
                     recovery_after = None;
                 }
                 if let Some((repo, pending)) = ready.front() {
-                    if host.schedule(repo, Some(pending), None) {
+                    if host.schedule(repo, Some(pending), None, None) {
                         ready.pop_front();
                     } else {
                         blocked = true
@@ -1109,11 +1186,13 @@ impl CheckerHost {
             }
         }
     }
-    async fn process(self: &Arc<Self>, key: Key) -> Result<()> {
+    async fn process(self: &Arc<Self>, key: Key, recover_only: Option<(u32, u32)>) -> Result<()> {
         self.diagnostic_stage(&key, CheckerStage::Preparation);
         let host = self.clone();
         let selected = key.clone();
-        let prepared = tokio::task::spawn_blocking(move || host.prepare_step(&selected)).await??;
+        let prepared =
+            tokio::task::spawn_blocking(move || host.prepare_step(&selected, recover_only))
+                .await??;
         let Some((record, attempt, mode, _candidate)) = prepared else {
             return Ok(());
         };
@@ -1230,6 +1309,7 @@ impl CheckerHost {
     fn prepare_step(
         &self,
         key: &Key,
+        recover_only: Option<(u32, u32)>,
     ) -> Result<
         Option<(
             Record,
@@ -1246,6 +1326,16 @@ impl CheckerHost {
             .slots
             .get_mut(key)
             .context("checker job unavailable")?;
+        // Must precede Verified/RetryReady handling: a manual recovery can
+        // never become an execution if the phase changed after admission.
+        if let Some((attempts, recoveries)) = recover_only {
+            ensure!(
+                slot.record.uncertain()
+                    && slot.record.attempts == attempts as usize
+                    && slot.record.recoveries == recoveries as usize,
+                "recover-only state changed"
+            );
+        }
         if slot.record.phase == Phase::Verified {
             drop(state);
             self.apply_verified(key)?;
@@ -1347,20 +1437,30 @@ impl CheckerHost {
                 slot.record.recoveries < 256,
                 "checker recovery budget exhausted"
             );
+            // Spend this normal or explicit recovery admission durably before
+            // any fallible attempt-directory/root setup. A failed setup must
+            // not wake an unbounded retry loop or re-admit the same one-shot.
             slot.record.recoveries += 1;
+            slot.record.retry_at = now()?
+                .saturating_add(
+                    retry_delay(slot.record.authority.retry, slot.record.recoveries) as i64,
+                );
+            Self::save(slot)?;
             PrivateDir::open_existing(slot.directory.path().join(&slot.record.request.attempt_id))?
         };
-        slot.record.retry_at = now()?
-            .saturating_add(
-                retry_delay(slot.record.authority.retry, slot.record.recoveries) as i64,
-            );
         if slot.root.is_none() {
             slot.root = Some(
                 self.store
                     .pin_root(&key.0, candidate_key(&slot.record.request)?)?,
             );
         }
-        Self::save(slot)?;
+        if !recovering {
+            slot.record.retry_at = now()?
+                .saturating_add(
+                    retry_delay(slot.record.authority.retry, slot.record.recoveries) as i64,
+                );
+            Self::save(slot)?;
+        }
         Ok(Some((
             slot.record.clone(),
             attempt,

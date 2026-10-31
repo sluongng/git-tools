@@ -43,10 +43,11 @@ impl Service<http::Request<Body>> for LandingGrpcService {
                 let method = match request.uri().path() {
                     "/tinytree.landing.v1.Landing/StartLanding" => "StartLanding",
                     "/tinytree.landing.v1.Landing/GetLanding" => "GetLanding",
+                    "/tinytree.landing.v1.Landing/RecoverLanding" => "RecoverLanding",
                     _ => return Err(Status::unimplemented("unknown landing method")),
                 };
                 let host = repository.landing_host();
-                if method == "StartLanding" {
+                if matches!(method, "StartLanding" | "RecoverLanding") {
                     if !host.config.enabled {
                         return Err(Status::unavailable("landing preparation is disabled"));
                     }
