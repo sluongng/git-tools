@@ -2,21 +2,22 @@
 //! Descriptor-only FILE entries in closure requests MUST come from the host's
 //! verified, durable byte receipts; this API cannot authenticate an external CAS.
 use serde::Deserialize;
-mod forge;
 mod accounts;
+mod checker;
+mod closure_step;
+mod forge;
+mod imports;
 mod landing;
 mod projection;
-mod closure_step;
-mod views;
-mod search;
 mod reads;
-mod imports;
-mod uploads;
-mod reviews;
 mod review_admission;
-mod checker;
-mod transforms;
+mod reviews;
+mod search;
+mod session;
 mod transform_commands;
+mod transforms;
+mod uploads;
+mod views;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
@@ -397,8 +398,8 @@ pub extern "C" fn tt_forge_validate_view(ptr: *const u8, len: usize) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_parse_call(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, |bytes| {
-        let envelope = tinytree_forge_core::wire::Call::decode(bytes)
-            .map_err(|error| error.to_string())?;
+        let envelope =
+            tinytree_forge_core::wire::Call::decode(bytes).map_err(|error| error.to_string())?;
         serde_json::to_value(envelope).map_err(|_| "forge envelope encoding".to_string())
     })
 }
@@ -429,6 +430,10 @@ pub extern "C" fn tt_forge_transform_lineage(ptr: *const u8, len: usize) -> u32 
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_transform_build(ptr: *const u8, len: usize) -> u32 {
     call(ptr, len, transforms::build)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn tt_forge_session(ptr: *const u8, len: usize) -> u32 {
+    call(ptr, len, session::derive)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn tt_forge_build_candidate(ptr: *const u8, len: usize) -> u32 {

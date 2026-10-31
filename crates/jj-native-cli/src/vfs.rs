@@ -103,7 +103,8 @@ pub(crate) async fn initialize(
             .join("records")
             .join(format!("{}.json", binding.id()));
         if ready_record.try_exists().map_err(failure)? {
-            let ready = registry.resume_info(&binding.root).map_err(failure)?;
+            let ready = registry.resume_info(&binding.root).map_err(failure)?
+                .ok_or_else(|| failure("no Ready native workspace registration; preserve pending initialization and reconcile explicitly"))?;
             if ready.binding != binding || ready.initial_commit != *initial {
                 return Err(failure("Ready workspace differs from provisioning intent"));
             }
@@ -582,7 +583,8 @@ pub(crate) async fn resume(
                 .join("records")
                 .join(format!("{}.json", binding.id()));
             if ready_record.try_exists().map_err(failure)? {
-                let ready = registry.resume_info(&binding.root).map_err(failure)?;
+                let ready = registry.resume_info(&binding.root).map_err(failure)?
+                .ok_or_else(|| failure("no Ready native workspace registration; preserve pending initialization and reconcile explicitly"))?;
                 if ready.binding != binding || ready.initial_commit != intent.initial_commit() {
                     return Err(failure(
                         "Ready registration differs from the original provisioning intent",
@@ -635,7 +637,7 @@ pub(crate) async fn resume(
                 failure(format!(
                     "{error}; restored origins require tinytree resume --daemon-config PATH"
                 ))
-            })?;
+            })?.ok_or_else(|| failure("no Ready native workspace registration; preserve pending initialization and reconcile explicitly"))?;
             let binding = mount(
                 &registry,
                 &ready.binding.root,

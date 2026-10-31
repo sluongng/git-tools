@@ -60,6 +60,9 @@ pub struct NativeCloudRestored {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
+    /// Exact owner-private derived Forge client only; unsupported in full mode.
+    ForgeClientReady { descriptor_digest: [u8; 32] },
+    ForgeClientStop { descriptor_digest: [u8; 32] },
     IdentityChallenge,
     Scoped {
         version: u32,

@@ -9,7 +9,7 @@ pub(crate) mod landing;
 #[path = "forge.rs"]
 pub(crate) mod forge;
 #[path = "forge_resolve.rs"]
-mod forge_resolve;
+pub(crate) mod forge_resolve;
 #[path = "forge_review.rs"]
 mod forge_review;
 #[path = "forge_transform.rs"]

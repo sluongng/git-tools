@@ -564,15 +564,16 @@ fn open_native_repositories(
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
 ) -> Result<Option<native_broker::BrokerService>> {
-    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new(), None, &[])?.0)
+    Ok(open_native_host(config, cache, native_ca, &BTreeMap::new(), None, &[], None)?.0)
 }
-fn open_native_host(
+pub(crate) fn open_native_host(
     config: &Config,
     cache: &Arc<LocalCas>,
     native_ca: &BTreeMap<String, Arc<[u8]>>,
     native_credentials: &BTreeMap<String, Option<String>>,
     command_host: Option<Arc<crate::native_commands::NativeCommandHost>>,
     pending_registrations: &[native_retention::Registration],
+    expected_forge: Option<&crate::forge_client::ProjectionPin>,
 ) -> Result<(
     Option<native_broker::BrokerService>,
     BTreeMap<String, crate::native_workspaces::Repository>,
@@ -627,6 +628,9 @@ fn open_native_host(
                 .context("Forge provider requires the daemon runtime")?
                 .block_on(native_broker::ForgeObjectIo::open_with_ca_certificate(provider, forge_config.clone(), native_ca.get(alias).cloned()))
                 .map_err(|_| anyhow::anyhow!("cannot open configured Forge projection; local work retained"))?;
+            if let Some(expected)=expected_forge {
+                ensure!(crate::forge_client::ProjectionPin::from(remote.projection())==*expected, "Forge projection differs from saved client descriptor");
+            }
             let remote = Arc::new(remote);
             stores.insert(alias.clone(), remote.clone());
             controls.insert(alias.clone(), remote);
@@ -879,6 +883,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
             &native_credentials,
             startup_commands,
             startup_pending.as_ref().map(|snapshot|snapshot.as_slice()).unwrap_or(&[]),
+            None,
         )
     })
     .await
@@ -1258,6 +1263,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     state_slot=Some(returned);result
                 }
                 Ok(Request::IdentityChallenge) => serde_json::to_value(state_slot.as_ref().unwrap().identity.challenge()).map_err(Into::into),
+                Ok(Request::ForgeClientReady { .. } | Request::ForgeClientStop { .. }) => Err(anyhow::anyhow!("not a derived Forge client")),
                 Ok(Request::Scoped { .. }) => Err(anyhow::anyhow!("nested scoped request is invalid")),
                 Ok(Request::Status) => Ok(state_slot.as_ref().unwrap().status()),
                 Ok(Request::RetryBes) => match state_slot.as_ref().unwrap().bes.as_ref() {
@@ -1561,7 +1567,7 @@ mod tests {
         drop(reopened);
 
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[])?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[], None)?;
         assert_eq!(providers.len(), 1);
         let scope = providers["example"].scope.backend().to_owned();
         drop(broker);
@@ -1571,7 +1577,7 @@ mod tests {
         );
         drop(providers);
         let (broker, providers) =
-            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[])?;
+            open_native_host(&config, &cache, &BTreeMap::new(), &BTreeMap::new(), None, &[], None)?;
         assert_eq!(providers["example"].scope.backend(), scope);
         config.native.workspaces.registry_path = Some(directory.path().join("registry"));
         let mut manager =

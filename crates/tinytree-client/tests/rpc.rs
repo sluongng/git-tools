@@ -48,7 +48,12 @@ impl tinytree_client::forge_protocol::forge_server::Forge for ForgeTransportFixt
     ) -> Result<Response<tinytree_client::forge_protocol::ForgeCallResponse>, Status> {
         use tinytree_client::forge_protocol::ForgeCallResponse;
         assert_eq!(
-            request.metadata().get("authorization").unwrap().to_str().unwrap(),
+            request
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             format!("Bearer {TOKEN}"),
         );
         let input = request.into_inner();
@@ -101,7 +106,9 @@ async fn forge_transport_fixture(
             .add_service(tinytree_client::forge_protocol::forge_server::ForgeServer::new(service))
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async { let _ = stopped.await; },
+                async {
+                    let _ = stopped.await;
+                },
             )
             .await
             .unwrap();
@@ -144,6 +151,11 @@ enum ForgeHttpMode {
     TransformRegression,
     TransformAckRebound,
     TransformStuck,
+    SessionAuthenticated,
+    SessionAnonymous,
+    SessionAuthDowngrade,
+    SessionOtherAccount,
+    SessionExtraField,
 }
 async fn forge_http_fixture(
     mode: ForgeHttpMode,
@@ -175,7 +187,8 @@ async fn forge_http_fixture(
                 let header=String::from_utf8(header).unwrap();
                 assert!(header.starts_with("POST /api/v1/forge/call HTTP/1.1\r\n"));
                 let header=header.to_ascii_lowercase();
-                assert!(header.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+                if matches!(mode, ForgeHttpMode::SessionAnonymous) { assert!(!header.contains("authorization:")); }
+                else { assert!(header.contains(&format!("authorization: bearer {TOKEN}\r\n"))); }
                 assert!(header.contains("accept-encoding: identity\r\n"));
                 let len:usize=header.lines().find_map(|line|line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
                 assert!(len<=tinytree_proto::FORGE_MAX_REQUEST_BYTES);
@@ -242,6 +255,14 @@ async fn forge_http_fixture(
                     reply["result_json"]=serde_json::json!(value.to_string());
                     if matches!(mode,ForgeHttpMode::TransformPending)&&call==2 {status=503;reply=serde_json::json!({"version":1,"error":{"code":"unavailable","message":"lost transform acknowledgement"}});}
                 }
+                if matches!(mode, ForgeHttpMode::SessionAuthenticated | ForgeHttpMode::SessionAnonymous | ForgeHttpMode::SessionAuthDowngrade | ForgeHttpMode::SessionOtherAccount | ForgeHttpMode::SessionExtraField) {
+                    assert_eq!(input["operation"], 12); assert_eq!(input["payload_json"], "{}");
+                    let mut session = serde_json::json!({"schema_version":1,"account_id":"alpha","identity":{"kind":"authenticated","principal":"member","credential_id":"a".repeat(64)}});
+                    if matches!(mode, ForgeHttpMode::SessionAnonymous | ForgeHttpMode::SessionAuthDowngrade) { session["identity"] = serde_json::json!({"kind":"anonymous"}); }
+                    if matches!(mode, ForgeHttpMode::SessionOtherAccount) { session["account_id"] = serde_json::json!("other"); }
+                    if matches!(mode, ForgeHttpMode::SessionExtraField) { session["identity"]["actor_override"] = serde_json::json!("ignored-is-not-allowed"); }
+                    reply["state"] = serde_json::json!("complete"); reply["result_json"] = serde_json::json!(session.to_string());
+                }
                 let body=serde_json::to_vec(&reply).unwrap();
                 if matches!(mode,ForgeHttpMode::ChunkedResponseLimit) {
                     socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
@@ -269,7 +290,16 @@ async fn forge_http_fixture(
         compression: false,
         ..Default::default()
     };
-    if matches!(mode, ForgeHttpMode::SlowBody | ForgeHttpMode::ResolveStuck | ForgeHttpMode::AdmissionStuck | ForgeHttpMode::TransformStuck) {
+    if matches!(mode, ForgeHttpMode::SessionAnonymous) {
+        config.token_env = None;
+    }
+    if matches!(
+        mode,
+        ForgeHttpMode::SlowBody
+            | ForgeHttpMode::ResolveStuck
+            | ForgeHttpMode::AdmissionStuck
+            | ForgeHttpMode::TransformStuck
+    ) {
         config.rpc.operation_timeout_ms = 80;
         config.rpc.rpc_timeout_ms = 80;
         config.rpc.connect_timeout_ms = 50;
@@ -293,79 +323,287 @@ async fn forge_resolve_view_pins_pending_selection_replays_continuations_and_sha
         let mut input = forge_http_input();
         input.operation = tinytree_client::forge_protocol::ForgeOperation::ResolveView as i32;
         input.payload_json = b"{}".to_vec();
-        let result = client.forge_resolve_view(input).await;
-        assert_eq!(result.as_ref().err().map(Status::code), expected, "{mode:?}");
+        let mut selections = Vec::new();
+        let result = client
+            .forge_resolve_view_with_selection(input, |selection| {
+                assert_eq!(
+                    inputs.lock().unwrap().len(),
+                    1,
+                    "first selection is checkpointed before any continuation"
+                );
+                selections.push(selection.clone());
+                Ok(())
+            })
+            .await;
+        assert_eq!(
+            selections.len(),
+            if matches!(mode, ForgeHttpMode::ResolveInvalid) {
+                0
+            } else {
+                1
+            }
+        );
+        if let Some(selection) = selections.first() {
+            assert_eq!(selection.view_version, [1; 32]);
+            assert_eq!(selection.policy_epoch, 1);
+        }
+        assert_eq!(
+            result.as_ref().err().map(Status::code),
+            expected,
+            "{mode:?}"
+        );
         if let Ok(reply) = result {
             assert_eq!(reply.state, "complete");
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&reply.result_json).unwrap(), resolve_snapshot());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&reply.result_json).unwrap(),
+                resolve_snapshot()
+            );
         }
         let seen = inputs.lock().unwrap().clone();
         if matches!(mode, ForgeHttpMode::ResolvePending) {
             assert_eq!(seen.len(), 5);
-            assert_eq!(seen[1], seen[2], "transport retry must replay exact pinned continuation");
-            assert_eq!(seen[2], seen[3], "stale generation reply must not restart selection");
+            assert_eq!(
+                seen[1], seen[2],
+                "transport retry must replay exact pinned continuation"
+            );
+            assert_eq!(
+                seen[2], seen[3],
+                "stale generation reply must not restart selection"
+            );
             for request in &seen[1..] {
-                let body: serde_json::Value = serde_json::from_str(request["payload_json"].as_str().unwrap()).unwrap();
-                assert_eq!(body["version"], serde_json::json!(vec![1u8;32]));
-                assert_eq!(body["progress"]["job_id"], "12345678-1234-4234-8234-123456789abc");
+                let body: serde_json::Value =
+                    serde_json::from_str(request["payload_json"].as_str().unwrap()).unwrap();
+                assert_eq!(body["version"], serde_json::json!(vec![1u8; 32]));
+                assert_eq!(
+                    body["progress"]["job_id"],
+                    "12345678-1234-4234-8234-123456789abc"
+                );
             }
-            assert_eq!(serde_json::from_str::<serde_json::Value>(seen[4]["payload_json"].as_str().unwrap()).unwrap()["progress"]["expected_generation"], 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    seen[4]["payload_json"].as_str().unwrap()
+                )
+                .unwrap()["progress"]["expected_generation"],
+                1
+            );
         }
-        if matches!(mode, ForgeHttpMode::ResolveComplete) { assert_eq!(seen.len(), 1); }
-        if matches!(mode, ForgeHttpMode::ResolveStuck) { assert!(seen.len() < 16); }
-        stop.send(()).unwrap(); task.await.unwrap();
+        if matches!(mode, ForgeHttpMode::ResolveComplete) {
+            assert_eq!(seen.len(), 1);
+        }
+        if matches!(mode, ForgeHttpMode::ResolveStuck) {
+            assert!(seen.len() < 16);
+        }
+        stop.send(()).unwrap();
+        task.await.unwrap();
     }
-    let (client, fixture, stop, task) = forge_transport_fixture(ForgeReplyMode::ResolveComplete).await;
+    let (client, inputs, stop, task) = forge_http_fixture(ForgeHttpMode::ResolvePending).await;
     let mut input = forge_http_input();
     input.operation = tinytree_client::forge_protocol::ForgeOperation::ResolveView as i32;
     input.payload_json = b"{}".to_vec();
-    assert_eq!(client.forge_resolve_view(input).await.unwrap().state, "complete");
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "local gRPC complete needs no continuation");
-    stop.send(()).unwrap(); task.await.unwrap();
+    let failed = client
+        .forge_resolve_view_with_selection(input, |_| {
+            Err(Status::failed_precondition(
+                "durable checkpoint unavailable",
+            ))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code(), Code::FailedPrecondition);
+    assert_eq!(
+        inputs.lock().unwrap().len(),
+        1,
+        "a failed durable checkpoint permits no continuation"
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    let (client, fixture, stop, task) =
+        forge_transport_fixture(ForgeReplyMode::ResolveComplete).await;
+    let mut input = forge_http_input();
+    input.operation = tinytree_client::forge_protocol::ForgeOperation::ResolveView as i32;
+    input.payload_json = b"{}".to_vec();
+    assert_eq!(
+        client.forge_resolve_view(input).await.unwrap().state,
+        "complete"
+    );
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "local gRPC complete needs no continuation"
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap();
 }
 #[tokio::test]
-async fn forge_push_review_continues_only_exact_pre_admission_intent_with_one_deadline() {
-    for (mode,expected,calls) in [
-        (ForgeHttpMode::AdmissionPending,None,Some(4)),
-        (ForgeHttpMode::AdmissionAccepted,None,Some(1)),
-        (ForgeHttpMode::AdmissionMismatch,Some(Code::DataLoss),Some(1)),
-        (ForgeHttpMode::AdmissionBadShape,Some(Code::DataLoss),Some(1)),
-        (ForgeHttpMode::AdmissionStuck,Some(Code::DeadlineExceeded),None),
+async fn forge_session_decodes_strict_server_identity_and_requires_exact_result_account() {
+    for (mode, anonymous, expected) in [
+        (ForgeHttpMode::SessionAuthenticated, false, None),
+        (ForgeHttpMode::SessionAnonymous, true, None),
+        (
+            ForgeHttpMode::SessionAuthDowngrade,
+            false,
+            Some(Code::DataLoss),
+        ),
+        (
+            ForgeHttpMode::SessionOtherAccount,
+            false,
+            Some(Code::DataLoss),
+        ),
+        (
+            ForgeHttpMode::SessionExtraField,
+            false,
+            Some(Code::DataLoss),
+        ),
     ] {
-        let (client,inputs,stop,task)=forge_http_fixture(mode).await;
-        let mut input=forge_http_input();
-        input.operation=tinytree_client::forge_protocol::ForgeOperation::PushReview as i32;
-        input.payload_json=format!("{{\n \"source_base\":\"{}\", \"source_head\":\"{}\", \"view_version\":\"{}\"\n}}", "1".repeat(64), "2".repeat(64), "3".repeat(64)).into_bytes();
-        let result=client.forge_push_review(input.clone()).await;
-        assert_eq!(result.as_ref().err().map(Status::code),expected,"{mode:?}");
-        if let Ok(reply)=result {assert_eq!(reply.state,"rebase_pending");let value:serde_json::Value=serde_json::from_slice(&reply.result_json).unwrap();assert_eq!(value["candidate"],serde_json::Value::Null);assert_eq!(value["patchset_id"],"5".repeat(64));}
-        let seen=inputs.lock().unwrap().clone();
-        if let Some(calls)=calls {assert_eq!(seen.len(),calls,"{mode:?}");}else{assert!(!seen.is_empty()&&seen.len()<16);}
-        for request in &seen {assert_eq!(request,&seen[0],"every retry/quantum retains original envelope bytes");assert_eq!(request["payload_json"],String::from_utf8(input.payload_json.clone()).unwrap());}
-        stop.send(()).unwrap();task.await.unwrap();
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        let result = client.forge_get_session("alpha", "public").await;
+        assert_eq!(
+            result.as_ref().err().map(Status::code),
+            expected,
+            "{mode:?}"
+        );
+        if let Ok(session) = result {
+            assert_eq!(session.account_id, "alpha");
+            assert_eq!(
+                matches!(
+                    session.identity,
+                    tinytree_forge_core::session::ForgeSessionIdentity::Anonymous {}
+                ),
+                anonymous
+            );
+        }
+        assert_eq!(inputs.lock().unwrap().len(), 1);
+        stop.send(()).unwrap();
+        task.await.unwrap();
     }
 }
 #[tokio::test]
-async fn forge_transform_preserves_original_intent_and_pins_optional_destination_across_preparation() {
-    use tinytree_client::forge_protocol::ForgeOperation as Op;
-    for (mode,operation,expected,calls) in [
-        (ForgeHttpMode::TransformPending,Op::StartTransform,None,Some(4)),
-        (ForgeHttpMode::TransformPending,Op::SetPin,None,Some(4)),
-        (ForgeHttpMode::TransformRebound,Op::StartTransform,Some(Code::DataLoss),Some(2)),
-        (ForgeHttpMode::TransformRegression,Op::StartTransform,Some(Code::DataLoss),Some(2)),
-        (ForgeHttpMode::TransformAckRebound,Op::StartTransform,Some(Code::DataLoss),Some(4)),
-        (ForgeHttpMode::TransformStuck,Op::StartTransform,Some(Code::DeadlineExceeded),None),
+async fn forge_push_review_continues_only_exact_pre_admission_intent_with_one_deadline() {
+    for (mode, expected, calls) in [
+        (ForgeHttpMode::AdmissionPending, None, Some(4)),
+        (ForgeHttpMode::AdmissionAccepted, None, Some(1)),
+        (
+            ForgeHttpMode::AdmissionMismatch,
+            Some(Code::DataLoss),
+            Some(1),
+        ),
+        (
+            ForgeHttpMode::AdmissionBadShape,
+            Some(Code::DataLoss),
+            Some(1),
+        ),
+        (
+            ForgeHttpMode::AdmissionStuck,
+            Some(Code::DeadlineExceeded),
+            None,
+        ),
     ] {
-        let (client,inputs,stop,task)=forge_http_fixture(mode).await;
-        let mut input=forge_http_input();input.operation=operation as i32;
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        let mut input = forge_http_input();
+        input.operation = tinytree_client::forge_protocol::ForgeOperation::PushReview as i32;
+        input.payload_json = format!(
+            "{{\n \"source_base\":\"{}\", \"source_head\":\"{}\", \"view_version\":\"{}\"\n}}",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64)
+        )
+        .into_bytes();
+        let result = client.forge_push_review(input.clone()).await;
+        assert_eq!(
+            result.as_ref().err().map(Status::code),
+            expected,
+            "{mode:?}"
+        );
+        if let Ok(reply) = result {
+            assert_eq!(reply.state, "rebase_pending");
+            let value: serde_json::Value = serde_json::from_slice(&reply.result_json).unwrap();
+            assert_eq!(value["candidate"], serde_json::Value::Null);
+            assert_eq!(value["patchset_id"], "5".repeat(64));
+        }
+        let seen = inputs.lock().unwrap().clone();
+        if let Some(calls) = calls {
+            assert_eq!(seen.len(), calls, "{mode:?}");
+        } else {
+            assert!(!seen.is_empty() && seen.len() < 16);
+        }
+        for request in &seen {
+            assert_eq!(
+                request, &seen[0],
+                "every retry/quantum retains original envelope bytes"
+            );
+            assert_eq!(
+                request["payload_json"],
+                String::from_utf8(input.payload_json.clone()).unwrap()
+            );
+        }
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn forge_transform_preserves_original_intent_and_pins_optional_destination_across_preparation()
+ {
+    use tinytree_client::forge_protocol::ForgeOperation as Op;
+    for (mode, operation, expected, calls) in [
+        (
+            ForgeHttpMode::TransformPending,
+            Op::StartTransform,
+            None,
+            Some(4),
+        ),
+        (ForgeHttpMode::TransformPending, Op::SetPin, None, Some(4)),
+        (
+            ForgeHttpMode::TransformRebound,
+            Op::StartTransform,
+            Some(Code::DataLoss),
+            Some(2),
+        ),
+        (
+            ForgeHttpMode::TransformRegression,
+            Op::StartTransform,
+            Some(Code::DataLoss),
+            Some(2),
+        ),
+        (
+            ForgeHttpMode::TransformAckRebound,
+            Op::StartTransform,
+            Some(Code::DataLoss),
+            Some(4),
+        ),
+        (
+            ForgeHttpMode::TransformStuck,
+            Op::StartTransform,
+            Some(Code::DeadlineExceeded),
+            None,
+        ),
+    ] {
+        let (client, inputs, stop, task) = forge_http_fixture(mode).await;
+        let mut input = forge_http_input();
+        input.operation = operation as i32;
         input.payload_json=serde_json::to_vec(&serde_json::json!({"source_account":"upstream","source_view":"public","source_before_view":"a".repeat(64),"source_after_view":"b".repeat(64),"change_id":"c".repeat(32),"spec":{"mappings":[{"source_prefix":"","destination_prefix":"vendor"}]}})).unwrap();
-        let result=client.forge_transform(input.clone()).await;
-        assert_eq!(result.as_ref().err().map(Status::code),expected,"{mode:?}");
-        if let Ok(reply)=result {assert_eq!(reply.state,"rebase_pending");}
-        let seen=inputs.lock().unwrap().clone();
-        if let Some(calls)=calls {assert_eq!(seen.len(),calls,"{mode:?}");}else{assert!(!seen.is_empty()&&seen.len()<16);}
-        for request in &seen {assert_eq!(request,&seen[0]);assert_eq!(request["payload_json"],String::from_utf8(input.payload_json.clone()).unwrap());}
-        stop.send(()).unwrap();task.await.unwrap();
+        let result = client.forge_transform(input.clone()).await;
+        assert_eq!(
+            result.as_ref().err().map(Status::code),
+            expected,
+            "{mode:?}"
+        );
+        if let Ok(reply) = result {
+            assert_eq!(reply.state, "rebase_pending");
+        }
+        let seen = inputs.lock().unwrap().clone();
+        if let Some(calls) = calls {
+            assert_eq!(seen.len(), calls, "{mode:?}");
+        } else {
+            assert!(!seen.is_empty() && seen.len() < 16);
+        }
+        for request in &seen {
+            assert_eq!(request, &seen[0]);
+            assert_eq!(
+                request["payload_json"],
+                String::from_utf8(input.payload_json.clone()).unwrap()
+            );
+        }
+        stop.send(()).unwrap();
+        task.await.unwrap();
     }
 }
 fn forge_http_input() -> tinytree_client::forge_protocol::ForgeCallRequest {
@@ -502,7 +740,14 @@ async fn forge_call_preserves_intent_on_retry_and_rejects_rebound_responses() {
         let actual = client.forge_call(input.clone()).await;
         assert_eq!(actual.as_ref().err().map(|e| e.code()), expected_error);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), expected_calls);
-        assert!(fixture.inputs.lock().unwrap().iter().all(|received| received == &input));
+        assert!(
+            fixture
+                .inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|received| received == &input)
+        );
         stop.send(()).unwrap();
         task.await.unwrap();
     }
@@ -519,7 +764,10 @@ async fn forge_call_rejects_oversized_request_before_dispatch() {
         request_id: "saved-upload".into(),
         payload_json: vec![b' '; tinytree_proto::FORGE_MAX_REQUEST_BYTES],
     };
-    assert_eq!(client.forge_call(input).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(
+        client.forge_call(input).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     stop.send(()).unwrap();
     task.await.unwrap();
@@ -600,8 +848,15 @@ impl Running {
         };
         let cloud_faults = CloudFaults::default();
         let cloud_calls = cloud_faults.calls.clone();
-        let cloud_service = matches!(mode, Mode::CapabilitiesOutOfRange | Mode::CapabilitiesParentUnavailable).then(||
-            tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(cloud_faults));
+        let cloud_service = matches!(
+            mode,
+            Mode::CapabilitiesOutOfRange | Mode::CapabilitiesParentUnavailable
+        )
+        .then(|| {
+            tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloudServer::new(
+                cloud_faults,
+            )
+        });
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(
@@ -761,37 +1016,67 @@ async fn structured_publication_requires_its_exact_capability_without_legacy_fal
         running.stop().await;
     }
     // A capability error cannot prove pin/publication expiry or missing ancestry.
-    for mode in [Mode::CapabilitiesOutOfRange, Mode::CapabilitiesParentUnavailable] {
+    for mode in [
+        Mode::CapabilitiesOutOfRange,
+        Mode::CapabilitiesParentUnavailable,
+    ] {
         let (_directory, _store, service) = setup();
         let running = Running::start(service, mode).await;
-        assert_eq!(running.client().await.acquire_cloud_version_pin(
-            [71; 32], tinytree_client::CloudVersionPinIdentity {
-                pin_id: [19; 16], acquire_not_after_unix_seconds: 120,
-            }, tinytree_client::CloudPinSelection::LatestCaptured,
-        ).await.unwrap_err().code(), Code::FailedPrecondition);
+        assert_eq!(
+            running
+                .client()
+                .await
+                .acquire_cloud_version_pin(
+                    [71; 32],
+                    tinytree_client::CloudVersionPinIdentity {
+                        pin_id: [19; 16],
+                        acquire_not_after_unix_seconds: 120,
+                    },
+                    tinytree_client::CloudPinSelection::LatestCaptured,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
         assert_eq!(running.capabilities.load(Ordering::SeqCst), 1);
         let client = running.client().await;
         let identity = tinytree_client::CloudPublicationIdentity {
-            workspace_id: [71; 32], generation: 1, nonce: [19; 16],
+            workspace_id: [71; 32],
+            generation: 1,
+            nonce: [19; 16],
         };
         let error = client.cloud_publication_v2(identity).await.unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert_eq!(error.message(), "cloud publication capability negotiation unavailable",
-            "capability failure is neither publication expiry nor missing-parent evidence");
+        assert_eq!(
+            error.message(),
+            "cloud publication capability negotiation unavailable",
+            "capability failure is neither publication expiry nor missing-parent evidence"
+        );
         let intent = tinytree_client::CloudPublishIntent {
-            workspace_id: identity.workspace_id, expected_generation: 0,
-            idempotency_key: identity.token(), manifest: b"capability preflight fixture".to_vec(),
+            workspace_id: identity.workspace_id,
+            expected_generation: 0,
+            idempotency_key: identity.token(),
+            manifest: b"capability preflight fixture".to_vec(),
             staging_leases: vec![],
         };
-        let error = client.cloud_publish_version_v2(&intent, identity).await.unwrap_err();
+        let error = client
+            .cloud_publish_version_v2(&intent, identity)
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert_eq!(error.message(), "cloud publication capability negotiation unavailable");
+        assert_eq!(
+            error.message(),
+            "cloud publication capability negotiation unavailable"
+        );
         assert_eq!(running.capabilities.load(Ordering::SeqCst), 3);
-        assert_eq!(running.cloud_calls.load(Ordering::SeqCst), 0,
-            "failed negotiation must not issue a publication lookup or publish RPC");
+        assert_eq!(
+            running.cloud_calls.load(Ordering::SeqCst),
+            0,
+            "failed negotiation must not issue a publication lookup or publish RPC"
+        );
         running.stop().await;
     }
-
 }
 
 #[tokio::test]
@@ -999,7 +1284,9 @@ impl Repository for Faults {
             return Err(Status::out_of_range("capability fixture unavailable"));
         }
         if self.mode == Mode::CapabilitiesParentUnavailable {
-            return Err(Status::failed_precondition("cloud manifest parent unavailable"));
+            return Err(Status::failed_precondition(
+                "cloud manifest parent unavailable",
+            ));
         }
         if self.mode == Mode::CapabilitiesTransport {
             return Err(Status::unavailable("capability transport unavailable"));
@@ -7277,12 +7564,17 @@ async fn cloud_exact_representation_sdk_routes_large_nonprimary_bytes_with_priva
         manifest: tinytree_cloud::encode_manifest(&missing_parent, Default::default()).unwrap(),
         staging_leases: intent.staging_leases.clone(),
     };
-    let error = sdk.cloud_publish_version_v2(&missing_parent, identity).await.unwrap_err();
+    let error = sdk
+        .cloud_publish_version_v2(&missing_parent, identity)
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert_eq!(error.message(), "cloud manifest parent unavailable");
     assert!(error.details().is_empty());
-    assert!(sdk.cloud_publication_v2(identity).await.unwrap().is_none(),
-        "a missing parent must reject publication without consuming its identity");
+    assert!(
+        sdk.cloud_publication_v2(identity).await.unwrap().is_none(),
+        "a missing parent must reject publication without consuming its identity"
+    );
     let published = sdk
         .cloud_publish_version_v2(&intent, identity)
         .await
@@ -7388,12 +7680,19 @@ impl tinytree_client::cloud_protocol::workspace_cloud_server::WorkspaceCloud for
         request: Request<tinytree_client::cloud_protocol::AcquireVersionPinRequest>,
     ) -> Result<Response<tinytree_client::cloud_protocol::VersionPin>, Status> {
         let input = request.into_inner();
-        self.pin_requests.lock().unwrap().push(tinytree_client::CloudVersionPinIdentity {
-            pin_id: input.pin_id.as_slice().try_into().unwrap(),
-            acquire_not_after_unix_seconds: input.acquire_not_after_unix_seconds,
-        });
+        self.pin_requests
+            .lock()
+            .unwrap()
+            .push(tinytree_client::CloudVersionPinIdentity {
+                pin_id: input.pin_id.as_slice().try_into().unwrap(),
+                acquire_not_after_unix_seconds: input.acquire_not_after_unix_seconds,
+            });
         match self.mode.load(Ordering::SeqCst) {
-            63 => return Err(Status::failed_precondition("cloud pin source version expired")),
+            63 => {
+                return Err(Status::failed_precondition(
+                    "cloud pin source version expired",
+                ));
+            }
             64 => return Err(Status::out_of_range("cloud pin admission closed")),
             _ => {}
         }
@@ -10325,16 +10624,31 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     assert_eq!(intent.capture_data(), data);
     faults.mode.store(65, Ordering::SeqCst);
     let before = faults.calls.load(Ordering::SeqCst);
-    assert_eq!(client.cloud_publication_v2(tinytree_client::CloudPublicationIdentity {
-        workspace_id: [1; 32], generation: 1, nonce: [19; 16],
-    }).await.unwrap_err().code(), Code::OutOfRange,
-        "real publication endpoint expiry remains terminal evidence");
+    assert_eq!(
+        client
+            .cloud_publication_v2(tinytree_client::CloudPublicationIdentity {
+                workspace_id: [1; 32],
+                generation: 1,
+                nonce: [19; 16],
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::OutOfRange,
+        "real publication endpoint expiry remains terminal evidence"
+    );
     assert_eq!(faults.calls.load(Ordering::SeqCst), before + 1);
     faults.mode.store(40, Ordering::SeqCst);
     let pin_identity = tinytree_client::CloudVersionPinIdentity {
         pin_id: [21; 16],
-        acquire_not_after_unix_seconds: i64::try_from(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()).unwrap() + 120,
+        acquire_not_after_unix_seconds: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            + 120,
     };
     let pin = client
         .acquire_cloud_version_pin(
@@ -10349,10 +10663,14 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     assert_eq!(pin.version.manifest_selected(), selected);
     assert_eq!(pin.version.manifest(), manifest);
     client.cloud_workspace([1; 32]).await.unwrap();
-    let exact_pin = client.acquire_cloud_version_pin(
-        [1; 32], pin_identity,
-        tinytree_client::CloudPinSelection::Exact { selector, selected },
-    ).await.unwrap();
+    let exact_pin = client
+        .acquire_cloud_version_pin(
+            [1; 32],
+            pin_identity,
+            tinytree_client::CloudPinSelection::Exact { selector, selected },
+        )
+        .await
+        .unwrap();
     assert_eq!(exact_pin.identity, pin_identity);
     assert_eq!(exact_pin.version.selector(), pin.version.selector());
     drop(exact_pin);
@@ -10365,33 +10683,69 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     bounded_config.limits.max_graph_bytes = 8 * 1024 * 1024;
     bounded_config.limits.max_buffered_bytes = 32 * 1024 * 1024;
     let bounded = NativeClient::connect(bounded_config).await.unwrap();
-    let retained = bounded.cloud_retained_version_selected(selector, selected).await.unwrap();
+    let retained = bounded
+        .cloud_retained_version_selected(selector, selected)
+        .await
+        .unwrap();
     let retained = bounded.cloud_captured_version(retained).unwrap();
     let capture = bounded.cloud_read_capture(&retained).await.unwrap();
-    let bounded_pin = bounded.acquire_cloud_version_pin(
-        [1; 32], pin_identity,
-        tinytree_client::CloudPinSelection::Exact { selector, selected },
-    ).await.unwrap();
+    let bounded_pin = bounded
+        .acquire_cloud_version_pin(
+            [1; 32],
+            pin_identity,
+            tinytree_client::CloudPinSelection::Exact { selector, selected },
+        )
+        .await
+        .unwrap();
     assert_eq!(bounded_pin.version.selector(), selector);
     assert_eq!(bounded_pin.version.manifest_selected(), selected);
     assert_eq!(capture.payload(), data);
-    assert_eq!(bounded.acquire_cloud_version_pin(
-        [1; 32], pin_identity, tinytree_client::CloudPinSelection::LatestCaptured,
-    ).await.unwrap_err().code(), Code::ResourceExhausted,
-        "discovery retains its static maximum instead of borrowing available permits");
+    assert_eq!(
+        bounded
+            .acquire_cloud_version_pin(
+                [1; 32],
+                pin_identity,
+                tinytree_client::CloudPinSelection::LatestCaptured,
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted,
+        "discovery retains its static maximum instead of borrowing available permits"
+    );
     let before = faults.calls.load(Ordering::SeqCst);
     let mut oversized = selected;
     oversized.size_bytes = u64::MAX;
-    assert_eq!(bounded.acquire_cloud_version_pin(
-        [1; 32], pin_identity,
-        tinytree_client::CloudPinSelection::Exact { selector, selected: oversized },
-    ).await.unwrap_err().code(), Code::ResourceExhausted);
-    assert_eq!(faults.calls.load(Ordering::SeqCst), before,
-        "an oversized exact bound is rejected before any RPC");
+    assert_eq!(
+        bounded
+            .acquire_cloud_version_pin(
+                [1; 32],
+                pin_identity,
+                tinytree_client::CloudPinSelection::Exact {
+                    selector,
+                    selected: oversized
+                },
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    assert_eq!(
+        faults.calls.load(Ordering::SeqCst),
+        before,
+        "an oversized exact bound is rejected before any RPC"
+    );
     drop((bounded_pin, capture, retained));
     faults.mode.store(62, Ordering::SeqCst);
-    assert_eq!(client.release_cloud_version_pin(pin.identity, selector, selected)
-        .await.unwrap_err().code(), Code::DataLoss);
+    assert_eq!(
+        client
+            .release_cloud_version_pin(pin.identity, selector, selected)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
     faults.mode.store(40, Ordering::SeqCst);
     client
         .release_cloud_version_pin(
@@ -10412,16 +10766,34 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     drop(pin);
     for mode in [56, 61] {
         faults.mode.store(mode, Ordering::SeqCst);
-        assert_eq!(client.acquire_cloud_version_pin(
-            [1; 32], pin_identity, tinytree_client::CloudPinSelection::LatestCaptured,
-        ).await.unwrap_err().code(), Code::DataLoss);
+        assert_eq!(
+            client
+                .acquire_cloud_version_pin(
+                    [1; 32],
+                    pin_identity,
+                    tinytree_client::CloudPinSelection::LatestCaptured,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::DataLoss
+        );
     }
     for (mode, expected) in [(63, Code::FailedPrecondition), (64, Code::OutOfRange)] {
         faults.mode.store(mode, Ordering::SeqCst);
-        assert_eq!(client.acquire_cloud_version_pin(
-            [1; 32], pin_identity, tinytree_client::CloudPinSelection::Exact { selector, selected },
-        ).await.unwrap_err().code(), expected,
-        "source expiry is not terminal admission proof");
+        assert_eq!(
+            client
+                .acquire_cloud_version_pin(
+                    [1; 32],
+                    pin_identity,
+                    tinytree_client::CloudPinSelection::Exact { selector, selected },
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            expected,
+            "source expiry is not terminal admission proof"
+        );
     }
     faults.mode.store(40, Ordering::SeqCst);
     assert_eq!(
@@ -10468,9 +10840,15 @@ async fn captured_version_transport_checks_client_footer_stream_and_original_pub
     );
     assert_eq!(faults.calls.load(Ordering::SeqCst), before_pin);
 
-    assert!(faults.pin_requests.lock().unwrap().iter()
-        .all(|identity| *identity == pin_identity),
-        "latest/exact retry and proof failures never renew the admission identity");
+    assert!(
+        faults
+            .pin_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|identity| *identity == pin_identity),
+        "latest/exact retry and proof failures never renew the admission identity"
+    );
 
     use tinytree_client::PublicationFailureReason as Reason;
     let mut manifest_config = config.clone();

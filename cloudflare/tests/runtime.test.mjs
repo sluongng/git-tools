@@ -137,6 +137,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   const persist = await mkdtemp(path.join(tmpdir(), 'tinytree-forge-account-'));
   const owner = 'forge-owner-runtime-token';
   const memberToken = 'forge-member-runtime-token';
+  const narrowMemberToken = 'forge-narrow-member-runtime-token';
   const other = 'forge-other-runtime-token';
   const raw = 'forge-raw-runtime-token';
   const account = fixture.forge.account_id;
@@ -144,6 +145,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   const config = [
     { principal: 'forge-owner', token_sha256: sha(owner), accounts: allowed, operator: true, kind: 'forge' },
     { principal: 'forge-member', token_sha256: sha(memberToken), accounts: allowed, operator: false, kind: 'forge' },
+    { principal: 'forge-member', token_sha256: sha(narrowMemberToken), accounts: [account], operator: false, kind: 'forge' },
     { principal: 'forge-other', token_sha256: sha(other), accounts: allowed, operator: true, kind: 'forge' },
     { principal: 'raw-owner', token_sha256: sha(raw), accounts: allowed, operator: true, kind: 'raw' },
   ];
@@ -154,7 +156,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
     payload_json: typeof payload === 'string' ? payload : JSON.stringify(payload),
   });
   const callForge = (operation, payload = {}, requestId = '', { token = owner, selectedAccount = account } = {}) => mf.dispatchFetch(
-    'https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    'https://repository.invalid/api/v1/forge/call', { method: 'POST', headers: { ...(token === null ? {} : { authorization: `Bearer ${token}` }), 'content-type': 'application/json' },
       body: JSON.stringify(envelope(operation, payload, requestId, selectedAccount)) });
   const forgeValue = async (response, status = 200, code) => {
     const result = await response.json();
@@ -163,6 +165,21 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
     assert.equal(result.view, 'public'); assert.equal(result.state, 'complete');
     return JSON.parse(result.result_json);
   };
+  const ownerSession = await forgeValue(await callForge(12));
+  assert.equal(ownerSession.schema_version, 1); assert.equal(ownerSession.account_id, account);
+  assert.equal(ownerSession.identity.kind, 'authenticated'); assert.equal(ownerSession.identity.principal, 'forge-owner');
+  assert.match(ownerSession.identity.credential_id, /^[0-9a-f]{64}$/); assert.notEqual(ownerSession.identity.credential_id, sha(owner));
+  assert.deepEqual(await forgeValue(await callForge(12)), ownerSession, 'discovery before provisioning is not an account existence proof');
+  const wideSession = await forgeValue(await callForge(12, {}, '', { token: memberToken }));
+  const narrowSession = await forgeValue(await callForge(12, {}, '', { token: narrowMemberToken }));
+  assert.equal(wideSession.identity.principal, narrowSession.identity.principal);
+  assert.notEqual(wideSession.identity.credential_id, narrowSession.identity.credential_id, 'actual same-principal credentials do not merge ceilings');
+  await forgeValue(await callForge(12, {}, '', { token: narrowMemberToken, selectedAccount: 'legacy' }), 403, 'permission_denied');
+  assert.equal((await forgeValue(await callForge(12, {}, '', { token: memberToken, selectedAccount: 'legacy' }))).identity.credential_id, wideSession.identity.credential_id);
+  await forgeValue(await callForge(12, {}, '', { token: narrowMemberToken, selectedAccount: 'legacy' }), 403, 'permission_denied');
+  await forgeValue(await callForge(12, {}, '', { token: 'invalid-supplied-credential' }), 401, 'unauthenticated');
+  await forgeValue(await callForge(12, { principal: 'forged' }), 400, 'invalid_argument');
+  await forgeValue(await callForge(12, {}, '', { token: raw }), 403, 'permission_denied');
   await forgeValue(await callForge(1, {}, 'member-create', { token: memberToken }), 403, 'permission_denied');
   await forgeValue(await callForge(1, {}, 'wrong-kind', { token: raw }), 403, 'permission_denied');
   await forgeValue(await callForge(5, {}, '', { selectedAccount: 'legacy' }), 403, 'permission_denied');
@@ -171,6 +188,8 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   assert.deepEqual(await forgeValue(await callForge(1, {}, 'provision-owner')), provisioned);
   assert.deepEqual(await forgeValue(await callForge(2)), provisioned);
   await forgeValue(await callForge(2, {}, '', { token: memberToken }), 403, 'permission_denied');
+  await forgeValue(await callForge(12, {}, '', { token: null }), 403, 'permission_denied');
+  await forgeValue(await callForge(6, {}, '', { token: memberToken }), 403, 'permission_denied');
   await forgeValue(await callForge(1, {}, 'steal-owner', { token: other }), 403, 'permission_denied');
   const member = { principal: 'forge-member', can_write: true, can_review: true, is_admin: true, roles: ['reviewer'] };
   const mutation = { member, expected_epoch: 1 };
@@ -194,12 +213,18 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   await forgeValue(await callForge(4, publishPublic, 'add-member'), 400, 'invalid_argument');
   await forgeValue(await callForge(4, { ...publishPublic, spec: { ...views.public_spec, revision: Array(32).fill(9) } }, 'unknown-view-root'), 403, 'permission_denied');
   assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public);
+  assert.deepEqual(await forgeValue(await callForge(12, {}, '', { token: null })), { schema_version: 1, account_id: account, identity: { kind: 'anonymous' } });
+  await forgeValue(await callForge(12, {}, '', { token: 'invalid-supplied-credential' }), 401, 'unauthenticated');
+
   assert.deepEqual(await forgeValue(await callForge(4, publishPublic, 'public-view')), views.public);
   assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: other })), [views.public], 'current public policy permits nonmember view discovery');
   assert.deepEqual((await forgeValue(await callForge(2))).public_view, views.public.view_version);
   const publishLocked = { spec: views.locked_spec, expected_epoch: 4, make_default: false };
   assert.deepEqual(await forgeValue(await callForge(4, publishLocked, 'locked-view')), views.locked);
   assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: other })), [], 'new current member policy removes old public discovery');
+  await forgeValue(await callForge(12, {}, '', { token: null }), 403, 'permission_denied');
+  assert.deepEqual(await forgeValue(await callForge(12, {}, '', { token: memberToken })), wideSession, 'session identity is not a cached ACL grant');
+
   assert.deepEqual(await forgeValue(await callForge(5, {}, '', { token: memberToken })), [views.locked]);
   assert.equal((await forgeValue(await callForge(2))).public_view, null);
   await forgeValue(await callForge(11, { version: views.locked.view_version, expected_epoch: 5 }, 'cannot-retire-current'), 400, 'failed_precondition');
@@ -222,6 +247,7 @@ test('Forge HTTP account authority matches native Store and fences raw access ac
   await forgeValue(await callForge(1, {}, 'adopt-legacy', { selectedAccount: 'legacy' }), 400, 'failed_precondition');
   await mf.dispose(); mf = new Miniflare(options(persist, { config, forge: true }));
   assert.equal((await forgeValue(await callForge(2))).policy_epoch, 6);
+  assert.deepEqual(await forgeValue(await callForge(12)), ownerSession, 'same exact credential remains stable across SQLite restart');
   assert.deepEqual(await forgeValue(await callForge(5)), [{ ...views.locked, policy_epoch: 6 }]);
   assert.deepEqual(await forgeValue(await callForge(3, mutation, 'add-member')), fixture.forge.added);
   for (const [fault, selectedAccount] of [['after', 'r2-recovery'], ['sql-receipt', 'sql-recovery']]) {

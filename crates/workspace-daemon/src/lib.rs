@@ -36,3 +36,6 @@ mod native_restore_source;
 
 #[cfg(unix)]
 mod provider_identity;
+
+#[cfg(unix)]
+pub mod forge_client;

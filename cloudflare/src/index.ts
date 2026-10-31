@@ -1,4 +1,4 @@
-import { inspect, validateClosure, forgeViewCore, normalizeForgeAccountCommand, validateCheckerReceipt, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
+import { deriveForgeSession, inspect, validateClosure, forgeViewCore, normalizeForgeAccountCommand, validateCheckerReceipt, type Descriptor, type Inspection, type ObjectKey, type ForgeCall } from './core';
 import { authenticate, admitsForgeAccount, body, digest, fail, Failure, hash, identifier, input, integer, json, name, protect, record, requestId, type Auth } from './protocol';
 import { forgeReply, protectForge, readForgeCall } from './forge';
 import { ForgeAccounts, hasForgeAccount, type CanonicalAccountObject } from './forge_accounts';
@@ -111,7 +111,7 @@ async function admitForge(request: Request, env: Env): Promise<{ auth: Auth | nu
   if (auth) {
     if (!auth.accounts.includes(framed.call.account_id)) fail(403, 'permission_denied');
   } else {
-    if (![5, 6, 7, 8, 9].includes(framed.call.operation)) fail(401, 'unauthenticated');
+    if (![5, 6, 7, 8, 9, 12].includes(framed.call.operation)) fail(401, 'unauthenticated');
     if (!admitsForgeAccount(env.PRINCIPALS_JSON, framed.call.account_id)) fail(403, 'permission_denied');
   }
   return { auth, ...framed };
@@ -552,6 +552,24 @@ class RepositoryEngine {
     const { auth, call } = await admitForge(request, this.env);
     const repository = this.one('SELECT account FROM repository WHERE singleton=1');
     if (repository && repository.account !== call.account_id) fail(403, 'permission_denied');
+    if (call.operation === 12) {
+      // Both ingress and this DO already independently matched the actual
+      // credential row/account ceiling. Discovery grants no membership/view
+      // access and is deliberately independent of Store/account existence.
+      let session;
+      try { session = deriveForgeSession({ account_id: call.account_id, payload_json: call.payload_json,
+        identity: auth ? { kind: 'authenticated', principal: auth.principal, verifier_scheme: 'sha256', verifier: auth.credential_id,
+          ceiling: { kind: 'cloudflare', accounts: auth.accounts, operator: auth.operator, credential_kind: auth.kind } }
+          : { kind: 'anonymous' } }); }
+      catch { fail(400, 'invalid_argument'); }
+      if (!auth) {
+        const storage = this.forgeStorage(call.account_id);
+        const api = this.forgeAccounts(call.account_id, null, false, storage);
+        const { views } = this.forgeServices(call.account_id, null, api, storage);
+        this.ctx.storage.transactionSync(() => views.resolveInTx(call.view));
+      }
+      return forgeReply(call, 'complete', session);
+    }
     // This host is per request. Never cache an actor/grant on the DO instance.
     const storage = this.forgeStorage(call.account_id);
     const api = this.forgeAccounts(call.account_id, auth?.principal ?? null, auth?.operator ?? false, storage);

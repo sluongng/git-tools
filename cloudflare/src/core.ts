@@ -4,6 +4,10 @@ import type { ViewCore } from './forge_views';
 export interface ObjectKey { kind: number; id: string }
 export interface Descriptor extends ObjectKey { size_bytes: number; format_version: number }
 export interface Inspection extends Descriptor { references: ObjectKey[] }
+export interface ForgeSession {
+  schema_version: 1; account_id: string;
+  identity: { kind: 'anonymous' } | { kind: 'authenticated'; principal: string; credential_id: string };
+}
 interface CoreExports {
   tt_forge_transform_command(pointer: number, length: number): number;
   tt_forge_transform_format(pointer: number, length: number): number;
@@ -19,6 +23,7 @@ interface CoreExports {
   tt_forge_validate_view(pointer: number, length: number): number;
   tt_forge_parse_call(pointer: number, length: number): number;
   tt_forge_account_command(pointer: number, length: number): number;
+  tt_forge_session(pointer: number, length: number): number;
   tt_forge_build_candidate(pointer: number, length: number): number;
   tt_forge_build_projection(pointer: number, length: number): number;
   tt_closure_step(pointer: number, length: number): number;
@@ -65,6 +70,12 @@ export function verifyForgeTransformLineage(input: unknown): unknown { return tr
 export function buildForgeTransform(input: unknown): unknown { return transformCore(input, core.tt_forge_transform_build); }
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+
+/** Host-only caller identity. Session discovery does not grant view access. */
+export function deriveForgeSession(input: unknown): ForgeSession {
+  const bytes = encoder.encode(JSON.stringify(input));
+  return invoke(bytes, pointer => core.tt_forge_session(pointer, bytes.byteLength)) as ForgeSession;
+}
 
 /** Strict dedicated checker framing; authentication and leases remain SQL-owned. */
 export function parseCheckerCall(bytes: Uint8Array): unknown {

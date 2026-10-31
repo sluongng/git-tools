@@ -458,6 +458,17 @@ mod forge_product {
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved, result["result"]);
         assert!(saved.get("transport").is_none(), "default gRPC encoding stays unchanged");
+        let original = fs::read(&path).unwrap();
+        for name in ["HOME", "PATH"] {
+            let rejected = client.run(&["context", "set", "--transport", "forge-https-v1", "--server", "https://example.invalid", "--account", "example", "--token-env", name, "--json"]);
+            assert!(!rejected.status.success());
+            assert_eq!(fs::read(&path).unwrap(), original, "reserved runtime variables cannot replace a working credential context");
+        }
+        for suffix in [vec!["--broker", "/tmp/missing-broker"], vec!["--store", "missing-store"]] {
+            let failed = client.run(&[vec!["work", "target"], suffix].concat());
+            assert!(!failed.status.success(), "advanced work flags are a required pair");
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -761,6 +772,89 @@ mod forge_product {
         let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
         assert_eq!(report["operation"], "status");
         assert_eq!(report["state"], "failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forge_product_work_distinguishes_validated_absence_from_registry_failure() {
+        for corrupt_registry in [false, true] {
+            let client = client();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            client.success(&["context", "set", "--transport", "forge-https-v1", "--server", &endpoint, "--account", "example", "--json"]);
+            let destination = client.root.join("retained");
+            fs::create_dir(&destination).unwrap();
+            let sentinel = destination.join("unpublished-source.txt");
+            let original = b"retained work must not be rebound to the current context\n";
+            fs::write(&sentinel, original).unwrap();
+            let registry = client.home.join(".local/state/git-tools/native-workspaces");
+            let corrupt_bytes = b"not a native registry";
+            if corrupt_registry {
+                fs::create_dir_all(&registry).unwrap();
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                fs::write(registry.join("registry.json"), corrupt_bytes).unwrap();
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(registry.join("registry.json"), fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            let failed = client.run(&["work", "retained", "--json"]);
+            assert!(!failed.status.success());
+            let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+            assert_eq!(report["state"], "failed");
+            assert_eq!(fs::read(&sentinel).unwrap(), original);
+            assert!(!client.home.join("config/tinytree/work-targets").exists(), "registry refusal precedes durable enrollment intent");
+            assert!(!client.home.join("config/tinytree/clients").exists(), "registry refusal starts no derived client");
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "registry refusal must not contact current Forge context");
+            if corrupt_registry { assert_eq!(fs::read(registry.join("registry.json")).unwrap(), corrupt_bytes); }
+            else { assert!(!registry.exists()); }
+        }
+        // A healthy registry with no matching registration is different from a
+        // failed scan. A precreated empty destination must reach SDK discovery.
+        let client = client();
+        let registry_path = client.home.join(".local/state/git-tools/native-workspaces");
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let registry = native_workspace_admin::Registry::create(&registry_path).unwrap();
+        let original_registry = fs::read(registry.path().join("registry.json")).unwrap();
+        let destination = client.root.join("empty-target");
+        fs::create_dir(&destination).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        client.success(&["context", "set", "--transport", "forge-https-v1", "--server", &endpoint, "--account", "example", "--json"]);
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0]; socket.read_exact(&mut byte).await.unwrap(); headers.push(byte[0]);
+                assert!(headers.len() < 16384);
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("post /api/v1/forge/call http/1.1\r\n"));
+            assert!(!headers.contains("authorization:"), "explicit anonymous context stays anonymous");
+            let size: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+            assert!(size < 2048);
+            let mut body = vec![0; size]; socket.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let body = br#"{"version":1,"error":{"code":"permission_denied","message":"fixture_empty_target_denied"}}"#;
+            socket.write_all(format!("HTTP/1.1 403 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            request
+        });
+        let failed = client.run(&["work", "empty-target", "--json"]);
+        assert!(!failed.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+        assert_eq!(report["state"], "failed");
+        assert!(String::from_utf8_lossy(&failed.stdout).contains("fixture_empty_target_denied"), "runtime reaches the real SDK HTTP response, not a no-reactor panic");
+        let request = server.await.unwrap();
+        assert_eq!(request["operation"], 12); assert_eq!(request["account_id"], "example");
+        assert_eq!(request["payload_json"], "{}");
+        assert_eq!(fs::read(registry.path().join("registry.json")).unwrap(), original_registry);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert!(!client.home.join("config/tinytree/clients").exists(), "discovery denial starts no native client");
     }
 
     #[test]

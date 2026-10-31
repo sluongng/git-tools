@@ -1013,33 +1013,127 @@ mod tests {
         result
     }
 
-    #[tokio::test]
-    async fn forge_browser_body_collection_obeys_the_admitted_short_deadline() {
-        let (_directory, service, _) = setup(b"# Example", false, true);
-        let body = Body::from_stream(async_stream::stream! {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::from_static(b"{}"));
-        });
-        let request = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/forge/call")
-            .header("host", "localhost:8093")
-            .header("origin", "http://localhost:8093")
-            .header("content-type", "application/json")
-            .header("grpc-timeout", "20m")
-            .body(body)
+    #[test]
+    fn forge_browser_body_collection_obeys_the_admitted_short_deadline() {
+        async fn exercise() {
+            let (_directory, existing, _) = setup(b"# Example", false, true);
+            let mut config = ServiceConfig::default();
+            config.max_inflight = 1;
+            config.max_inflight_per_repository = 1;
+            let service = RepositoryService::new(
+                existing.forge_store(),
+                config,
+                vec!["example".into(), "hidden".into()],
+                vec![Principal::new_forge("session-reader", TOKEN).unwrap()],
+            )
             .unwrap();
-        let response = browser_routes(service, Some(8093))
-            .oneshot(request)
+            drop(existing);
+            let body = Body::from_stream(async_stream::stream! {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                yield Ok::<bytes::Bytes,std::io::Error>(bytes::Bytes::from_static(b"{}"));
+            });
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/forge/call")
+                .header("host", "localhost:8093")
+                .header("origin", "http://localhost:8093")
+                .header("content-type", "application/json")
+                .header("grpc-timeout", "20m")
+                .body(body)
+                .unwrap();
+            let response = browser_routes(service.clone(), Some(8093))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value,
+                json!({"version":1,"error":{"code":"deadline_exceeded","message":"deadline_exceeded"}})
+            );
+            // Hold the sole blocking thread: a real Session worker is queued, not
+            // replaced by a test hook or an imitation of the dispatch helper.
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (resume, release) = std::sync::mpsc::sync_channel(1);
+            let holder = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("blocking holder release");
+            });
+            started.await.unwrap();
+            let request = |payload: String, timeout: &str| {
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/forge/call")
+                    .header("host", "localhost:8093")
+                    .header("origin", "http://localhost:8093")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("grpc-timeout", timeout)
+                    .body(Body::from(payload))
+                    .unwrap()
+            };
+            let session = json!({"version":1,"operation":12,"account_id":"example","view":"public","request_id":"","payload_json":"{}"});
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                browser_routes(service.clone(), Some(8093))
+                    .oneshot(request(session.to_string(), "100m")),
+            )
             .await
+            .expect("Session must return at its deadline before blocking work is released")
             .unwrap();
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            value,
-            json!({"version":1,"error":{"code":"deadline_exceeded","message":"deadline_exceeded"}})
-        );
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"],
+                "deadline_exceeded"
+            );
+            // This valid-auth but malformed envelope would return 400 immediately
+            // after admission, without spawning another worker. It must instead
+            // time out waiting for the first queued worker's physical permit.
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                browser_routes(service.clone(), Some(8093)).oneshot(request("{}".into(), "20m")),
+            )
+            .await
+            .expect("admission wait must respect the second deadline")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            drop(response);
+            resume.send(()).unwrap();
+            holder.await.unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                browser_routes(service.clone(), Some(8093)).oneshot(request("{}".into(), "2S")),
+            )
+            .await
+            .expect("physical permit must return when expired queued work finishes")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            drop(response);
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                browser_routes(service, Some(8093)).oneshot(request(session.to_string(), "2S")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                forge_payload(&serde_json::from_slice::<Value>(&bytes).unwrap())["identity"]["principal"],
+                "session-reader"
+            );
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise());
     }
 
     #[tokio::test]

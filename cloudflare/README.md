@@ -37,8 +37,28 @@ copy origins.
 Cold snapshots return bounded pending progress, pinned to an immutable view and
 current policy epoch. The SDK and `tt view show` continue that same preparation;
 there is no unnamed/latest restart or local fallback. Use the explicit
-`forge-https-v1` transport when selecting a CLI context. Account/view publication
-does not register a local workspace provider automatically.
+`forge-https-v1` transport when selecting a CLI context.
+
+On Linux, `tt work DIRECTORY` derives an owner-private snapshot client from the
+selected context; no separately configured repository alias is needed. The
+client independently verifies the authenticated session, exact view selection
+and projected native objects before creating a lazy workspace. It connects
+directly to the Forge API, not to a native repository origin. For example:
+
+```sh
+tt context set --transport forge-https-v1 \
+  --server https://forge.example.invalid --account example --view public \
+  --token-env TT_FORGE_TOKEN
+tt work workspace
+```
+
+Supply the selected credential through its environment reference, not a command
+argument or saved context value. Anonymous public access can omit `--token-env`.
+Repeating `tt work` or resuming the workspace uses its original client descriptor
+and immutable selection, even when the current context or named view advances.
+The paired `--broker` and `--store` options remain an explicit advanced path.
+These clients keep unpublished work locally; they do not provide private cloud
+backup, automatic capture/upload, raw publication or general remote queries.
 
 Review operations 20–23 provide immutable patchset admission, server-side candidate
 preparation, exact-candidate decisions and comments. Large source admission returns
@@ -77,10 +97,14 @@ operations fail explicitly; there is no fallback to the local backend. Do not
 expose it as an equivalent public Forge service or switch an existing account
 between the two authorities.
 
-There is no object-deletion API or garbage collector in this first backend.
-Pending uploads and their byte reservations count toward finite account limits.
-Pin release does not delete data, and old replay receipts are not silently
-discarded to make room for new requests. Reaching a limit fails closed.
+Bounded idle maintenance traces trusted retained roots before collecting
+unreachable R2 payloads. A failed or incomplete mark does not authorize deletion.
+Each physical upload has its own durable incarnation and accounting; a delayed
+delete cannot remove a replacement payload. Unknown write outcomes retain
+custody until reconciled. Pending uploads and their byte reservations count
+toward finite account limits. Pin release is not immediate deletion, and old
+replay receipts are not silently discarded to make room for new requests.
+Reaching a limit fails closed; there is no arbitrary object-deletion API.
 
 ## Build and verify
 
@@ -110,6 +134,12 @@ it drives cold preparation of a native-generated 701-path view and verifies the
 native snapshot. Separate storage/projection cases cover revocation, scoped
 ranges, closure progress and rollback. These do not establish the full native
 workspace, deployed browser or checked-landing workflow.
+
+The explicitly selected `//cloudflare:forge_client_acceptance` target additionally
+requires Linux FUSE and an execution-only checker proxy. It exercises the shipped
+Worker and CLI with separate native clients, real checked publication, retained
+local iteration and exact-snapshot restart. Like the other local tests, it is
+not evidence of a deployed HTTPS service or a complete backup/restore workflow.
 
 ## Authority and authentication
 

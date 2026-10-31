@@ -827,6 +827,15 @@ impl Manager {
             .collect_native(repository.local_objects.clone(), apply)
             .await
     }
+    /// Derived snapshot clients may recover only their saved destination. The
+    /// shared administration registry is a lookup store, not an adoption list.
+    pub(crate) fn require_forge_client_scope(&self, root: &Path, store: &str, commit: [u8;32]) -> Result<()> {
+        ensure!(self.cloud_intents.is_empty() && self.retirements.is_empty(), "foreign recovery state in Forge client");
+        for entry in self.entries.values() {
+            ensure!(entry.record.root==root && entry.record.store==store && matches!(&entry.record.origin, Origin::Clone {bootstrap_commit} if *bootstrap_commit==commit), "foreign workspace record in Forge client; preserve state");
+        }
+        Ok(())
+    }
     pub fn status(&self) -> serde_json::Value {
         serde_json::json!(self.entries.iter().map(|(id,entry)| serde_json::json!({"workspace_id":id,"root":entry.record.root,"store":entry.record.store,"state":entry.record.state,"active":entry.mount.is_some(),"provider_recovery_owned":entry.provider_failure.is_some(),"fuse_metadata":entry.mount.as_ref().and_then(|mount|mount.metadata_diagnostics())})).collect::<Vec<_>>())
     }

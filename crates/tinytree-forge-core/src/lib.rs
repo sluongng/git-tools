@@ -10,6 +10,7 @@ pub mod review_commands;
 pub mod review_admission;
 pub mod projection;
 pub mod wire;
+pub mod session;
 pub mod search;
 pub mod upload;
 pub mod upload_scope;

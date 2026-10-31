@@ -6,6 +6,7 @@ mod forge_http;
 mod transport;
 mod verified;
 pub use client::NativeClient;
+pub use client::forge_resolve::ForgeViewSelection;
 pub use client::capabilities::{Capabilities, CapabilityFeature, FeatureCapability, RootReadiness};
 pub use client::cloud::{
     CloudCapture, CloudCaptureDescriptor, CloudCaptureId, CloudCapturedPublishIntent,

@@ -6,12 +6,13 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
-import { mkdtemp, mkdir, readFile, writeFile, readdir, stat, lstat, open, rm, copyFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, readdir, stat, lstat, open, rm, copyFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Miniflare } from 'miniflare';
 
-const inputs = process.argv.slice(2);
+export async function runCheckerAcceptance({ inputs, clientWorkflow } = {}) {
 assert.equal(inputs.length, 7, 'declared fixture, checker, readonly helper, Bazel, Worker, Wasm and tt arguments required');
 const [fixtureBinary, runner, helper, bazel, worker, wasm, tt] = inputs.map(value => path.resolve(value));
 const socket = process.env.TT_CHECKER_ACCEPT_RBE_SOCKET;
@@ -36,7 +37,7 @@ const pin = async file => sha(await readFile(file));
 const execute = promisify(execFile);
 const environment = { HOME: home, XDG_CONFIG_HOME: path.join(home, 'config'), TMPDIR: root, PATH: emptyPath,
   TT_CHECKER_TOKEN: checkerToken, TERM: 'dumb' };
-let mf, relay;
+let mf, relay, workflow;
 const relayEvents = [];
 let lostAck;
 const evidence = [];
@@ -50,7 +51,7 @@ try {
     durableObjects: { REPOSITORIES: { className: 'AccountRepository', useSQLite: true } },
     r2Buckets: ['OBJECTS'], durableObjectsPersist: path.join(root, 'do'), r2Persist: path.join(root, 'r2'),
     bindings: { FORGE_BACKEND: 'enabled', EXPERIMENTAL_RAW_BACKEND: 'disabled',
-      PRINCIPALS_JSON: JSON.stringify([{ principal: 'check-owner', token_sha256: sha(token), accounts: ['forge-check', 'forge-input'], operator: true, kind: 'forge' }]) },
+      PRINCIPALS_JSON: JSON.stringify([{ principal: 'check-owner', token_sha256: sha(token), accounts: ['forge-check', 'forge-input'], operator: true, kind: 'forge' }, ...(clientWorkflow?.configurePrincipals?.() ?? [])]) },
   };
   mf = new Miniflare(configuration);
   const origin = (await mf.ready).origin;
@@ -149,17 +150,17 @@ force_remote_execution = true
   configuration.bindings.FORGE_REVIEW_CONFIG_JSON = JSON.stringify({ profile, committer: { name: 'Checker Acceptance', email: 'fixture@example.invalid' } });
   configuration.bindings.FORGE_CHECK_POLICY_JSON = JSON.stringify({ profile, targets: ['//:smoke'], test: true });
   await mf.dispose(); mf = new Miniflare(configuration); assert.equal((await mf.ready).origin, origin);
-  const generated = await execute(fixtureBinary, ['--checker-profile-version', profileVersion], { env: { HOME: home, PATH: emptyPath, TMPDIR: root }, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 });
+  const generated = await execute(fixtureBinary, ['--checker-profile-version', profileVersion, ...(clientWorkflow?.fixtureArgs ?? [])], { env: { HOME: home, PATH: emptyPath, TMPDIR: root }, encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 });
   const source = JSON.parse(generated.stdout).checker;
   assert.deepEqual(source.profile, profile);
-  const invoke = async (operation, payload = {}, id = '', expected = 200, selectedAccount = source.account_id) => {
+  const invoke = async (operation, payload = {}, id = '', expected = 200, view = 'public', selectedAccount = source.account_id) => {
     const response = await mf.dispatchFetch(origin + '/api/v1/forge/call', { signal: AbortSignal.timeout(30000), method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 1, operation, account_id: selectedAccount, view: 'public', request_id: id, payload_json: JSON.stringify(payload) }),
+      body: JSON.stringify({ version: 1, operation, account_id: selectedAccount, view, request_id: id, payload_json: JSON.stringify(payload) }),
     });
     const envelope = await response.json(); assert.equal(response.status, expected, JSON.stringify(envelope));
     if (expected !== 200) return envelope;
-    assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id); assert.equal(envelope.account_id, selectedAccount); assert.equal(envelope.view, 'public');
+    assert.equal(envelope.operation, operation); assert.equal(envelope.request_id, id); assert.equal(envelope.account_id, selectedAccount); assert.equal(envelope.view, view);
     return { state: envelope.state, value: JSON.parse(envelope.result_json) };
   };
   stage = 'bootstrap';
@@ -177,7 +178,8 @@ force_remote_execution = true
   }
   assert.equal(imported.phase, 'ready');
   await invoke(44, { import_id: begin.import_id, expected_generation: imported.generation }, 'accept-bootstrap-finish');
-  await invoke(4, { spec: source.spec, expected_epoch: 1, make_default: true, follow_main: false }, 'accept-view');
+  await clientWorkflow?.beforePublish?.({ invoke, source });
+  await invoke(4, { spec: source.spec, expected_epoch: source.publish_epoch ?? 1, make_default: true, follow_main: source.client_workspace === true }, 'accept-view');
   let baseline = await invoke(6);
   for (let round = 0; round < 128 && baseline.state === 'pending'; round++) baseline = await invoke(6, { version: baseline.value.view_version, progress: baseline.value.progress });
   assert.equal(baseline.state, 'complete');
@@ -219,10 +221,16 @@ force_remote_execution = true
     assert.equal(review.value.candidate.root_tree, selected.expected_canonical_tree, 'canonical rebase preserves excluded subtree and earlier positive change');
     return review;
   };
+  const restartWorker = async () => {
+    await mf.dispose(); mf = new Miniflare(configuration);
+    assert.equal((await mf.ready).origin, origin);
+  };
+  workflow = clientWorkflow;
+  await workflow?.start?.({ root, origin, source, token, invoke, execute, profile, run, restartWorker });
   for (const selected of source.reviews) {
-    const review = await prepareReview(selected);
+    const review = selected.label === 'positive' && workflow ? await workflow.preparePositive(selected) : await prepareReview(selected);
     const candidate = review.value.candidate;
-    const selector = { change_id: selected.change_id, patchset_id: selected.patchset_id, candidate_id: candidate.id };
+    const selector = { change_id: review.value.change_id, patchset_id: review.value.patchset_id, candidate_id: candidate.id };
     const current = (await invoke(2)).value;
     stage = `${selected.label}-physical-check`;
     const claim = `accept-${selected.label}`;
@@ -270,7 +278,7 @@ force_remote_execution = true
     assert.deepEqual((await readdir(scratch)).filter(name => /^[0-9a-f]{64}$/.test(name)).sort(), attemptNames);
     assert.equal(relayEvents.length, requestCount, 'terminal recovery does not dispatch fresh execution');
     assert.equal(await readFile(path.join(attempt, 'bep.jsonl'), 'utf8'), bep);
-    const checked = await invoke(21, { change_id: selected.change_id });
+    const checked = await invoke(21, { change_id: selector.change_id });
     assert.equal(checked.state, selected.label === 'positive' ? 'prepared' : 'check_failed');
     await invoke(23, { ...selector, decision: 'approve' }, `approve-${selected.label}`);
     if (selected.label === 'positive') {
@@ -281,6 +289,7 @@ force_remote_execution = true
       const after = (await invoke(2)).value;
       assert.equal(after.main_generation, current.main_generation + 1);
       assert.equal(Buffer.from(after.main_revision).toString('hex'), candidate.head);
+      await workflow?.afterPositive?.({ review, landed, selector });
     } else {
       assert.equal((await invoke(24, selector, 'accept-negative-land', 400)).error.code, 'failed_precondition');
       assert.deepEqual((await invoke(2)).value, current, 'real failed Bazel check cannot publish');
@@ -298,23 +307,23 @@ force_remote_execution = true
   stage = 'transform-source-bootstrap';
   const dependency = source.transform;
   const upstream = dependency.source;
-  const sourceAccount = (await invoke(1, {}, 'accept-source-provision', 200, upstream.account_id)).value;
+  const sourceAccount = (await invoke(1, {}, 'accept-source-provision', 200, 'public', upstream.account_id)).value;
   const sourceBegin = (await invoke(40, { root: upstream.root,
     source: { repository_id: 'native-transform-source', reference: 'main', generation: 1, head: upstream.root.id },
-    destination: { generation: 1, head: Buffer.from(sourceAccount.main_revision).toString('hex') } }, 'accept-source-bootstrap', 200, upstream.account_id)).value;
+    destination: { generation: 1, head: Buffer.from(sourceAccount.main_revision).toString('hex') } }, 'accept-source-bootstrap', 200, 'public', upstream.account_id)).value;
   for (const object of upstream.objects) await invoke(41, { import_id: sourceBegin.import_id,
     descriptor: { kind: object.kind, id: object.id, size_bytes: object.size_bytes, format_version: object.format_version },
-    data_base64: Buffer.from(object.bytes).toString('base64') }, `io-${sourceBegin.import_id}-${object.kind}-${object.id}`, 200, upstream.account_id);
+    data_base64: Buffer.from(object.bytes).toString('base64') }, `io-${sourceBegin.import_id}-${object.kind}-${object.id}`, 200, 'public', upstream.account_id);
   let sourceStatus = sourceBegin.status;
   for (let step = 0; step < 128 && !sourceStatus.complete; step++) {
     sourceStatus = (await invoke(42, { import_id: sourceBegin.import_id, expected_generation: sourceStatus.generation },
-      `ia-${sourceBegin.import_id}-${sourceStatus.generation}`, 200, upstream.account_id)).value.status;
+      `ia-${sourceBegin.import_id}-${sourceStatus.generation}`, 200, 'public', upstream.account_id)).value.status;
     assert.equal(sourceStatus.error, null);
   }
   assert.equal(sourceStatus.phase, 'ready');
-  await invoke(44, { import_id: sourceBegin.import_id, expected_generation: sourceStatus.generation }, 'accept-source-finish', 200, upstream.account_id);
-  await invoke(4, { spec: upstream.before_spec, expected_epoch: 1, make_default: true, follow_main: false }, 'accept-source-before', 200, upstream.account_id);
-  await invoke(4, { spec: upstream.after_spec, expected_epoch: 2, make_default: true, follow_main: false }, 'accept-source-after', 200, upstream.account_id);
+  await invoke(44, { import_id: sourceBegin.import_id, expected_generation: sourceStatus.generation }, 'accept-source-finish', 200, 'public', upstream.account_id);
+  await invoke(4, { spec: upstream.before_spec, expected_epoch: 1, make_default: true, follow_main: false }, 'accept-source-before', 200, 'public', upstream.account_id);
+  await invoke(4, { spec: upstream.after_spec, expected_epoch: 2, make_default: true, follow_main: false }, 'accept-source-after', 200, 'public', upstream.account_id);
   const ttConfig = path.join(root, 'tt-user.toml');
   await writeFile(ttConfig, '[user]\nname="Acceptance Fixture"\nemail="fixture@example.invalid"\n[operation]\nhostname="test"\nusername="test"\n[ui]\npaginate="never"\n', { mode: 0o600 });
   const ttEnvironment = { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'config'), JJ_CONFIG: ttConfig,
@@ -560,7 +569,8 @@ force_remote_execution = true
     await writeFile(path.join(artifacts, 'cancellation-proc.json'), JSON.stringify(observation, null, 2), { mode: 0o600 });
   }
   assert.equal((await invoke(2)).value.main_generation, before.main_generation + 2);
-  const summary = { schema: 1, production_worker: true, execution_only_linux: true, no_synthetic_verdict: true, evidence };
+  const clientEvidence = await workflow?.finish?.();
+  const summary = { ...(clientEvidence ? { client_workspaces: clientEvidence } : {}), schema: 1, production_worker: true, execution_only_linux: true, no_synthetic_verdict: true, evidence };
   if (artifacts) await writeFile(path.join(artifacts, 'checker-acceptance.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
   console.log(JSON.stringify(summary));
   acceptanceComplete = true;
@@ -591,6 +601,7 @@ force_remote_execution = true
 } finally {
   let disposed = false;
   try {
+    await workflow?.cleanup?.();
     if (relay) { relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve)); }
     if (mf) await mf.dispose(); disposed = true;
   }
@@ -599,4 +610,10 @@ force_remote_execution = true
     else console.error(JSON.stringify({ stage, retained_private_fixture: root,
       reason: 'failed acceptance retains original journals, source and SQLite/R2 custody for explicit recovery' }));
   }
+}
+
+}
+
+if (process.argv[1] && await realpath(process.argv[1]) === await realpath(fileURLToPath(import.meta.url))) {
+  await runCheckerAcceptance({ inputs: process.argv.slice(2) });
 }

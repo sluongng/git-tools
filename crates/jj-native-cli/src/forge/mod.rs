@@ -1,6 +1,8 @@
 //! Single-process product façade over the native VCS and hosted forge service.
 mod bootstrap;
 mod context;
+mod client;
+pub(crate) use client::{hidden as client_hidden, resume as resume_client, finish_resume as finish_client_resume};
 mod output;
 mod pending;
 mod reconcile;

@@ -876,6 +876,15 @@ impl Config {
         }
         Ok(())
     }
+    /// Derived Forge client only. Deliberately does not validate or fabricate
+    /// an upstream/cache proxy configuration that this runtime never opens.
+    pub(crate) fn validate_forge_client(&self) -> Result<()> {
+        ensure!(self.state_dir.is_absolute() && self.native.repositories.len()==1, "invalid Forge client state/providers");
+        ensure!(self.cache.upstream.is_empty() && self.cache.api_key_env.is_empty() && !self.bes.enabled && !self.bos.enabled && self.git_proxy.repositories.is_empty() && !self.git_proxy.sync_to_cas, "Forge client cannot enable ancillary services");
+        ensure!(self.native.workspaces.index_mode==NativeIndexMode::Legacy && self.native.workspaces.capture.policy==NativeCapturePolicy::Disabled && self.native.workspaces.upload.policy==NativeCaptureUploadPolicy::Disabled && self.native.workspaces.gc.policy==NativeGcPolicy::Disabled, "Forge client requires snapshot-only local policy");
+        ensure!(self.native.repositories.values().all(|r|r.forge.is_some()&&r.remote.is_none()&&!r.checker_forge_accounts), "Forge client cannot use raw sources");
+        self.reapi.validate()?; self.native.validate(&self.reapi)
+    }
     pub fn socket(&self) -> PathBuf {
         self.state_dir.join("control.sock")
     }

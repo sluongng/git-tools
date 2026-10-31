@@ -977,7 +977,38 @@ async fn forge_checker_reads_only_actual_dynamic_accounts_and_never_writes() {
     let mut forge=tinytree_proto::forge_v1::forge_client::ForgeClient::new(channel);
     let error=forge.call(request(tinytree_proto::forge_v1::ForgeCallRequest{operation:tinytree_proto::forge_v1::ForgeOperation::ProvisionAccount as i32,account_id:"checker-created".into(),view:String::new(),request_id:"denied".into(),payload_json:b"{}".to_vec()},CHECKER)).await.unwrap_err();assert_eq!(error.code(),Code::PermissionDenied);
     assert!(!store.forge_has_account_repository("forge-checker-created").unwrap());
+    let session_request=tinytree_proto::forge_v1::ForgeCallRequest{operation:tinytree_proto::forge_v1::ForgeOperation::GetSession as i32,account_id:account.0.clone(),view:"public".into(),request_id:String::new(),payload_json:b"{}".to_vec()};
+    let reply=forge.call(request(session_request.clone(),PRODUCT)).await.unwrap().into_inner();
+    let session:tinytree_forge_core::session::ForgeSession=serde_json::from_slice(&reply.result_json).unwrap();session.validate().unwrap();
+    let tinytree_forge_core::session::ForgeSessionIdentity::Authenticated{principal,credential_id}=&session.identity else{panic!("authenticated session missing")};
+    assert_eq!(principal,"product");assert_ne!(credential_id,&blake3::hash(PRODUCT.as_bytes()).to_hex().to_string());
+    assert_eq!(forge.call(request(session_request.clone(),PRODUCT)).await.unwrap().into_inner().result_json,reply.result_json);
+    let mut get_account=session_request.clone();get_account.operation=tinytree_proto::forge_v1::ForgeOperation::GetAccount as i32;
+    assert_eq!(forge.call(request(get_account,PRODUCT)).await.unwrap_err().code(),Code::PermissionDenied,"session grants no account membership");
+    assert_eq!(forge.call(Request::new(session_request.clone())).await.unwrap_err().code(),Code::PermissionDenied,"private account metadata is not anonymous session discovery");
+    assert_eq!(forge.call(request(session_request.clone(),"invalid-session-token")).await.unwrap_err().code(),Code::Unauthenticated);
+    assert_eq!(forge.call(request(session_request.clone(),CHECKER)).await.unwrap_err().code(),Code::PermissionDenied);
+    let mut forged=session_request.clone();forged.payload_json=br#"{"principal":"owner"}"#.to_vec();
+    assert_eq!(forge.call(request(forged,PRODUCT)).await.unwrap_err().code(),Code::InvalidArgument);
+    let owner=tinytree_store::ForgeActor{principal:"owner".into()};
+    let snapshot=store.forge_get_account_snapshot(&account,&owner).unwrap();
+    let revision:[u8;32]=serde_json::from_value(snapshot["main_revision"].clone()).unwrap();
+    store.forge_publish_view(&account,&owner,tinytree_store::ViewSpec{name:"public".into(),root_prefix:String::new(),include_prefixes:vec![String::new()],exclude_prefixes:vec![],visibility:tinytree_store::ForgeViewVisibility::Public,revision,export_allowed:false},tinytree_store::PolicyEpoch(1),true).unwrap();
+    let anonymous=forge.call(Request::new(session_request.clone())).await.unwrap().into_inner();
+    assert_eq!(serde_json::from_slice::<tinytree_forge_core::session::ForgeSession>(&anonymous.result_json).unwrap().identity,tinytree_forge_core::session::ForgeSessionIdentity::Anonymous{});
+
     drop(forge);drop(client);server.stop().await;
+    // Auth-disabled native local-owner bypass is not an authenticated product
+    // credential. Missing auth may only take the independently public path.
+    let local=RepositoryService::new(store,ServiceConfig::default(),vec!["alpha".into(),"beta".into()],vec![]).unwrap();
+    let local=Running::start_service(local).await;
+    let channel=Endpoint::from_shared(format!("http://{}",local.address)).unwrap().connect().await.unwrap();
+    let mut forge=tinytree_proto::forge_v1::forge_client::ForgeClient::new(channel);
+    assert_eq!(forge.call(request(session_request.clone(),PRODUCT)).await.unwrap_err().code(),Code::Unauthenticated);
+    let reply=forge.call(Request::new(session_request)).await.unwrap().into_inner();
+    assert_eq!(serde_json::from_slice::<tinytree_forge_core::session::ForgeSession>(&reply.result_json).unwrap().identity,tinytree_forge_core::session::ForgeSessionIdentity::Anonymous{});
+    drop(forge);local.stop().await;
+
 }
 
 #[tokio::test]

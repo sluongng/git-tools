@@ -67,7 +67,8 @@ impl ProvisioningIntent {
                 && binding.workspace_id == self.record.workspace_id,
             "provisioning completion differs from durable intent"
         );
-        let ready = self.registry.resume_info(&self.record.root)?;
+        let ready = self.registry.resume_info(&self.record.root)?
+            .context("provisioning completion requires a Ready native workspace registration")?;
         ensure!(
             ready.binding == *binding && ready.initial_commit == self.initial_commit(),
             "provisioning completion requires the exact Ready registration"
@@ -84,7 +85,10 @@ impl ProvisioningIntent {
 impl Registry {
     /// Explicit recovery only. Never use this marker-free lookup to load a
     /// working copy or infer that a provider is mounted.
-    pub fn resume_info(&self, root: &Path) -> Result<ResumeInfo> {
+    /// Validate the registry and return the exact Ready clone registration, if
+    /// present. Corruption, ambiguous matches and restore-only state are errors;
+    /// None means only that the validated registry has no Ready match.
+    pub fn resume_info(&self, root: &Path) -> Result<Option<ResumeInfo>> {
         normalized(root)?;
         let root = root.canonicalize()?;
         let _lock = self.lock()?;
@@ -122,7 +126,7 @@ impl Registry {
                 initial_commit: CommitId::new(journal.initial_commit),
             });
         }
-        found.context("no Ready native workspace registration for this root; preserve pending initialization and reconcile explicitly")
+        Ok(found)
     }
 
     /// Allocate and SyncAll-persist a random opaque ID before sending any mount

@@ -665,12 +665,12 @@ fn ready_resume_needs_no_marker_but_normal_loader_still_does_and_intent_completi
             )
             .unwrap();
         fs::write(fixture.binding.root.join(MARKER), fixture.binding.id()).unwrap();
-        assert!(fixture.registry.resume_info(&fixture.binding.root).is_err());
+        assert!(fixture.registry.resume_info(&fixture.binding.root).unwrap().is_none());
         let (workspace, repo) = fixture.initialize().await.unwrap();
         drop(workspace);
         drop(repo);
         fs::remove_file(fixture.binding.root.join(MARKER)).unwrap();
-        let resumed = fixture.registry.resume_info(&fixture.binding.root).unwrap();
+        let resumed = fixture.registry.resume_info(&fixture.binding.root).unwrap().unwrap();
         assert_eq!(resumed.binding, fixture.binding);
         assert_eq!(resumed.initial_commit, CommitId::new(vec![0; 32]));
         assert!(fixture.registry.lookup(&fixture.binding.root).is_err());
@@ -2789,7 +2789,7 @@ async fn fresh_restore_stages_original_plural_operations_and_wc_without_publishi
         fixture.registry.lookup(&fixture.binding.root).is_err(),
         "staged metadata must never publish Ready"
     );
-    assert!(fixture.registry.resume_info(&fixture.binding.root).is_err());
+    assert!(fixture.registry.resume_info(&fixture.binding.root).unwrap().is_none());
     assert!(fixture.binding.admin.join("restore-stage.json").exists());
     assert!(!fixture.binding.admin.join("initialization.json").exists());
     // Caller-editable diagnostic fields are never publication authority.

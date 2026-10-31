@@ -155,6 +155,7 @@ impl Authorization {
                 retain: true,
                 cloud: true,
                 authenticated: false,
+                credential_verifier: None,
                 landing_profiles: Vec::new(),
                 forge_only: false,
                 forge_checker: false,
@@ -180,6 +181,7 @@ impl Authorization {
             retain: p.retain,
             cloud: p.cloud,
             authenticated: true,
+            credential_verifier: Some(hash),
             landing_profiles: p.landing_profiles.clone(),
             forge_only: p.forge_only,
             forge_checker: p.forge_checker,
@@ -193,6 +195,7 @@ pub(crate) struct Identity {
     retain: bool,
     cloud: bool,
     authenticated: bool,
+    credential_verifier: Option<[u8; 32]>,
     landing_profiles: Vec<String>,
     forge_only: bool,
     forge_checker: bool,
@@ -210,6 +213,29 @@ impl Identity {
             ));
         }
         Ok(&self.id)
+    }
+    /// A public opaque binding to this exact matched credential and ceiling,
+    /// never the private token verifier or a principal-only owner hash.
+    pub(crate) fn forge_credential_id(&self) -> Result<String, Status> {
+        let principal = self.forge_principal()?;
+        let verifier = self
+            .credential_verifier
+            .ok_or_else(|| Status::unauthenticated("forge identity requires authentication"))?;
+        tinytree_forge_core::session::credential_id(
+            principal,
+            tinytree_forge_core::session::VerifierScheme::Blake3,
+            verifier,
+            tinytree_forge_core::session::CredentialCeiling::Native {
+                repositories: self.repositories.iter().cloned().collect(),
+                write: self.write,
+                retain: self.retain,
+                cloud: self.cloud,
+                landing_profiles: self.landing_profiles.clone(),
+                forge_only: self.forge_only,
+                forge_checker: self.forge_checker,
+            },
+        )
+        .map_err(|_| Status::internal("forge credential binding unavailable"))
     }
     pub fn landing_owner_hash(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();

@@ -45,6 +45,7 @@ tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["zstd"] }
 
 [dev-dependencies]
+native-workspace-admin = { path = "../native-workspace-admin" }
 base64 = "0.22"
 tinytree-check-runner = { path = "../tinytree-check-runner" }
 sha2 = "0.10"

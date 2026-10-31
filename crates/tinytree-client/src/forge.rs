@@ -5,6 +5,25 @@ use super::*;
 use tinytree_proto::{FORGE_MAX_REQUEST_BYTES, FORGE_MAX_RESPONSE_BYTES, forge_v1 as f};
 
 impl NativeClient {
+    /// Read server-derived session identity. This grants no account/view access.
+    pub async fn forge_get_session(
+        &self, account_id: &str, view: &str,
+    ) -> Result<tinytree_forge_core::session::ForgeSession, Status> {
+        let reply = self.forge_call(f::ForgeCallRequest {
+            operation: f::ForgeOperation::GetSession as i32,
+            account_id: account_id.to_owned(), view: view.to_owned(),
+            request_id: String::new(), payload_json: b"{}".to_vec(),
+        }).await?;
+        let session: tinytree_forge_core::session::ForgeSession = serde_json::from_slice(&reply.result_json)
+            .map_err(|_| Status::data_loss("invalid Forge session"))?;
+        let anonymous = matches!(&session.identity, tinytree_forge_core::session::ForgeSessionIdentity::Anonymous {});
+        if reply.state != "complete" || session.account_id != account_id || session.validate().is_err()
+            || anonymous != self.inner.token.is_none() {
+            return Err(Status::data_loss("invalid Forge session binding"));
+        }
+        Ok(session)
+    }
+
     /// Execute an account-scoped operation using its already-saved intent ID.
     /// Transport retry preserves the exact account/view/payload and request ID.
     pub async fn forge_call(

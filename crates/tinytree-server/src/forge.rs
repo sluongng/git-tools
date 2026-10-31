@@ -16,14 +16,20 @@ const CALL_MEMORY: usize = 64 * 1024 * 1024;
 pub(crate) struct ForgeWork {
     _global: OwnedSemaphorePermit,
     _memory: Arc<OwnedSemaphorePermit>,
-    actor: Option<ForgeActor>,
+    identity: Option<ForgeAdmissionIdentity>,
     pub(crate) deadline: Instant,
 }
 
-fn actor(
+#[derive(Clone, PartialEq, Eq)]
+struct ForgeAdmissionIdentity {
+    principal: String,
+    credential_id: String,
+}
+
+fn transport_identity(
     service: &RepositoryService,
     metadata: &MetadataMap,
-) -> Result<Option<ForgeActor>, Status> {
+) -> Result<Option<ForgeAdmissionIdentity>, Status> {
     let count = metadata.get_all("authorization").iter().count();
     if count == 0 {
         return Ok(None);
@@ -32,8 +38,9 @@ fn actor(
         return Err(Status::unauthenticated("invalid forge authorization"));
     }
     let identity = service.query_identity(metadata)?;
-    Ok(Some(ForgeActor {
+    Ok(Some(ForgeAdmissionIdentity {
         principal: identity.forge_principal()?.to_owned(),
+        credential_id: identity.forge_credential_id()?,
     }))
 }
 
@@ -41,14 +48,14 @@ pub(crate) async fn admit(
     service: &RepositoryService,
     metadata: &MetadataMap,
 ) -> Result<Arc<ForgeWork>, Status> {
-    let actor = actor(service, metadata)?;
+    let identity = transport_identity(service, metadata)?;
     let deadline = service.query_deadline(metadata, false)?;
     let global = service.forge_global(deadline).await?;
     let memory = service.forge_memory(CALL_MEMORY, deadline).await?;
     Ok(Arc::new(ForgeWork {
         _global: global,
         _memory: memory,
-        actor,
+        identity,
         deadline,
     }))
 }
@@ -68,8 +75,8 @@ pub(crate) async fn call_http_admitted(
     input: wire::Call,
     work: Arc<ForgeWork>,
 ) -> Result<Vec<u8>, Status> {
-    let current = actor(&service, &MetadataMap::from_headers(headers.clone()))?;
-    if current.as_ref().map(|a| &a.principal) != work.actor.as_ref().map(|a| &a.principal) {
+    let current = transport_identity(&service, &MetadataMap::from_headers(headers.clone()))?;
+    if current != work.identity {
         return Err(Status::permission_denied(
             "forge admission identity changed",
         ));
@@ -166,7 +173,7 @@ async fn call_admitted(
             | p::ForgeOperation::GetBootstrapImport
             | p::ForgeOperation::FinishBootstrapImport
     ) {
-        if work.actor.is_none() {
+        if work.identity.is_none() {
             return Err(Status::unauthenticated(
                 "bootstrap requires an authenticated owner",
             ));
@@ -179,6 +186,68 @@ async fn call_admitted(
     account
         .validate()
         .map_err(|error| crate::service::store_status(error.into()))?;
+    if operation == p::ForgeOperation::GetSession {
+        let deadline = work.deadline;
+        let output = tokio::task::spawn_blocking(move || {
+            // Retain physical admission if the transport caller cancels while
+            // current anonymous policy waits on the Store read gate.
+            let _physical_work = work;
+            if input.payload_json.len()
+                > tinytree_forge_core::account_commands::MAX_ACCOUNT_COMMAND_BYTES
+            {
+                return Err(Status::resource_exhausted(
+                    "forge session payload exceeds budget",
+                ));
+            }
+            let _: tinytree_forge_core::account_commands::EmptyRequest =
+                serde_json::from_slice(&input.payload_json)
+                    .map_err(|_| Status::invalid_argument("invalid session payload"))?;
+            if Instant::now() >= _physical_work.deadline {
+                return Err(Status::deadline_exceeded("forge session deadline exceeded"));
+            }
+            // Missing auth is the existing explicit anonymous Forge path. Never
+            // consult unauthenticated native local-owner identity for this reply.
+            if _physical_work.identity.is_none() {
+                service
+                    .forge_store()
+                    .forge_resolve_view(&account, None, &input.view, None)
+                    .map_err(crate::service::store_status)?;
+            }
+            if Instant::now() >= _physical_work.deadline {
+                return Err(Status::deadline_exceeded("forge session deadline exceeded"));
+            }
+            let identity = match _physical_work.identity.as_ref() {
+                None => tinytree_forge_core::session::ForgeSessionIdentity::Anonymous {},
+                Some(identity) => {
+                    tinytree_forge_core::session::ForgeSessionIdentity::Authenticated {
+                        principal: identity.principal.clone(),
+                        credential_id: identity.credential_id.clone(),
+                    }
+                }
+            };
+            let session = tinytree_forge_core::session::ForgeSession {
+                schema_version: 1,
+                account_id: account.0.clone(),
+                identity,
+            };
+            session
+                .validate()
+                .map_err(|_| Status::internal("invalid session assertion"))?;
+            Ok(p::ForgeCallResponse {
+                operation: input.operation,
+                state: "complete".into(),
+                result_json: serde_json::to_vec(&session)
+                    .map_err(|_| Status::internal("session encoding failed"))?,
+                account_id: input.account_id,
+                view: input.view,
+                request_id: input.request_id,
+            })
+        });
+        return tokio::time::timeout_at(deadline, output)
+            .await
+            .map_err(|_| Status::deadline_exceeded("forge session deadline exceeded"))?
+            .map_err(|_| Status::internal("forge session worker failed"))?;
+    }
     let profile = service.landing_host().forge_profile()?;
     let store = service.forge_store();
     let forge_reads = service.forge_read_api();
@@ -205,7 +274,10 @@ async fn call_admitted(
                 tz_offset_minutes: 0,
             },
         };
-        let actor = _physical_work.actor.as_ref();
+        let actor = _physical_work.identity.as_ref().map(|identity| ForgeActor {
+            principal: identity.principal.clone(),
+        });
+        let actor = actor.as_ref();
         let upload = crate::forge_upload::upload_call(
             &store,
             actor,

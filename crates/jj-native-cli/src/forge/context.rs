@@ -54,6 +54,7 @@ impl Context {
     }
 
     pub fn client_config(&self) -> io::Result<tinytree_client::Config> {
+        if self.token_env.as_ref().is_some_and(|name| workspace_daemon::forge_client::validate_token_reference(name).is_err()) { return Err(invalid()); }
         if self.schema_version != 1
             || !valid_name(&self.account_id)
             || !valid_name(&self.view)

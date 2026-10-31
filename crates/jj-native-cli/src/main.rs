@@ -162,7 +162,15 @@ async fn run_native_command(
                     destination,
                     daemon_config,
                 },
-        } => vfs::resume(ui, command, &command.cwd().join(destination), daemon_config).await,
+        } => {
+            let destination = command.cwd().join(destination);
+            #[cfg(feature = "forge-cli")]
+            let client = daemon_config.is_none() && forge::resume_client(&destination, None).await?;
+            vfs::resume(ui, command, &destination, daemon_config).await?;
+            #[cfg(feature = "forge-cli")]
+            if client { forge::finish_client_resume(&destination)?; }
+            Ok(())
+        },
         NativeCommand::Tinytree {
             command:
                 TinytreeCommand::Restore {
@@ -396,6 +404,8 @@ fn load_audit_workspace(
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(feature = "forge-cli")]
+    if let Some(status) = forge::client_hidden() { return status; }
     let mut factories = StoreFactories::empty();
     broker::register(&mut factories);
     let runner = CliRunner::init();

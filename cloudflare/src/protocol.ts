@@ -66,7 +66,7 @@ export async function hash(value: string): Promise<string> {
   const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
 }
-export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge'; credential_id: string }
+export interface Auth { principal: string; operator: boolean; accounts: string[]; kind: 'raw' | 'forge'; /** Private matched-row reference, NOT the public session identity. */ credential_id: string }
 interface Principal extends Omit<Auth, 'credential_id'> { token_sha256: string }
 function configuredPrincipals(secret: string | undefined): Principal[] {
   if (!secret || secret.length > 32 * 1024) fail(503, 'principal_configuration_invalid');

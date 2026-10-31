@@ -1,7 +1,7 @@
 //! Bounded projection preparation. Pending control assertions are never object
 //! proofs; callers still verify native objects before importing the snapshot.
 use super::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tinytree_forge_core::{
     account_commands::{ResolveViewPending, ResolveViewRequest},
     accounts::{validate_name, validate_path},
@@ -13,6 +13,19 @@ use tinytree_proto::forge_v1 as f;
 // the existing absolute operation deadline still bounds the whole workflow.
 const MAX_STEPS: usize = 512;
 const MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+
+/// First acknowledged immutable selection. A durable caller can checkpoint it
+/// before this workflow issues another request; it is not an object proof.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeViewSelection {
+    pub account_id: String,
+    pub view: String,
+    pub view_version: [u8; 32],
+    pub revision: [u8; 32],
+    pub policy_epoch: u64,
+    pub root_prefix: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,8 +88,19 @@ impl NativeClient {
     /// All calls and pacing share one operation deadline and a finite step cap.
     pub async fn forge_resolve_view(
         &self,
-        mut input: f::ForgeCallRequest,
+        input: f::ForgeCallRequest,
     ) -> Result<f::ForgeCallResponse, Status> {
+        self.forge_resolve_view_with_selection(input, |_| Ok(())).await
+    }
+
+    /// As above, but checkpoint the first validated server selection before any
+    /// further preparation. Callback failure stops without another network call.
+    pub async fn forge_resolve_view_with_selection<F>(
+        &self,
+        mut input: f::ForgeCallRequest,
+        mut checkpoint: F,
+    ) -> Result<f::ForgeCallResponse, Status>
+    where F: FnMut(&ForgeViewSelection) -> Result<(), Status> {
         if input.operation != f::ForgeOperation::ResolveView as i32 {
             return Err(Status::invalid_argument("expected ResolveView operation"));
         }
@@ -141,6 +165,13 @@ impl NativeClient {
                             ));
                         }
                     }
+                    if selected.is_none() {
+                        checkpoint(&ForgeViewSelection {
+                            account_id: pending.account_id.clone(), view: pending.view.clone(),
+                            view_version: pending.view_version, revision: pending.revision,
+                            policy_epoch: pending.policy_epoch, root_prefix: pending.root_prefix.clone(),
+                        })?;
+                    }
                     request.version = Some(pending.view_version);
                     request.progress = Some(pending.progress.clone());
                     input.payload_json = serde_json::to_vec(&request)
@@ -180,6 +211,13 @@ impl NativeClient {
                                 "projection selection changed during preparation",
                             ));
                         }
+                    }
+                    if selected.is_none() {
+                        checkpoint(&ForgeViewSelection {
+                            account_id: snapshot.account_id.clone(), view: snapshot.view.clone(),
+                            view_version: snapshot.view_version, revision: snapshot.revision,
+                            policy_epoch: snapshot.policy_epoch, root_prefix: snapshot.root_prefix.clone(),
+                        })?;
                     }
                     // README remains a control-plane DTO, not a native FILE proof.
                     let _ = (&snapshot.readme, &snapshot.readme_error);
