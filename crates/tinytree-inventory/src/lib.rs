@@ -173,6 +173,172 @@ impl InventorySink for Discard {
         Ok(())
     }
 }
+/// Original canonical bytes exported for a bounded offline fit check. This is
+/// not a retention lease, source publication fence, or authenticated attestation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotObject {
+    pub kind: u8,
+    pub id: String,
+    pub size_bytes: u64,
+    pub format_version: u16,
+    pub file: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotManifest {
+    pub schema_version: u32,
+    pub scope: String,
+    pub repository_id: String,
+    pub intrinsic_commit_root: bool,
+    pub report: Report,
+    pub objects: Vec<SnapshotObject>,
+}
+struct SnapshotSink {
+    output: std::path::PathBuf,
+    index: std::fs::File,
+    count: u64,
+    bytes: u64,
+}
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+fn private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+impl SnapshotSink {
+    fn create(output: &Path) -> Result<Self, String> {
+        // Never follow an existing output or a symlink in its parent path.
+        // Only the requested new leaf is created; parents must already exist.
+        let absolute = if output.is_absolute() { output.to_path_buf() } else {
+            std::env::current_dir().map_err(|_| "snapshot_directory_failed")?.join(output)
+        };
+        let mut current = std::path::PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::ParentDir => return Err("snapshot_parent_component".into()),
+                std::path::Component::CurDir => continue,
+                _ => current.push(component.as_os_str()),
+            }
+            if current == absolute { break; }
+            let metadata = std::fs::symlink_metadata(&current).map_err(|_| "snapshot_parent_unavailable")?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("snapshot_parent_not_directory".into());
+            }
+        }
+        private_directory(&absolute).map_err(|_| "snapshot_output_exists_or_unavailable")?;
+        use std::io::Write as _;
+        let mut marker = private_file(&absolute.join("INCOMPLETE")).map_err(|_| "snapshot_create_failed")?;
+        marker.write_all(b"Incomplete until manifest.json is atomically published. No source lock or lease.\n").map_err(|_| "snapshot_write_failed")?;
+        marker.sync_all().map_err(|_| "snapshot_sync_failed")?;
+        private_directory(&absolute.join("objects")).map_err(|_| "snapshot_create_failed")?;
+        let index = private_file(&absolute.join("objects.pending.jsonl")).map_err(|_| "snapshot_create_failed")?;
+        Ok(Self { output: absolute, index, count: 0, bytes: 0 })
+    }
+    fn finish(&mut self, report: &Report, repository: &str) -> Result<(), String> {
+        use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
+        if !report.complete || report.error.is_some() || report.initial_refs != report.final_refs
+            || report.unique_objects != self.count || report.unique_bytes != self.bytes {
+            return Err("snapshot_incomplete".into());
+        }
+        self.index.sync_all().map_err(|_| "snapshot_sync_failed")?;
+        std::fs::File::open(self.output.join("objects")).and_then(|f| f.sync_all()).map_err(|_| "snapshot_sync_failed")?;
+        let mut file = private_file(&self.output.join("manifest.pending")).map_err(|_| "snapshot_create_failed")?;
+        let header = serde_json::json!({"schema_version":1,"scope":"explicit-reference-reachable-closure", "repository_id":repository,"intrinsic_commit_root":true,"report":report});
+        let mut header = serde_json::to_vec(&header).map_err(|_| "snapshot_encode_failed")?;
+        if header.pop() != Some(b'}') { return Err("snapshot_encode_failed".into()); }
+        file.write_all(&header).and_then(|_| file.write_all(b",\"objects\":[")).map_err(|_| "snapshot_write_failed")?;
+        let mut index = self.index.try_clone().map_err(|_| "snapshot_read_failed")?;
+        index.rewind().map_err(|_| "snapshot_read_failed")?;
+        let mut reader = std::io::BufReader::new(index);
+        for number in 0..self.count {
+            let mut line = Vec::new();
+            reader.by_ref().take(1025).read_until(b'\n', &mut line).map_err(|_| "snapshot_read_failed")?;
+            if line.len() > 1024 || line.pop() != Some(b'\n') { return Err("snapshot_index_invalid".into()); }
+            let _: SnapshotObject = serde_json::from_slice(&line).map_err(|_| "snapshot_index_invalid")?;
+            if number != 0 { file.write_all(b",").map_err(|_| "snapshot_write_failed")?; }
+            file.write_all(&line).map_err(|_| "snapshot_write_failed")?;
+        }
+        if !reader.fill_buf().map_err(|_| "snapshot_read_failed")?.is_empty() { return Err("snapshot_index_invalid".into()); }
+        file.write_all(b"]}\n").and_then(|_| file.sync_all()).map_err(|_| "snapshot_sync_failed")?;
+        // Link is create-only and atomically publishes the completed manifest.
+        std::fs::hard_link(self.output.join("manifest.pending"), self.output.join("manifest.json")).map_err(|_| "snapshot_publish_failed")?;
+        std::fs::File::open(&self.output).and_then(|f| f.sync_all()).map_err(|_| "snapshot_sync_failed")?;
+        std::fs::remove_file(self.output.join("manifest.pending")).map_err(|_| "snapshot_cleanup_failed")?;
+        std::fs::remove_file(self.output.join("INCOMPLETE")).map_err(|_| "snapshot_cleanup_failed")?;
+        std::fs::File::open(&self.output).and_then(|f| f.sync_all()).map_err(|_| "snapshot_sync_failed")?;
+        Ok(())
+    }
+}
+impl InventorySink for SnapshotSink {
+    async fn object(&mut self, value: VerifiedObject) -> Result<(), String> {
+        use std::io::{Read as _, Write as _};
+        let descriptor = match &value { VerifiedObject::Metadata(v) => v.descriptor(), VerifiedObject::File(v) => v.descriptor() };
+        if intrinsic(descriptor.key) { return Err("snapshot_intrinsic_payload".into()); }
+        let id = hex(&descriptor.key.id.0);
+        let relative = format!("objects/{}-{id}.bin", descriptor.key.kind as u8);
+        let mut file = private_file(&self.output.join(&relative)).map_err(|_| "snapshot_object_exists_or_unavailable")?;
+        match value {
+            VerifiedObject::Metadata(value) => file.write_all(value.canonical_bytes()).map_err(|_| "snapshot_write_failed")?,
+            VerifiedObject::File(value) => {
+                let mut reader = value.open().map_err(|_| "snapshot_source_read_failed")?;
+                let copied = std::io::copy(&mut reader.by_ref().take(descriptor.size_bytes.checked_add(1).ok_or("snapshot_size_invalid")?), &mut file).map_err(|_| "snapshot_write_failed")?;
+                if copied != descriptor.size_bytes { return Err("snapshot_size_invalid".into()); }
+            }
+        }
+        file.sync_all().map_err(|_| "snapshot_sync_failed")?;
+        let object = SnapshotObject {kind:descriptor.key.kind as u8,id,size_bytes:descriptor.size_bytes,format_version:descriptor.format_version,file:relative};
+        serde_json::to_writer(&mut self.index, &object).map_err(|_| "snapshot_write_failed")?;
+        self.index.write_all(b"\n").map_err(|_| "snapshot_write_failed")?;
+        self.count = self.count.checked_add(1).ok_or("snapshot_count_invalid")?;
+        self.bytes = self.bytes.checked_add(descriptor.size_bytes).ok_or("snapshot_count_invalid")?;
+        Ok(())
+    }
+    async fn checkpoint(&mut self, _: Checkpoint) -> Result<(), String> {
+        self.index.sync_all().map_err(|_| "snapshot_sync_failed".into())
+    }
+}
+/// Create-only owner-private snapshot using exactly the ordinary verified walk.
+/// `repository_id` is the explicit source configuration label, not an attestation.
+/// Failed artifacts remain private and visibly incomplete; there is no resume or
+/// overwrite mode for the output directory.
+pub async fn inventory_snapshot(client: &NativeClient, names: Vec<String>, temporary: &Path,
+    budgets: Budgets, output: &Path, repository_id: &str) -> Report {
+    let mut sink = match SnapshotSink::create(output) {
+        Ok(sink) => sink,
+        Err(error) => return Report::failed(budgets, &error),
+    };
+    let mut report = inventory_with_sink(client, names, temporary, budgets, None, &mut sink).await;
+    if report.complete {
+        if let Err(error) = sink.finish(&report, repository_id) {
+            // Never leave an apparently successful manifest after a failed
+            // final directory sync/cleanup. The private partial output stays.
+            let _ = std::fs::remove_file(sink.output.join("manifest.json"));
+            if !sink.output.join("INCOMPLETE").exists() {
+                if let Ok(mut marker) = private_file(&sink.output.join("INCOMPLETE")) {
+                    use std::io::Write as _;
+                    let _ = marker.write_all(b"Snapshot finalization failed.\n");
+                    let _ = marker.sync_all();
+                }
+            }
+            report.complete = false;
+            report.error = Some(error);
+        }
+    }
+    report
+}
+
 /// Compact owner-local traversal progress, not a remote proof or retention lease.
 /// Hex-packed keys are33bytes(kind+id); length records append8big-endian bytes.
 /// No source object bytes or credentials are persisted here.
@@ -598,10 +764,12 @@ mod tests {
             store.create_repository("example").unwrap();
             let mut leases = vec![];
             let mut expected = HashMap::new();
+            let mut expected_bytes = HashMap::new();
             let mut put = |d: Descriptor, bytes: &[u8]| {
                 let receipt = store.put("example", d, bytes, 10).unwrap();
                 leases.push(receipt.staging_lease);
                 expected.insert(d.key, d.size_bytes);
+                expected_bytes.insert(d.key, bytes.to_vec());
             };
             let file = tinytree_model::describe_file(b"same file");
             put(file, b"same file");
@@ -790,6 +958,60 @@ mod tests {
                 report.initial_refs[0].head,
                 Some(hex(&head.descriptor.key.id.0))
             );
+            // Export the same actual protocol fixture through the public API:
+            // parent/predecessor/negative-tree/copy ancestry bytes are original.
+            let snapshot_path = dir.path().join("snapshot");
+            let snapshot = inventory_snapshot(&client, vec!["main".into()], temp.path(),
+                Budgets::default(), &snapshot_path, "example").await;
+            assert!(snapshot.complete, "{:?}", snapshot.error);
+            let manifest_bytes = std::fs::read(snapshot_path.join("manifest.json")).unwrap();
+            let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+            assert_eq!(manifest.schema_version, 1);
+            assert_eq!(manifest.repository_id, "example");
+            assert!(manifest.intrinsic_commit_root);
+            assert_eq!(manifest.report.initial_refs, report.initial_refs);
+            assert_eq!(manifest.report.final_refs, report.final_refs);
+            assert_eq!(manifest.report.unique_bytes, report.unique_bytes);
+            assert_eq!(manifest.objects.len(), expected_bytes.len());
+            let mut exported = HashSet::new();
+            for object in &manifest.objects {
+                let key = expected_bytes.keys().find(|key| key.kind as u8 == object.kind && hex(&key.id.0) == object.id).unwrap();
+                assert!(exported.insert(*key));
+                assert!(!intrinsic(*key), "intrinsic ROOT never has a payload");
+                assert_eq!(object.file, format!("objects/{}-{}.bin", object.kind, object.id));
+                let bytes = std::fs::read(snapshot_path.join(&object.file)).unwrap();
+                assert_eq!(&bytes, &expected_bytes[key]);
+                assert_eq!(bytes.len() as u64, object.size_bytes);
+                let descriptor = Descriptor { key: *key, size_bytes: object.size_bytes, format_version: object.format_version };
+                tinytree_model::verify(&descriptor, &bytes, Default::default()).unwrap();
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    assert_eq!(std::fs::metadata(snapshot_path.join(&object.file)).unwrap().permissions().mode() & 0o777, 0o600);
+                }
+            }
+            assert!(!snapshot_path.join("INCOMPLETE").exists());
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(std::fs::metadata(&snapshot_path).unwrap().permissions().mode() & 0o777, 0o700);
+                assert_eq!(std::fs::metadata(snapshot_path.join("manifest.json")).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            let refused = inventory_snapshot(&client, vec!["main".into()], temp.path(),
+                Budgets::default(), &snapshot_path, "example").await;
+            assert!(!refused.complete);
+            assert_eq!(std::fs::read(snapshot_path.join("manifest.json")).unwrap(), manifest_bytes);
+            let failed_path = dir.path().join("incomplete-snapshot");
+            let failed = inventory_snapshot(&client, vec!["main".into()], temp.path(),
+                Budgets {max_objects:1,..Budgets::default()}, &failed_path, "example").await;
+            assert!(!failed.complete);
+            assert!(failed_path.join("INCOMPLETE").is_file());
+            assert!(!failed_path.join("manifest.json").exists());
+            #[cfg(unix)] {
+                let link = dir.path().join("snapshot-link");
+                std::os::unix::fs::symlink(&snapshot_path, &link).unwrap();
+                assert!(!inventory_snapshot(&client, vec!["main".into()], temp.path(),
+                    Budgets::default(), &link, "example").await.complete);
+                assert_eq!(std::fs::read(snapshot_path.join("manifest.json")).unwrap(), manifest_bytes);
+            }
             // The sink ACK is distinct from a completed inventory report. A
             // durable EOF checkpoint can survive interruption before final ref
             // stability/readback, then resume without redelivering ACKed bytes.

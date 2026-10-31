@@ -262,3 +262,15 @@ js_test(
         "//crates/tinytree-ui:wasm",
     ],
 )
+
+# Explicit external, owner-private corpus: immutable snapshot protocol fit only.
+# It is not source-pause, native cutover or deployed HTTPS acceptance.
+js_test(
+    name = "forge_import_fit",
+    entry_point = "tools/forge-import-fit.mjs",
+    args = ["cloudflare/worker.mjs", "cloudflare/core.wasm"],
+    data = [":worker", ":node_modules/miniflare"],
+    tags = ["local", "manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+    timeout = "eternal",
+)
