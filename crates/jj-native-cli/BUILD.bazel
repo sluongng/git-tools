@@ -219,6 +219,7 @@ rust_test(
         ":landing_fault_driver",
         "//crates/workspace-daemon:workspace",
         "//crates/tinytree-server:checker_fixture",
+        "//crates/tinytree-check-runner:tinytree-check-runner-bin",
     ],
     edition = "2024",
     rustc_env = {
@@ -226,6 +227,7 @@ rust_test(
         "CARGO_BIN_EXE_landing_fault_driver": "$(rootpath :landing_fault_driver)",
         "CARGO_BIN_EXE_workspace": "$(rootpath //crates/workspace-daemon:workspace)",
         "TINYTREE_CHECKER_FIXTURE": "$(rootpath //crates/tinytree-server:checker_fixture)",
+        "TINYTREE_ACCEPTANCE_RUNNER": "$(rootpath //crates/tinytree-check-runner:tinytree-check-runner-bin)",
     },
     tags = ["manual"],
     deps = all_crate_deps(normal = True, normal_dev = True),
@@ -242,4 +244,16 @@ fixture_test(
         "--test-threads=1",
     ],
     tags = ["local", "manual"],
+)
+
+# Stopped disposable backend backup and fresh restore with a real checker.
+# Compilation stays remote; only physical Linux/FUSE execution is local.
+fixture_test(
+    name = "native_self_hosted_acceptance",
+    binary = ":forge_mount_fixture",
+    script = "tests/native-self-hosted.sh",
+    binary_env = "TINYTREE_ACCEPTANCE_TEST_BINARY",
+    tags = ["local", "manual"],
+    size = "large",
+    timeout = "long",
 )

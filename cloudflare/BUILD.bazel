@@ -276,3 +276,26 @@ js_test(
     target_compatible_with = ["@platforms//os:linux"],
     timeout = "eternal",
 )
+
+# Real-origin operator probes; tests inject transport and never contact providers.
+js_binary(
+    name = "forge_health",
+    entry_point = "tools/forge-health.mjs",
+)
+
+js_test(
+    name = "forge_health_tests",
+    entry_point = "tools/forge-health.test.mjs",
+    data = ["tools/forge-health.mjs"],
+)
+
+js_binary(
+    name = "forge_deployed_acceptance",
+    entry_point = "tools/forge-deployed-acceptance.mjs",
+)
+
+js_test(
+    name = "forge_deployed_acceptance_tests",
+    entry_point = "tools/forge-deployed-acceptance.test.mjs",
+    data = ["tools/forge-deployed-acceptance.mjs"],
+)

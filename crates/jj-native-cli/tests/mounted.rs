@@ -12117,11 +12117,14 @@ fn forge_mount_hex(bytes: &[u8]) -> String {
 }
 #[cfg(feature = "forge-cli")]
 struct ForgeMountedServer {
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
+    preserve: bool,
+    service_config: tinytree_server::ServiceConfig,
+    store_config: tinytree_store::Config,
     runtime: Option<tokio::runtime::Runtime>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    store: tinytree_store::Store,
+    store: Option<tinytree_store::Store>,
     endpoint: String,
     seed_base: String,
     seed_head: String,
@@ -12132,6 +12135,9 @@ struct ForgeMountedServer {
 impl ForgeMountedServer {
     const TOKEN: &'static str = "public-forge-mounted-owner-fixture-token";
     fn start() -> Self {
+        Self::start_mode(false)
+    }
+    fn start_mode(real: bool) -> Self {
         // The selected native wrapper runs this one case serially. Establish
         // only its public fixture credential before starting any runtime or
         // child; this never reads or mutates the user's parent environment.
@@ -12143,9 +12149,20 @@ impl ForgeMountedServer {
         }
         use sha2::{Digest as _, Sha256};
         use tinytree_store::{AccountId, ForgeActor, ForgeViewVisibility, ViewSpec};
+        let receipts = if real {
+            let path = PathBuf::from(
+                std::env::var("TINYTREE_ACCEPTANCE_RECEIPTS")
+                    .expect("explicit private acceptance directory required"),
+            );
+            assert!(path.is_absolute());
+            private_fs::PrivateDir::open_existing(&path).unwrap();
+            path
+        } else {
+            PathBuf::from("/tmp")
+        };
         let directory = tempfile::Builder::new()
             .prefix("tt-forge-server-")
-            .tempdir_in("/tmp")
+            .tempdir_in(receipts)
             .unwrap();
         let base = directory.path();
         let operator = private_fs::PrivateDir::create(base.join("operator")).unwrap();
@@ -12154,9 +12171,18 @@ impl ForgeMountedServer {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let executable = Path::new(env!("TINYTREE_CHECKER_FIXTURE"))
+        let executable = if real {
+            Path::new(
+                option_env!("TINYTREE_ACCEPTANCE_RUNNER")
+                    .expect("use declared native acceptance target"),
+            )
             .canonicalize()
-            .unwrap();
+            .unwrap()
+        } else {
+            Path::new(env!("TINYTREE_CHECKER_FIXTURE"))
+                .canonicalize()
+                .unwrap()
+        };
         let pin = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let quoted = |p: &Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
         let daemon = operator.path().join("daemon.toml");
@@ -12200,7 +12226,31 @@ token_env="FORGE_MOUNT_CHECKER_TOKEN"
         .unwrap();
         workspace_daemon::config::Config::load(&daemon).unwrap();
         drop((cache_listener, git_listener));
-        let scratch = operator.path().join("checker-state");
+        let scratch = if real {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Retain physical evidence on a caller-selected private disk. Keep
+            // this parent short enough for the native daemon's Unix sockets.
+            let parent = std::env::var_os("TINYTREE_ACCEPTANCE_SCRATCH_PARENT").map(PathBuf::from);
+            if let Some(parent) = &parent {
+                assert!(parent.is_absolute());
+                private_fs::PrivateDir::open_existing(parent).unwrap();
+            }
+            tempfile::Builder::new()
+                .prefix("tns.")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent.unwrap_or_else(std::env::temp_dir))
+                .unwrap()
+                .keep()
+        } else {
+            operator.path().join("checker-state")
+        };
+        if real {
+            fs::write(
+                base.join("runtime.json"),
+                serde_json::to_vec(&serde_json::json!({"scratch":scratch})).unwrap(),
+            )
+            .unwrap();
+        }
         let policy = operator.path().join("checker.toml");
         fs::write(
             &policy,
@@ -12237,6 +12287,73 @@ timeout_seconds=60
             ),
         )
         .unwrap();
+        if real {
+            use std::os::unix::fs::FileTypeExt as _;
+            let bazel = PathBuf::from(
+                std::env::var("TINYTREE_ACCEPTANCE_BAZEL")
+                    .expect("explicit pinned Bazel ELF required"),
+            )
+            .canonicalize()
+            .unwrap();
+            let rbe = PathBuf::from(
+                std::env::var("TINYTREE_ACCEPTANCE_RBE_SOCKET")
+                    .expect("explicit RBE socket required"),
+            );
+            assert!(rbe.is_absolute() && fs::metadata(&rbe).unwrap().file_type().is_socket());
+            let mut magic = [0; 4];
+            fs::File::open(&bazel)
+                .unwrap()
+                .read_exact(&mut magic)
+                .unwrap();
+            assert_eq!(&magic, b"\x7fELF");
+            let mut value: toml::Value =
+                toml::from_str(&fs::read_to_string(&policy).unwrap()).unwrap();
+            value["workspace"]["path"] = Path::new(env!("CARGO_BIN_EXE_workspace"))
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+                .into();
+            value["workspace"]["sha256"] = format!(
+                "{:x}",
+                Sha256::digest(
+                    fs::read(
+                        Path::new(env!("CARGO_BIN_EXE_workspace"))
+                            .canonicalize()
+                            .unwrap()
+                    )
+                    .unwrap()
+                )
+            )
+            .into();
+            value["bazel"]["path"] = bazel.to_string_lossy().as_ref().into();
+            value["bazel"]["sha256"] =
+                format!("{:x}", Sha256::digest(fs::read(&bazel).unwrap())).into();
+            value["rbe_socket"] = rbe.to_string_lossy().as_ref().into();
+            let table = value.as_table_mut().unwrap();
+            table.insert(
+                "remote_instance_name".into(),
+                std::env::var("TINYTREE_ACCEPTANCE_INSTANCE_NAME")
+                    .unwrap_or_default()
+                    .into(),
+            );
+            table.insert("cleanup_timeout_seconds".into(), 60.into());
+            table.insert("remote_timeout_seconds".into(), 180.into());
+            let flags: Vec<String> = serde_json::from_str(
+                &std::env::var("TINYTREE_ACCEPTANCE_PROFILE_FLAGS_JSON")
+                    .unwrap_or_else(|_| "[]".into()),
+            )
+            .unwrap();
+            assert!(flags.len() <= 16);
+            value["profiles"][0]["flags"] = toml::Value::try_from(flags).unwrap();
+            value["profiles"][0]["targets"] = toml::Value::try_from(vec!["//:checks"]).unwrap();
+            value["profiles"][0]["timeout_seconds"] = 300.into();
+            value["profiles"][0]
+                .as_table_mut()
+                .unwrap()
+                .insert("force_remote_execution".into(), true.into());
+            fs::write(&policy, toml::to_string(&value).unwrap()).unwrap();
+        }
         let version = tinytree_check_runner::Config::load(&policy)
             .unwrap()
             .profile_version("checks")
@@ -12248,7 +12365,7 @@ timeout_seconds=60
         store_config.max_closure_edges = 32768;
         store_config.max_path_contexts = 8192;
         store_config.max_path_context_bytes = 8 * 1024 * 1024;
-        let store = tinytree_store::Store::open(base.join("store"), store_config).unwrap();
+        let store = tinytree_store::Store::open(base.join("store"), store_config.clone()).unwrap();
         let account = AccountId("mounted".into());
         let actor = ForgeActor {
             principal: "owner".into(),
@@ -12303,6 +12420,86 @@ timeout_seconds=60
                 },
             });
         }
+        if real {
+            let build =
+                b"genrule(name=\"checks\", outs=[\"checked.txt\"], cmd=\"echo checked > $@\")\n";
+            for (path, bytes) in [
+                ("README.md", b"native self hosted needle\n".as_slice()),
+                (
+                    "MODULE.bazel",
+                    b"module(name = \"native_self_hosted\")\n".as_slice(),
+                ),
+                ("BUILD.bazel", build.as_slice()),
+            ] {
+                let descriptor = m::describe_file(bytes);
+                store
+                    .forge_upload_object(&view, &actor, path, descriptor, bytes, now)
+                    .unwrap();
+                entries.push(m::TreeEntry {
+                    name: path.into(),
+                    value: m::TreeValue::File {
+                        id: m::FileId(descriptor.key.id.0),
+                        executable: false,
+                        size_bytes: descriptor.size_bytes,
+                        copy_id: None,
+                    },
+                });
+            }
+            let bytes = b"nested needle\n";
+            let d = m::describe_file(bytes);
+            store
+                .forge_upload_object(&view, &actor, "nested/note.txt", d, bytes, now)
+                .unwrap();
+            let nested = m::encode(
+                &m::Object::Tree(m::Tree {
+                    entries: vec![m::TreeEntry {
+                        name: "note.txt".into(),
+                        value: m::TreeValue::File {
+                            id: m::FileId(d.key.id.0),
+                            executable: false,
+                            size_bytes: d.size_bytes,
+                            copy_id: None,
+                        },
+                    }],
+                }),
+                Default::default(),
+            )
+            .unwrap();
+            store
+                .forge_upload_object(
+                    &view,
+                    &actor,
+                    "nested",
+                    nested.descriptor,
+                    &nested.bytes,
+                    now,
+                )
+                .unwrap();
+            entries.push(m::TreeEntry {
+                name: "nested".into(),
+                value: m::TreeValue::Tree(m::TreeId(nested.descriptor.key.id.0)),
+            });
+            let link =
+                m::encode(&m::Object::Symlink("README.md".into()), Default::default()).unwrap();
+            store
+                .forge_upload_object(
+                    &view,
+                    &actor,
+                    "readme-link",
+                    link.descriptor,
+                    &link.bytes,
+                    now,
+                )
+                .unwrap();
+            entries.push(m::TreeEntry {
+                name: "readme-link".into(),
+                value: m::TreeValue::Symlink {
+                    id: m::SymlinkId(link.descriptor.key.id.0),
+                    target_bytes: 9,
+                },
+            });
+        }
+        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let tree = m::encode(&m::Object::Tree(m::Tree { entries }), Default::default()).unwrap();
         store
             .forge_upload_object(&view, &actor, "", tree.descriptor, &tree.bytes, now)
@@ -12339,7 +12536,7 @@ timeout_seconds=60
         config.max_buffered_bytes = 256 * 1024 * 1024;
         config.landing.enabled = true;
         config.landing.poll_interval_ms = 10;
-        config.landing.job_ttl_seconds = 120;
+        config.landing.job_ttl_seconds = if real { 900 } else { 120 };
         config.landing.max_buffered_bytes = 6 * 1024 * 1024 * 1024;
         config.landing.forge_profile = Some("checks".into());
         config.landing.profiles = vec![tinytree_server::LandingProfile {
@@ -12358,12 +12555,12 @@ timeout_seconds=60
             max_attempts: 2,
             max_recovery_attempts: 8,
             retry_delay_seconds: 1,
-            execution_timeout_seconds: 30,
-            cleanup_grace_seconds: 10,
+            execution_timeout_seconds: if real { 360 } else { 30 },
+            cleanup_grace_seconds: if real { 90 } else { 10 },
         });
         let service = tinytree_server::RepositoryService::new(
             store.clone(),
-            config,
+            config.clone(),
             vec![],
             vec![
                 tinytree_server::Principal::new_forge("owner", Self::TOKEN).unwrap(),
@@ -12380,11 +12577,14 @@ timeout_seconds=60
             let _ = stopped.await;
         }));
         Self {
-            _directory: directory,
+            _directory: Some(directory),
+            preserve: real,
+            service_config: config,
+            store_config,
             runtime: Some(runtime),
             task: Some(task),
             stop: Some(stop),
-            store,
+            store: Some(store),
             endpoint,
             seed_base: forge_mount_hex(&projected.projected_commit),
             seed_head: forge_mount_hex(&head.descriptor.key.id.0),
@@ -12400,6 +12600,8 @@ timeout_seconds=60
         };
         let revision = self
             .store
+            .as_ref()
+            .unwrap()
             .references(&account.repository_id(), &["main".into()])
             .unwrap()[0]
             .commit
@@ -12409,10 +12611,14 @@ timeout_seconds=60
             .0;
         let epoch = self
             .store
+            .as_ref()
+            .unwrap()
             .forge_get_account(&account, &actor)
             .unwrap()
             .epoch;
         self.store
+            .as_ref()
+            .unwrap()
             .forge_publish_view(
                 &account,
                 &actor,
@@ -12434,23 +12640,169 @@ timeout_seconds=60
     }
 }
 #[cfg(feature = "forge-cli")]
-impl Drop for ForgeMountedServer {
-    fn drop(&mut self) {
-        let _ = self.stop.take().unwrap().send(());
-        let task = self.task.take().unwrap();
-        self.runtime.as_ref().unwrap().block_on(async {
-            tokio::time::timeout(Duration::from_secs(15), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        });
-        self.runtime
-            .take()
-            .unwrap()
-            .shutdown_timeout(Duration::from_secs(5));
+impl ForgeMountedServer {
+    fn stop_service(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            self.runtime.as_ref().unwrap().block_on(async {
+                tokio::time::timeout(Duration::from_secs(120), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        }
+        drop(self.store.take());
+    }
+    fn restore_stopped_backend(&mut self) {
+        assert!(self.preserve);
+        let root = self._directory.as_ref().unwrap().path().to_owned();
+        self.stop_service();
+        assert!(self.store.is_none() && self.runtime.is_none() && self.task.is_none());
+        let backup = root.join("backend-backup");
+        let restored = root.join("restored-store");
+        native_acceptance_copy(&root.join("store"), &backup, true);
+        native_acceptance_copy(&backup, &restored, false);
+        let store =
+            tinytree_store::Store::open_existing(&restored, self.store_config.clone()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind(
+                self.endpoint.strip_prefix("http://").unwrap(),
+            ))
+            .unwrap();
+        let service = tinytree_server::RepositoryService::new(
+            store.clone(),
+            self.service_config.clone(),
+            vec![],
+            vec![
+                tinytree_server::Principal::new_forge("owner", Self::TOKEN).unwrap(),
+                tinytree_server::Principal::new_forge_checker(
+                    "checker",
+                    "public-forge-mounted-checker-fixture-token",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(tinytree_server::serve_tcp(listener, service, None, async {
+            let _ = stopped.await;
+        }));
+        self.store = Some(store);
+        self.runtime = Some(runtime);
+        self.task = Some(task);
+        self.stop = Some(stop);
     }
 }
+/// Only the fixture's drained, owned backend is eligible. Never follow links,
+/// hard-link payloads, overwrite a destination, or reopen the immutable backup.
+#[cfg(feature = "forge-cli")]
+fn native_acceptance_copy(source: &Path, destination: &Path, readonly: bool) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    fn copy(
+        source: &Path,
+        target: &Path,
+        uid: u32,
+        readonly: bool,
+        count: &mut usize,
+        bytes: &mut u64,
+    ) {
+        let metadata = fs::symlink_metadata(source).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        *count += 1;
+        assert!(*count <= 100_000);
+        if metadata.is_dir() {
+            fs::create_dir(target).unwrap();
+            fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut children = fs::read_dir(source)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .collect::<Vec<_>>();
+            children.sort_by_key(|e| e.file_name());
+            for entry in children {
+                copy(
+                    &entry.path(),
+                    &target.join(entry.file_name()),
+                    uid,
+                    readonly,
+                    count,
+                    bytes,
+                );
+            }
+            fs::File::open(target).unwrap().sync_all().unwrap();
+            if readonly {
+                fs::set_permissions(target, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+        } else {
+            assert!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsupported backend entry"
+            );
+            *bytes = bytes.checked_add(metadata.len()).unwrap();
+            assert!(*bytes <= 1024 * 1024 * 1024);
+            let mut input = fs::File::open(source).unwrap();
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)
+                .unwrap();
+            assert_eq!(
+                std::io::copy(&mut input, &mut output).unwrap(),
+                metadata.len()
+            );
+            output.sync_all().unwrap();
+            fs::set_permissions(
+                target,
+                fs::Permissions::from_mode(if readonly {
+                    if metadata.mode() & 0o111 != 0 {
+                        0o500
+                    } else {
+                        0o400
+                    }
+                } else if metadata.mode() & 0o111 != 0 {
+                    0o700
+                } else {
+                    0o600
+                }),
+            )
+            .unwrap();
+        }
+    }
+    let metadata = fs::symlink_metadata(source).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.mode() & 0o077, 0);
+    assert!(!destination.exists());
+    copy(
+        source,
+        destination,
+        metadata.uid(),
+        readonly,
+        &mut 0,
+        &mut 0,
+    );
+    fs::File::open(destination.parent().unwrap())
+        .unwrap()
+        .sync_all()
+        .unwrap();
+}
+#[cfg(feature = "forge-cli")]
+impl Drop for ForgeMountedServer {
+    fn drop(&mut self) {
+        self.stop_service();
+        if self.preserve {
+            if let Some(directory) = self._directory.take() {
+                let _ = directory.keep();
+            }
+        }
+    }
+}
+
 #[cfg(feature = "forge-cli")]
 fn forge_mount_json(fixture: &mut Fixture, root: &Path, args: &[&str]) -> serde_json::Value {
     let mut args = args.to_vec();
@@ -12523,6 +12875,396 @@ fn forge_mount_approve_land(
     );
     assert_eq!(landed["state"], "landed");
     landed
+}
+
+#[cfg(feature = "forge-cli")]
+fn native_self_hosted_work(server: &ForgeMountedServer, name: &str) -> (Fixture, PathBuf) {
+    let mut fixture = Fixture::new();
+    fixture.child_env.push((
+        "FORGE_MOUNT_OWNER_TOKEN".into(),
+        ForgeMountedServer::TOKEN.into(),
+    ));
+    let base = fixture.base().to_owned();
+    forge_mount_json(
+        &mut fixture,
+        &base,
+        &[
+            "context",
+            "set",
+            "--server",
+            &server.endpoint,
+            "--account",
+            "mounted",
+            "--view",
+            "workspace",
+            "--token-env",
+            "FORGE_MOUNT_OWNER_TOKEN",
+        ],
+    );
+    let version = server.current_view();
+    let mut daemon: toml::Value =
+        toml::from_str(&fs::read_to_string(&fixture.daemon_config).unwrap()).unwrap();
+    let mut client = tinytree_client::Config::default();
+    client.endpoint = server.endpoint.clone();
+    client.token_env = Some("FORGE_MOUNT_OWNER_TOKEN".into());
+    let provider = native_broker::ForgeRemoteConfig {
+        account_id: "mounted".into(),
+        view: "workspace".into(),
+        view_version: Some(version),
+        client,
+    };
+    daemon["native"]["repositories"]["example"]
+        .as_table_mut()
+        .unwrap()
+        .insert("forge".into(), toml::Value::try_from(provider).unwrap());
+    fs::write(&fixture.daemon_config, toml::to_string(&daemon).unwrap()).unwrap();
+    fixture.start();
+    let root = base.join(name);
+    let broker = fixture.broker.clone();
+    forge_mount_json(
+        &mut fixture,
+        &base,
+        &[
+            "work",
+            root.to_str().unwrap(),
+            "--broker",
+            broker.to_str().unwrap(),
+            "--store",
+            "example",
+            "--version",
+            &forge_mount_hex(&version),
+        ],
+    );
+    assert_fuse_mounted(&root);
+    (fixture, root)
+}
+#[cfg(feature = "forge-cli")]
+fn native_self_hosted_checked(
+    server: &ForgeMountedServer,
+    fixture: &mut Fixture,
+    root: &Path,
+    change: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(420);
+    loop {
+        let value = forge_mount_json(fixture, root, &["review", "show", change]);
+        if matches!(value["state"].as_str(), Some("prepared" | "ready_to_land")) {
+            let candidate = &value["result"]["value"]["candidate"];
+            let mut matched = false;
+            for entry in fs::read_dir(&server.scratch).unwrap() {
+                let path = entry.unwrap().path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let journal = path.join("attempt.json");
+                if !journal.is_file() {
+                    continue;
+                }
+                let raw = fs::read(&journal).unwrap();
+                assert!(raw.len() <= 256 * 1024);
+                let journal: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                if journal["receipt"].is_null() {
+                    continue;
+                }
+                let receipt: tinytree_check_runner::Receipt =
+                    serde_json::from_value(journal["receipt"].clone()).unwrap();
+                if receipt.request.candidate_commit != candidate["head"].as_str().unwrap() {
+                    continue;
+                }
+                assert!(!matched);
+                matched = true;
+                receipt.validate_for(&receipt.request).unwrap();
+                assert_eq!(receipt.outcome, tinytree_check_runner::Outcome::Passed);
+                assert!(receipt.cleanup_confirmed);
+                assert_eq!(receipt.request.repository_id, "forge-mounted");
+                assert_eq!(receipt.request.job_id, candidate["id"].as_str().unwrap());
+                assert_eq!(
+                    receipt.request.root_tree,
+                    candidate["root_tree"].as_str().unwrap()
+                );
+                assert_eq!(receipt.request.profile_name, "checks");
+                assert_eq!(
+                    receipt.request.profile_version,
+                    server.service_config.landing.profiles[0].version
+                );
+                let evidence = receipt.evidence.as_ref().unwrap();
+                assert_eq!(evidence.bazel_exit_code, 0);
+                assert_eq!(evidence.requested_targets, ["//:checks"]);
+                assert!(evidence.execution_log_blake3.is_some());
+                let bep = fs::read(path.join("bep.jsonl")).unwrap();
+                assert!(bep.len() <= 64 * 1024 * 1024);
+                let mut remote = 0u64;
+                for line in bep.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                    let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+                    if let Some(runners) =
+                        event["buildMetrics"]["actionSummary"]["runnerCount"].as_array()
+                    {
+                        for runner in runners {
+                            if runner["name"] == "remote" {
+                                remote += runner["count"]
+                                    .as_u64()
+                                    .or_else(|| {
+                                        runner["count"].as_str().and_then(|n| n.parse().ok())
+                                    })
+                                    .unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    remote > 0,
+                    "cache-only/local checks do not prove physical RBE"
+                );
+                assert!(path.join("execution.compact").is_file());
+            }
+            assert!(
+                matched,
+                "checked review requires exact genuine physical receipt"
+            );
+            let main = server
+                .store
+                .as_ref()
+                .unwrap()
+                .references("forge-mounted", &["main".into()])
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                main.generation,
+                candidate["target_generation"].as_u64().unwrap()
+            );
+            assert_eq!(
+                forge_mount_hex(&main.commit.unwrap().key.id.0),
+                candidate["target"].as_str().unwrap(),
+                "checks must not publish main"
+            );
+            return value;
+        }
+        assert!(
+            !matches!(
+                value["state"].as_str(),
+                Some("check_failed" | "unsupported" | "expired" | "conflict")
+            ),
+            "{value}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "genuine checker timed out: {value}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+#[cfg(feature = "forge-cli")]
+#[test]
+#[ignore = "requires explicit pinned real runner/Bazel, Linux FUSE and trusted RBE; no mock fallback"]
+fn native_self_hosted_backend_backup_restore_checks_and_lands_from_fresh_client() {
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(
+        fs::metadata("/dev/fuse")
+            .unwrap()
+            .file_type()
+            .is_char_device()
+    );
+    let mut server = ForgeMountedServer::start_mode(true);
+    let mut seed = Fixture::new();
+    seed.child_env.push((
+        "FORGE_MOUNT_OWNER_TOKEN".into(),
+        ForgeMountedServer::TOKEN.into(),
+    ));
+    let base = seed.base().to_owned();
+    forge_mount_json(
+        &mut seed,
+        &base,
+        &[
+            "context",
+            "set",
+            "--server",
+            &server.endpoint,
+            "--account",
+            "mounted",
+            "--view",
+            "workspace",
+            "--token-env",
+            "FORGE_MOUNT_OWNER_TOKEN",
+        ],
+    );
+    let pushed = forge_mount_json(
+        &mut seed,
+        &base,
+        &[
+            "push",
+            "--source-base",
+            &server.seed_base,
+            "--source-head",
+            &server.seed_head,
+            "--view-version",
+            &server.seed_view,
+            "--request-id",
+            "native-backend-seed",
+        ],
+    );
+    let change = pushed["result"]["value"]["change_id"].as_str().unwrap();
+    let checked = native_self_hosted_checked(&server, &mut seed, &base, change);
+    forge_mount_approve_land(&mut seed, &base, &checked, "native-backend-seed");
+    drop(seed);
+    let (mut first, root) = native_self_hosted_work(&server, "before-backup");
+    assert_eq!(
+        fs::read(root.join("README.md")).unwrap(),
+        b"native self hosted needle\n"
+    );
+    assert_eq!(
+        fs::read(root.join("nested/note.txt")).unwrap(),
+        b"nested needle\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("readme-link")).unwrap(),
+        PathBuf::from("README.md")
+    );
+    forge_mount_json(&mut first, &root, &["view", "read", "README.md"]);
+    let search = forge_mount_json(&mut first, &root, &["search", "needle", "-F"]);
+    assert!(search.to_string().contains("README.md"));
+    let large = vec![b'x'; 1024 * 1024];
+    fs::write(root.join("large.bin"), &large).unwrap();
+    fixture_snapshot_limit(&first);
+    fs::write(
+        root.join("README.md"),
+        b"native first acknowledged needle\n",
+    )
+    .unwrap();
+    first.success(&root, &["describe", "-m", "first real user publication"]);
+    let pushed = forge_mount_json(
+        &mut first,
+        &root,
+        &["push", "--request-id", "native-before-backup"],
+    );
+    let change = pushed["result"]["value"]["change_id"].as_str().unwrap();
+    let checked = native_self_hosted_checked(&server, &mut first, &root, change);
+    forge_mount_approve_land(&mut first, &root, &checked, "native-before-backup");
+    let account = tinytree_store::AccountId("mounted".into());
+    let actor = tinytree_store::ForgeActor {
+        principal: "owner".into(),
+    };
+    let original = server
+        .store
+        .as_ref()
+        .unwrap()
+        .references(&account.repository_id(), &["main".into()])
+        .unwrap()
+        .remove(0);
+    let epoch = server
+        .store
+        .as_ref()
+        .unwrap()
+        .forge_get_account(&account, &actor)
+        .unwrap()
+        .epoch;
+    let first_home = first.home.clone();
+    let first_base = first.base().to_owned();
+    first.success(
+        &first_base,
+        &["tinytree", "unmount", root.to_str().unwrap()],
+    );
+    first.stop_daemon();
+    drop(first);
+    server.restore_stopped_backend();
+    assert_eq!(
+        server
+            .store
+            .as_ref()
+            .unwrap()
+            .references(&account.repository_id(), &["main".into()])
+            .unwrap()
+            .remove(0),
+        original
+    );
+    assert_eq!(
+        server
+            .store
+            .as_ref()
+            .unwrap()
+            .forge_get_account(&account, &actor)
+            .unwrap()
+            .epoch,
+        epoch
+    );
+    let (mut restored, root) = native_self_hosted_work(&server, "fresh-restored-client");
+    assert_ne!(restored.home, first_home);
+    assert_eq!(
+        fs::read(root.join("README.md")).unwrap(),
+        b"native first acknowledged needle\n"
+    );
+    assert_eq!(fs::read(root.join("large.bin")).unwrap(), large);
+    assert_eq!(
+        fs::read(root.join("nested/note.txt")).unwrap(),
+        b"nested needle\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("readme-link")).unwrap(),
+        PathBuf::from("README.md")
+    );
+    forge_mount_json(&mut restored, &root, &["view", "read", "README.md"]);
+    let search = forge_mount_json(&mut restored, &root, &["search", "needle", "-F"]);
+    assert!(search.to_string().contains("README.md"));
+    fs::write(
+        root.join("after-restore.txt"),
+        b"fresh restored author needle\n",
+    )
+    .unwrap();
+    restored.success(
+        &root,
+        &["describe", "-m", "fresh restored user publication"],
+    );
+    let pushed = forge_mount_json(
+        &mut restored,
+        &root,
+        &["push", "--request-id", "native-after-backup"],
+    );
+    let change = pushed["result"]["value"]["change_id"].as_str().unwrap();
+    let checked = native_self_hosted_checked(&server, &mut restored, &root, change);
+    let landed = forge_mount_approve_land(&mut restored, &root, &checked, "native-after-backup");
+    assert_eq!(landed["state"], "landed");
+    let current = server
+        .store
+        .as_ref()
+        .unwrap()
+        .references(&account.repository_id(), &["main".into()])
+        .unwrap()
+        .remove(0);
+    assert_eq!(current.generation, original.generation + 1);
+    assert_eq!(
+        forge_mount_hex(&current.commit.unwrap().key.id.0),
+        checked["result"]["value"]["candidate"]["head"]
+            .as_str()
+            .unwrap()
+    );
+    let base = restored.base().to_owned();
+    restored.success(&base, &["tinytree", "unmount", root.to_str().unwrap()]);
+    restored.stop_daemon();
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "backend_backup_restored": true,
+        "fresh_client": true,
+        "main_generation": current.generation,
+        "private_wip_restore_claimed": false,
+    });
+    fs::write(
+        server
+            ._directory
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("acceptance.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+#[cfg(feature = "forge-cli")]
+fn fixture_snapshot_limit(fixture: &Fixture) {
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.jj_config)
+        .unwrap()
+        .write_all(b"\n[snapshot]\nmax-new-file-size=2097152\n")
+        .unwrap();
 }
 
 #[cfg(feature = "forge-cli")]
