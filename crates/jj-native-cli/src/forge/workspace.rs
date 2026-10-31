@@ -14,6 +14,9 @@ const FILE: &str = "forge-workspace.json";
 #[derive(clap::Args, Clone, Debug)]
 pub(super) struct WorkArgs {
     pub destination: PathBuf,
+    /// Recover sealed private WIP into a fresh independent lazy workspace.
+    #[arg(long, conflicts_with_all = ["broker", "store", "version"])]
+    pub capsule: Option<String>,
     /// Trusted local native broker configured for this account/view projection.
     #[arg(long, requires = "store")]
     pub broker: Option<PathBuf>,
@@ -65,59 +68,107 @@ pub(super) async fn work(
     machine: bool,
     args: WorkArgs,
 ) -> Result<(), CommandError> {
+    if let Some(capsule) = args.capsule {
+        return super::backup::restore(
+            ui,
+            command,
+            machine,
+            super::backup::RestoreArgs {
+                destination: args.destination,
+                capsule,
+            },
+        )
+        .await;
+    }
     let target = command.cwd().join(&args.destination);
     let version = args.version.as_deref().map(service::id::<32>).transpose()?;
     let existing_target = if args.broker.is_none() && args.store.is_none() {
         match std::fs::symlink_metadata(&target) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() { return Err(user_error("Forge workspace destination must be a nonsymlink directory")); }
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(user_error(
+                        "Forge workspace destination must be a nonsymlink directory",
+                    ));
+                }
                 true
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(user_error(error)),
         }
-    } else { false };
+    } else {
+        false
+    };
     if existing_target {
         // Original workspace identity takes precedence over any current context.
-        if super::client::resume(&target, version).await? {
-            crate::vfs::resume(ui, command, &target, None).await?;
+        let resumed = super::client::resume(&target, version).await?;
+        if resumed != super::client::ClientResume::NotClient {
+            if resumed == super::client::ClientResume::Clone {
+                crate::vfs::resume(ui, command, &target, None).await?;
+            }
             super::client::finish_resume(&target)?;
             let scope = Scope::load(&target)?;
-            if machine { output::write(ui, "work", "ready", json!({"account_id":scope.context.account_id,"view":scope.context.view,
+            if machine {
+                output::write(
+                    ui,
+                    "work",
+                    "ready",
+                    json!({"account_id":scope.context.account_id,"view":scope.context.view,
                 "view_version":hex(&scope.view_version),"base":hex(&scope.base),"destination":target.canonicalize().map_err(user_error)?,
-                "client_descriptor":scope.client_descriptor,"provider_identity":scope.client_provider_identity.map(|id|hex(&id))}))?; }
+                "client_descriptor":scope.client_descriptor,"provider_identity":scope.client_provider_identity.map(|id|hex(&id))}),
+                )?;
+            }
             return Ok(());
         }
         let mut entries = std::fs::read_dir(&target).map_err(user_error)?;
         if entries.next().transpose().map_err(user_error)?.is_some() {
-            return Err(user_error("nonempty destination has no matching Forge client descriptor; existing work retained"));
+            return Err(user_error(
+                "nonempty destination has no matching Forge client descriptor; existing work retained",
+            ));
         }
     }
     let context = service::context()?;
     let enrollment = if args.broker.is_none() && args.store.is_none() {
         Some(super::client::enroll(&context, &target, version).await?)
-    } else { None };
-    let (projection, broker, store) = if let Some(enrollment) = &enrollment {
-        (enrollment.projection.clone(), enrollment.broker.clone(), enrollment.store.clone())
     } else {
-        let (Some(broker), Some(store)) = (&args.broker, &args.store) else { return Err(user_error("--broker and --store must be supplied together")); };
-        let reply = rpc::call(&context, Op::ResolveView, json!({"version":version}), None, false, None).await?;
+        None
+    };
+    let (projection, broker, store) = if let Some(enrollment) = &enrollment {
+        (
+            enrollment.projection.clone(),
+            enrollment.broker.clone(),
+            enrollment.store.clone(),
+        )
+    } else {
+        let (Some(broker), Some(store)) = (&args.broker, &args.store) else {
+            return Err(user_error("--broker and --store must be supplied together"));
+        };
+        let reply = rpc::call(
+            &context,
+            Op::ResolveView,
+            json!({"version":version}),
+            None,
+            false,
+            None,
+        )
+        .await?;
         let projection: native_broker::ForgeProjection = serde_json::from_slice(&reply.result_json)
             .map_err(|_| user_error("invalid forge projection reply"))?;
         (projection, broker.clone(), store.clone())
     };
-    if projection.account_id != context.account_id || projection.view != context.view || !projection.complete
-        || version.is_some_and(|version| version != projection.view_version) {
-        return Err(user_error("forge workspace projection scope is incomplete or mismatched"));
+    if projection.account_id != context.account_id
+        || projection.view != context.view
+        || !projection.complete
+        || version.is_some_and(|version| version != projection.view_version)
+    {
+        return Err(user_error(
+            "forge workspace projection scope is incomplete or mismatched",
+        ));
     }
     let socket = command.cwd().join(&broker);
-    let client = native_broker::BrokerControlClient::connect(
-        &socket,
-        store.clone(),
-        Default::default(),
-    )
-    .await
-    .map_err(user_error)?;
+    let client =
+        native_broker::BrokerControlClient::connect(&socket, store.clone(), Default::default())
+            .await
+            .map_err(user_error)?;
     let observed = client.observe_reference("main").await.map_err(user_error)?;
     if observed.generation != projection.policy_epoch
         || observed.head.as_ref().map(|h| h.head.0) != Some(projection.projected_commit)
@@ -129,8 +180,12 @@ pub(super) async fn work(
     let locator = crate::broker::Locator::new(socket, store.clone()).map_err(user_error)?;
     let initial = CommitId::from_bytes(&projection.projected_commit);
     let plan = crate::broker::creation_plan(&locator, &initial).map_err(user_error)?;
-    if plan.index_mode != native_broker::ProviderIndexMode::Legacy || plan.policy.upload_enabled
-        || plan.policy.capture_enabled || plan.policy.auto_capture || plan.policy.auto_upload {
+    if plan.index_mode != native_broker::ProviderIndexMode::Legacy
+        || plan.policy.upload_enabled
+        || plan.policy.capture_enabled
+        || plan.policy.auto_capture
+        || plan.policy.auto_upload
+    {
         return Err(user_error(
             "forge workspaces require the projected legacy index with raw remote upload disabled",
         ));

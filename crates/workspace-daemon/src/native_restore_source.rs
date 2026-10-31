@@ -21,6 +21,35 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
+/// Private Legacy collection has no native query facade or cloud selector. The
+/// admin collector retains its physical job, authenticated SDK source and spool
+/// through cancellation; only semantic verification plus live sealed authority
+/// can mint PreparedRestore.
+pub(crate) async fn collect_private(
+    client: tinytree_client::private_capsule::PrivateCapsuleClient,
+    account_id: String,
+    capsule_id: String,
+    spool: std::fs::File,
+    provider: native_workspace_admin::restore::PrivateRestoreProvider,
+    restore: RestoreLimits,
+    bundle: native_workspace_admin::private_bundle::BundleLimits,
+    owner: QueryOwner,
+    original: Instant,
+) -> Result<PreparedRestore> {
+    native_workspace_admin::restore::prepare_private_restore_until(
+        client,
+        account_id,
+        capsule_id,
+        spool,
+        provider,
+        restore,
+        bundle,
+        owner,
+        original.into_std(),
+    )
+    .await
+}
+
 const MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const UNIT: usize = 1024;
 #[derive(Clone, Copy, Debug)]

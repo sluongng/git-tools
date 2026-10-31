@@ -323,14 +323,46 @@ impl QuiescentRootInventory {
         self.inventory.retained_operations()
     }
 }
+/// Actual host-quiescent Legacy capture. Normalized semantics only, never raw
+/// source WC/remote files or a public/cloud authorization token.
+pub struct PrivateLegacyCaptureCandidate {
+    pub(crate) state: crate::private_bundle::LegacyCaptureState,
+    pub(crate) source_workspace: [u8; 32],
+    _owner: Arc<CaptureOwner>,
+}
+impl PrivateLegacyCaptureCandidate {
+    pub fn state(&self) -> &crate::private_bundle::LegacyCaptureState {
+        &self.state
+    }
+    pub fn source_workspace_id(&self) -> [u8; 32] {
+        self.source_workspace
+    }
+}
+pub async fn read_private_candidate(
+    input: CaptureInput,
+    permit: TreeFreezePermit,
+    limits: CaptureLimits,
+    sink: &mut dyn LocalCaptureSink,
+) -> Result<PrivateLegacyCaptureCandidate> {
+    ensure!(
+        matches!(permit.source, CaptureFreeze::Host(_)),
+        "private backup requires frontend-quiescent capture"
+    );
+    match read_inventory(input, permit, limits, sink, InventoryMode::PrivateLegacy).await? {
+        InventoryRead::Private(candidate) => Ok(candidate),
+        _ => unreachable!("private Legacy inventory mode"),
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InventoryMode {
     Portable,
     Local,
+    PrivateLegacy,
 }
 enum InventoryRead {
     Portable(LocalCaptureCandidate),
     Local(LocalRootInventory),
+    Private(PrivateLegacyCaptureCandidate),
 }
 struct DiscardCaptureSink;
 #[async_trait::async_trait]
@@ -574,6 +606,124 @@ fn read_remote(
     }
 }
 
+// Recognized Forge scope is owner-private input, not portable transport authority.
+// Validate every known field before retaining ONLY path-independent review state.
+fn read_review_base(
+    input: &CaptureInput,
+) -> Result<Option<(crate::private_bundle::PrivateReviewBase, Vec<u8>)>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Context {
+        schema_version: u32,
+        #[serde(default)]
+        transport: tinytree_client::Transport,
+        server: String,
+        account_id: String,
+        view: String,
+        token_env: Option<String>,
+        #[serde(default)]
+        ca_certificate: Option<std::path::PathBuf>,
+        #[serde(default)]
+        tls_domain: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Scope {
+        schema_version: u32,
+        context: Context,
+        view_version: [u8; 32],
+        base: [u8; 32],
+        tree: [u8; 32],
+        policy_epoch: u64,
+        #[serde(default)]
+        client_descriptor: Option<std::path::PathBuf>,
+        #[serde(default)]
+        client_provider_identity: Option<[u8; 32]>,
+    }
+    let directory = private_fs::PrivateDir::open_existing(&input.binding.working_copy)?;
+    let bytes = match directory.read("forge-workspace.json", 32768) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let scope: Scope = serde_json::from_slice(&bytes).context("invalid Forge review scope")?;
+    let valid_name = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let ctx = scope.context;
+    ensure!(
+        scope.schema_version == 1
+            && ctx.schema_version == 1
+            && scope.base != [0; 32]
+            && scope.policy_epoch > 0
+            && scope.policy_epoch <= 9_007_199_254_740_991
+            && valid_name(&ctx.account_id)
+            && (ctx.view.is_empty()
+                || tinytree_forge_core::accounts::validate_name(&ctx.view).is_ok()),
+        "invalid Forge review scope binding"
+    );
+    ensure!(
+        ctx.server.len() <= 4096
+            && (ctx.server.starts_with("https://") || ctx.server.starts_with("http://"))
+            && !ctx.server.contains(['\n', '\r', '@', '?', '#'])
+            && ctx.tls_domain.as_ref().is_none_or(|s| !s.is_empty()
+                && s.len() <= 253
+                && !s.chars().any(char::is_control)),
+        "invalid Forge review transport context"
+    );
+    ensure!(
+        ctx.token_env.as_ref().is_none_or(|s| !s.is_empty()
+            && s.len() <= 128
+            && s.bytes().enumerate().all(|(i, b)| b == b'_'
+                || b.is_ascii_alphabetic()
+                || (i > 0 && b.is_ascii_digit()))),
+        "invalid Forge review token reference"
+    );
+    ensure!(
+        scope
+            .client_descriptor
+            .as_ref()
+            .is_none_or(|p| p.is_absolute()
+                && p.as_os_str().len() <= 4096
+                && !p
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)))
+            && scope
+                .client_provider_identity
+                .is_none_or(|id| id == input.index_config.provider_fingerprint),
+        "Forge review scope provider changed"
+    );
+    let config = tinytree_client::Config {
+        transport: ctx.transport,
+        endpoint: ctx.server,
+        repository_id: format!("forge-{}", ctx.account_id),
+        token_env: ctx.token_env,
+        tls: ctx
+            .ca_certificate
+            .map(|ca_certificate| tinytree_client::Tls {
+                ca_certificate,
+                domain_name: ctx.tls_domain,
+            }),
+        compression: false,
+        ..Default::default()
+    };
+    config
+        .validate()
+        .context("invalid Forge review transport")?;
+    Ok(Some((
+        crate::private_bundle::PrivateReviewBase {
+            view_version: scope.view_version,
+            policy_epoch: scope.policy_epoch,
+            base: scope.base,
+            tree: scope.tree,
+        },
+        bytes,
+    )))
+}
 pub use c::data_digest;
 fn data_limits(limits: &CaptureLimits) -> c::CaptureDataLimits {
     c::CaptureDataLimits {
@@ -629,7 +779,7 @@ fn read_locator(binding: &Binding, input: &CaptureInput) -> Result<Vec<u8>> {
     let locator: Locator = toml::from_str(std::str::from_utf8(&bytes)?)?;
     let checked = remote_state::RemoteScope::new(locator.socket, locator.store)?;
     ensure!(
-        matches!(locator.version, 1 | 2) && checked == input.remote_scope,
+        matches!(locator.version, 1 | 2 | 3) && checked == input.remote_scope,
         "capture backend locator changed"
     );
     ensure!(
@@ -680,7 +830,7 @@ pub async fn read_candidate(
 ) -> Result<LocalCaptureCandidate> {
     match read_inventory(input, permit, limits, sink, InventoryMode::Portable).await? {
         InventoryRead::Portable(candidate) => Ok(candidate),
-        InventoryRead::Local(_) => unreachable!("portable inventory mode"),
+        _ => unreachable!("portable inventory mode"),
     }
 }
 /// Read all retained local operation/view/index roots without a pack, provider
@@ -702,7 +852,7 @@ pub async fn read_local_root_inventory(
     .await?
     {
         InventoryRead::Local(inventory) => Ok(inventory),
-        InventoryRead::Portable(_) => unreachable!("local inventory mode"),
+        _ => unreachable!("local inventory mode"),
     }
 }
 async fn read_inventory(
@@ -738,8 +888,13 @@ async fn read_inventory(
     let index_type = read_type_bytes(&input.binding.repo.join("index/type"))?;
     ensure!(
         index_type == jj_native_index::NAME.as_bytes()
-            || (mode == InventoryMode::Local && index_type == DefaultIndexStore::NAME.as_bytes()),
+            || (mode != InventoryMode::Portable
+                && index_type == DefaultIndexStore::NAME.as_bytes()),
         "unsupported local inventory index type"
+    );
+    ensure!(
+        mode != InventoryMode::PrivateLegacy || index_type == DefaultIndexStore::NAME.as_bytes(),
+        "private backup requires Legacy index"
     );
     let binding = &input.binding;
     let locator = read_locator(binding, &input)?;
@@ -755,7 +910,7 @@ async fn read_inventory(
         used: Mutex::new(0),
         maximum: limits.max_working_bytes,
     });
-    let base = if mode == InventoryMode::Local {
+    let base = if mode != InventoryMode::Portable {
         limits.local_base(index_type == jj_native_index::NAME.as_bytes())?
     } else {
         limits
@@ -808,6 +963,19 @@ async fn read_inventory(
         "unrepresented native working-copy recovery state or projection mismatch"
     );
     let remote = read_remote(binding, &input.remote_scope, state_cap)?;
+    if mode == InventoryMode::PrivateLegacy {
+        ensure!(
+            remote
+                .as_ref()
+                .is_none_or(|(state, _)| state.pending.is_none()),
+            "private backup active remote intent unsupported"
+        );
+    }
+    let review_base = if mode == InventoryMode::PrivateLegacy {
+        read_review_base(&input)?
+    } else {
+        None
+    };
     ensure!(
         mode == InventoryMode::Local
             || remote
@@ -907,7 +1075,7 @@ async fn read_inventory(
         let mut codec = c::Limits::default();
         codec.max_payload_bytes = limits.max_file_bytes;
         codec.max_decode_bytes = limits.max_decode_bytes;
-        if mode == InventoryMode::Portable && id.as_bytes() != [0; 64] {
+        if mode != InventoryMode::Local && id.as_bytes() != [0; 64] {
             let reservation = owner.quota.reserve(
                 limits
                     .max_decode_bytes
@@ -939,7 +1107,7 @@ async fn read_inventory(
             })
             .await?;
         }
-        if mode == InventoryMode::Portable
+        if mode != InventoryMode::Local
             && operation.view_id().as_bytes() != [0; 64]
             && seen_views.insert(operation.view_id().clone())
         {
@@ -1081,6 +1249,9 @@ async fn read_inventory(
             budget.root(&mut roots, m::Kind::Commit, &bytes)?;
         }
     }
+    if let Some((review, _)) = &review_base {
+        budget.root(&mut roots, m::Kind::Commit, &review.base)?;
+    }
     let operation_ids = operations
         .keys()
         .map(|id| id.as_bytes().try_into().unwrap())
@@ -1161,6 +1332,12 @@ async fn read_inventory(
                 == remote.as_ref().map(|(_, bytes)| bytes.clone()),
         "capture source changed during read"
     );
+    if mode == InventoryMode::PrivateLegacy {
+        ensure!(
+            read_review_base(&input)? == review_base,
+            "Forge review scope changed during capture"
+        );
+    }
     verify_registration(&input.registry, binding)?;
     ensure!(
         read_locator(binding, &input)? == locator,
@@ -1204,6 +1381,61 @@ async fn read_inventory(
         );
     }
     budget.check()?;
+    if mode == InventoryMode::PrivateLegacy {
+        ensure!(
+            remote
+                .as_ref()
+                .is_none_or(|(state, _)| state.pending.is_none()),
+            "private backup active remote intent unsupported"
+        );
+        let state = crate::private_bundle::LegacyCaptureState {
+            review_base: review_base.map(|(state, _)| state),
+            operation_heads: operation_heads.iter().map(|id| id.hex()).collect(),
+            working_copy: PortableWorkingCopy {
+                workspace: wc.workspace.as_str().into(),
+                wc_operation: wc.operation.hex(),
+                snapshot_operation: wc.operation.hex(),
+                snapshot_commit: wc_commit,
+                tree: CaptureTree {
+                    terms: wc.trees[0].terms.clone(),
+                    labels: wc.trees[0].labels.clone(),
+                },
+            },
+            operations: operations.into_values().collect(),
+            roots: roots.into_iter().collect(),
+            remote: remote.as_ref().map(|(state, _)| PortableRemoteState {
+                observations: state
+                    .observations
+                    .iter()
+                    .map(|entry| c::RemoteObservation {
+                        reference: entry.reference.clone(),
+                        bookmark: entry.bookmark.clone(),
+                        generation: entry.generation,
+                        head: entry.head.clone(),
+                    })
+                    .collect(),
+                archived_pushes: state
+                    .archived_pushes
+                    .iter()
+                    .map(|entry| c::ArchivedIntent {
+                        reference: entry.reference.clone(),
+                        bookmark: entry.bookmark.clone(),
+                        generation: entry.generation,
+                        head: entry.head.clone(),
+                        request_id: entry.request_id.clone(),
+                        base_operation: entry.base_operation.clone(),
+                        confirmed_generation: entry.confirmed_generation,
+                    })
+                    .collect(),
+                landing: state.landing.clone(),
+            }),
+        };
+        return Ok(InventoryRead::Private(PrivateLegacyCaptureCandidate {
+            state,
+            source_workspace: binding.workspace_id,
+            _owner: owner,
+        }));
+    }
     if mode == InventoryMode::Local {
         return Ok(InventoryRead::Local(LocalRootInventory {
             roots: roots

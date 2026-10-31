@@ -56,13 +56,25 @@ pub struct NativeCloudRestored {
     pub source: NativeRestoreSelection,
     pub reused_destination: bool,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCapsuleRestored {
+    pub mounted: crate::native_workspaces::Mounted,
+    pub receipt: native_vfs_rpc::PrivateBackupReceipt,
+    pub base: String,
+    pub tree: String,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
     /// Exact owner-private derived Forge client only; unsupported in full mode.
-    ForgeClientReady { descriptor_digest: [u8; 32] },
-    ForgeClientStop { descriptor_digest: [u8; 32] },
+    ForgeClientReady {
+        descriptor_digest: [u8; 32],
+    },
+    ForgeClientStop {
+        descriptor_digest: [u8; 32],
+    },
     IdentityChallenge,
     Scoped {
         version: u32,
@@ -107,6 +119,11 @@ pub enum Request {
     NativeCandidateRetire {
         workspace_id: String,
         expected_commit: String,
+    },
+    /// Owner-private WIP restore in a descriptor-bound native-only client.
+    NativeRestoreCapsule {
+        root: PathBuf,
+        capsule_id: [u8; 32],
     },
     NativeRestore {
         root: PathBuf,
@@ -172,7 +189,12 @@ impl Client {
     pub fn call(&self, request: Request) -> Result<Value> {
         let mut stream = UnixStream::connect(&self.socket)
             .context("workspace daemon unavailable; run workspace serve")?;
-        stream.set_read_timeout(Some(Duration::from_secs(180)))?;
+        let seconds = if matches!(request, Request::NativeRestoreCapsule { .. }) {
+            310
+        } else {
+            180
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(seconds)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');

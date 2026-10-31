@@ -23,6 +23,7 @@ native-workspace = { path = "../native-workspace" }
 jj-native-index = { path = "../jj-native-index" }
 jj-native-backend = { path = "../jj-native-backend" }
 tinytree-cloud = { path = "../tinytree-cloud" }
+tinytree-forge-core = { path = "../tinytree-forge-core" }
 tinytree-model = { path = "../tinytree-model" }
 async-trait = "0.1"
 tinytree-client = { path = "../tinytree-client" }

@@ -165,10 +165,14 @@ async fn run_native_command(
         } => {
             let destination = command.cwd().join(destination);
             #[cfg(feature = "forge-cli")]
-            let client = daemon_config.is_none() && forge::resume_client(&destination, None).await?;
-            vfs::resume(ui, command, &destination, daemon_config).await?;
+            let client = if daemon_config.is_none() { forge::resume_client(&destination, None).await? } else { forge::ClientResume::NotClient };
             #[cfg(feature = "forge-cli")]
-            if client { forge::finish_client_resume(&destination)?; }
+            let private = client == forge::ClientResume::Private;
+            #[cfg(not(feature = "forge-cli"))]
+            let private = false;
+            if !private { vfs::resume(ui, command, &destination, daemon_config).await?; }
+            #[cfg(feature = "forge-cli")]
+            if client != forge::ClientResume::NotClient { forge::finish_client_resume(&destination)?; }
             Ok(())
         },
         NativeCommand::Tinytree {
@@ -451,7 +455,11 @@ fn main() -> std::process::ExitCode {
         .run();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     broker::drain_cleanup(deadline);
-    commands::finish(deadline);
+    let outcome = commands::finish(deadline, status == 0);
+    #[cfg(feature = "forge-cli")]
+    if status == 0 && !forge::finish_private_backup(outcome) { return std::process::ExitCode::FAILURE; }
+    #[cfg(not(feature = "forge-cli"))]
+    let _ = outcome;
     status.into()
 }
 

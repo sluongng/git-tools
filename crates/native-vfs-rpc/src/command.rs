@@ -24,6 +24,41 @@ pub struct CommandStarted {
     pub token: [u8; 32],
     pub epoch: u64,
 }
+/// Explicit private backup acknowledgement. This conveys no object/read grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateBackupReceipt {
+    pub schema: u32,
+    pub capsule_id: String,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub bytes: u64,
+    pub chain_root: String,
+    pub snapshot_commit: String,
+    pub snapshot_operation: String,
+}
+impl PrivateBackupReceipt {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        fn hex(s: &str, width: usize) -> bool {
+            s.len() == width
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        anyhow::ensure!(
+            self.schema == 1
+                && self.generation > 0
+                && self.generation <= 9_007_199_254_740_991
+                && (1..=512 * 1024 * 1024).contains(&self.bytes)
+                && hex(&self.capsule_id, 64)
+                && hex(&self.workspace_id, 64)
+                && hex(&self.chain_root, 64)
+                && hex(&self.snapshot_commit, 64)
+                && hex(&self.snapshot_operation, 128),
+            "invalid private backup receipt"
+        );
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum CommandRequest {
@@ -38,6 +73,16 @@ pub(crate) enum CommandRequest {
         replay: [u8; 32],
         preparation: CommandPreparation,
     },
+    SelectPrivateBackup {
+        version: u32,
+        mount: String,
+        token: [u8; 32],
+    },
+    FinishPrivateBackup {
+        version: u32,
+        mount: String,
+        token: [u8; 32],
+    },
     FinishDirty {
         version: u32,
         mount: String,
@@ -50,6 +95,8 @@ pub(crate) enum CommandReply {
     Prepared(CommandPreparation),
     Began(CommandStarted),
     DrainedDirty,
+    PrivateBackup(PrivateBackupReceipt),
+    SelectedPrivateBackup,
 }
 #[async_trait]
 pub trait CommandHost: Send + Sync {
@@ -61,6 +108,20 @@ pub trait CommandHost: Send + Sync {
         preparation: CommandPreparation,
     ) -> Result<CommandStarted, Status>;
     async fn finish_dirty(&self, mount: &str, token: [u8; 32]) -> Result<(), Status>;
+    async fn select_private_backup(&self, _mount: &str, _token: [u8; 32]) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "private backup is unsupported by this host",
+        ))
+    }
+    async fn finish_private_backup(
+        &self,
+        _mount: &str,
+        _token: [u8; 32],
+    ) -> Result<PrivateBackupReceipt, Status> {
+        Err(Status::unimplemented(
+            "private backup is unsupported by this host",
+        ))
+    }
     fn resolve(&self, mount: &str, token: [u8; 32]) -> Result<CommandJob, Status>;
 }
 /// This sibling namespace does not change the initializer's fresh-admin layout.
@@ -157,6 +218,41 @@ impl CommandClient {
             _ => anyhow::bail!("native command begin response mismatch"),
         }
     }
+    /// Select while the caller still holds the writer kernel lease.
+    pub async fn select_private_backup(&self, token: [u8; 32]) -> anyhow::Result<()> {
+        match self
+            .call(CommandRequest::SelectPrivateBackup {
+                version: 1,
+                mount: self.mount.clone(),
+                token,
+            })
+            .await?
+        {
+            CommandReply::SelectedPrivateBackup => Ok(()),
+            _ => anyhow::bail!("native private backup selection response mismatch"),
+        }
+    }
+    pub async fn finish_private_backup(
+        &self,
+        token: [u8; 32],
+    ) -> anyhow::Result<PrivateBackupReceipt> {
+        let mut client = self.clone();
+        client.limits.operation_timeout = std::time::Duration::from_secs(300);
+        match client
+            .call(CommandRequest::FinishPrivateBackup {
+                version: 1,
+                mount: self.mount.clone(),
+                token,
+            })
+            .await?
+        {
+            CommandReply::PrivateBackup(receipt) => {
+                receipt.validate()?;
+                Ok(receipt)
+            }
+            _ => anyhow::bail!("native private backup response mismatch"),
+        }
+    }
     pub async fn finish_dirty(&self, token: [u8; 32]) -> anyhow::Result<()> {
         match self
             .call(CommandRequest::FinishDirty {
@@ -169,5 +265,30 @@ impl CommandClient {
             CommandReply::DrainedDirty => Ok(()),
             _ => anyhow::bail!("native command drain response mismatch"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrivateBackupReceipt;
+    #[test]
+    fn backup_receipt_requires_complete_neutral_snapshot_identity() {
+        let receipt = PrivateBackupReceipt {
+            schema: 1,
+            capsule_id: "1".repeat(64),
+            workspace_id: "2".repeat(64),
+            generation: 1,
+            bytes: 17,
+            chain_root: "3".repeat(64),
+            snapshot_commit: "4".repeat(64),
+            snapshot_operation: "5".repeat(128),
+        };
+        receipt.validate().unwrap();
+        let mut malformed = receipt.clone();
+        malformed.snapshot_operation = "5".repeat(64);
+        assert!(malformed.validate().is_err());
+        let mut value = serde_json::to_value(receipt).unwrap();
+        value["locator"] = serde_json::json!("unexpected");
+        assert!(serde_json::from_value::<PrivateBackupReceipt>(value).is_err());
     }
 }

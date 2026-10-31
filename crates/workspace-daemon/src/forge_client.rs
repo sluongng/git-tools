@@ -1,5 +1,6 @@
 //! Owner-private snapshot client. No REAPI upstream, proxy, raw origin, Git,
-//! capture, BES or BOS is constructed. The descriptor contains references only.
+//! BES or BOS is constructed. Owner-private backup capture is explicit and
+//! separate from raw workspace-cloud upload. The descriptor contains references only.
 use crate::{
     config::{Config, NativeIndexMode, NativeRepository},
     control::{Request, Response},
@@ -589,7 +590,7 @@ pub async fn serve_forge_client(path: &Path) -> Result<()> {
     let broker = broker.context("Forge broker missing")?;
     let repository = repositories.get(ALIAS).context("Forge provider missing")?;
     verify_roots(&repository.io, &d.pin).await?;
-    verify_session(&d, ca).await?;
+    verify_session(&d, ca.clone()).await?;
     let description = broker
         .describe_provider(ALIAS)
         .map_err(|_| anyhow::anyhow!("Forge provider identity unavailable"))?;
@@ -613,10 +614,32 @@ pub async fn serve_forge_client(path: &Path) -> Result<()> {
         provider_identity: description.identity,
         pin: d.pin.clone(),
     };
+    if matches!(
+        d.session.identity,
+        ForgeSessionIdentity::Authenticated { .. }
+    ) {
+        let backup = crate::native_private_capture::Context::open(
+            &d.state_dir.join("private-backups"),
+            d.source.client.clone(),
+            d.trust_digest,
+            d.source.account_id.clone(),
+            tinytree_client::private_capsule::CapsuleSelection {
+                view: d.source.view.clone(),
+                view_version: hex(&d.pin.view_version),
+                policy_epoch: d.pin.policy_epoch,
+                projected_commit: hex(&d.pin.projected_commit),
+                projected_tree: hex(&d.pin.projected_tree),
+            },
+            d.digest()?,
+            d.session.clone(),
+            ca.clone(),
+        )?;
+        commands.configure_private_backup(backup)?;
+    }
     let mut manager =
         crate::native_workspaces::Manager::open(config.clone(), cache.clone(), repositories)?
             .with_commands(commands)?;
-    manager.require_forge_client_scope(&d.destination, ALIAS, d.pin.projected_commit)?;
+    manager.require_forge_client_scope(&d.destination, ALIAS, &d.pin)?;
     // The owner lock proves no cooperating old process owns these endpoints;
     // an unrelated live socket still refuses replacement rather than being killed.
     let listener = UnixListener::bind(d.state_dir.join("control.sock"))?;
@@ -666,13 +689,14 @@ pub async fn serve_forge_client(path: &Path) -> Result<()> {
     Some(Request::Status)=>Ok(serde_json::json!({"mode":"forge_client","descriptor_digest":ready.descriptor_digest,"workspaces":manager.status()})),
     Some(Request::NativeMount{root,store,commit,workspace_id})=>{ensure!(root==d.destination&&store==ALIAS&&commit==hex(&d.pin.projected_commit),"Forge workspace selection differs");Ok(serde_json::to_value(manager.create(root,store,commit,workspace_id).await?)?)},
     Some(Request::NativeMountPlanned{root,store,commit,workspace_id,creation_plan})=>{ensure!(root==d.destination&&store==ALIAS&&commit==hex(&d.pin.projected_commit),"Forge workspace selection differs");Ok(serde_json::to_value(manager.create_planned(root,store,commit,workspace_id,creation_plan).await?)?)},
+    Some(Request::NativeRestoreCapsule{root,capsule_id})=>{ensure!(root==d.destination,"Forge restore destination differs");verify_session(&d,ca.clone()).await?;Ok(serde_json::to_value(manager.restore_private_capsule(root,capsule_id,d.source.clone(),d.trust_digest,d.pin.clone()).await?)?)},
     Some(Request::NativeResume{root})=>{ensure!(root==d.destination,"Forge resume destination differs");Ok(serde_json::to_value(manager.resume_root(root).await?)?)},
     Some(Request::NativeMounted{workspace_id})=>Ok(serde_json::json!(manager.mounted(&workspace_id)?)),
     Some(Request::NativeUnmount{workspace_id})=>{manager.stop(&workspace_id).await?;Ok(serde_json::json!(true))},
         _=>anyhow::bail!("unsupported Forge client control operation"),
    }
   }.await;
-  let response=match result {Ok(result)=>Response{ok:true,result,error:None},Err(_)=>Response{ok:false,result:serde_json::Value::Null,error:Some("forge_client_operation_failed".into())}};
+  let response=match result {Ok(result)=>Response{ok:true,result,error:None},Err(error)=>{let diagnostic=format!("{error:#}");let end=diagnostic.char_indices().map(|(i,_)|i).take_while(|&i|i<=16384).last().unwrap_or(0);let bounded=if diagnostic.len()<=16384{diagnostic.as_str()}else{&diagnostic[..end]};let _=directory.replace("last-control-error.txt",bounded.as_bytes());Response{ok:false,result:serde_json::Value::Null,error:Some("forge_client_operation_failed".into())}}};
   let mut bytes=serde_json::to_vec(&response)?;bytes.push(b'\n');let _=tokio::time::timeout(Duration::from_secs(5),write.write_all(&bytes)).await;
   if end{break;}
  }Ok(())

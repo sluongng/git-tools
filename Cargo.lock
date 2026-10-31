@@ -3762,6 +3762,7 @@ dependencies = [
  "tempfile",
  "tinytree-client",
  "tinytree-cloud",
+ "tinytree-forge-core",
  "tinytree-model",
  "tokio",
  "toml",

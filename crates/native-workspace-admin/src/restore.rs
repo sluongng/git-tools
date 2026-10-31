@@ -59,18 +59,162 @@ impl Default for RestoreLimits {
         }
     }
 }
-struct Source {
+pub struct PrivateRestoreProvider {
+    pub store_alias: String,
+    pub endpoint: LocalEndpoint,
+    pub provider_identity: [u8; 32],
+    pub objects: Arc<jj_native_backend::DirectObjectIo>,
+}
+struct NativeSource {
     inputs: RestoreInputs,
     manifest: c::ManifestV3,
     _capture: tinytree_client::CloudCapture,
     data: c::CaptureData,
     provider: RestoreProvider,
+}
+struct PrivateAuthority {
+    client: tinytree_client::private_capsule::PrivateCapsuleClient,
+    binding: tinytree_client::private_capsule::CapsuleBinding,
+}
+impl PrivateAuthority {
+    async fn revalidate(&self, deadline: Instant) -> Result<()> {
+        use tinytree_client::private_capsule::{CapsuleAction, CapsuleCall, CapsuleState};
+        check_time(deadline)?;
+        let reply = self
+            .client
+            .call_until(
+                CapsuleCall::new(
+                    &self.binding.account_id,
+                    &self.binding.capsule_id,
+                    CapsuleAction::Status,
+                ),
+                Some(&self.binding),
+                deadline.into(),
+            )
+            .await?;
+        ensure!(
+            reply.state == CapsuleState::Sealed && reply.binding() == self.binding,
+            "private restore source no longer sealed"
+        );
+        check_time(deadline)
+    }
+}
+struct PrivateSource {
+    bundle: crate::private_bundle::VerifiedPrivateBundle,
+    authority: PrivateAuthority,
+    provider: PrivateRestoreProvider,
+}
+enum SourceKind {
+    Native(NativeSource),
+    Private(PrivateSource),
+}
+struct RestoreState {
+    operation_heads: Vec<String>,
+    working_copy: c::PortableWorkingCopy,
+    remote: Option<c::PortableRemoteState>,
+}
+struct Source {
+    kind: SourceKind,
+    data: RestoreState,
+    identity: RestoreSourceIdentity,
     limits: RestoreLimits,
     retained_bytes: usize,
-    // Payloads and provider state are destroyed before their physical owner.
     _owner: QueryOwner,
     _source_slot: tokio::sync::OwnedSemaphorePermit,
     deadline: Instant,
+}
+impl Source {
+    fn native(&self) -> Result<&NativeSource> {
+        match &self.kind {
+            SourceKind::Native(source) => Ok(source),
+            SourceKind::Private(_) => anyhow::bail!("native cloud restore strategy required"),
+        }
+    }
+    fn private(&self) -> Option<&PrivateSource> {
+        if let SourceKind::Private(source) = &self.kind {
+            Some(source)
+        } else {
+            None
+        }
+    }
+    fn objects(&self) -> &[c::VerifiedObject] {
+        match &self.kind {
+            SourceKind::Native(s) => &s.inputs.objects,
+            SourceKind::Private(s) => s.bundle.operations(),
+        }
+    }
+    fn artifacts(&self) -> &[c::VerifiedIndexArtifact] {
+        match &self.kind {
+            SourceKind::Native(s) => &s.inputs.artifacts,
+            SourceKind::Private(_) => &[],
+        }
+    }
+    fn objects_io(&self) -> Arc<dyn NativeObjectIo> {
+        match &self.kind {
+            SourceKind::Native(s) => s.provider.objects.clone(),
+            SourceKind::Private(s) => s.provider.objects.clone(),
+        }
+    }
+    fn store_alias(&self) -> &str {
+        match &self.kind {
+            SourceKind::Native(s) => &s.provider.config.store_alias,
+            SourceKind::Private(s) => &s.provider.store_alias,
+        }
+    }
+    fn endpoint(&self) -> LocalEndpoint {
+        match &self.kind {
+            SourceKind::Private(s) => s.provider.endpoint.clone(),
+            SourceKind::Native(s) => match &s.provider.config.endpoint {
+                jj_native_index::Endpoint::UnixSocket(p) => LocalEndpoint::UnixSocket(p.clone()),
+                jj_native_index::Endpoint::WindowsNamedPipe(p) => {
+                    LocalEndpoint::WindowsNamedPipe(p.clone())
+                }
+            },
+        }
+    }
+    async fn reauthorize(&self, deadline: Instant) -> Result<()> {
+        check_time(deadline)?;
+        match &self.kind {
+            SourceKind::Native(s) => {
+                let graph = c::verify_index_artifact_graph(
+                    &s.manifest.history.index_roots,
+                    &s.inputs.artifacts,
+                    self.limits.manifest.history.artifacts,
+                )?;
+                authorize(
+                    &s.inputs,
+                    &s.manifest,
+                    &s.data,
+                    &graph,
+                    &s.provider,
+                    self._owner.clone(),
+                    deadline,
+                )
+                .await?;
+            }
+            SourceKind::Private(s) => s.authority.revalidate(deadline).await?,
+        }
+        check_time(deadline)
+    }
+    fn operation_index_digest(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        match &self.kind {
+            SourceKind::Native(s) => {
+                hash.update(b"native-restore-operation-indexes-v1\0");
+                for entry in &s.manifest.history.operation_indexes {
+                    hash.update(&entry.operation);
+                    hash.update(&entry.root.0);
+                }
+            }
+            SourceKind::Private(_) => {
+                hash.update(b"private-restore-legacy-operations-v1\0");
+                for id in operation_ids(self) {
+                    hash.update(&id);
+                }
+            }
+        }
+        *hash.finalize().as_bytes()
+    }
 }
 // Stage-local only: Source keeps the BARE provider, so this owner edge cannot
 // form Source -> wrapper -> Source. The sole retained-source admission remains
@@ -171,8 +315,19 @@ pub struct RestoreSourceIdentity {
     capture_blake3: [u8; 32],
     capture_bytes: u64,
     provider: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_capsule: Option<tinytree_client::private_capsule::CapsuleBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_review_base: Option<crate::private_bundle::PrivateReviewBase>,
 }
 impl RestoreSourceIdentity {
+    pub fn private_review_base(&self) -> Option<&crate::private_bundle::PrivateReviewBase> {
+        self.private_review_base.as_ref()
+    }
+
+    pub fn private_capsule(&self) -> Option<&tinytree_client::private_capsule::CapsuleBinding> {
+        self.private_capsule.as_ref()
+    }
     pub fn workspace_id(&self) -> [u8; 32] {
         self.workspace
     }
@@ -202,8 +357,23 @@ impl RestoreSourceIdentity {
     }
 }
 impl PreparedRestore {
+    /// Fresh live source authorization before host-owned reservation mutations.
+    /// This does not publish Ready or authorize any unbound provider.
+    pub async fn revalidate_until(&self, original: Instant) -> Result<()> {
+        let source = self.source.clone();
+        let deadline = source.deadline.min(original);
+        check_time(deadline)?;
+        owned_job(deadline, move || {
+            futures::executor::block_on(source.reauthorize(deadline))
+        })
+        .await
+    }
+    /// Semantic proof borrowed from this authenticated, live-source preparation.
+    pub fn private_bundle(&self) -> Option<&crate::private_bundle::VerifiedPrivateBundle> {
+        self.source.private().map(|source| &source.bundle)
+    }
     pub fn source_identity(&self) -> RestoreSourceIdentity {
-        identity(&self.source.inputs, &self.source.provider)
+        self.source.identity.clone()
     }
     /// Borrow the independently verified exact tree/WC seed. It does not attest
     /// a mounted destination, and callers must not replace it with ambient refs.
@@ -448,10 +618,12 @@ fn identity(inputs: &RestoreInputs, provider: &RestoreProvider) -> RestoreSource
         capture_blake3: capture.selected.blake3,
         capture_bytes: capture.selected.size_bytes,
         provider: provider.config.provider_fingerprint,
+        private_capsule: None,
+        private_review_base: None,
     }
 }
 fn import_version(source: &Source) -> PortableImportVersion {
-    let source = identity(&source.inputs, &source.provider);
+    let source = source.identity.clone();
     PortableImportVersion {
         provider_identity: source.provider,
         workspace_id: source.workspace,
@@ -543,6 +715,194 @@ pub async fn prepare_restore(
     let original = deadline(&limits)?;
     prepare_restore_until(client, inputs, provider, limits, owner, original).await
 }
+/// Collect a sealed, authenticated capsule into an owner-private empty file.
+/// Semantic bundle proof alone never grants access to a restore destination.
+pub async fn prepare_private_restore_until(
+    client: tinytree_client::private_capsule::PrivateCapsuleClient,
+    account_id: String,
+    capsule_id: String,
+    mut spool: File,
+    provider: PrivateRestoreProvider,
+    limits: RestoreLimits,
+    bundle_limits: crate::private_bundle::BundleLimits,
+    owner: QueryOwner,
+    original: Instant,
+) -> Result<PreparedRestore> {
+    use tinytree_client::private_capsule::{
+        CapsuleAction, CapsuleCall, CapsuleState, ZERO_CHAIN, chain_chunk,
+    };
+    let deadline = deadline(&limits)?.min(original);
+    check_time(deadline)?;
+    let source_slot =
+        tokio::time::timeout_at(deadline.into(), runtime()?.sources.clone().acquire_owned())
+            .await
+            .context("private restore source admission exceeded")??;
+    owned_job(deadline, move || {
+        futures::executor::block_on(async move {
+            use std::io::{Seek, SeekFrom, Write};
+            ensure!(cfg!(target_os = "linux"), "private restore is Linux-only");
+            jj_native_index::Config {
+                endpoint: match &provider.endpoint {
+                    LocalEndpoint::UnixSocket(path) => {
+                        jj_native_index::Endpoint::UnixSocket(path.clone())
+                    }
+                    LocalEndpoint::WindowsNamedPipe(name) => {
+                        jj_native_index::Endpoint::WindowsNamedPipe(name.clone())
+                    }
+                },
+                store_alias: provider.store_alias.clone(),
+                provider_fingerprint: provider.provider_identity,
+            }
+            .validate()?;
+            let metadata = spool.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                ensure!(
+                    metadata.is_file()
+                        && metadata.nlink() == 1
+                        && metadata.permissions().mode() & 0o077 == 0,
+                    "private restore spool is not an owner-private regular file"
+                );
+            }
+            ensure!(metadata.len() == 0, "private restore spool is not empty");
+            let status = client
+                .call_until(
+                    CapsuleCall::new(&account_id, &capsule_id, CapsuleAction::Status),
+                    None,
+                    deadline.into(),
+                )
+                .await?;
+            check_time(deadline)?;
+            ensure!(
+                status.state == CapsuleState::Sealed,
+                "private restore capsule is not sealed"
+            );
+            let binding = status.binding();
+            ensure!(
+                binding.descriptor.total_bytes <= bundle_limits.max_bytes,
+                "private restore bundle byte limit"
+            );
+            let authority = PrivateAuthority { client, binding };
+            let mut chain = ZERO_CHAIN.to_owned();
+            let mut size = 0u64;
+            let mut digest = blake3::Hasher::new();
+            for sequence in 0..authority.binding.descriptor.chunk_count {
+                check_time(deadline)?;
+                let mut call = CapsuleCall::new(&account_id, &capsule_id, CapsuleAction::Read);
+                call.sequence = Some(sequence);
+                let reply = authority
+                    .client
+                    .call_until(call, Some(&authority.binding), deadline.into())
+                    .await?;
+                check_time(deadline)?;
+                ensure!(
+                    reply.state == CapsuleState::Sealed,
+                    "private restore capsule changed"
+                );
+                let bytes = reply.read_bytes()?;
+                size = size
+                    .checked_add(bytes.len() as u64)
+                    .context("private restore size overflow")?;
+                ensure!(
+                    size <= authority.binding.descriptor.total_bytes,
+                    "private restore excess bytes"
+                );
+                chain = chain_chunk(&chain, sequence, &bytes)?;
+                digest.update(&bytes);
+                spool.write_all(&bytes)?;
+            }
+            ensure!(
+                size == authority.binding.descriptor.total_bytes
+                    && chain == authority.binding.descriptor.chain_root,
+                "private restore capsule chain differs"
+            );
+            spool.sync_all()?;
+            spool.seek(SeekFrom::Start(0))?;
+            let bundle = crate::private_bundle::verify_file(
+                spool,
+                *digest.finalize().as_bytes(),
+                bundle_limits,
+            )?;
+            ensure!(
+                hex(&bundle.manifest().workspace_id) == authority.binding.workspace_id
+                    && bundle.manifest().generation == authority.binding.generation,
+                "private restore bundle/capsule identity differs"
+            );
+            if let Some(base) = bundle.review_base() {
+                ensure!(
+                    hex(&base.view_version) == authority.binding.selection.view_version
+                        && base.policy_epoch == authority.binding.selection.policy_epoch,
+                    "private restore review scope differs from authenticated selection"
+                );
+            }
+            authority.revalidate(deadline).await?;
+            let manifest_hash = *blake3::hash(bundle.manifest_bytes()).as_bytes();
+            let identity = RestoreSourceIdentity {
+                workspace: bundle.manifest().workspace_id,
+                generation: bundle.manifest().generation,
+                manifest: manifest_hash,
+                manifest_blake3: manifest_hash,
+                manifest_bytes: bundle.manifest_bytes().len() as u64,
+                capture: bundle.blake3(),
+                capture_blake3: bundle.blake3(),
+                capture_bytes: bundle.size_bytes(),
+                provider: provider.provider_identity,
+                private_capsule: Some(authority.binding.clone()),
+                private_review_base: bundle.review_base().cloned(),
+            };
+            let mut retained_bytes = bundle
+                .manifest_bytes()
+                .len()
+                .checked_mul(4)
+                .context("private restore manifest memory overflow")?;
+            ensure!(
+                retained_bytes <= limits.max_working_bytes,
+                "private restore retained metadata limit"
+            );
+            for object in bundle.operations() {
+                add(
+                    &mut retained_bytes,
+                    object.retained_size_upper_bound()?,
+                    limits.max_working_bytes,
+                )?;
+            }
+            add(
+                &mut retained_bytes,
+                bundle
+                    .native_descriptors()
+                    .len()
+                    .checked_mul(128)
+                    .context("private restore descriptor budget overflow")?,
+                limits.max_working_bytes,
+            )?;
+            let captured = bundle.capture_data();
+            let data = RestoreState {
+                operation_heads: captured.operation_heads.clone(),
+                working_copy: captured.working_copy.clone(),
+                remote: captured.remote.clone(),
+            };
+            Ok(PreparedRestore {
+                source: Arc::new(Source {
+                    kind: SourceKind::Private(PrivateSource {
+                        bundle,
+                        authority,
+                        provider,
+                    }),
+                    data,
+                    identity,
+                    limits,
+                    retained_bytes,
+                    _owner: owner,
+                    _source_slot: source_slot,
+                    deadline,
+                }),
+            })
+        })
+    })
+    .await
+}
+
 /// Bound source preparation, staging and exact finalization by the host's
 /// original absolute deadline. Rebinding never extends the configured policy.
 pub async fn prepare_restore_until(
@@ -659,11 +1019,19 @@ pub async fn prepare_restore_until(
             check_time(deadline)?;
             Ok(PreparedRestore {
                 source: Arc::new(Source {
-                    inputs,
-                    manifest,
-                    _capture: capture,
-                    data,
-                    provider,
+                    identity: identity(&inputs, &provider),
+                    data: RestoreState {
+                        operation_heads: data.operation_heads.clone(),
+                        working_copy: data.working_copy.clone(),
+                        remote: data.remote.clone(),
+                    },
+                    kind: SourceKind::Native(NativeSource {
+                        inputs,
+                        manifest,
+                        _capture: capture,
+                        data,
+                        provider,
+                    }),
                     limits: limits.clone(),
                     retained_bytes: retained_bytes
                         .checked_add(limits.manifest.history.recovery.max_decode_bytes)
@@ -712,8 +1080,11 @@ async fn authorize(
             },
             owner.clone(),
         ),
-    ).await?;
-    let query = prepared.as_ref().map_or(&provider.query, |reply| &reply.value);
+    )
+    .await?;
+    let query = prepared
+        .as_ref()
+        .map_or(&provider.query, |reply| &reply.value);
     let owner: QueryOwner = match &prepared {
         Some(reply) => Arc::new((owner, reply.owner.clone())),
         None => owner,
@@ -800,8 +1171,7 @@ async fn authorize(
                     let result = call(
                         deadline,
                         "commit_read",
-                        query
-                            .read_commit(scope.handle, commit, physical.clone()),
+                        query.read_commit(scope.handle, commit, physical.clone()),
                     )
                     .await?;
                     ensure!(
@@ -861,15 +1231,10 @@ impl Registry {
         check_time(source.source.deadline)?;
         self.validate(binding)?;
         ensure!(
-            binding.repository == source.source.provider.config.store_alias,
+            binding.repository == source.source.store_alias(),
             "restore destination alias mismatch"
         );
-        let endpoint = match &source.source.provider.config.endpoint {
-            jj_native_index::Endpoint::UnixSocket(path) => LocalEndpoint::UnixSocket(path.clone()),
-            jj_native_index::Endpoint::WindowsNamedPipe(name) => {
-                LocalEndpoint::WindowsNamedPipe(name.clone())
-            }
-        };
+        let endpoint = source.source.endpoint();
         ensure!(
             binding.endpoint.local() == endpoint,
             "restore destination endpoint mismatch"
@@ -890,16 +1255,10 @@ impl Registry {
             "restore administration exists; preserve and reconcile explicitly"
         );
         let data = &source.source.data;
-        let mut index_hash = blake3::Hasher::new();
-        index_hash.update(b"native-restore-operation-indexes-v1\0");
-        for entry in &source.source.manifest.history.operation_indexes {
-            index_hash.update(&entry.operation);
-            index_hash.update(&entry.root.0);
-        }
         let journal = Journal {
             version: if data.remote.is_some() { 2 } else { 1 },
             binding: binding.clone(),
-            source: identity(&source.source.inputs, &source.source.provider),
+            source: source.source.identity.clone(),
             operation_heads: data.operation_heads.len() as u64,
             operation_heads_digest: {
                 let mut hash = blake3::Hasher::new();
@@ -914,7 +1273,7 @@ impl Registry {
             snapshot_operation: data.working_copy.snapshot_operation.clone(),
             snapshot_commit: Some(data.working_copy.snapshot_commit),
             workspace: data.working_copy.workspace.clone(),
-            operation_indexes: *index_hash.finalize().as_bytes(),
+            operation_indexes: source.source.operation_index_digest(),
             index_fingerprint: None,
             remote_state_digest: None,
             phase: Phase::Reserved,
@@ -1061,29 +1420,115 @@ pub async fn initialize_restored(
 ) -> Result<StagedRestoreReceipt> {
     let deadline = prepared.source.deadline.min(intent.deadline);
     check_time(deadline)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_admission state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=worker_admission state=start\n",
+    );
     owned_job(deadline, move || {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_admission state=complete\n");
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_execute state=start\n");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=worker_admission state=complete\n",
+        );
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=worker_execute state=start\n",
+        );
         let result = futures::executor::block_on(stage(intent, prepared, host, deadline));
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=worker_execute state=complete\n");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=worker_execute state=complete\n",
+        );
         result
     })
     .await
 }
 
 fn operation_ids(source: &Source) -> Vec<[u8; 64]> {
+    if let SourceKind::Native(s) = &source.kind {
+        return s
+            .manifest
+            .history
+            .operation_indexes
+            .iter()
+            .map(|entry| entry.operation)
+            .collect();
+    }
     source
-        .manifest
-        .history
-        .operation_indexes
+        .objects()
         .iter()
-        .map(|entry| entry.operation)
+        .filter_map(|object| match object.id() {
+            c::ObjectId::Operation(id) => Some(id),
+            _ => None,
+        })
         .collect()
 }
+fn legacy_index_fingerprint(path: &Path, source: &Source) -> Result<[u8; 32]> {
+    use jj_lib::default_index::{DefaultIndexGcLimits, DefaultIndexStore};
+    let cap = source.limits.max_stage_entries;
+    let bytes = source.limits.max_working_bytes.min(256 * 1024 * 1024);
+    let bounds = DefaultIndexGcLimits {
+        max_operations: source.limits.manifest.capture.max_operations,
+        max_control_bytes: 65536,
+        max_total_control_bytes: bytes,
+        max_segment_bytes: bytes,
+        max_total_segment_bytes: bytes,
+        max_segments: cap,
+        max_chain_depth: 128,
+        max_commits: cap,
+        max_parent_edges: cap.saturating_mul(16),
+        max_validation_steps: cap.saturating_mul(64),
+        max_roots: cap,
+        max_working_bytes: bytes,
+    };
+    let mut ids = operation_ids(source)
+        .iter()
+        .map(|id| OperationId::from_bytes(id))
+        .collect::<Vec<_>>();
+    let intrinsic = OperationId::from_bytes(&[0; 64]);
+    if !ids.contains(&intrinsic) {
+        ids.push(intrinsic);
+    }
+    ids.sort();
+    let mut roots = DefaultIndexStore::load(path).gc_roots_readonly(
+        &ids,
+        &OperationId::from_bytes(&[0; 64]),
+        &CommitId::from_bytes(&m::CommitId::ROOT.0),
+        16,
+        bounds,
+    )?;
+    roots.sort();
+    roots.dedup();
+    let native = source.private().context("private Legacy source required")?;
+    let commits = native
+        .bundle
+        .native_descriptors()
+        .iter()
+        .filter(|d| d.key.kind == m::Kind::Commit)
+        .map(|d| d.key.id.0)
+        .collect::<BTreeSet<_>>();
+    for root in &roots {
+        ensure!(
+            root.as_bytes() == m::CommitId::ROOT.0
+                || commits.contains(&<[u8; 32]>::try_from(root.as_bytes())?),
+            "Legacy index root absent from verified bundle"
+        );
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"private-restore-legacy-index-v1\0");
+    for id in ids {
+        hash.update(id.as_bytes());
+    }
+    for root in roots {
+        hash.update(root.as_bytes());
+    }
+    Ok(*hash.finalize().as_bytes())
+}
 fn index_fingerprint(path: &Path, source: &Source) -> Result<[u8; 32]> {
+    if source.private().is_some() {
+        return legacy_index_fingerprint(path, source);
+    }
     let reserved = jj_native_index::LocalIndexExportReader::required_read_bytes(
-        &source.provider.index_limits,
+        &source.native()?.provider.index_limits,
     )?;
     ensure!(
         reserved <= source.limits.import.max_working_bytes,
@@ -1091,13 +1536,133 @@ fn index_fingerprint(path: &Path, source: &Source) -> Result<[u8; 32]> {
     );
     let reader = jj_native_index::LocalIndexExportReader::open_existing(
         path,
-        &source.provider.config,
-        source.provider.index_limits.clone(),
+        &source.native()?.provider.config,
+        source.native()?.provider.index_limits.clone(),
         reserved,
     )?;
     reader
         .association_fingerprint(&operation_ids(source), 65_536, 256 * 1024 * 1024)
         .map_err(Into::into)
+}
+
+async fn import_private_native(source: &Arc<Source>, deadline: Instant) -> Result<()> {
+    let Some(private) = source.private() else {
+        return Ok(());
+    };
+    let reader = private.bundle.native_reader();
+    let empty = m::empty_tree();
+    let actual = private
+        .provider
+        .objects
+        .write_metadata_with_owner(
+            m::decode(&empty.bytes, m::Limits::default())?,
+            source.clone(),
+        )
+        .await?;
+    ensure!(
+        actual == empty.descriptor,
+        "private restore intrinsic empty TREE differs"
+    );
+    for descriptor in private.bundle.native_descriptors() {
+        check_time(deadline)?;
+        if descriptor.key.kind == m::Kind::CopyHistory {
+            continue;
+        }
+        if descriptor.key.kind == m::Kind::File {
+            let (actual, mut input) = reader
+                .read_file_with_owner(m::FileId(descriptor.key.id.0), source.clone())
+                .await?
+                .into_parts();
+            ensure!(
+                actual == *descriptor,
+                "private restore FILE descriptor differs"
+            );
+            let id = private
+                .provider
+                .objects
+                .write_file_with_owner(&mut input, descriptor.size_bytes, source.clone())
+                .await?;
+            ensure!(
+                id.0 == descriptor.key.id.0,
+                "private restore FILE identity differs"
+            );
+        } else {
+            let metadata = reader
+                .read_metadata_with_owner(descriptor.key, source.clone())
+                .await?;
+            ensure!(
+                metadata.descriptor() == *descriptor,
+                "private restore metadata descriptor differs"
+            );
+            let actual = private
+                .provider
+                .objects
+                .write_metadata_with_owner(metadata.into_object(), source.clone())
+                .await?;
+            ensure!(
+                actual == *descriptor,
+                "private restore metadata identity differs"
+            );
+        }
+    }
+    // The direct provider requires each copy parent to be installed first. The
+    // source catalog is immutable and bounded; this walk never uses a network.
+    let mut done = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    let mut work = 0usize;
+    for descriptor in private
+        .bundle
+        .native_descriptors()
+        .iter()
+        .filter(|d| d.key.kind == m::Kind::CopyHistory)
+    {
+        let mut stack = vec![(descriptor.key, false)];
+        while let Some((key, expanded)) = stack.pop() {
+            check_time(deadline)?;
+            if done.contains(&key.id.0) {
+                continue;
+            }
+            work = work
+                .checked_add(1)
+                .context("private restore copy work overflow")?;
+            ensure!(
+                work <= source.limits.manifest.binding.max_work as usize,
+                "private restore copy work limit"
+            );
+            let metadata = reader.read_metadata_with_owner(key, source.clone()).await?;
+            let expected = metadata.descriptor();
+            let object = metadata.into_object();
+            if expanded {
+                let actual = private
+                    .provider
+                    .objects
+                    .write_metadata_with_owner(object, source.clone())
+                    .await?;
+                ensure!(actual == expected, "private restore copy identity differs");
+                visiting.remove(&key.id.0);
+                done.insert(key.id.0);
+            } else {
+                ensure!(
+                    visiting.insert(key.id.0),
+                    "private restore cyclic copy history"
+                );
+                stack.push((key, true));
+                let m::Object::CopyHistory(copy) = object else {
+                    anyhow::bail!("private restore copy type differs")
+                };
+                for parent in copy.parents.iter().rev() {
+                    stack.push((
+                        m::ObjectKey {
+                            kind: m::Kind::CopyHistory,
+                            id: m::ObjectId(parent.0),
+                        },
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+    source.reauthorize(deadline).await
 }
 
 async fn stage(
@@ -1108,17 +1673,23 @@ async fn stage(
 ) -> Result<StagedRestoreReceipt> {
     let source = prepared.source;
     ensure!(
-        intent.journal.source == identity(&source.inputs, &source.provider),
+        intent.journal.source == source.identity.clone(),
         "restore intent source changed"
     );
     ensure!(
         matches!(intent.journal.phase, Phase::Reserved),
         "restore journal already contains staged state"
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=marker_validation state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=marker_validation state=start\n",
+    );
     intent.registry.validate(&intent.journal.binding)?;
     validate_marker(&intent.journal.binding)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=marker_validation state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=marker_validation state=complete\n",
+    );
     let binding = intent.journal.binding.clone();
     let mut peak = source.retained_bytes;
     add(
@@ -1169,15 +1740,17 @@ async fn stage(
     add(
         &mut raw_peak,
         source
-            .inputs
-            .objects
+            .objects()
             .len()
             .checked_add(1)
             .and_then(|n| n.checked_mul(512))
             .context("restore ordering memory overflow")?,
         source.limits.max_working_bytes,
     )?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=projection_inspect state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=projection_inspect state=start\n",
+    );
     let projected = host.connector.connect(&binding.projection())?.inspect()?;
     let expected_tree = jj_vfs::native::NativeTree {
         terms: source.data.working_copy.tree.terms.clone(),
@@ -1187,41 +1760,53 @@ async fn stage(
         projected.repository == binding.repository && projected.tree == expected_tree,
         "restore lazy projection mismatch"
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=projection_inspect state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=projection_inspect state=complete\n",
+    );
     // All asynchronous backend preparation precedes jj's synchronous factory.
     let objects: Arc<dyn NativeObjectIo> = Arc::new(RestoreObjectIo {
-        inner: source.provider.objects.clone(),
+        inner: source.objects_io(),
         owner: source.clone(),
     });
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=backend_empty_tree state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=backend_empty_tree state=start\n",
+    );
+    if source.private().is_some() {
+        source.reauthorize(deadline).await?;
+        import_private_native(&source, deadline).await?;
+    }
     let backend = NativeBackend::from_io(objects.clone(), host.backend_config).await?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=backend_empty_tree state=complete\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=artifact_graph state=start\n");
-    let graph = c::verify_index_artifact_graph(
-        &source.manifest.history.index_roots,
-        &source.inputs.artifacts,
-        source.limits.manifest.history.artifacts,
-    )?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=artifact_graph state=complete\n");
-    // Reauthorize again immediately before stage mutation: a retained version may
-    // have expired since preparation. No reference/root fallback is permitted.
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=reauthorize state=start\n");
-    authorize(
-        &source.inputs,
-        &source.manifest,
-        &source.data,
-        &graph,
-        &source.provider,
-        source._owner.clone(),
-        deadline,
-    )
-    .await?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=reauthorize state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=backend_empty_tree state=complete\n",
+    );
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=artifact_graph state=start\n",
+    );
+    let graph = if let SourceKind::Native(native) = &source.kind {
+        Some(c::verify_index_artifact_graph(
+            &native.manifest.history.index_roots,
+            &native.inputs.artifacts,
+            source.limits.manifest.history.artifacts,
+        )?)
+    } else {
+        None
+    };
+    source.reauthorize(deadline).await?;
     check_time(deadline)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=stage_create state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=stage_create state=start\n",
+    );
     let staging = PrivateDir::create(intent.admin.path().join("restore-staging"))?;
     sync_directory(intent.admin.path())?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=stage_create state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=stage_create state=complete\n",
+    );
     let op_path = staging.path().join("op_store");
     let op_directory = PrivateDir::create(&op_path)?;
     let root_data = || RootOperationData {
@@ -1232,19 +1817,27 @@ async fn stage(
         op_store.root_operation_id().as_bytes() == [0; 64],
         "restore intrinsic operation convention mismatch"
     );
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=views_import state=start\n");
-    for object in &source.inputs.objects {
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=views_import state=start\n",
+    );
+    for object in source.objects() {
         if matches!(object.id(), c::ObjectId::View(_)) {
             check_time(deadline)?;
             object.import(&op_store).await?;
         }
     }
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=views_import state=complete\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=operations_import state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=views_import state=complete\n",
+    );
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=operations_import state=start\n",
+    );
     let mut installed = BTreeSet::from([[0; 64]]);
     let mut pending: BTreeMap<_, _> = source
-        .inputs
-        .objects
+        .objects()
         .iter()
         .filter_map(|object| match object.id() {
             c::ObjectId::Operation(id) if id != [0; 64] => Some((id, object)),
@@ -1283,33 +1876,47 @@ async fn stage(
     sync_directory(&op_path)?;
     sync_directory(staging.path())?;
     intent.advance(Phase::ObjectsStaged)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=operations_import state=complete\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=index_import state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=operations_import state=complete\n",
+    );
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=index_import state=start\n",
+    );
     let index_path = staging.path().join("index");
-    let imported = NativeIndexStore::import_fresh_operation_indexes(
-        &index_path,
-        source.provider.config.clone(),
-        source.provider.index_limits.clone(),
-        source.provider.query.clone(),
-        objects.clone(),
-        import_version(&source),
-        source.inputs.version.version().manifest(),
-        &graph,
-        source.limits.import.clone(),
-        source._owner.clone(),
-    )
-    .await?;
-    let cleanup = imported.store.cleanup_handle();
-    drop(imported);
-    cleanup.wait(Duration::from_millis(
-        source.provider.index_limits.cleanup_timeout_ms,
-    ))?;
-    drop(graph);
-    intent.journal.index_fingerprint = Some(index_fingerprint(&index_path, &source)?);
+    if source.private().is_none() {
+        let imported = NativeIndexStore::import_fresh_operation_indexes(
+            &index_path,
+            source.native()?.provider.config.clone(),
+            source.native()?.provider.index_limits.clone(),
+            source.native()?.provider.query.clone(),
+            objects.clone(),
+            import_version(&source),
+            source.native()?.inputs.version.version().manifest(),
+            graph.as_ref().context("native index graph missing")?,
+            source.limits.import.clone(),
+            source._owner.clone(),
+        )
+        .await?;
+        let cleanup = imported.store.cleanup_handle();
+        drop(imported);
+        cleanup.wait(Duration::from_millis(
+            source.native()?.provider.index_limits.cleanup_timeout_ms,
+        ))?;
+        drop(graph);
+        intent.journal.index_fingerprint = Some(index_fingerprint(&index_path, &source)?);
+    }
     intent.advance(Phase::IndexStaged)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=index_import state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=index_import state=complete\n",
+    );
     check_time(deadline)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=repository_install state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=repository_install state=start\n",
+    );
     let repository = PrivateDir::create(&binding.repo)?;
     let backend = RefCell::new(Some(backend));
     let backend_initializer: &BackendInitializer<'_> = &|_, path| {
@@ -1337,12 +1944,16 @@ async fn stage(
     };
     let index_initializer: &jj_lib::repo::IndexStoreInitializer<'_> = &|_, path| {
         (|| -> Result<Box<dyn jj_lib::index::IndexStore>> {
+            if source.private().is_some() {
+                return ReadonlyRepo::default_index_store_initializer()(&host.settings, path)
+                    .map_err(anyhow::Error::from);
+            }
             install_directory(&index_path, path)?;
             Ok(Box::new(NativeIndexStore::open(
                 path,
-                &source.provider.config,
-                source.provider.index_limits.clone(),
-                source.provider.query.clone(),
+                &source.native()?.provider.config,
+                source.native()?.provider.index_limits.clone(),
+                source.native()?.provider.query.clone(),
                 objects.clone(),
             )?))
         })()
@@ -1377,10 +1988,16 @@ async fn stage(
     )
     .await?;
     intent.advance(Phase::RepositoryInstalled)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=repository_install state=complete\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=metadata_readback state=start\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=repository_install state=complete\n",
+    );
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=metadata_readback state=start\n",
+    );
     let op_store = repo.op_store();
-    for object in &source.inputs.objects {
+    for object in source.objects() {
         match object.id() {
             c::ObjectId::Operation(id) => {
                 let actual = op_store
@@ -1402,9 +2019,9 @@ async fn stage(
             }
         }
     }
-    for association in &source.manifest.history.operation_indexes {
+    for operation in operation_ids(&source) {
         check_time(deadline)?;
-        let id = OperationId::from_bytes(&association.operation);
+        let id = OperationId::from_bytes(&operation);
         let data = op_store.read_operation(&id).await?;
         let operation = jj_lib::operation::Operation::new(op_store.clone(), id, data);
         let index = repo
@@ -1414,8 +2031,19 @@ async fn stage(
             .await?;
         drop(index);
     }
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=metadata_readback state=complete\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=working_copy_restore state=start\n");
+    if source.private().is_some() {
+        intent.journal.index_fingerprint =
+            Some(index_fingerprint(&binding.repo.join("index"), &source)?);
+        intent.advance(Phase::RepositoryInstalled)?;
+    }
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=metadata_readback state=complete\n",
+    );
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=working_copy_restore state=start\n",
+    );
     let working_copy = PrivateDir::create(&binding.working_copy)?;
     let factory = NativeVfsWorkingCopyFactory::new(binding.repository.clone(), host.connector);
     let wc_operation = array::<64>(&source.data.working_copy.wc_operation)?;
@@ -1480,7 +2108,10 @@ async fn stage(
     sync_directory(intent.admin.path())?;
     check_time(deadline)?;
     intent.advance(Phase::WorkingCopyStaged)?;
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=working_copy_restore state=complete\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        b"native_restore phase=working_copy_restore state=complete\n",
+    );
     Ok(StagedRestoreReceipt {
         binding,
         operation_heads: heads
@@ -1507,13 +2138,24 @@ fn restore_origin(source: &RestoreSourceIdentity) -> [u8; 32] {
     hash.update(&source.capture_blake3);
     hash.update(&source.capture_bytes.to_le_bytes());
     hash.update(&source.provider);
+    if let Some(base) = &source.private_review_base {
+        hash.update(b"private-review-base-v1\0");
+        hash.update(&base.view_version);
+        hash.update(&base.policy_epoch.to_le_bytes());
+        hash.update(&base.base);
+        hash.update(&base.tree);
+    }
+    if let Some(binding) = &source.private_capsule {
+        hash.update(b"private-capsule-source-v1\0");
+        hash.update(&serde_json::to_vec(binding).expect("validated capsule binding"));
+    }
     *hash.finalize().as_bytes()
 }
 fn recovery<T>(reason: &'static str) -> Result<T> {
     Err(RestoreRecoveryRequired(reason).into())
 }
 fn portable_remote_bytes(
-    data: &c::CaptureData,
+    data: &RestoreState,
     scope: &crate::remote_state::RemoteScope,
 ) -> Result<Option<Vec<u8>>> {
     data.remote
@@ -1539,7 +2181,7 @@ fn read_journal(admin: &PrivateDir) -> Result<Journal> {
 }
 fn check_journal_source(journal: &Journal, binding: &Binding, source: &Source) -> Result<()> {
     ensure!(
-        journal.binding == *binding && journal.source == identity(&source.inputs, &source.provider),
+        journal.binding == *binding && journal.source == source.identity.clone(),
         "restore journal source or destination differs"
     );
     let data = &source.data;
@@ -1549,16 +2191,10 @@ fn check_journal_source(journal: &Journal, binding: &Binding, source: &Source) -
     for head in &data.operation_heads {
         heads.update(head.as_bytes());
     }
-    let mut indexes = blake3::Hasher::new();
-    indexes.update(b"native-restore-operation-indexes-v1\0");
-    for entry in &source.manifest.history.operation_indexes {
-        indexes.update(&entry.operation);
-        indexes.update(&entry.root.0);
-    }
     ensure!(
         journal.operation_heads == data.operation_heads.len() as u64
             && journal.operation_heads_digest == *heads.finalize().as_bytes()
-            && journal.operation_indexes == *indexes.finalize().as_bytes()
+            && journal.operation_indexes == source.operation_index_digest()
             && journal.wc_operation == data.working_copy.wc_operation
             && journal.snapshot_operation == data.working_copy.snapshot_operation
             && journal.workspace == data.working_copy.workspace,
@@ -1736,34 +2372,24 @@ async fn readback(
     add(
         &mut export_peak,
         source
-            .inputs
-            .artifacts
+            .artifacts()
             .len()
             .checked_mul(1024)
             .context("restore readback inventory overflow")?,
         source.limits.max_working_bytes,
     )?;
-    {
-        let graph = c::verify_index_artifact_graph(
-            &source.manifest.history.index_roots,
-            &source.inputs.artifacts,
-            source.limits.manifest.history.artifacts,
-        )?;
-        authorize(
-            &source.inputs,
-            &source.manifest,
-            &source.data,
-            &graph,
-            &source.provider,
-            source._owner.clone(),
-            deadline,
-        )
-        .await?;
-    }
+    source.reauthorize(deadline).await?;
     let repository = PrivateDir::open_existing(&binding.repo)?;
     for (child, expected) in [
         ("store", NativeBackend::NAME),
-        ("index", jj_native_index::NAME),
+        (
+            "index",
+            if source.private().is_some() {
+                jj_lib::default_index::DefaultIndexStore::NAME
+            } else {
+                jj_native_index::NAME
+            },
+        ),
         ("op_store", SimpleOpStore::NAME),
         ("op_heads", SimpleOpHeadsStore::NAME),
         (
@@ -1775,7 +2401,8 @@ async fn readback(
             jj_lib::default_submodule_store::DefaultSubmoduleStore::NAME,
         ),
     ] {
-        let bytes = fs::File::open(repository.path().join(child).join("type"))?
+        let bytes = fs::File::open(repository.path().join(child).join("type"))
+            .with_context(|| format!("restore {child} store type unavailable"))?
             .take(129)
             .bytes()
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -1790,7 +2417,7 @@ async fn readback(
     );
     let mut operations = BTreeSet::new();
     let mut views = BTreeSet::new();
-    for object in &source.inputs.objects {
+    for object in source.objects() {
         check_time(deadline)?;
         let bytes = match object.id() {
             c::ObjectId::Operation(id) => {
@@ -1833,61 +2460,79 @@ async fn readback(
         source.limits.manifest.history.recovery.max_members,
     )?;
     let ids = operation_ids(source);
+    let associations = binding.repo.join(if source.private().is_some() {
+        "index/op_links"
+    } else {
+        "index/operations"
+    });
+    let mut index_names = expected_names(ids.iter());
+    if source.private().is_some() {
+        let root = hex(&[0; 64]);
+        // DefaultIndexStore may cache its intrinsic root association. Validate
+        // either representation through gc_roots_readonly, never require repair.
+        if associations.join(&root).try_exists()? {
+            index_names.insert(root);
+        } else {
+            index_names.remove(&root);
+        }
+    }
     scan_exact_files(
-        &binding.repo.join("index/operations"),
-        &expected_names(ids.iter()),
+        &associations,
+        &index_names,
         source.limits.manifest.capture.max_operations,
-    )?;
+    )
+    .context("restore index association inventory unavailable or changed")?;
     ensure!(
         Some(index_fingerprint(&binding.repo.join("index"), source)?)
             == actual_journal.index_fingerprint,
         "restore index source or association changed"
     );
-    let objects: Arc<dyn NativeObjectIo> = Arc::new(RestoreObjectIo {
-        inner: source.provider.objects.clone(),
-        owner: source.clone(),
-    });
-    // Actual configured-provider verification, through owned metadata only.
-    let backend = NativeBackend::from_io(objects.clone(), host.backend_config.clone()).await?;
-    drop(backend);
-    let index = NativeIndexStore::open(
-        &binding.repo.join("index"),
-        &source.provider.config,
-        source.provider.index_limits.clone(),
-        source.provider.query.clone(),
-        objects,
-    )?;
-    let expected = source
-        .inputs
-        .artifacts
-        .iter()
-        .map(|artifact| (artifact.descriptor().id, artifact.descriptor()))
-        .collect::<BTreeMap<_, _>>();
-    let mut sink = ReadbackSink {
-        expected: &expected,
-        seen: BTreeSet::new(),
-    };
-    let export_limits = jj_native_index::PortableExportLimits {
-        max_operations: source.limits.import.max_operations,
-        max_working_bytes: source.limits.import.max_working_bytes,
-        artifacts: source.limits.manifest.history.artifacts,
-        ..Default::default()
-    };
-    let exported = index
-        .export_operation_indexes(&ids, export_limits, &mut sink, source.clone())
-        .await?;
-    ensure!(
-        exported.operation_indexes() == source.manifest.history.operation_indexes
-            && exported.index_roots() == source.manifest.history.index_roots
-            && sink.seen.len() == expected.len(),
-        "restore exact logical index inventory changed"
-    );
-    drop(exported);
-    let cleanup = index.cleanup_handle();
-    drop(index);
-    cleanup.wait(Duration::from_millis(
-        source.provider.index_limits.cleanup_timeout_ms,
-    ))?;
+    if let SourceKind::Native(native) = &source.kind {
+        let objects: Arc<dyn NativeObjectIo> = Arc::new(RestoreObjectIo {
+            inner: source.objects_io(),
+            owner: source.clone(),
+        });
+        // Actual configured-provider verification, through owned metadata only.
+        let backend = NativeBackend::from_io(objects.clone(), host.backend_config.clone()).await?;
+        drop(backend);
+        let index = NativeIndexStore::open(
+            &binding.repo.join("index"),
+            &source.native()?.provider.config,
+            source.native()?.provider.index_limits.clone(),
+            source.native()?.provider.query.clone(),
+            objects,
+        )?;
+        let expected = source
+            .artifacts()
+            .iter()
+            .map(|artifact| (artifact.descriptor().id, artifact.descriptor()))
+            .collect::<BTreeMap<_, _>>();
+        let mut sink = ReadbackSink {
+            expected: &expected,
+            seen: BTreeSet::new(),
+        };
+        let export_limits = jj_native_index::PortableExportLimits {
+            max_operations: source.limits.import.max_operations,
+            max_working_bytes: source.limits.import.max_working_bytes,
+            artifacts: source.limits.manifest.history.artifacts,
+            ..Default::default()
+        };
+        let exported = index
+            .export_operation_indexes(&ids, export_limits, &mut sink, source.clone())
+            .await?;
+        ensure!(
+            exported.operation_indexes() == native.manifest.history.operation_indexes
+                && exported.index_roots() == native.manifest.history.index_roots
+                && sink.seen.len() == expected.len(),
+            "restore exact logical index inventory changed"
+        );
+        drop(exported);
+        let cleanup = index.cleanup_handle();
+        drop(index);
+        cleanup.wait(Duration::from_millis(
+            source.native()?.provider.index_limits.cleanup_timeout_ms,
+        ))?;
+    }
     let heads = SimpleOpHeadsStore::load(&binding.repo.join("op_heads"))
         .get_op_heads_bounded(source.limits.manifest.capture.max_operations)?;
     ensure!(
@@ -1911,7 +2556,8 @@ async fn readback(
     // The pinned loader repairs a missing legacy index. Require its actual
     // bounded current file before calling the present, read-only load path.
     let workspace_path = binding.repo.join("workspace_store/index");
-    let metadata = fs::symlink_metadata(&workspace_path)?;
+    let metadata = fs::symlink_metadata(&workspace_path)
+        .context("restore workspace registration index unavailable")?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 1024 * 1024,
         "restore workspace registration is unavailable or oversized"
@@ -1979,7 +2625,9 @@ pub async fn reopen_staged_restore(
                 },
                 source: prepared.source,
             };
-            readback(&authority, &host, deadline).await?;
+            readback(&authority, &host, deadline)
+                .await
+                .context("restore staged metadata readback failed")?;
             receipt_from_authority(authority)
         })
     })
@@ -2004,7 +2652,9 @@ pub async fn finalize_staged_restore(
         futures::executor::block_on(async move {
             check_receipt(&receipt)?;
             let mut authority = receipt.authority;
-            readback(&authority, &host, deadline).await?;
+            readback(&authority, &host, deadline)
+                .await
+                .context("restore staged metadata readback failed")?;
             let binding = authority.intent.journal.binding.clone();
             let initialization = Initialization {
                 version: 1,
@@ -2044,6 +2694,9 @@ pub async fn finalize_staged_restore(
             )?;
             sync_stage(&binding.repo, &authority.source.limits, deadline)?;
             sync_stage(&binding.working_copy, &authority.source.limits, deadline)?;
+            // Local validation and fsync can outlive the previous source check.
+            // Fence eligibility with current authority at the original deadline.
+            authority.source.reauthorize(deadline).await?;
             check_time(deadline)?;
             authority.intent.advance(Phase::PublishingReady)?;
             authority.intent.admin.replace(JOURNAL, &bytes)?;
@@ -2053,7 +2706,7 @@ pub async fn finalize_staged_restore(
             authority.intent.registry.publish_ready(&binding)?;
             Ok(AdminRestoreReady {
                 binding,
-                source: identity(&authority.source.inputs, &authority.source.provider),
+                source: authority.source.identity.clone(),
             })
         })
     })
@@ -2125,7 +2778,9 @@ impl Registry {
             if binding.root != root {
                 continue;
             }
-            validate_marker(&binding)?;
+            // This selector returns saved eligibility DATA before a stopped
+            // frontend is remounted. Activation still validates the real marker.
+
             self.validate_ready(&binding)?;
             let admin = PrivateDir::open_existing(&binding.admin)?;
             let initialization: Initialization =

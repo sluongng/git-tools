@@ -34,6 +34,8 @@ pub(crate) struct Target {
     pub registry: Arc<Registry>,
     pub binding: Binding,
     pub local: Arc<jj_native_backend::DirectObjectIo>,
+    /// Exact configured source, including newly written local objects.
+    pub native: Arc<dyn jj_native_backend::NativeObjectIo>,
     pub index: jj_native_index::Config,
     pub remote_scope: native_workspace_admin::remote_state::RemoteScope,
 }

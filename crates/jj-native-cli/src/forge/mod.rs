@@ -1,9 +1,11 @@
 //! Single-process product façade over the native VCS and hosted forge service.
 mod bootstrap;
+mod backup;
+pub(crate) use backup::finish as finish_private_backup;
 mod archive;
 mod context;
 mod client;
-pub(crate) use client::{hidden as client_hidden, resume as resume_client, finish_resume as finish_client_resume};
+pub(crate) use client::{hidden as client_hidden, resume as resume_client, finish_resume as finish_client_resume, ClientResume};
 mod output;
 mod pending;
 mod reconcile;
@@ -43,6 +45,8 @@ enum Command {
     Move(crate::forge_paths::PathArgs),
     /// Create a lazy native workspace from an authorized account/view snapshot.
     Work(workspace::WorkArgs),
+    /// Snapshot and durably back up private, unpublished working-copy state.
+    Backup,
     /// Submit an immutable patchset for server-side rebase and review, not main publication.
     Push(review::PushArgs),
     /// Inspect, discuss, approve or land exact review patchsets.
@@ -123,7 +127,7 @@ pub(crate) fn configure<'a>(runner: CliRunner<'a>) -> CliRunner<'a> {
             let operation = command.matches().subcommand_name().unwrap_or("unknown");
             let result = if machine && matches!(operation, "status" | "diff") {
                 workspace_summary(ui, command, operation).await
-            } else if machine && !matches!(operation, "context" | "login" | "account" | "view" | "search" | "request" | "push" | "review" | "transform" | "pin" | "lineage" | "work" | "copy" | "move") {
+            } else if machine && !matches!(operation, "context" | "login" | "account" | "view" | "search" | "request" | "push" | "review" | "transform" | "pin" | "lineage" | "work" | "copy" | "move" | "backup") {
                 Err(user_error("this command has no stable Tinytree JSON schema; omit --json for native human output"))
             } else {
                 dispatch.call(ui, command).await
@@ -149,6 +153,7 @@ fn machine(command: &CommandHelper) -> bool {
 
 async fn run(ui: &mut Ui, command: &CommandHelper, args: Command) -> Result<(), CommandError> {
     match args {
+        Command::Backup => backup::backup(ui, command, machine(command)).await,
         Command::Copy(args) => {
             let result = crate::forge_paths::run(ui, command, args, false).await?;
             if machine(command) {

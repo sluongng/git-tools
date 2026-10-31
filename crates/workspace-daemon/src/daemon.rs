@@ -1263,7 +1263,7 @@ pub async fn serve(mut config: Config) -> Result<()> {
                     state_slot=Some(returned);result
                 }
                 Ok(Request::IdentityChallenge) => serde_json::to_value(state_slot.as_ref().unwrap().identity.challenge()).map_err(Into::into),
-                Ok(Request::ForgeClientReady { .. } | Request::ForgeClientStop { .. }) => Err(anyhow::anyhow!("not a derived Forge client")),
+                Ok(Request::ForgeClientReady { .. } | Request::ForgeClientStop { .. } | Request::NativeRestoreCapsule { .. }) => Err(anyhow::anyhow!("not a derived Forge client")),
                 Ok(Request::Scoped { .. }) => Err(anyhow::anyhow!("nested scoped request is invalid")),
                 Ok(Request::Status) => Ok(state_slot.as_ref().unwrap().status()),
                 Ok(Request::RetryBes) => match state_slot.as_ref().unwrap().bes.as_ref() {

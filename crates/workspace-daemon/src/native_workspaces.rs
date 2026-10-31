@@ -198,8 +198,14 @@ pub(crate) fn inspect_provider_enrollments(
         for item in fs::read_dir(directory.path())? {
             census.entry()?;
             let item = item?;
-            ensure!(item.file_type()?.is_dir(), "unknown provider workspace census entry");
-            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider workspace census name"))?;
+            ensure!(
+                item.file_type()?.is_dir(),
+                "unknown provider workspace census entry"
+            );
+            let name = item
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid provider workspace census name"))?;
             let id = unhex(&name)?;
             let child = PrivateDir::open_existing(item.path())?;
             if !child.path().join("workspace.json").try_exists()? {
@@ -209,13 +215,30 @@ pub(crate) fn inspect_provider_enrollments(
                 continue;
             }
             let bytes = census.read(&child, "workspace.json", MAX_RECORD)?;
-            let record = read_record(&bytes).map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
-            validate_record(&record).map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
-            ensure!(record.workspace_id == id, "provider workspace census identity differs");
+            let record = read_record(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
+            validate_record(&record)
+                .map_err(|_| anyhow::anyhow!("invalid provider workspace census record"))?;
+            ensure!(
+                record.workspace_id == id,
+                "provider workspace census identity differs"
+            );
             census_record(&record, census)?;
             census.charge(4096)?;
-            known.insert(id, Some(ProviderEnrollment {workspace_id: id, store: record.store, root: record.root,
-                pending: matches!(record.state, Lifecycle::Pending | Lifecycle::RecoveryRequired), retired: false, intent_only: false}));
+            known.insert(
+                id,
+                Some(ProviderEnrollment {
+                    workspace_id: id,
+                    store: record.store,
+                    root: record.root,
+                    pending: matches!(
+                        record.state,
+                        Lifecycle::Pending | Lifecycle::RecoveryRequired
+                    ),
+                    retired: false,
+                    intent_only: false,
+                }),
+            );
         }
     }
     let path = config.state_dir.join("native-cloud-restores");
@@ -224,27 +247,50 @@ pub(crate) fn inspect_provider_enrollments(
         for item in fs::read_dir(directory.path())? {
             census.entry()?;
             let item = item?;
-            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider restore census name"))?;
+            let name = item
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid provider restore census name"))?;
             let bytes = census.read(&directory, &name, MAX_RECORD)?;
-            if is_retirement_temporary(&name) { continue; }
-            let key = name.strip_suffix(".json").context("unknown provider restore census entry")?;
+            if is_retirement_temporary(&name) {
+                continue;
+            }
+            let key = name
+                .strip_suffix(".json")
+                .context("unknown provider restore census entry")?;
             unhex(key)?;
             let intent: CloudRestoreIntent = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid provider restore census record"))?;
-            validate_cloud_intent(&intent).map_err(|_| anyhow::anyhow!("invalid provider restore census record"))?;
-            ensure!(cloud_intent_key(&intent.root)? == key, "provider restore census filename differs");
+            validate_cloud_intent(&intent)
+                .map_err(|_| anyhow::anyhow!("invalid provider restore census record"))?;
+            ensure!(
+                cloud_intent_key(&intent.root)? == key,
+                "provider restore census filename differs"
+            );
             census.identity(&intent.store, intent.provider_identity)?;
             census.charge(4096)?;
             if let Some(Some(existing)) = known.get(&intent.workspace_id) {
-                ensure!(existing.store == intent.store && existing.root == intent.root,
-                    "provider restore census enrollment conflicts");
+                ensure!(
+                    existing.store == intent.store && existing.root == intent.root,
+                    "provider restore census enrollment conflicts"
+                );
             }
-            ensure!(intent.selection_pending.is_none() || !known.contains_key(&intent.workspace_id),
-                "pending cloud selection cannot authorize per-workspace census state");
+            ensure!(
+                intent.selection_pending.is_none() || !known.contains_key(&intent.workspace_id),
+                "pending cloud selection cannot authorize per-workspace census state"
+            );
             let intent_only = !known.contains_key(&intent.workspace_id);
-            known.entry(intent.workspace_id).or_insert(None).get_or_insert(ProviderEnrollment {
-                workspace_id: intent.workspace_id, store: intent.store, root: intent.root, pending: true, retired: false, intent_only,
-            });
+            known
+                .entry(intent.workspace_id)
+                .or_insert(None)
+                .get_or_insert(ProviderEnrollment {
+                    workspace_id: intent.workspace_id,
+                    store: intent.store,
+                    root: intent.root,
+                    pending: true,
+                    retired: false,
+                    intent_only,
+                });
         }
     }
     let path = config.state_dir.join("native-candidate-retirements");
@@ -253,31 +299,56 @@ pub(crate) fn inspect_provider_enrollments(
         for item in fs::read_dir(directory.path())? {
             census.entry()?;
             let item = item?;
-            let name = item.file_name().into_string().map_err(|_| anyhow::anyhow!("invalid provider retirement census name"))?;
+            let name = item
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid provider retirement census name"))?;
             let bytes = census.read(&directory, &name, MAX_RECORD)?;
-            if is_retirement_temporary(&name) { continue; }
-            let id = unhex(name.strip_suffix(".json").context("unknown provider retirement census entry")?)?;
+            if is_retirement_temporary(&name) {
+                continue;
+            }
+            let id = unhex(
+                name.strip_suffix(".json")
+                    .context("unknown provider retirement census entry")?,
+            )?;
             let receipt: CandidateRetirement = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid provider retirement census record"))?;
-            validate_retirement(&receipt, id).map_err(|_| anyhow::anyhow!("invalid provider retirement census record"))?;
+            validate_retirement(&receipt, id)
+                .map_err(|_| anyhow::anyhow!("invalid provider retirement census record"))?;
             census_record(&receipt.record, census)?;
-            ensure!(!receipt.complete || !known.contains_key(&id),
-                "completed provider retirement retains workspace state");
+            ensure!(
+                !receipt.complete || !known.contains_key(&id),
+                "completed provider retirement retains workspace state"
+            );
             census.charge(4096)?;
             if let Some(Some(existing)) = known.get_mut(&id) {
-                ensure!(existing.store == receipt.record.store && existing.root == receipt.record.root
-                    && !receipt.complete, "provider retirement census enrollment conflicts");
+                ensure!(
+                    existing.store == receipt.record.store
+                        && existing.root == receipt.record.root
+                        && !receipt.complete,
+                    "provider retirement census enrollment conflicts"
+                );
                 existing.pending = true;
                 existing.intent_only = false;
             } else {
-                known.insert(id, Some(ProviderEnrollment {
-                    workspace_id:id, store:receipt.record.store, root:receipt.record.root,
-                    pending:!receipt.complete, retired:receipt.complete, intent_only:false,
-                }));
+                known.insert(
+                    id,
+                    Some(ProviderEnrollment {
+                        workspace_id: id,
+                        store: receipt.record.store,
+                        root: receipt.record.root,
+                        pending: !receipt.complete,
+                        retired: receipt.complete,
+                        intent_only: false,
+                    }),
+                );
             }
         }
     }
-    ensure!(known.values().all(Option::is_some), "unreserved provider workspace census entry");
+    ensure!(
+        known.values().all(Option::is_some),
+        "unreserved provider workspace census entry"
+    );
     Ok(known.into_values().flatten().collect())
 }
 fn census_record(record: &Record, census: &mut crate::provider_identity::Census) -> Result<()> {
@@ -287,7 +358,7 @@ fn census_record(record: &Record, census: &mut crate::provider_identity::Census)
             .map_err(|_| anyhow::anyhow!("invalid provider creation census record"))?;
         census.identity(&record.store, plan.provider_identity)?;
     }
-    if let Origin::Restore {source,..} = &record.origin {
+    if let Origin::Restore { source, .. } = &record.origin {
         census.identity(&record.store, source.provider_identity())?;
     }
     Ok(())
@@ -406,7 +477,8 @@ impl Manager {
                 ensure!(
                     cloud_intents
                         .values()
-                        .any(|intent| intent.workspace_id == id && intent.selection_pending.is_none()),
+                        .any(|intent| intent.workspace_id == id
+                            && intent.selection_pending.is_none()),
                     "unknown native workspace state; preserve it"
                 );
                 reconcile_cloud_temporary_files(&child)?;
@@ -829,10 +901,44 @@ impl Manager {
     }
     /// Derived snapshot clients may recover only their saved destination. The
     /// shared administration registry is a lookup store, not an adoption list.
-    pub(crate) fn require_forge_client_scope(&self, root: &Path, store: &str, commit: [u8;32]) -> Result<()> {
-        ensure!(self.cloud_intents.is_empty() && self.retirements.is_empty(), "foreign recovery state in Forge client");
+    pub(crate) fn require_forge_client_scope(
+        &self,
+        root: &Path,
+        store: &str,
+        pin: &crate::forge_client::ProjectionPin,
+    ) -> Result<()> {
+        ensure!(
+            self.cloud_intents.is_empty() && self.retirements.is_empty(),
+            "foreign recovery state in Forge client"
+        );
+        let source = self
+            .config
+            .native
+            .repositories
+            .get(store)
+            .and_then(|r| r.forge.as_ref())
+            .context("Forge client source unavailable")?;
         for entry in self.entries.values() {
-            ensure!(entry.record.root==root && entry.record.store==store && matches!(&entry.record.origin, Origin::Clone {bootstrap_commit} if *bootstrap_commit==commit), "foreign workspace record in Forge client; preserve state");
+            ensure!(
+                entry.record.root == root && entry.record.store == store,
+                "foreign workspace record in Forge client; preserve state"
+            );
+            match &entry.record.origin {
+                Origin::Clone { bootstrap_commit } => ensure!(
+                    *bootstrap_commit == pin.projected_commit,
+                    "Forge clone snapshot differs"
+                ),
+                Origin::Restore {
+                    source: identity, ..
+                } => validate_private_binding(
+                    identity
+                        .private_capsule()
+                        .context("foreign restore origin in Forge client")?,
+                    source,
+                    pin,
+                )?,
+                Origin::Candidate { .. } => anyhow::bail!("foreign candidate in Forge client"),
+            }
         }
         Ok(())
     }
@@ -969,7 +1075,10 @@ impl Manager {
                 "native creation plan root mismatch"
             );
             let description = self.config.native.repositories[&store].creation_description(
-                &self.config.native.workspaces, repository.identity, repository.query.is_some());
+                &self.config.native.workspaces,
+                repository.identity,
+                repository.query.is_some(),
+            );
             let expected = description.creation_plan(commit)?;
             ensure!(
                 plan == expected,
@@ -1293,6 +1402,7 @@ impl Manager {
                     registry: registry.clone(),
                     binding: binding.clone(),
                     local: repository.local_objects.clone(),
+                    native: repository.io.clone(),
                     index: jj_native_index::Config {
                         endpoint: jj_native_index::Endpoint::UnixSocket(endpoint.clone()),
                         store_alias: binding.repository.clone(),
@@ -1368,6 +1478,9 @@ impl Manager {
                 )
                 .await
             }
+            Origin::Restore { source, .. } if source.private_capsule().is_some() => {
+                self.resume_private_ready(record.clone(), deadline).await
+            }
             Origin::Restore { source, .. } => {
                 self.restore_until(
                     record.root,
@@ -1419,7 +1532,8 @@ impl Manager {
             .context("native restore requires managed command admission")?
             .outer_host_access_until(deadline)
             .await?;
-        self.ensure_restore_source_pin(&root, &store, &workspace_id, &selection, deadline).await?;
+        self.ensure_restore_source_pin(&root, &store, &workspace_id, &selection, deadline)
+            .await?;
         let mut started = false;
         let result = self
             .restore_inner(
@@ -1602,10 +1716,6 @@ impl Manager {
             .query
             .clone()
             .context("native restore requires configured native queries")?;
-        let commands = self
-            .commands
-            .clone()
-            .context("native restore requires managed command admission")?;
         let settings = self.config.native.workspaces.clone();
         let existing = self
             .entries
@@ -1736,7 +1846,7 @@ impl Manager {
                 }
             }
         }
-        let mut record = if current {
+        let record = if current {
             existing.clone().unwrap()
         } else {
             let collected = crate::native_restore_source::collect(
@@ -1804,6 +1914,442 @@ impl Manager {
             prepared = Some(collected);
             record
         };
+        self.finish_prepared_restore_record(
+            root,
+            store,
+            workspace_id,
+            record,
+            existing,
+            prepared,
+            repository,
+            provider.config,
+            current,
+            started,
+            access,
+            deadline,
+        )
+        .await
+    }
+    async fn resume_private_ready(
+        &mut self,
+        record: Record,
+        deadline: tokio::time::Instant,
+    ) -> Result<Mounted> {
+        let Origin::Restore { source, .. } = &record.origin else {
+            anyhow::bail!("incomplete private restore requires exact capsule retry");
+        };
+        let binding = source
+            .private_capsule()
+            .context("private resume source missing")?;
+        let repository = self
+            .repositories
+            .get(&record.store)
+            .context("private resume provider unavailable")?
+            .clone();
+        let configured = self
+            .config
+            .native
+            .repositories
+            .get(&record.store)
+            .and_then(|r| r.forge.as_ref())
+            .context("private resume Forge context missing")?;
+        ensure!(
+            binding.account_id == configured.account_id
+                && binding.selection.view == configured.view
+                && configured
+                    .view_version
+                    .as_ref()
+                    .is_some_and(|v| hex(v) == binding.selection.view_version),
+            "private resume configured source differs"
+        );
+        self.open_existing_registry()?;
+        let registered = self.binding(&record)?;
+        let eligible = self
+            .registry
+            .as_ref()
+            .unwrap()
+            .restore_resume_eligibility(&registered, repository.identity)?
+            .context("private restored Ready eligibility missing")?;
+        ensure!(
+            eligible.binding == registered && eligible.source == *source,
+            "private restored source eligibility differs"
+        );
+        let id = hex(&record.workspace_id);
+        let entry = self
+            .entries
+            .get(&id)
+            .context("private resume entry missing")?;
+        ensure!(
+            entry.mount.is_none()
+                || (entry.record.state == Lifecycle::Ready
+                    && entry.startup.is_none()
+                    && entry.command_startup.is_none()),
+            "private restored provider remains startup-gated; stop before retry"
+        );
+        if self.mounted(&id)? {
+            return self.response(&record);
+        }
+        let commands = self
+            .commands
+            .clone()
+            .context("private resume command host missing")?;
+        let access = commands.outer_host_access_until(deadline).await?;
+        let config = jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(self.config.state_dir.join("rbe.sock")),
+            store_alias: record.store.clone(),
+            provider_fingerprint: repository.identity,
+        };
+        let mut started = false;
+        let result = self
+            .finish_prepared_restore_record(
+                record.root.clone(),
+                record.store.clone(),
+                &id,
+                record.clone(),
+                Some(record),
+                None,
+                repository,
+                config,
+                true,
+                &mut started,
+                access,
+                deadline,
+            )
+            .await;
+        if result.is_err() && started {
+            let _ = self.failed(&id);
+        }
+        result
+    }
+    /// Restore only an authenticated owner-private capsule into this configured
+    /// snapshot client. The full source is verified before destination records.
+    pub(crate) async fn restore_private_capsule(
+        &mut self,
+        root: PathBuf,
+        capsule_id: [u8; 32],
+        source: native_broker::ForgeRemoteConfig,
+        trust_digest: Option<[u8; 32]>,
+        pin: crate::forge_client::ProjectionPin,
+    ) -> Result<crate::control::NativeCapsuleRestored> {
+        let root = canonical_candidate(&root)?;
+        let store = "forge".to_owned();
+        let repository = self
+            .repositories
+            .get(&store)
+            .context("Forge provider unavailable")?
+            .clone();
+        ensure!(
+            source.view_version == Some(pin.view_version),
+            "private restore view selection differs"
+        );
+        let commands = self
+            .commands
+            .clone()
+            .context("private restore command host unavailable")?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        let access = commands.outer_host_access_until(deadline).await?;
+        let existing = self
+            .entries
+            .values()
+            .find(|entry| entry.record.root == root)
+            .map(|entry| entry.record.clone());
+        let id = if let Some(record) = &existing {
+            let Origin::Restore { source: saved, .. } = &record.origin else {
+                anyhow::bail!("private restore destination has another origin");
+            };
+            let binding = saved
+                .private_capsule()
+                .context("private restore destination has another source")?;
+            validate_private_binding(binding, &source, &pin)?;
+            ensure!(
+                binding.capsule_id == hex(&capsule_id)
+                    && record.store == store
+                    && record.scope == repository.scope.backend(),
+                "private restore intent differs"
+            );
+            record.workspace_id
+        } else {
+            normalized(&root)?;
+            ensure!(
+                self.entries.len() < self.config.native.workspaces.max_workspaces,
+                "native workspace limit reached"
+            );
+            ensure!(
+                !self
+                    .entries
+                    .values()
+                    .any(|entry| overlaps(&entry.record.root, &root)),
+                "native workspace roots overlap"
+            );
+            if root.try_exists()? {
+                ensure!(
+                    fs::symlink_metadata(&root)?.is_dir() && fs::read_dir(&root)?.next().is_none(),
+                    "private restore destination is not empty"
+                );
+            }
+            let mut id = [0; 32];
+            id[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            id[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            id
+        };
+        let workspace_id = hex(&id);
+        ensure!(
+            !self.retirements.contains_key(&workspace_id),
+            "private restore workspace is retired"
+        );
+        let index_config = jj_native_index::Config {
+            endpoint: jj_native_index::Endpoint::UnixSocket(self.config.state_dir.join("rbe.sock")),
+            store_alias: store.clone(),
+            provider_fingerprint: repository.identity,
+        };
+        if let Some(record) = &existing {
+            let Origin::Restore {
+                source: saved,
+                seed,
+                committed,
+            } = &record.origin
+            else {
+                unreachable!()
+            };
+            self.open_existing_registry()?;
+            let binding = self.binding(record)?;
+            let eligible = self
+                .registry
+                .as_ref()
+                .unwrap()
+                .restore_resume_eligibility(&binding, repository.identity)?;
+            if let Some(eligible) = eligible {
+                ensure!(
+                    eligible.source == *saved && eligible.binding == binding,
+                    "private restore eligibility differs"
+                );
+                let receipt = private_restore_receipt(saved, seed)?;
+                let mapped = saved
+                    .private_review_base()
+                    .context("private restore review base missing")?
+                    .clone();
+                let entry = self
+                    .entries
+                    .get(&workspace_id)
+                    .context("private restore entry missing")?;
+                ensure!(
+                    entry.mount.is_none()
+                        || (entry.record.state == Lifecycle::Ready
+                            && entry.startup.is_none()
+                            && entry.command_startup.is_none()),
+                    "private restored provider remains startup-gated; stop before exact retry"
+                );
+                if self.mounted(&workspace_id)? {
+                    return Ok(crate::control::NativeCapsuleRestored {
+                        mounted: self.response(record)?,
+                        receipt,
+                        base: hex(&mapped.base),
+                        tree: hex(&mapped.tree),
+                    });
+                }
+                let mut started = false;
+                let mounted = self
+                    .finish_prepared_restore_record(
+                        root,
+                        store,
+                        &workspace_id,
+                        record.clone(),
+                        existing.clone(),
+                        None,
+                        repository,
+                        index_config,
+                        true,
+                        &mut started,
+                        access,
+                        deadline,
+                    )
+                    .await;
+                if mounted.is_err() && started {
+                    let _ = self.failed(&workspace_id);
+                }
+                return Ok(crate::control::NativeCapsuleRestored {
+                    mounted: mounted?,
+                    receipt,
+                    base: hex(&mapped.base),
+                    tree: hex(&mapped.tree),
+                });
+            }
+            ensure!(
+                !*committed,
+                "committed private restore has incomplete eligibility; preserve state"
+            );
+            let entry = self
+                .entries
+                .get(&workspace_id)
+                .context("private restore entry unavailable")?;
+            ensure!(
+                entry.mount.is_none() && entry.startup.is_none() && entry.command_startup.is_none(),
+                "private restore remains startup-gated; stop before exact retry"
+            );
+        }
+        // A unique owner-private scratch file is never adopted as source proof.
+        // Failed files are retained, under a finite per-client spool allowance.
+        let spool_dir = PrivateDir::create(self.config.state_dir.join("private-restores"))?;
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for entry in fs::read_dir(spool_dir.path())? {
+            let entry = entry?;
+            count += 1;
+            ensure!(
+                count < 16 && entry.file_type()?.is_file(),
+                "private restore spool limit; preserve existing state"
+            );
+            bytes = bytes
+                .checked_add(entry.metadata()?.len())
+                .context("private restore spool overflow")?;
+        }
+        ensure!(
+            bytes <= 2 * 1024 * 1024 * 1024u64 - 512 * 1024 * 1024,
+            "private restore spool byte limit; preserve existing state"
+        );
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let spool = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(
+                spool_dir
+                    .path()
+                    .join(format!("{}.download", uuid::Uuid::new_v4())),
+            )?;
+        let client = tinytree_client::private_capsule::PrivateCapsuleClient::connect(
+            source.client.clone(),
+            trust_digest,
+        )
+        .await?;
+        let mut limits = native_workspace_admin::restore::RestoreLimits::default();
+        limits.timeout_ms = 300_000;
+        let mut bundle_limits = native_workspace_admin::private_bundle::BundleLimits::default();
+        bundle_limits.max_elapsed_ms = 300_000;
+        let prepared = crate::native_restore_source::collect_private(
+            client,
+            source.account_id.clone(),
+            hex(&capsule_id),
+            spool,
+            native_workspace_admin::restore::PrivateRestoreProvider {
+                store_alias: store.clone(),
+                endpoint: LocalEndpoint::UnixSocket(self.config.state_dir.join("rbe.sock")),
+                provider_identity: repository.identity,
+                objects: repository.local_objects.clone(),
+            },
+            limits,
+            bundle_limits,
+            Arc::new(access.clone()),
+            deadline,
+        )
+        .await?;
+        let identity = prepared.source_identity();
+        let capsule = identity
+            .private_capsule()
+            .context("private restore source tag missing")?;
+        validate_private_binding(capsule, &source, &pin)?;
+        ensure!(
+            capsule.capsule_id == hex(&capsule_id),
+            "private restore capsule differs"
+        );
+        let seed = prepared.projection_seed().clone();
+        let _ = restore_root(&seed)?;
+        let mapped = identity
+            .private_review_base()
+            .context("private restore review base missing")?
+            .clone();
+        if let Some(record) = &existing {
+            let Origin::Restore {
+                source: saved,
+                seed: old,
+                ..
+            } = &record.origin
+            else {
+                unreachable!()
+            };
+            ensure!(
+                *saved == identity && old == &seed,
+                "private restore source changed"
+            );
+        }
+        prepared.revalidate_until(deadline.into_std()).await?;
+        commands.seed_private_backup(
+            prepared
+                .private_bundle()
+                .context("private restore semantic bundle missing")?,
+            capsule,
+        )?;
+        let receipt = private_restore_receipt(&identity, &seed)?;
+        let record = Record {
+            version: 2,
+            workspace_id: id,
+            store: store.clone(),
+            root: root.clone(),
+            origin: Origin::Restore {
+                source: identity,
+                seed,
+                committed: false,
+            },
+            scope: repository.scope.backend().into(),
+            state: Lifecycle::Pending,
+            native_mount: existing.as_ref().and_then(|r| r.native_mount.clone()),
+            creation_plan: None,
+            restore_enrollment: None,
+        };
+        let mut started = false;
+        let mounted = self
+            .finish_prepared_restore_record(
+                root,
+                store,
+                &workspace_id,
+                record,
+                existing,
+                Some(prepared),
+                repository,
+                index_config,
+                false,
+                &mut started,
+                access,
+                deadline,
+            )
+            .await;
+        if mounted.is_err() && started {
+            let _ = self.failed(&workspace_id);
+        }
+        Ok(crate::control::NativeCapsuleRestored {
+            mounted: mounted?,
+            receipt,
+            base: hex(&mapped.base),
+            tree: hex(&mapped.tree),
+        })
+    }
+
+    /// Shared startup-gated installation for authenticated native-cloud and
+    /// complete owner-private Legacy sources. Transport selection precedes this
+    /// method; no source is inferred from a caller-provided hash.
+    async fn finish_prepared_restore_record(
+        &mut self,
+        root: PathBuf,
+        store: String,
+        workspace_id: &str,
+        mut record: Record,
+        existing: Option<Record>,
+        mut prepared: Option<native_workspace_admin::restore::PreparedRestore>,
+        repository: Repository,
+        index_config: jj_native_index::Config,
+        current: bool,
+        started: &mut bool,
+        access: Arc<native_retention::HostAccessGuard>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Mounted> {
+        let id = unhex(workspace_id)?;
+        let settings = self.config.native.workspaces.clone();
+        let commands = self
+            .commands
+            .clone()
+            .context("native restore requires managed command admission")?;
         let root_merge = match &record.origin {
             Origin::Restore { seed, .. } => restore_root(seed)?,
             _ => unreachable!(),
@@ -1934,19 +2480,24 @@ impl Manager {
                 &record.root,
                 &native_source_name(id),
                 mount.tree().identity(),
-            )?;
+            )
+            .context("restore mount proof capture failed")?;
             let entry = self.entries.get_mut(workspace_id).unwrap();
             entry.record.native_mount = Some(proof);
             persist(entry)?;
         }
         if !current && !binding.admin.try_exists()? {
-            let mut intent = registry.begin_restore(
-                &binding,
-                prepared
-                    .as_ref()
-                    .context("native restore source is unavailable")?,
-            )?;
-            intent.prepare_working_copy_directory()?;
+            let mut intent = registry
+                .begin_restore(
+                    &binding,
+                    prepared
+                        .as_ref()
+                        .context("native restore source is unavailable")?,
+                )
+                .context("reserve restore administration failed")?;
+            intent
+                .prepare_working_copy_directory()
+                .context("prepare restore working-copy directory failed")?;
             self.entries.get_mut(workspace_id).unwrap().restore_intent = Some(intent);
         }
         let mut controller_config =
@@ -1954,15 +2505,23 @@ impl Manager {
         controller_config.source_limits = source_limits;
         controller_config.max_file_bytes = settings.max_file_bytes;
         controller_config.max_snapshot_bytes = settings.max_snapshot_bytes;
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=controller_open state=start\n");
-        let controller = Arc::new(
-            Controller::open(mount.clone(), repository.io.clone(), controller_config).await?,
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=controller_open state=start\n",
         );
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=controller_open state=complete\n");
+        let controller = Arc::new(
+            Controller::open(mount.clone(), repository.io.clone(), controller_config)
+                .await
+                .context("open restore controller failed")?,
+        );
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=controller_open state=complete\n",
+        );
         self.entries.get_mut(workspace_id).unwrap().controller = Some(controller.clone());
         let metadata = restore_locator(self.config.state_dir.join("rbe.sock"), store.clone());
         if current {
-            validate_current_restore(&binding, &repository, &controller, &provider.config).await?;
+            validate_current_restore(&binding, &repository, &controller, &index_config, matches!(&record.origin, Origin::Restore { source, .. } if source.private_capsule().is_some())).await?;
             (metadata.1)(&binding.repo.join("store"))?;
             registry.publish_ready(&binding)?;
             let resumed = registry.restored_resume_info(&root, repository.identity)?;
@@ -1984,7 +2543,10 @@ impl Manager {
                 .restore_intent
                 .take()
             {
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=initialize_stage state=start\n");
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    b"native_restore phase=initialize_stage state=start\n",
+                );
                 let receipt = native_workspace_admin::restore::initialize_restored(
                     intent,
                     restore,
@@ -2000,8 +2562,12 @@ impl Manager {
                         backend_metadata: metadata.0.clone(),
                     },
                 )
-                .await?;
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=initialize_stage state=complete\n");
+                .await
+                .context("initialize restore stage failed")?;
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    b"native_restore phase=initialize_stage state=complete\n",
+                );
                 receipt
             } else {
                 native_workspace_admin::restore::reopen_staged_restore(
@@ -2029,7 +2595,10 @@ impl Manager {
                 .restore_receipt
                 .take()
                 .unwrap();
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=finalize_stage state=start\n");
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"native_restore phase=finalize_stage state=start\n",
+            );
             let ready = native_workspace_admin::restore::finalize_staged_restore(
                 receipt,
                 native_workspace_admin::restore::RestoreReadbackHost {
@@ -2043,8 +2612,12 @@ impl Manager {
                     backend_metadata_check: metadata.1.clone(),
                 },
             )
-            .await?;
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=finalize_stage state=complete\n");
+            .await
+            .context("finalize restore stage failed")?;
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"native_restore phase=finalize_stage state=complete\n",
+            );
             let Origin::Restore { source, .. } = &record.origin else {
                 unreachable!()
             };
@@ -2065,7 +2638,8 @@ impl Manager {
                 registry: registry.clone(),
                 binding: binding.clone(),
                 local: repository.local_objects.clone(),
-                index: provider.config,
+                native: repository.io.clone(),
+                index: index_config,
                 remote_scope: native_workspace_admin::remote_state::RemoteScope::new(
                     self.config.state_dir.join("rbe.sock"),
                     store,
@@ -2089,7 +2663,10 @@ impl Manager {
             .take()
             .context("native restore command reservation missing")?
             .validate_for_activation(&commands, &binding, repository.identity)?;
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=activation state=start\n");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=activation state=start\n",
+        );
         entry
             .startup
             .as_mut()
@@ -2100,7 +2677,10 @@ impl Manager {
         // Only infallible owner movement and best-effort diagnostics follow
         // opening. The active mount remains owned by the Entry/controller.
         entry.startup.take();
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"native_restore phase=activation state=complete\n");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"native_restore phase=activation state=complete\n",
+        );
         Ok(Mounted {
             binding,
             registry_path: registry.path().to_owned(),
@@ -2798,7 +3378,10 @@ fn cloud_intent_transition(old: &CloudRestoreIntent, new: &CloudRestoreIntent) -
     Ok(())
 }
 fn validate_cloud_record(intent: &CloudRestoreIntent, record: &Record) -> Result<()> {
-    ensure!(intent.selection_pending.is_none(), "pending cloud selection cannot authorize workspace state");
+    ensure!(
+        intent.selection_pending.is_none(),
+        "pending cloud selection cannot authorize workspace state"
+    );
     let Origin::Restore { source, .. } = &record.origin else {
         anyhow::bail!("cloud restore reservation conflicts with workspace origin");
     };
@@ -3189,7 +3772,8 @@ fn restore_locator(
     Arc<native_workspace_admin::restore::BackendMetadataWriter>,
 ) {
     let expected = RestoreLocator {
-        version: 1,
+        // Restored history may contain Forge rewrite semantics.
+        version: 3,
         socket,
         store,
     };
@@ -3223,7 +3807,7 @@ fn restore_locator(
         let bytes = directory.read_descendant("store/native-broker.toml", 16 * 1024)?;
         let actual: RestoreLocator = toml::from_str(std::str::from_utf8(&bytes)?)?;
         ensure!(
-            matches!(actual.version, 1 | 2)
+            matches!(actual.version, 1 | 2 | 3)
                 && actual.socket == expected.socket
                 && actual.store == expected.store,
             "restored backend locator differs from current configuration"
@@ -3233,11 +3817,49 @@ fn restore_locator(
     });
     (writer, checker)
 }
+fn validate_private_binding(
+    binding: &tinytree_client::private_capsule::CapsuleBinding,
+    source: &native_broker::ForgeRemoteConfig,
+    pin: &crate::forge_client::ProjectionPin,
+) -> Result<()> {
+    binding.validate()?;
+    ensure!(
+        binding.account_id == source.account_id
+            && binding.selection.view == source.view
+            && binding.selection.view_version == hex(&pin.view_version)
+            && binding.selection.policy_epoch == pin.policy_epoch
+            && binding.selection.projected_commit == hex(&pin.projected_commit)
+            && binding.selection.projected_tree == hex(&pin.projected_tree),
+        "private capsule differs from exact configured Forge projection"
+    );
+    Ok(())
+}
+fn private_restore_receipt(
+    source: &native_workspace_admin::restore::RestoreSourceIdentity,
+    seed: &tinytree_cloud::PortableWorkingCopy,
+) -> Result<native_vfs_rpc::PrivateBackupReceipt> {
+    let capsule = source
+        .private_capsule()
+        .context("private source capsule tag missing")?;
+    let receipt = native_vfs_rpc::PrivateBackupReceipt {
+        schema: 1,
+        capsule_id: capsule.capsule_id.clone(),
+        workspace_id: capsule.workspace_id.clone(),
+        generation: capsule.generation,
+        bytes: capsule.descriptor.total_bytes,
+        chain_root: capsule.descriptor.chain_root.clone(),
+        snapshot_commit: hex(&seed.snapshot_commit),
+        snapshot_operation: seed.snapshot_operation.clone(),
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
 async fn validate_current_restore(
     binding: &Binding,
     repository: &Repository,
     controller: &Arc<Controller>,
     config: &jj_native_index::Config,
+    private_legacy: bool,
 ) -> Result<()> {
     use jj_vfs::native::ProjectionConnector as _;
     ensure!(
@@ -3301,6 +3923,26 @@ async fn validate_current_restore(
                     || view.wc_commit_ids.contains_key(&workspace),
                 "native current operation has no selected workspace"
             );
+            if private_legacy {
+                use jj_lib::default_index::{DefaultIndexGcLimits, DefaultIndexStore};
+                use jj_lib::index::IndexStore as _;
+                ensure!(
+                    fs::read(path.join("index/type"))? == DefaultIndexStore::NAME.as_bytes(),
+                    "private current index type differs"
+                );
+                let roots = ids
+                    .iter()
+                    .map(|id| jj_lib::op_store::OperationId::from_bytes(id))
+                    .collect::<Vec<_>>();
+                DefaultIndexStore::load(&path.join("index")).gc_roots_readonly(
+                    &roots,
+                    &jj_lib::op_store::OperationId::from_bytes(&[0; 64]),
+                    &jj_lib::backend::CommitId::from_bytes(&m::CommitId::ROOT.0),
+                    16,
+                    DefaultIndexGcLimits::default(),
+                )?;
+                return Ok(());
+            }
             let limits = jj_native_index::Limits::default();
             let reserved = jj_native_index::LocalIndexExportReader::required_read_bytes(&limits)?;
             ensure!(
@@ -3611,6 +4253,12 @@ mod tests {
             store.join("native-broker.toml"),
             toml::to_string(&upgraded)?,
         )?;
+        check(&store)?;
+        upgraded.version = 4;
+        fs::write(
+            store.join("native-broker.toml"),
+            toml::to_string(&upgraded)?,
+        )?;
         assert!(check(&store).is_err());
         upgraded.version = 2;
         fs::write(
@@ -3625,36 +4273,92 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn pre_registry_cloud_intent_preserves_legacy_identity_without_adopting_per_id_state() -> Result<()> {
+    fn pre_registry_cloud_intent_preserves_legacy_identity_without_adopting_per_id_state()
+    -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let state = PrivateDir::create(temporary.path().join("state"))?;
         let native = PrivateDir::create(state.path().join("native"))?;
         PrivateDir::create(native.path().join("example"))?;
-        let mut config = Config::default(); config.state_dir = state.path().to_owned();
+        let mut config = Config::default();
+        config.state_dir = state.path().to_owned();
         config.native.workspaces.registry_path = Some(temporary.path().join("absent-registry"));
         let mut repository = crate::config::NativeRepository::default();
         repository.remote = Some(Default::default());
         repository.remote.as_mut().unwrap().query.max_replays = 256;
-        config.native.repositories.insert("example".into(),repository);
-        let old = crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None)?["example"];
-        let intent = CloudRestoreIntent { pin: None, selection_pending: None, pin_confirmed: false, version:1,root:temporary.path().join("restored"),store:"example".into(),
-            workspace_id:[7;32],provider_identity:old,requested_policy:None,
-            source:crate::control::NativeRestoreSelection {workspace_id:[1;32],generation:1,
-                manifest_id:[2;32],manifest_blake3:[3;32],manifest_size_bytes:256} };
+        config
+            .native
+            .repositories
+            .insert("example".into(), repository);
+        let old = crate::provider_identity::resolve(
+            &config,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )?["example"];
+        let intent = CloudRestoreIntent {
+            pin: None,
+            selection_pending: None,
+            pin_confirmed: false,
+            version: 1,
+            root: temporary.path().join("restored"),
+            store: "example".into(),
+            workspace_id: [7; 32],
+            provider_identity: old,
+            requested_policy: None,
+            source: crate::control::NativeRestoreSelection {
+                workspace_id: [1; 32],
+                generation: 1,
+                manifest_id: [2; 32],
+                manifest_blake3: [3; 32],
+                manifest_size_bytes: 256,
+            },
+        };
         let intents = PrivateDir::create(state.path().join("native-cloud-restores"))?;
-        persist_cloud_intent(&intents,&intent)?;
-        let name = format!("{}.json",cloud_intent_key(&intent.root)?);
-        let before = intents.read(&name,MAX_RECORD)?;
-        config.native.repositories.get_mut("example").unwrap().remote.as_mut().unwrap().query.max_replays = 4096;
-        assert_eq!(crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None)?["example"],old);
-        assert_eq!(intents.read(&name,MAX_RECORD)?,before);
-        assert_eq!(config.native.repositories["example"].remote.as_ref().unwrap().query.max_replays,4096);
-        assert!(!intent.root.exists()); assert!(!config.native.workspaces.registry_path.as_ref().unwrap().exists());
+        persist_cloud_intent(&intents, &intent)?;
+        let name = format!("{}.json", cloud_intent_key(&intent.root)?);
+        let before = intents.read(&name, MAX_RECORD)?;
+        config
+            .native
+            .repositories
+            .get_mut("example")
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .query
+            .max_replays = 4096;
+        assert_eq!(
+            crate::provider_identity::resolve(&config, &BTreeMap::new(), &BTreeMap::new(), None)?["example"],
+            old
+        );
+        assert_eq!(intents.read(&name, MAX_RECORD)?, before);
+        assert_eq!(
+            config.native.repositories["example"]
+                .remote
+                .as_ref()
+                .unwrap()
+                .query
+                .max_replays,
+            4096
+        );
+        assert!(!intent.root.exists());
+        assert!(
+            !config
+                .native
+                .workspaces
+                .registry_path
+                .as_ref()
+                .unwrap()
+                .exists()
+        );
         let workspaces = PrivateDir::create(state.path().join("native-workspaces"))?;
         PrivateDir::create(workspaces.path().join(hex(&intent.workspace_id)))?;
-        assert!(crate::provider_identity::resolve(&config,&BTreeMap::new(),&BTreeMap::new(),None).is_err(),
-            "an intent cannot excuse unaccounted per-ID state when its registry is missing");
-        assert_eq!(intents.read(&name,MAX_RECORD)?,before);
+        assert!(
+            crate::provider_identity::resolve(&config, &BTreeMap::new(), &BTreeMap::new(), None)
+                .is_err(),
+            "an intent cannot excuse unaccounted per-ID state when its registry is missing"
+        );
+        assert_eq!(intents.read(&name, MAX_RECORD)?, before);
         Ok(())
     }
     struct NoRemoteContent;
@@ -3837,7 +4541,9 @@ mod tests {
             manifest_size_bytes: 256,
         };
         let mut intent = CloudRestoreIntent {
-            pin: None, selection_pending: None, pin_confirmed: false,
+            pin: None,
+            selection_pending: None,
+            pin_confirmed: false,
             requested_policy: None,
             version: 1,
             root: root.clone(),
@@ -4639,8 +5345,8 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn failed_candidate_before_admission_can_stop_and_retire_without_relaxing_unknown_writers(
-    ) -> Result<()> {
+    async fn failed_candidate_before_admission_can_stop_and_retire_without_relaxing_unknown_writers()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let state = PrivateDir::create(directory.path().join("state"))?;
         let objects = PrivateDir::create(directory.path().join("objects"))?;
@@ -4707,10 +5413,12 @@ mod tests {
             "specific pending cleanup must not weaken global unknown-writer policy"
         );
         fs::write(root.join("keep"), b"foreign source state")?;
-        assert!(manager
-            .retire_candidate(&id, &hex(&[93; 32]))
-            .await
-            .is_err());
+        assert!(
+            manager
+                .retire_candidate(&id, &hex(&[93; 32]))
+                .await
+                .is_err()
+        );
         let result = manager.retire_candidate(&id, &commit).await?;
         assert_eq!(result["retired"], true);
         assert_eq!(result["root_removed"], false);
@@ -4720,10 +5428,12 @@ mod tests {
         assert_eq!(manager.retire_candidate(&id, &commit).await?, result);
         drop(manager);
         let mut reopened = Manager::open(config, cache, providers)?.with_commands(commands)?;
-        assert!(reopened
-            .create_candidate(root, "example".into(), commit.clone(), id.clone())
-            .await
-            .is_err());
+        assert!(
+            reopened
+                .create_candidate(root, "example".into(), commit.clone(), id.clone())
+                .await
+                .is_err()
+        );
         assert_eq!(reopened.retire_candidate(&id, &commit).await?, result);
         Ok(())
     }

@@ -23,6 +23,8 @@ mod native_commands;
 mod native_capture;
 #[cfg(unix)]
 mod native_gc;
+#[cfg(unix)]
+mod native_private_capture;
 
 #[cfg(unix)]
 mod native_capture_upload;

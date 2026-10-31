@@ -18,7 +18,7 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const hex = value => Buffer.from(value).toString('hex');
 const PAGE_LIMIT = 16 * 1024 * 1024 + 65536;
 let context, localRoot, target, targetConfiguration, targetOrigin, sourceRelay, targetRelay;
-let sourceClient, targetClient, workspace, descriptor, complete = false, cleaned = false;
+let sourceClient, targetClient, workspace, descriptor, wipClient, wipWorkspace, wipDescriptor, firstWip, secondWip, complete = false, cleaned = false;
 const fault = { export: true, restore: true };
 const events = [], physicalEvidence = [];
 const grants = token => JSON.stringify([{ principal: 'archive-target', token_sha256: sha(token), accounts: ['forge-check'], export: false, restore: true }]);
@@ -157,6 +157,31 @@ const workflow = {
     context = value; localRoot = await mkdtemp('/tmp/tfa.');
     if (process.env.TT_CHECKER_ACCEPT_ARTIFACTS_DIR) assert.equal(typeof context.artifacts, 'string', 'configured evidence directory must reach archive workflow');
     const directory = path.join(localRoot, 'archive');
+    // Exercise the actual supported Legacy client, not an opaque byte fixture.
+    const prior = (await context.invoke(2)).value;
+    await context.invoke(4, { spec: { ...context.source.spec, revision: prior.main_revision, export_allowed: true },
+      expected_epoch: prior.policy_epoch, make_default: true, follow_main: true }, 'archive-enable-private-capture');
+    wipClient = await client('wip-source', context.origin, exportToken);
+    wipWorkspace = path.join(wipClient.cwd, 'work');
+    const enrolled = await command(wipClient, ['work', wipWorkspace]); wipDescriptor = enrolled.result.client_descriptor;
+    assert.ok(await mounted(wipWorkspace));
+    await writeFile(path.join(wipWorkspace, 'src/source.txt'), 'unpublished private source before rename\n');
+    await raw(wipClient, ['move', 'src/source.txt', 'src/renamed.txt'], { cwd: wipWorkspace });
+    await rm(path.join(wipWorkspace, 'readme-link'));
+    await writeFile(path.join(wipWorkspace, 'private-wip-added.txt'), 'private addition never pushed before backup\n');
+    // Do NOT run status/describe before backup: backup itself must snapshot this.
+    await writeFile(path.join(wipWorkspace, 'dirty-before-backup.txt'), 'unsnapshotted private backup input\n');
+    const backed = await command(wipClient, ['backup'], { cwd: wipWorkspace });
+    assert.equal(backed.state, 'complete'); firstWip = backed.result;
+    assert.match(firstWip.capsule_id, /^[0-9a-f]{64}$/); assert.equal(firstWip.generation, 1);
+    assert.equal(await raw(wipClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: wipWorkspace }), firstWip.snapshot_commit);
+    assert.equal(await raw(wipClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: wipWorkspace }), firstWip.snapshot_operation);
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-backup.json'), JSON.stringify(firstWip, null, 2), { mode: 0o600 });
+    await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
+    await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipDescriptor = undefined;
+    assert.equal(await mounted(wipWorkspace), false);
+    await rm(wipClient.home, { recursive: true, force: true });
+    // Source descriptor, private object pool, OP store, CAS and config are gone.
     const acknowledged = (await context.invoke(2)).value;
     const positive = context.evidence.find(item => item.label === 'positive'); assert.ok(positive);
     const selector = { change_id: context.source.reviews[0].change_id, patchset_id: context.source.reviews[0].patchset_id, candidate_id: positive.candidate.id };
@@ -185,17 +210,19 @@ const workflow = {
     for (const table of ['review_landings', 'review_decisions', 'check_leases', 'forge_view_versions', 'closure_jobs', 'forge_storage_attempts', 'gc_jobs']) {
       assert.ok(manifest.tables.some(item => item.name === table), `compiled metadata inventory must include ${table}`);
     }
-    let boundary = false;
+    let boundary = false, privatePayload = false;
     for (let sequence = 0; sequence < manifest.page_count; sequence++) {
       const page = await privateJson(pageFile(directory, sequence)); assert.equal(page.sequence, sequence);
       const encoded = JSON.stringify(page);
       for (const secret of [exportToken, otherExportToken, restoreToken, context.token]) assert.ok(!encoded.includes(secret), 'archive must never contain bearer values');
       assert.equal(page.archive_id, archiveId); assert.equal(page.build_id, manifest.build_id);
+      if (page.content.kind === 'private_payload' && page.content.presence === 'present' && page.content.bytes_hex?.length) privatePayload = true;
       if (page.content.kind === 'payload' && page.content.size === 1048576 && page.content.presence === 'present') {
         assert.equal(page.content.bytes_hex, Buffer.alloc(1048576, 'K').toString('hex')); boundary = true;
       }
     }
     assert.ok(boundary, 'archive must contain the real 1MiB source payload');
+    assert.ok(privatePayload, 'whole-account archive must contain actual native WIP capsule bytes');
     assert.deepEqual((await context.invoke(2)).value, acknowledged);
     targetConfiguration = { ...context.configuration, port: 0, durableObjectsPersist: path.join(localRoot, 'target-do'),
       r2Persist: path.join(localRoot, 'target-r2'), bindings: { ...context.configuration.bindings, ARCHIVERS_JSON: grants(restoreToken) } };
@@ -248,7 +275,15 @@ const workflow = {
     } finally { await occupied.dispose(); }
     await select(targetClient, targetOrigin);
     workspace = path.join(targetClient.cwd, 'work');
-    const work = await command(targetClient, ['work', workspace]); descriptor = work.result.client_descriptor;
+    const work = await command(targetClient, ['work', workspace, '--capsule', firstWip.capsule_id]); descriptor = work.result.client_descriptor;
+    assert.equal(work.state, 'ready'); assert.deepEqual(work.result.receipt, firstWip);
+    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), firstWip.snapshot_commit);
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), firstWip.snapshot_operation);
+    assert.equal(await readFile(path.join(workspace, 'src/renamed.txt'), 'utf8'), 'unpublished private source before rename\n');
+    await assert.rejects(lstat(path.join(workspace, 'src/source.txt')), error => error.code === 'ENOENT');
+    await assert.rejects(lstat(path.join(workspace, 'readme-link')), error => error.code === 'ENOENT');
+    assert.equal(await readFile(path.join(workspace, 'private-wip-added.txt'), 'utf8'), 'private addition never pushed before backup\n');
+    assert.equal(await readFile(path.join(workspace, 'dirty-before-backup.txt'), 'utf8'), 'unsnapshotted private backup input\n');
     assert.ok(await mounted(workspace)); assert.equal(typeof descriptor, 'string');
     assert.deepEqual(await readFile(path.join(workspace, 'boundary.bin')), Buffer.alloc(1048576, 'K'));
     await writeFile(path.join(workspace, 'restored-receipt.txt'), 'genuine checked work after full account restore\n');
@@ -278,16 +313,47 @@ const workflow = {
     assert.equal((await forgeCall(targetOrigin, 2)).value.main_generation, acknowledged.main_generation + 1);
     const reconciled = await command(targetClient, ['request', 'reconcile', 'restored-source'], { cwd: workspace });
     assert.equal(reconciled.result.value.local_reconciliation, 'applied');
+    // Capture again after a real Land/reconcile: the mapped review base differs
+    // from the original enrolled snapshot and must survive another fresh client.
+    await writeFile(path.join(workspace, 'after-land-private.txt'), 'post-land unpublished backup input\n');
+    const nextBackup = await command(targetClient, ['backup'], { cwd: workspace });
+    assert.equal(nextBackup.state, 'complete'); secondWip = nextBackup.result;
+    assert.equal(secondWip.workspace_id, firstWip.workspace_id); assert.equal(secondWip.generation, firstWip.generation + 1);
+    const sourceScope = (await command(targetClient, ['status'], { cwd: workspace })).result.workspace;
+    await raw(targetClient, ['tinytree', 'unmount', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined;
+    const finalClient = await client('post-land-target', targetOrigin, restoreToken);
+    const finalWorkspace = path.join(finalClient.cwd, 'work');
+    const final = await command(finalClient, ['work', finalWorkspace, '--capsule', secondWip.capsule_id]);
+    targetClient = finalClient; workspace = finalWorkspace; descriptor = final.result.client_descriptor;
+    assert.equal(final.state, 'ready'); assert.deepEqual(final.result.receipt, secondWip);
+    assert.equal(final.result.base, sourceScope.base, 'post-Land mapped review base is not reset to enrollment');
+    assert.equal(await raw(targetClient, ['log', '--no-graph', '-r', '@', '-T', 'commit_id'], { cwd: workspace }), secondWip.snapshot_commit);
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), secondWip.snapshot_operation);
+    assert.equal(await readFile(path.join(workspace, 'after-land-private.txt'), 'utf8'), 'post-land unpublished backup input\n');
+    await writeFile(path.join(workspace, 'after-restore-private.txt'), 'new work must survive normal restored resume\n');
+    await raw(targetClient, ['status'], { cwd: workspace });
+    const currentOp = await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace });
+    await raw(targetClient, ['tinytree', 'unmount', workspace]);
+    await raw(targetClient, ['__forge_client_stop', descriptor]);
+    await raw(targetClient, ['tinytree', 'resume', workspace]);
+    assert.ok(await mounted(workspace));
+    assert.equal(await raw(targetClient, ['op', 'log', '--no-graph', '-n', '1', '-T', 'id'], { cwd: workspace }), currentOp, 'normal restored resume does not replay original backup over subsequent WIP');
+    assert.equal(await readFile(path.join(workspace, 'after-restore-private.txt'), 'utf8'), 'new work must survive normal restored resume\n');
+    if (context.artifacts) await writeFile(path.join(context.artifacts, 'native-wip-recovery.json'), JSON.stringify({ first: firstWip, second: secondWip, resumed_operation: currentOp, full_account_archive_contains_private_bytes: privatePayload }, null, 2), { mode: 0o600 });
     await this.cleanup({ success: true }); complete = true;
     return { production_worker: true, actual_sqlite_r2: true, source_archive_id: archiveId, build_id: manifest.build_id,
       page_count: manifest.page_count, chain_root: manifest.chain_root, source_replay_preserved: true,
       export_page_ack_reconciled: true, restore_page_ack_reconciled: true, fresh_namespace_restore: true,
+      native_private_wip: { genuine_dirty_snapshot: true, complete_native_capsule: true, source_client_state_removed: true, fresh_service_archive_restore: true, exact_operation_and_wc_restored: true, added_removed_renamed_bytes_restored: true, subsequent_real_check_land: true, post_land_review_base_and_generation_preserved: true, normal_resume_preserves_new_wip: true, first_capsule: firstWip, second_capsule: secondWip },
       subsequent_actual_bazel_passed: true, exact_candidate: review.candidate.id, subsequent_checked_landing: true, physical_checks: physicalEvidence,
       tamper_and_missing_page_rejected: true, existing_target_preserved: true, legacy_orphan_target_rejected: true, incomplete_restore_fenced: true,
       owned_cleanup: true, deployed_recovery_proof: false };
   },
   async cleanup({ success = false } = {}) {
     if (cleaned) return;
+    if (wipWorkspace && await mounted(wipWorkspace)) await raw(wipClient, ['tinytree', 'unmount', wipWorkspace]);
+    if (wipDescriptor) { await raw(wipClient, ['__forge_client_stop', wipDescriptor]); wipDescriptor = undefined; }
     if (workspace && await mounted(workspace)) await raw(targetClient, ['tinytree', 'unmount', workspace]);
     if (descriptor) { await raw(targetClient, ['__forge_client_stop', descriptor]); descriptor = undefined; }
     if (workspace) assert.equal(await mounted(workspace), false);

@@ -552,9 +552,20 @@ impl PrivateCapsuleClient {
         input: CapsuleCall,
         expected: Option<&CapsuleBinding>,
     ) -> Result<CapsuleReply, Status> {
+        self.call_until(input, expected, Instant::now() + self.timeout)
+            .await
+    }
+    /// Bound a multi-chunk workflow by one inherited absolute deadline. The
+    /// configured per-operation timeout may shorten, never extend that budget.
+    pub async fn call_until(
+        &self,
+        input: CapsuleCall,
+        expected: Option<&CapsuleBinding>,
+        deadline: Instant,
+    ) -> Result<CapsuleReply, Status> {
         let client = self.clone();
         let expected = expected.cloned();
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline.min(Instant::now() + self.timeout);
         let job = tokio::spawn(async move {
             tokio::time::timeout_at(deadline, async {
                 let _permit = client

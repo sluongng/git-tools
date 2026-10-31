@@ -439,6 +439,27 @@ impl p::projection_server::Projection for ProjectionService {
                 let _lease = self.lease(&mount).await?;
                 CommandReply::Began(host.begin(&mount, replay, preparation).await?)
             }
+            CommandRequest::SelectPrivateBackup {
+                version: 1,
+                mount,
+                token,
+            } => {
+                let _lease = self.lease(&mount).await?;
+                host.select_private_backup(&mount, token).await?;
+                CommandReply::SelectedPrivateBackup
+            }
+            CommandRequest::FinishPrivateBackup {
+                version: 1,
+                mount,
+                token,
+            } => {
+                let _lease = self.lease(&mount).await?;
+                let receipt = host.finish_private_backup(&mount, token).await?;
+                receipt
+                    .validate()
+                    .map_err(|_| Status::internal("invalid private backup receipt"))?;
+                CommandReply::PrivateBackup(receipt)
+            }
             CommandRequest::FinishDirty {
                 version: 1,
                 mount,

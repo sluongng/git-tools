@@ -6,7 +6,9 @@ use native_retention::{
     CommandJobGuard, CommandOwner, CommandToken, OpStoreId, Registration, Registry, RegistryId,
     Tracking, WorkspaceId,
 };
-use native_vfs_rpc::{CommandHost, CommandJob, CommandPreparation, CommandStarted};
+use native_vfs_rpc::{
+    CommandHost, CommandJob, CommandPreparation, CommandStarted, PrivateBackupReceipt,
+};
 use native_workspace_admin::Binding;
 use private_fs::PrivateDir;
 use serde::{Deserialize, Serialize};
@@ -15,8 +17,8 @@ use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tonic::Status;
@@ -54,6 +56,7 @@ struct Workspace {
     lease: PathBuf,
     lease_identity: (u64, u64),
     closed: Mutex<Option<[u8; 32]>>,
+    closed_private: Mutex<Option<([u8; 32], std::result::Result<PrivateBackupReceipt, Status>)>>,
     capture: Mutex<Option<Arc<crate::native_capture::Target>>>,
     pending: Mutex<Option<([u8; 32], CommandPreparation)>>,
     binding: Binding,
@@ -74,6 +77,9 @@ struct Session {
     released: AtomicBool,
     drained: AtomicBool,
     drain_started: AtomicBool,
+    private_selected: Mutex<bool>,
+    backup_capture_done: AtomicBool,
+    backup_receipt: Mutex<Option<PrivateBackupReceipt>>,
     changed: tokio::sync::Notify,
     failure: Mutex<Option<Status>>,
 }
@@ -87,6 +93,7 @@ struct Inner {
     sessions: Mutex<HashMap<[u8; 32], Arc<Session>>>,
     starts: tokio::sync::Mutex<()>,
     upload_status: std::sync::OnceLock<Arc<crate::native_capture_upload::Stats>>,
+    private_backup: std::sync::OnceLock<Arc<crate::native_private_capture::Context>>,
     dirty_transitions: AtomicU64,
     dirty_transition_ns: AtomicU64,
     drains: AtomicU64,
@@ -324,6 +331,7 @@ impl NativeCommandHost {
                 sessions: Default::default(),
                 starts: Default::default(),
                 upload_status: Default::default(),
+                private_backup: Default::default(),
                 dirty_transitions: AtomicU64::new(0),
                 dirty_transition_ns: AtomicU64::new(0),
                 drains: AtomicU64::new(0),
@@ -548,6 +556,7 @@ impl NativeCommandHost {
             lease,
             lease_identity,
             closed: Mutex::new(None),
+            closed_private: Mutex::new(None),
             capture: Mutex::new(None),
             pending: Mutex::new(None),
             binding: binding.clone(),
@@ -839,6 +848,9 @@ impl NativeCommandHost {
             released: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             drain_started: AtomicBool::new(false),
+            private_selected: Mutex::new(false),
+            backup_capture_done: AtomicBool::new(false),
+            backup_receipt: Mutex::new(None),
             changed: tokio::sync::Notify::new(),
             failure: Mutex::new(None),
         });
@@ -889,10 +901,132 @@ impl NativeCommandHost {
             changed.await;
         }
     }
-    fn start_drain(&self, session: Arc<Session>) {
-        if session.drain_started.swap(true, Ordering::AcqRel) {
-            return;
+    pub(crate) fn configure_private_backup(
+        &self,
+        context: Arc<crate::native_private_capture::Context>,
+    ) -> Result<()> {
+        self.inner
+            .private_backup
+            .set(context)
+            .map_err(|_| anyhow::anyhow!("private backup is already configured"))
+    }
+    pub(crate) fn seed_private_backup(
+        &self,
+        source: &native_workspace_admin::private_bundle::VerifiedPrivateBundle,
+        binding: &tinytree_client::private_capsule::CapsuleBinding,
+    ) -> Result<()> {
+        self.inner
+            .private_backup
+            .get()
+            .context("private backup context unavailable")?
+            .seed_restored(source, binding)
+    }
+    async fn select_private(
+        &self,
+        mount: &str,
+        token: [u8; 32],
+    ) -> std::result::Result<(), Status> {
+        if self.inner.private_backup.get().is_none() {
+            return Err(Status::unimplemented(
+                "private backup is unsupported by this host",
+            ));
         }
+        let session = self.session(token)?;
+        if session.workspace.mapping.mount != mount {
+            return Err(Status::permission_denied(
+                "native command workspace mismatch",
+            ));
+        }
+        let mut selected = session
+            .private_selected
+            .lock()
+            .map_err(|_| Status::internal("command mode unavailable"))?;
+        if *selected {
+            return Ok(());
+        }
+        if session.drain_started.load(Ordering::Acquire) || session.released.load(Ordering::Acquire)
+        {
+            return Err(Status::failed_precondition(
+                "private backup selection requires the active writer lease",
+            ));
+        }
+        match session.probe.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = FileExt::unlock(&session.probe);
+                return Err(Status::failed_precondition(
+                    "private backup selection requires the active writer lease",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                return Err(Status::failed_precondition(
+                    "private backup writer lease unavailable",
+                ));
+            }
+        }
+        *selected = true;
+        Ok(())
+    }
+    async fn finish_private(
+        &self,
+        mount: &str,
+        token: [u8; 32],
+    ) -> std::result::Result<PrivateBackupReceipt, Status> {
+        if self.inner.private_backup.get().is_none() {
+            return Err(Status::unimplemented(
+                "private backup is unsupported by this host",
+            ));
+        }
+        let workspace = self.workspace(mount)?;
+        if let Some((old, result)) = &*workspace
+            .closed_private
+            .lock()
+            .map_err(|_| Status::internal("command result unavailable"))?
+        {
+            if *old == token {
+                return result.clone();
+            }
+        }
+        let session = match self.session(token) {
+            Ok(session) => session,
+            Err(error) => {
+                return workspace
+                    .closed_private
+                    .lock()
+                    .map_err(|_| Status::internal("command result unavailable"))?
+                    .as_ref()
+                    .filter(|(old, _)| *old == token)
+                    .map(|(_, result)| result.clone())
+                    .unwrap_or(Err(error));
+            }
+        };
+        if !*session
+            .private_selected
+            .lock()
+            .map_err(|_| Status::internal("command mode unavailable"))?
+        {
+            return Err(Status::failed_precondition(
+                "private backup mode was not selected",
+            ));
+        }
+        self.finish_job(mount, token).await?;
+        session
+            .backup_receipt
+            .lock()
+            .map_err(|_| Status::internal("private backup result unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("private backup is not acknowledged"))
+    }
+    fn start_drain(&self, session: Arc<Session>) {
+        let private = match session.private_selected.lock() {
+            Ok(selected) => {
+                if session.drain_started.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                *selected
+            }
+            Err(_) => return,
+        };
         // Policy/target are frozen before either sealing operation. Staging
         // admission waits inside the host-owned drain, bounded by the original
         // deadline and MAX_ACTIVE sessions, never by a detached user waiter.
@@ -910,13 +1044,21 @@ impl NativeCommandHost {
         } else {
             None
         };
-        let capture_deadline = tokio::time::Instant::now() + self.inner.capture.timeout();
+        let capture_deadline = tokio::time::Instant::now()
+            + if private {
+                std::time::Duration::from_secs(300)
+            } else {
+                self.inner.capture.timeout()
+            };
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(self.inner.gc.config.timeout_ms);
         let host = self.clone();
         tokio::spawn(async move {
             let drain_started = std::time::Instant::now();
-            let result = if let Some((target, permit)) = clean {
+            let result = if private {
+                host.private_session(&session, target, capture_deadline)
+                    .await
+            } else if let Some((target, permit)) = clean {
                 host.checkpoint_session(&session, target, permit, deadline)
                     .await
             } else {
@@ -952,6 +1094,15 @@ impl NativeCommandHost {
                     if let Ok(mut closed) = session.workspace.closed.lock() {
                         *closed = Some(session.token);
                     }
+                    if private {
+                        if let Ok(receipt) = session.backup_receipt.lock() {
+                            if let Some(receipt) = receipt.clone() {
+                                if let Ok(mut closed) = session.workspace.closed_private.lock() {
+                                    *closed = Some((session.token, Ok(receipt)));
+                                }
+                            }
+                        }
+                    }
                     if let Ok(mut owner) = session.owner.lock() {
                         owner.take();
                     }
@@ -961,6 +1112,17 @@ impl NativeCommandHost {
                     session.drained.store(true, Ordering::Release);
                 }
                 Err(error) => {
+                    if private && session.backup_capture_done.load(Ordering::Acquire) {
+                        if let Ok(mut closed) = session.workspace.closed_private.lock() {
+                            *closed = Some((session.token, Err(error.clone())));
+                        }
+                        if let Ok(mut owner) = session.owner.lock() {
+                            owner.take();
+                        }
+                        if let Ok(mut entries) = host.inner.sessions.lock() {
+                            entries.remove(&session.token);
+                        }
+                    }
                     if let Ok(mut failure) = session.failure.lock() {
                         *failure = Some(error);
                     }
@@ -968,6 +1130,92 @@ impl NativeCommandHost {
             }
             session.changed.notify_waiters();
         });
+    }
+    async fn private_session(
+        &self,
+        session: &Arc<Session>,
+        target: Option<Arc<crate::native_capture::Target>>,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), Status> {
+        let context =
+            self.inner.private_backup.get().cloned().ok_or_else(|| {
+                Status::unimplemented("private backup is unsupported by this host")
+            })?;
+        let target = target
+            .ok_or_else(|| Status::failed_precondition("private backup target unavailable"))?;
+        let command = session
+            .owner
+            .lock()
+            .map_err(|_| Status::internal("command owner unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("command owner closed"))?;
+        let admission = context
+            .admit(deadline)
+            .await
+            .map_err(|_| Status::resource_exhausted("private backup admission unavailable"))?;
+        let _upload_admission = admission.clone();
+        let lease = session.workspace.lease.clone();
+        let identity = session.workspace.lease_identity;
+        let prepare = context.clone();
+        let callback = move || async move {
+            let diagnostics = prepare.clone();
+            let result = async move {
+                let kernel = loop {
+                    ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "private backup lease deadline"
+                    );
+                    let file = existing_lease(&lease, Some(identity))?;
+                    match file.try_lock_exclusive() {
+                        Ok(()) => break file,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                };
+                prepare
+                    .prepare(target, command, kernel, admission, deadline)
+                    .await
+            }
+            .await;
+            result.map_err(|error| {
+                diagnostics.record_error("prepare", &error);
+                native_retention::Error::Storage
+            })
+        };
+        let captured = self
+            .inner
+            .registry
+            .capture_dirty_or_reuse_pending_owned(CommandToken::from_bytes(session.token), callback)
+            .await;
+        if let Err(error) = captured {
+            let state = self
+                .inner
+                .registry
+                .workspace(session.workspace.registration)
+                .await
+                .map_err(status)?;
+            if state.state == native_retention::WorkspaceState::Dirty
+                && state.command_epoch == session.epoch
+            {
+                // The owned registry worker has physically completed. An unavailable
+                // backup leaves Dirty state and its immutable spool, not a stuck writer.
+                session.backup_capture_done.store(true, Ordering::Release);
+            }
+            return Err(status(error));
+        }
+        session.backup_capture_done.store(true, Ordering::Release);
+        let receipt = context.upload(deadline).await.map_err(|error| {
+            context.record_error("upload", &error);
+            Status::unavailable(
+                "private backup is not durably acknowledged; preserve original intent",
+            )
+        })?;
+        *session
+            .backup_receipt
+            .lock()
+            .map_err(|_| Status::internal("private backup result unavailable"))? = Some(receipt);
+        Ok(())
     }
     async fn checkpoint_session(
         &self,
@@ -1234,10 +1482,15 @@ impl NativeCommandHost {
     /// Startup-only metadata validation. No registration or capture payload is
     /// opened, and pending roots are never altered by this census.
     pub(crate) async fn pending_provider_registrations(
-        &self, max_entries: usize, max_bytes: usize,
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
     ) -> Result<native_retention::CaptureRegistrations> {
-        self.inner.registry.pending_capture_registrations(max_entries,max_bytes).await
-            .map_err(|_|anyhow::anyhow!("invalid pending provider census metadata"))
+        self.inner
+            .registry
+            .pending_capture_registrations(max_entries, max_bytes)
+            .await
+            .map_err(|_| anyhow::anyhow!("invalid pending provider census metadata"))
     }
     pub(crate) fn inspect_provider_mappings(
         &self,
@@ -1249,34 +1502,62 @@ impl NativeCommandHost {
         for item in std::fs::read_dir(self.inner.records.path())? {
             census.entry()?;
             let name = item?.file_name();
-            let name = name.to_str().context("invalid provider command census name")?;
+            let name = name
+                .to_str()
+                .context("invalid provider command census name")?;
             let bytes = census.read(&self.inner.records, name, MAX_RECORD)?;
-            if crate::provider_identity::is_atomic_temporary(name) { continue; }
+            if crate::provider_identity::is_atomic_temporary(name) {
+                continue;
+            }
             let mapping: Mapping = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid provider command census record"))?;
-            ensure!(mapping.version == 1 && name == format!("{}.json", mapping.mount)
-                && mapping.workspace.0 != [0;16] && mapping.op_store.0 != [0;16]
-                && !mapping.mount.is_empty() && mapping.mount.len() <=128
-                && mapping.mount.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
-                "invalid provider command census record");
+            ensure!(
+                mapping.version == 1
+                    && name == format!("{}.json", mapping.mount)
+                    && mapping.workspace.0 != [0; 16]
+                    && mapping.op_store.0 != [0; 16]
+                    && !mapping.mount.is_empty()
+                    && mapping.mount.len() <= 128
+                    && mapping
+                        .mount
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+                "invalid provider command census record"
+            );
             census.charge(512)?;
-            ensure!(registrations.insert((mapping.workspace.0,mapping.op_store.0),mapping.mount.clone()).is_none(),
-                "ambiguous pending provider census mapping");
+            ensure!(
+                registrations
+                    .insert(
+                        (mapping.workspace.0, mapping.op_store.0),
+                        mapping.mount.clone()
+                    )
+                    .is_none(),
+                "ambiguous pending provider census mapping"
+            );
             census.identity(&mapping.alias, mapping.identity)?;
-            ensure!(result.insert(mapping.mount, (mapping.alias, mapping.identity)).is_none(),
-                "duplicate provider command census record");
+            ensure!(
+                result
+                    .insert(mapping.mount, (mapping.alias, mapping.identity))
+                    .is_none(),
+                "duplicate provider command census record"
+            );
         }
         for registration in pending {
-            let mount = registrations.get(&(registration.workspace.0,registration.op_store.0))
+            let mount = registrations
+                .get(&(registration.workspace.0, registration.op_store.0))
                 .context("pending provider census mapping unavailable")?;
-            ensure!(result.contains_key(mount),"pending provider census route unavailable");
+            ensure!(
+                result.contains_key(mount),
+                "pending provider census route unavailable"
+            );
         }
         Ok(result)
     }
     pub(crate) fn inspect_writer_lease(binding: &Binding) -> Result<File> {
         let path = native_vfs_rpc::command_lock_path(&binding.admin, &binding.rpc_mount_id)?;
         let file = existing_lease(&path, None)?;
-        file.try_lock_exclusive().context("native command writer is active during provider census")?;
+        file.try_lock_exclusive()
+            .context("native command writer is active during provider census")?;
         Ok(file)
     }
     fn capture_mapping_record(&self, ticket: &native_retention::PendingCapture) -> Result<Mapping> {
@@ -1288,7 +1569,12 @@ impl NativeCommandHost {
             let item = item?;
             let name = item.file_name();
             let bytes = self.inner.records.read(&name, MAX_RECORD)?;
-            if name.to_str().is_some_and(crate::provider_identity::is_atomic_temporary) { continue; }
+            if name
+                .to_str()
+                .is_some_and(crate::provider_identity::is_atomic_temporary)
+            {
+                continue;
+            }
             let mapping: Mapping = serde_json::from_slice(&bytes)?;
             ensure!(
                 mapping.version == 1 && name.to_str() == Some(&format!("{}.json", mapping.mount)),
@@ -1452,7 +1738,32 @@ impl CommandHost for NativeCommandHost {
             .await
             .map_err(|_| Status::internal("native command worker failed"))?
     }
+    async fn select_private_backup(
+        &self,
+        mount: &str,
+        token: [u8; 32],
+    ) -> std::result::Result<(), Status> {
+        self.select_private(mount, token).await
+    }
+    async fn finish_private_backup(
+        &self,
+        mount: &str,
+        token: [u8; 32],
+    ) -> std::result::Result<PrivateBackupReceipt, Status> {
+        self.finish_private(mount, token).await
+    }
     async fn finish_dirty(&self, mount: &str, token: [u8; 32]) -> std::result::Result<(), Status> {
+        if let Ok(session) = self.session(token) {
+            if *session
+                .private_selected
+                .lock()
+                .map_err(|_| Status::internal("command mode unavailable"))?
+            {
+                return Err(Status::failed_precondition(
+                    "private backup requires explicit finish",
+                ));
+            }
+        }
         self.finish_job(mount, token).await
     }
     fn resolve(&self, mount: &str, token: [u8; 32]) -> std::result::Result<CommandJob, Status> {
@@ -1548,6 +1859,10 @@ mod tests {
         let registration = host.workspace("queue")?.registration;
         let objects = PrivateDir::create(private.path().join("objects"))?;
         let socket = private.path().join("rbe.sock");
+        let local = Arc::new(jj_native_backend::DirectObjectIo::init(
+            objects.path(),
+            Default::default(),
+        )?);
         let target = Arc::new(Target {
             auto_enrolled: false,
             controller: std::sync::Weak::new(),
@@ -1555,10 +1870,8 @@ mod tests {
                 private.path().join("admin-registry"),
             )?,
             binding,
-            local: Arc::new(jj_native_backend::DirectObjectIo::init(
-                objects.path(),
-                Default::default(),
-            )?),
+            local: local.clone(),
+            native: local,
             index: jj_native_index::Config {
                 endpoint: jj_native_index::Endpoint::UnixSocket(socket.clone()),
                 store_alias: "example".into(),
@@ -1663,11 +1976,19 @@ mod tests {
         drop(cleanup);
         let pending = registry.pending_captures().await?;
         assert_eq!(pending.len(), 1);
-        host.inner.records.replace(".private-12-34.tmp",b"{interrupted")?;
-        let registrations = host.pending_provider_registrations(128,16384).await?;
-        assert_eq!(registrations.as_slice(),&[pending[0].registration]);
-        assert_eq!(host.capture_mapping(&pending[0])?,("queue".into(),"example".into(),[8;32]));
-        assert_eq!(host.inner.records.read(".private-12-34.tmp",MAX_RECORD)?,b"{interrupted");
+        host.inner
+            .records
+            .replace(".private-12-34.tmp", b"{interrupted")?;
+        let registrations = host.pending_provider_registrations(128, 16384).await?;
+        assert_eq!(registrations.as_slice(), &[pending[0].registration]);
+        assert_eq!(
+            host.capture_mapping(&pending[0])?,
+            ("queue".into(), "example".into(), [8; 32])
+        );
+        assert_eq!(
+            host.inner.records.read(".private-12-34.tmp", MAX_RECORD)?,
+            b"{interrupted"
+        );
         Ok(())
     }
     #[tokio::test]
@@ -2039,6 +2360,25 @@ mod tests {
         assert_eq!(
             started.epoch, 1,
             "the SAME preparation is accepted only with an actual CLI lease"
+        );
+        assert_eq!(
+            host.select_private_backup("activated", started.token)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            host.finish_private_backup("activated", started.token)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            host.workspace_state("activated").await?.command_epoch,
+            1,
+            "unsupported explicit backup must not mutate ordinary command state"
         );
         drop(lease);
         tokio::time::timeout(
