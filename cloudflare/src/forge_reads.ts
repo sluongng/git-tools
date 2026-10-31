@@ -167,14 +167,18 @@ export class ForgeReads {
     const key = { kind: command.kind, id: hex(command.id) };
     const expected = this.host.transactionSync(() => {
       this.checkInTx(view);
-      return this.host.projections.authorizedReadMemberInTx(view, key).descriptor;
+      const member = this.host.projections.findAuthorizedMemberInTx(view, key);
+      if (!member) fail(403, 'permission_denied');
+      return member.descriptor;
     });
     if (!Number.isSafeInteger(expected.size_bytes) || expected.size_bytes < 0) fail(503, 'unavailable');
     if (command.offset > expected.size_bytes) fail(400, 'invalid_argument');
     const length = Math.min(command.max_bytes, expected.size_bytes - command.offset);
     const recheck = () => {
       this.checkInTx(view);
-      if (!same(expected, this.host.projections.authorizedReadMemberInTx(view, key).descriptor)) fail(409, 'aborted');
+      const member = this.host.projections.findAuthorizedMemberInTx(view, key);
+      if (!member) fail(403, 'permission_denied');
+      if (!same(expected, member.descriptor)) fail(409, 'aborted');
     };
     let bytes: Uint8Array = new Uint8Array();
     if (length !== 0) {

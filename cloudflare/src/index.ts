@@ -733,9 +733,9 @@ class RepositoryEngine {
         nowSeconds: () => Math.floor(Date.now() / 1000),
         requireWriterInTx: () => { api.requireWriterInTx(); },
         projectionMemberInTx: (view, descriptor) => {
-          const ready = projections.readyInTx(view);
-          if (!ready || !this.one('SELECT 1 FROM projection_members WHERE projection=? AND kind=? AND id=?', ready.catalog_id, descriptor.kind, descriptor.id)) return false;
-          const member = projections.memberInTx(view, descriptor).descriptor;
+          const membership = projections.findAuthorizedMemberInTx(view, descriptor);
+          if (!membership) return false;
+          const member = membership.descriptor;
           if (member.size_bytes !== descriptor.size_bytes || member.format_version !== descriptor.format_version) fail(503, 'unavailable');
           return true;
         },
@@ -1092,11 +1092,12 @@ class RepositoryEngine {
           const allowed = views.pathsAllowedInTx(view, [path]);
           if (allowed.paths.length !== 1 || !allowed.paths[0].allowed) fail(403, 'permission_denied');
         }
-        try {
-          const actual = projections.authorizedReadMemberInTx(view, descriptor).descriptor;
+        const membership = projections.findAuthorizedMemberInTx(view, descriptor);
+        if (membership) {
+          const actual = membership.descriptor;
           if (actual.size_bytes !== descriptor.size_bytes || actual.format_version !== descriptor.format_version) fail(503, 'unavailable');
           return Number.MAX_SAFE_INTEGER;
-        } catch (error) { if (!(error instanceof Failure) || error.status !== 403) throw error; }
+        }
         return requireOwnedUploadInTx(ownedHost, view, path, descriptor, now);
       },
       requireRetainedClosureInTx: root => this.retainedForgeClosureInTx(account, storage, root),

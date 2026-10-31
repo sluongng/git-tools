@@ -655,10 +655,11 @@ export class ForgeProjections {
     const result=this.catalogForProjectedInTx(view,projectedCommit);
     return result?{canonical_revision:hex(result.binding.canonical_revision),projection_id:result.catalog_id}:undefined;
   }
-  authorizedReadMemberInTx(view:ResolvedView,object:ObjectKey):{projection:ReadyProjection;descriptor:Descriptor} {
+  /** Only absent membership returns undefined; policy and integrity errors propagate. */
+  findAuthorizedMemberInTx(view:ResolvedView,object:ObjectKey):{projection:ReadyProjection;descriptor:Descriptor}|undefined {
     const d=this.check(view);if(!key(object)) fail(400,'invalid_argument');
     const row=this.one<Catalog&{size:number}>('SELECT c.id,c.binding,c.proof_job,c.retired,m.size FROM projection_catalogs c JOIN projection_members m ON m.projection=c.id WHERE c.account=? AND c.version=? AND c.epoch=? AND c.retired=0 AND m.kind=? AND m.id=? ORDER BY c.id LIMIT 1',this.host.accountId,hex(d.view_version),d.policy_epoch,object.kind,object.id);
-    if(!row) fail(403,'permission_denied');
+    if(!row) return undefined;
     const projection=this.catalog(view,row),expected=descriptor({...object,size_bytes:row.size,format_version:1}),actual=this.host.describeObjectInTx(object);
     if(!actual||!same(expected,actual)) fail(503,'unavailable');return {projection,descriptor:expected};
   }
@@ -666,7 +667,7 @@ export class ForgeProjections {
   projectedCopyOriginInTx(view:ResolvedView,copyId:string):{projection:ReadyProjection;origin:ProjectionCopyOrigin}|undefined {
     const d=this.check(view);if(!key({kind:5,id:copyId})) fail(400,'invalid_argument');
     const row=this.one<Catalog&{value:string}>('SELECT c.id,c.binding,c.proof_job,c.retired,o.value FROM projection_private_origins o JOIN projection_catalogs c ON c.id=o.projection WHERE c.account=? AND c.version=? AND c.epoch=? AND c.retired=0 AND o.projected_copy=? ORDER BY c.id LIMIT 1',this.host.accountId,hex(d.view_version),d.policy_epoch,copyId);
-    if(!row) return undefined;this.authorizedReadMemberInTx(view,{kind:5,id:copyId});const projection=this.catalog(view,row);let origin:ProjectionCopyOrigin;try{origin=JSON.parse(row.value);}catch{throw new Invalid();}
+    if(!row) return undefined;if(!this.findAuthorizedMemberInTx(view,{kind:5,id:copyId})) fail(403,'permission_denied');const projection=this.catalog(view,row);let origin:ProjectionCopyOrigin;try{origin=JSON.parse(row.value);}catch{throw new Invalid();}
     if(hex(origin.projected_copy)!==copyId||hex(origin.canonical_revision)!==hex(projection.binding.canonical_revision)||!this.allowedPathsInTx(view,[origin.canonical_path])[0]?.allowed) throw new Invalid();
     hex(origin.file);if(origin.canonical_copy!==null) hex(origin.canonical_copy);return {projection,origin};
   }
